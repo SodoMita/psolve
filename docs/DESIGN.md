@@ -85,7 +85,47 @@ Well-conditioned bounded LPs, cross-checked against GLPK:
 - Medium dense LPs: correct but slower than GLPK — the dense basis is O(m²)
   per solve, which is the remaining algorithmic gap for dense problems.
 
-## 4. Honest status and known limitations
+## 5. Quadratic programming (src/qp.c)
+
+A **primal active-set method** for convex QPs:
+
+```
+minimize  1/2 x^T Q x + c^T x
+subject to       A x  <=  b      (Q symmetric PSD)
+```
+
+- Maintains a rank-managed working set of active inequalities (dependent rows
+  are skipped via Gram–Schmidt) so the KKT system `[Q A^T; A 0]` is never
+  singular.
+- Solves the KKT system with the dense LU code, taking a step to the blocking
+  constraint or dropping the most-negative multiplier.
+- A **Phase-I feasibility** step (minimize sum of artificial slacks, `sum s`,
+  with a tiny quadratic regularization to keep it strictly convex) finds a
+  feasible point when the origin is infeasible, and correctly reports an
+  infeasible QP.
+- Verified against scipy (SLSQP) on randomized convex QPs including
+  infeasible-origin cases and genuinely infeasible instances.
+
+## 6. Incremental solving (warm starts)
+
+The LP solver exposes a warm-start API so a perturbed problem can be re-solved
+from the previous basis instead of from scratch:
+
+- `solver_set_objective` / `solver_set_bounds` + `solver_warm_solve`:
+  objective changes never affect feasibility, so the previous basis warm-starts
+  Phase II directly.  Bound changes can make a basic variable leave its bounds;
+  `warm_solve` detects an infeasible warm start and falls back to a clean
+  re-solve (via `solver_refresh`, which reconstructs the LP and re-solves).
+- `solver_add_row` appends a constraint; it reconstructs the LP including the
+  new row and does a clean re-solve, guaranteeing the result matches a
+  from-scratch solve.
+
+All three operations are verified against from-scratch solves on 200+ random
+bounded LPs (`tools/incr_rand.c`), and the round-trip LP reconstruction is
+validated (it re-scales the equality-form coefficients back to the original
+problem).
+
+## 7. Honest status and known limitations
 
 - **Correctness:** verified against GLPK on hundreds of random instances —
   100% objective agreement on well-conditioned problems (all sizes/densities),

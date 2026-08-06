@@ -1,12 +1,15 @@
-# AVX512-Simplex — a vectorized revised simplex LP solver in C
+# AVX512-Simplex — a vectorized LP & QP solver in C
 
-A from-scratch linear-programming solver built around the **revised simplex
-method**, tuned for modern x86 hardware (AVX-512 FMA), cache-friendly sparse
-data layout, and hyper-sparsity-aware pricing.
+A from-scratch **linear programming** (revised simplex) and **quadratic
+programming** (active-set) solver, tuned for modern x86 hardware (AVX-512 FMA),
+cache-friendly sparse data layout, and hyper-sparsity-aware pricing. It also
+supports **incremental solving** (warm starts) so you can re-solve a perturbed
+problem without starting over.
 
-It reads a simple text LP format, solves it, and prints the optimum.  It also
-ships a GLPK-based differential tester and a benchmark harness so results can
-be cross-checked and timed against a reference solver.
+It reads a simple text LP format, solves it, and prints the optimum.  The QP
+solver (`qpsolve`) solves convex QPs (minimize ½xᵀQx + cᵀx s.t. Ax ≤ b).  It
+ships a GLPK-based differential tester, a scipy-based QP verifier, a benchmark
+harness, and an incremental-solving test.
 
 ## Building
 
@@ -21,14 +24,37 @@ code falls back to AVX2/SSE2/scalar automatically (see `src/kernels.c`).
 ## Usage
 
 ```sh
-./lpsolve <problem.lp> [--print]
+./lpsolve <problem.lp> [--print]      # LP (revised simplex)
+./qpsolve <qp.qp>                      # convex QP (active-set)
 ```
 
 `--print` also dumps the optimal variable values.
 
-The solver handles: **maximize or minimize**, `<`, `>`, and `=` constraints,
+The LP solver handles: **maximize or minimize**, `<`, `>`, and `=` constraints,
 variables with arbitrary finite/infinite bounds (lower, upper, or boxed), and
 correctly reports `OPTIMAL`, `INFEASIBLE`, or `UNBOUNDED`.
+
+The QP solver handles: **minimize** ½xᵀQx + cᵀx subject to Ax ≤ b with Q
+symmetric positive semi-definite (convex), reporting the optimum, Lagrange
+multipliers, and status (solved / infeasible).
+
+## Incremental solving
+
+The C API supports warm-start re-solving after a problem changes:
+
+```c
+Solver *s = solver_create(&lp);
+solver_solve(s);                      // initial solve
+solver_set_objective(s, newc, 1);     // change objective -> re-solve fast
+solver_warm_solve(s);
+solver_set_bounds(s, newl, newu);     // change bounds -> re-solve fast
+solver_warm_solve(s);
+solver_add_row(s, arow, rhs, '<');    // add a constraint -> re-solve
+solver_solve(s);
+```
+
+`set_objective` and `set_bounds` warm-start from the previous basis; `add_row`
+does a clean re-solve.  All are verified against from-scratch solves.
 
 ### LP file format
 
@@ -84,9 +110,11 @@ src/lu.c        dense LU factorization + forward/back substitution (BTRAN/FTRAN)
 src/splu.c      sparse LU factorization (fill-reducing order + partial pivoting)
                 with hyper-sparse triangular solves
 src/solver.c    revised-simplex driver, two-phase method, steepest-edge pricing,
-                sparse/dense basis dispatch + fallback
+                sparse/dense dispatch, incremental (warm-start) solving
+src/qp.c        convex QP solver (active-set method + Phase-I feasibility)
 src/parser.c    LP file reader
-src/main.c      CLI
+src/main.c      LP CLI
+tools/qpsolve.c QP CLI
 tools/          generators, differential tester, unit tests, benchmarks
 examples/       sample LP files
 ```

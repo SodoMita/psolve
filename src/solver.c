@@ -84,7 +84,10 @@ Solver *solver_create(const LP *lp)
     s->slackVar = (int*)xmalloc(m * sizeof(int));
     s->artVar = (int*)xmalloc(m * sizeof(int));
     s->beq = (double*)xmalloc(m * sizeof(double));
-    for (i = 0; i < m; i++) s->beq[i] = fabs(lp->b[i]);
+    s->borig = (double*)xmalloc(m * sizeof(double));
+    s->mlt = (int*)xmalloc(m * sizeof(int));
+    s->rel = (char*)xmalloc(m);
+    for (i = 0; i < m; i++) { s->beq[i] = fabs(lp->b[i]); s->borig[i] = lp->b[i]; s->mlt[i] = (lp->b[i]>=0)?1:-1; s->rel[i] = lp->rel[i]; }
 
     /* determine mlt and transformed rhs */
     for (i = 0; i < m; i++) mlt[i] = (lp->b[i] >= 0) ? 1 : -1;
@@ -229,7 +232,7 @@ void solver_destroy(Solver *s)
     free(s->l); free(s->u); free(s->cobj); free(s->c0); free(s->basis); free(s->basispos);
     free(s->status); free(s->x); free(s->rc); free(s->cB);
     free(s->lu); free(s->piv); free(s->y); free(s->d); free(s->v); free(s->xb);
-    free(s->slackVar); free(s->artVar); free(s->beq);
+    free(s->slackVar); free(s->artVar); free(s->beq); free(s->borig); free(s->mlt); free(s->rel);
     free(s->w); free(s->vw); free(s->piw);
     free(s->colptr); free(s->row); free(s->val);
     splu_free(&s->splu);
@@ -691,9 +694,20 @@ static int solve_phase(Solver *s)
 int solver_solve(Solver *s)
 {
     int r = 0;
-    /* Phase I: only needed if artificials are in the initial basis */
-    if (s->needs_phase1) {
+    /* Phase I: needed if any artificial is in the current basis.  Detecting it
+       from the basis (not a flag) makes this work both for the initial solve
+       and for warm starts after incremental changes. */
+    int first_art = s->N - s->M;
+    int need_p1 = 0;
+    for (int i = 0; i < s->M; i++)
+        if (s->basis[i] >= first_art) { need_p1 = 1; break; }
+    if (need_p1) {
         s->phase = 1;
+        for (int j = 0; j < s->N; j++) s->cobj[j] = 0.0;
+        for (int i = 0; i < s->M; i++) {
+            int av = s->artVar[i];
+            if (s->status[av] == LP_BASIC) s->cobj[av] = -1.0;
+        }
         r = solve_phase(s);
         if (r == 2) { s->status_out = 2; return 2; }
         if (r != 0) { s->status_out = 1; return 1; }
@@ -716,8 +730,8 @@ int solver_solve(Solver *s)
     s->bland = 0; s->flat = 0; s->last_obj = -LP_INF;
     refactorize(s);
 
-    /* if Phase I ran, re-derive the basic values so Phase II starts feasible */
-    if (s->needs_phase1) recompute_basic(s);
+    /* re-derive the basic values so the solve always starts exactly feasible */
+    recompute_basic(s);
 
     r = solve_phase(s);
     if (r == 2) { s->status_out = 2; return 2; }
@@ -736,6 +750,132 @@ void solver_optimum(const Solver *s, double *x_orig, double *obj)
 {
     for (int j = 0; j < s->n_orig; j++) x_orig[j] = s->x[j];
     *obj = s->negate_obj ? -s->objval : s->objval;
+}
+
+void solver_set_objective(Solver *s, const double *c, int maximize)
+{
+    s->negate_obj = maximize ? 0 : 1;
+    for (int j = 0; j < s->n_orig; j++) s->c0[j] = maximize ? c[j] : -c[j];
+    memcpy(s->cobj, s->c0, (size_t)s->N * sizeof(double));
+    /* slacks/artificials keep zero objective (already 0 after Phase II) */
+}
+
+void solver_set_bounds(Solver *s, const double *l, const double *u)
+{
+    for (int j = 0; j < s->n_orig; j++) { s->l[j] = l[j]; s->u[j] = u[j]; }
+}
+
+/* Reconstruct the original LP from the current solver state and do a clean
+ * full re-solve, swapping the result into *s.  Used as a robust fallback when
+ * an incremental change makes the warm-start basis infeasible. */
+static void solver_refresh(Solver *s)
+{
+    int n = s->n_orig, m = s->M;
+    LP lp; memset(&lp, 0, sizeof(lp));
+    lp.n = n; lp.m = m; lp.maximize = !s->negate_obj;
+    lp.c  = (double*)xmalloc(n * sizeof(double));
+    lp.l  = (double*)xmalloc(n * sizeof(double));
+    lp.u  = (double*)xmalloc(n * sizeof(double));
+    lp.b  = (double*)xmalloc(m * sizeof(double));
+    lp.rel = (char*)xmalloc(m);
+    for (int j = 0; j < n; j++) {
+        lp.c[j] = s->negate_obj ? -s->c0[j] : s->c0[j];
+        lp.l[j] = s->l[j]; lp.u[j] = s->u[j];
+    }
+    for (int i = 0; i < m; i++) { lp.b[i] = s->borig[i]; lp.rel[i] = s->rel[i]; }
+    long nnz = 0;
+    for (int j = 0; j < n; j++) nnz += (long)(s->colptr[j+1] - s->colptr[j]);
+    lp.Acolptr = (int*)calloc((size_t)(n + 1), sizeof(int));
+    lp.Arow = (int*)malloc((size_t)nnz * sizeof(int));
+    lp.Aval = (double*)malloc((size_t)nnz * sizeof(double));
+    long pos = 0;
+    for (int j = 0; j < n; j++) {
+        lp.Acolptr[j] = (int)pos;
+        for (int k = s->colptr[j]; k < s->colptr[j+1]; k++) {
+            int row = s->row[k];
+            double v = s->val[k] / s->mlt[row];
+            if (v != 0.0) { lp.Arow[pos] = row; lp.Aval[pos] = v; pos++; }
+        }
+    }
+    lp.Acolptr[n] = (int)pos;
+    Solver *fresh = solver_create(&lp);
+    solver_solve(fresh);
+    Solver hold = *fresh; *fresh = *s; *s = hold;
+    solver_destroy(fresh);
+    free(lp.c); free(lp.b); free(lp.rel); free(lp.l); free(lp.u);
+    free(lp.Acolptr); free(lp.Arow); free(lp.Aval);
+}
+
+/* Re-solve from the current basis (warm start).  Assumes Phase I has been
+ * completed (or was unnecessary) and the basis is a valid starting point.
+ * If an incremental change (e.g. a tightened bound) makes the warm start
+ * infeasible, falls back to a clean re-solve. */
+int solver_warm_solve(Solver *s)
+{
+    s->phase = 2;
+    s->bland = 0; s->flat = 0; s->last_obj = -LP_INF;
+    refactorize(s);
+    recompute_basic(s);     /* restore primal feasibility for the current basis */
+    int r = solve_phase(s);
+    if (r == 2 || !solver_feasible(s)) { solver_refresh(s); return s->status_out; }
+    double obj = 0.0;
+    for (int i = 0; i < s->M; i++) obj += s->cobj[s->basis[i]] * s->x[s->basis[i]];
+    for (int j = 0; j < s->N; j++)
+        if (s->status[j] != LP_BASIC && s->status[j] != LP_REMOVED)
+            obj += s->cobj[j] * s->x[j];
+    s->objval = obj;
+    s->status_out = 0;
+    return 0;
+}
+
+int solver_add_row(Solver *s, const double *a, double rhs, char rel)
+{
+    int n = s->n_orig, m = s->M;
+    /* Reconstruct the current LP (original constraints) from the solver state,
+       add the new row, and do a clean full re-solve.  This is guaranteed to
+       match a from-scratch solve regardless of the solver's prior state. */
+    LP lp; memset(&lp, 0, sizeof(lp));
+    lp.n = n; lp.m = m + 1; lp.maximize = !s->negate_obj;
+    lp.c  = (double*)xmalloc(n * sizeof(double));
+    lp.l  = (double*)xmalloc(n * sizeof(double));
+    lp.u  = (double*)xmalloc(n * sizeof(double));
+    lp.b  = (double*)xmalloc((m + 1) * sizeof(double));
+    lp.rel = (char*)xmalloc(m + 1);
+    for (int j = 0; j < n; j++) {
+        lp.c[j] = s->negate_obj ? -s->c0[j] : s->c0[j];
+        lp.l[j] = s->l[j]; lp.u[j] = s->u[j];
+    }
+    for (int i = 0; i < m; i++) { lp.b[i] = s->borig[i]; lp.rel[i] = s->rel[i]; }
+    lp.b[m] = rhs; lp.rel[m] = rel;
+
+    /* count nnz: original columns + new-row entries in the original columns */
+    long nnz = 0;
+    for (int j = 0; j < n; j++) nnz += (long)(s->colptr[j+1] - s->colptr[j]);
+    for (int j = 0; j < n; j++) if (a[j] != 0.0) nnz++;
+
+    lp.Acolptr = (int*)calloc((size_t)(n + 1), sizeof(int));
+    lp.Arow = (int*)malloc((size_t)nnz * sizeof(int));
+    lp.Aval = (double*)malloc((size_t)nnz * sizeof(double));
+    long pos = 0;
+    for (int j = 0; j < n; j++) {
+        lp.Acolptr[j] = (int)pos;
+        for (int k = s->colptr[j]; k < s->colptr[j+1]; k++) {
+            int row = s->row[k];
+            double v = s->val[k] / s->mlt[row];     /* unscale to original A */
+            if (v != 0.0) { lp.Arow[pos] = row; lp.Aval[pos] = v; pos++; }
+        }
+        if (a[j] != 0.0) { lp.Arow[pos] = m; lp.Aval[pos] = a[j]; pos++; }
+    }
+    lp.Acolptr[n] = (int)pos;
+
+    /* clean full re-solve and swap the result into *s */
+    Solver *fresh = solver_create(&lp);
+    int r = solver_solve(fresh);
+    Solver hold = *fresh; *fresh = *s; *s = hold;
+    solver_destroy(fresh);     /* frees the old *s data that now lives in fresh */
+    free(lp.c); free(lp.b); free(lp.rel); free(lp.l); free(lp.u);
+    free(lp.Acolptr); free(lp.Arow); free(lp.Aval);
+    return r;
 }
 
 /* Primal-feasibility check of the current solution. */

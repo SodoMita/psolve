@@ -69,6 +69,9 @@ typedef struct {
     int *slackVar;         /* per row: slack var or -1 */
     int *artVar;           /* per row: artificial var */
     double *beq;           /* scaled rhs |b| (equality form), M */
+    double *borig;         /* original rhs (with sign), M */
+    int *mlt;              /* row sign: +1 if b>=0 else -1, M */
+    char *rel;             /* per row: original relation '<' '>' '=' */
 
     /* controls / stats */
     long iters;
@@ -97,5 +100,24 @@ int solver_solve(Solver *s);
 void solver_optimum(const Solver *s, double *x_orig, double *obj);
 /* returns 1 if the current solution is primal feasible (bounds + constraints) */
 int solver_feasible(const Solver *s);
+
+/* ------------------------------------------------------------------ */
+/* Incremental solving (warm starts).                                  */
+/* These let you change part of a solved problem and re-solve starting  */
+/* from the previous basis, instead of from scratch.                   */
+/* ------------------------------------------------------------------ */
+
+/* Replace the objective coefficients (for the original variables). */
+void solver_set_objective(Solver *s, const double *c, int maximize);
+
+/* Replace the lower/upper bounds of the original variables. */
+void solver_set_bounds(Solver *s, const double *l, const double *u);
+
+/* Add one inequality/equality row:  a^T x (rel) rhs.  rel in {'<','>','='}.
+ * Rebuilds the matrix and warm-starts from the previous basis. */
+int solver_add_row(Solver *s, const double *a, double rhs, char rel);
+
+/* Re-solve from the current basis (warm start).  Returns status_out. */
+int solver_warm_solve(Solver *s);
 
 #endif
