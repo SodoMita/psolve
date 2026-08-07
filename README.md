@@ -42,14 +42,17 @@ with an explicit baseline `ARCH`.
 ## Usage
 
 ```sh
-./lpsolve <problem.lp> [--print]      # LP (revised simplex, double)
+./lpsolve [-t ms|--time-limit ms] <problem.lp> [--print]  # LP (revised simplex, double)
 ./qpsolve <qp.qp>                      # convex QP (active-set)
 ./mipsolve <problem.lp> <nint> <j...> [--print]   # MIP (branch-and-bound)
 ./fznsolve <problem.fzn>               # FlatZinc reader + solver (Phase 3)
 ./fxsolve <problem.lp> [--print]      # LP (exact rational / fixed-point simplex)
 ```
 
-`--print` also dumps the optimal variable values.
+`--print` also dumps the optimal variable values. `-t` / `--time-limit` sets a
+cooperative wall-clock limit in milliseconds; `Ctrl-C` also stops the double LP
+solve cleanly. Both return `STOPPED` rather than presenting a partial solution
+as optimal.
 
 The LP solver handles: **maximize or minimize**, `<`, `>`, and `=` constraints,
 variables with lower, upper, boxed, or fully free bounds (use `-inf inf`), and
