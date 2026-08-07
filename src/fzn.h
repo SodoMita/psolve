@@ -5,7 +5,8 @@
  *
  * Parses a FlatZinc (.fzn) file produced by the MiniZinc compiler and solves
  * the subset of constraints it can handle natively (linear int/bool/float
- * constraints, int_lin_*, bool_*, set_in, all_different, ...) with the LP
+ * constraints, int_lin_*, bool_*, set_in, all_different, table, circuit, ...)
+ * with the LP
  * solver.  Nonlinear/unhandled constraints are reported so the driver can
  * return =====UNKNOWN===== rather than silently giving a wrong answer.
  *
@@ -36,8 +37,14 @@ typedef struct {
     int   is_array;    /* 1 = array decl */
     int   n;           /* number of elements (array) or 1 (scalar) */
     int   index_lo;    /* FlatZinc lower array index (1 for scalars/default arrays) */
-    int   base_idx;    /* first solver index for vars; array element i is base_idx+i */
+    int   base_idx;    /* first solver index for owned contiguous vars */
     int   is_output;   /* ::output_var / ::output_array */
+    /* An initialized var declaration is an alias/view in FlatZinc.  Each
+       element either references an existing solver variable (alias_idx[e]>=0)
+       or is a fixed alias_const[e] (alias_idx[e]<0).  NULL means owned,
+       contiguous variables beginning at base_idx. */
+    int   *alias_idx;
+    double *alias_const;
     /* parameter value(s) */
     double *par;       /* fixed values for parameters (NULL if var) */
     int   *par_int;

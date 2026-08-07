@@ -165,6 +165,103 @@ def test_float_linear_subset() -> None:
     require("x = 1.5;" in out, f"decimal annotation domain was parsed incorrectly:\n{out}")
 
 
+def test_table_and_constant_aliases() -> None:
+    out = run_model(
+        """
+        predicate gecode_table_int(array [int] of var int: x, array [int] of int: t);
+        array [1..6] of int: tuples = [1,2,2,3,3,1];
+        var 2..3: x1 :: output_var;
+        var 1..3: x2 :: output_var;
+        array [1..2] of var int: x :: output_array([1..2]) = [x1,x2];
+        constraint gecode_table_int(x, tuples);
+        solve maximize x2;
+        """
+    )
+    require("x = array1d(1..2, [2, 3]);" in out and "objective=3" in out,
+            f"table encoding did not select an exact optimum tuple:\n{out}")
+
+    # MiniZinc constant propagation can turn a var-array view into literals.
+    # [1,3] combines values that occur in the table but is not a table row.
+    out = run_model(
+        """
+        predicate gecode_table_int(array [int] of var int: x, array [int] of int: t);
+        array [1..6] of int: tuples = [1,2,2,3,3,1];
+        array [1..2] of var int: x :: output_array([1..2]) = [1,3];
+        constraint gecode_table_int(x, tuples);
+        solve satisfy;
+        """
+    )
+    require("=====UNSATISFIABLE=====" in out,
+            f"table was weakened to independent column membership:\n{out}")
+
+    out = run_model(
+        """
+        predicate gecode_table_int(array [int] of var int: x, array [int] of int: t);
+        array [1..6] of int: tuples = [1,2,2,3,3,1];
+        array [1..2] of var int: x :: output_array([1..2]) = [1,2];
+        constraint gecode_table_int(x, tuples);
+        solve satisfy;
+        """
+    )
+    require("x = array1d(1..2, [1, 2]);" in out and "----------" in out,
+            f"constant var-array alias/output failed:\n{out}")
+
+    out = run_model(
+        """
+        array [1..4] of int: tuples = [1,2,2,1];
+        array [1..2] of var int: x :: output_array([1..2]) = [2,1];
+        constraint fzn_table_int(x, tuples);
+        solve satisfy;
+        """
+    )
+    require("----------" in out, f"standard fzn_table_int variant failed:\n{out}")
+
+
+def test_circuit() -> None:
+    out = run_model(
+        """
+        predicate gecode_circuit(int: offset, array [int] of var int: x);
+        array [1..4] of var int: s :: output_array([1..4]) = [2,3,4,1];
+        constraint gecode_circuit(1, s);
+        solve satisfy;
+        """
+    )
+    require("s = array1d(1..4, [2, 3, 4, 1]);" in out and "----------" in out,
+            f"valid Hamiltonian circuit was rejected:\n{out}")
+
+    # Two 2-cycles satisfy assignment/all-different but are not one circuit.
+    out = run_model(
+        """
+        predicate gecode_circuit(int: offset, array [int] of var int: x);
+        array [1..4] of var int: s :: output_array([1..4]) = [2,1,4,3];
+        constraint gecode_circuit(1, s);
+        solve satisfy;
+        """
+    )
+    require("=====UNSATISFIABLE=====" in out,
+            f"circuit encoding allowed disconnected subtours:\n{out}")
+
+    out = run_model(
+        """
+        predicate gecode_circuit(int: offset, array [int] of var int: x);
+        array [1..4] of var int: s :: output_array([1..4]) = [1,2,3,0];
+        constraint gecode_circuit(0, s);
+        solve satisfy;
+        """
+    )
+    require("s = array1d(1..4, [1, 2, 3, 0]);" in out and "----------" in out,
+            f"offset-zero circuit was not handled:\n{out}")
+
+    out = run_model(
+        """
+        array [1..3] of var int: s :: output_array([1..3]) = [2,3,1];
+        constraint fzn_circuit(s);
+        solve satisfy;
+        """
+    )
+    require("----------" in out, f"standard fzn_circuit variant failed:\n{out}")
+
+
 def test_declaration_indices_and_honest_unknown() -> None:
     out = run_model(
         """
@@ -213,11 +310,13 @@ def main() -> int:
         test_integer_strict()
         test_integer_reification_truth_table()
         test_float_linear_subset()
+        test_table_and_constant_aliases()
+        test_circuit()
         test_declaration_indices_and_honest_unknown()
     except AssertionError as exc:
         print(f"FlatZinc semantics test FAILED: {exc}", file=sys.stderr)
         return 1
-    print("FlatZinc semantics: strict/reified int + continuous float subset PASSED")
+    print("FlatZinc semantics: strict/reified int + float + table/circuit subset PASSED")
     return 0
 
 

@@ -73,6 +73,21 @@ MODELS = [
         constraint val = arr[idx];
         solve maximize val;
     """, "max"),
+    ("table", """
+        include "table.mzn";
+        array[1..2] of var 1..3: x :: output_array([1..2]);
+        array[1..3,1..2] of int: tuples =
+          array2d(1..3, 1..2, [1,2, 2,3, 3,1]);
+        constraint table(x, tuples);
+        constraint x[1] >= 2;
+        solve maximize x[2];
+    """, "max"),
+    ("circuit", """
+        include "circuit.mzn";
+        array[1..4] of var 1..4: successor :: output_array([1..4]);
+        constraint circuit(successor);
+        solve satisfy;
+    """, "sat"),
     ("reif_eq", """
         var 0..10: x :: output_var;
         var 0..10: y :: output_var;
@@ -153,6 +168,7 @@ def main():
             elif name == 'max2': bobj = 10
             elif name == 'setdom': bobj = 5
             elif name == 'element': bobj = 40
+            elif name == 'table': bobj = 3
             elif name == 'reif_eq': bobj = 6
             elif name == 'not_eq': bobj = 10
             elif name == 'lin_ne': bobj = 10

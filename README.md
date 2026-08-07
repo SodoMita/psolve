@@ -251,21 +251,27 @@ integration point used by [SmazkaVG](https://github.com/SodoMita/SmazkaVG).
 ## FlatZinc (Phase 3, linear subset)
 
 `fznsolve <problem.fzn>` reads a MiniZinc-compiled FlatZinc file and solves the
-linear subset it can handle natively with the LP solver (and the MIP solver
-when integer variables are present, so answers are integral):
+linear plus selected exact finite-domain global-constraint subset natively with
+the LP solver (and the MIP solver when integer variables are present, so answers
+are integral):
 
 - **Declarations**: `par`/`var` int/float/bool (including bare scalar
   parameters such as `int: n = 4;`), scalar + arrays with their original index
   ranges, annotations, and domains in both `var 1..10:` shorthand and
-  `::`-annotation forms. Decimal shorthand domains infer `var float`.
+  `::`-annotation forms. Decimal shorthand domains infer `var float`; var-array
+  aliases retain compiler-propagated literal elements such as `x = [1,3]`.
 - **Constraints**: exact integer/bool `*_lin_eq/le/lt/ge/gt` and
   `*_eq/le/lt/ge/gt` relations; `int_eq/le/lt/ge/gt_reif` and their bool
   counterparts; `int_lin_ne`, `count`/`among`; boolean logic; `int_abs/max/min`,
   `int_times` (constant operand), `set_in` + set domains, `all_different`,
-  `array_int_element`, `bool2int`/`int2float`; and the continuous linear float
+  `array_int_element`, exact Gecode/standard integer `table` (up to 1,024 rows)
+  and Hamiltonian `circuit` constraints (up to 64 nodes), `bool2int`/`int2float`;
+  and the continuous linear float
   subset `float_lin_eq/le/ge`, `float_eq/le/ge`, `float_plus/minus/neg`,
   constant-operand `float_times`, and constant-denominator `float_div`; see
-  `examples/fzn/float_lin.fzn` for a runnable continuous model.
+  `examples/fzn/float_lin.fzn` for a runnable continuous model,
+  `examples/fzn/table.fzn` for an exact extensional table, and
+  `examples/fzn/circuit.fzn` for a Hamiltonian successor circuit.
 - **Solve**: satisfy / minimize / maximize; type-faithful FlatZinc output
   (including full-precision float values and declared array indices), objective always, and `-s` stats
   (`nodes`, `objectiveBound`); `-n` node limit and `-t`/SIGINT time limits are

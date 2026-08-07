@@ -7,6 +7,7 @@
 #include <string.h>
 #include <math.h>
 #include <ctype.h>
+#include <limits.h>
 
 /* ------------------------------------------------------------------ */
 /* Lexer                                                               */
@@ -121,12 +122,27 @@ static Expr parse_primary(const char*s,size_t*pos,FZModel*m,int*err)
             int elem=d?(int)(ival-d->index_lo):-1;
             if(!d||!d->is_array||elem<0||elem>=d->n){*err=1;return e;}
             if(d->is_var){
-                if(d->base_idx<0){*err=1;return e;}
-                lin_term(&e.els[0], d->base_idx+elem, 1.0);
+                if(d->alias_idx){
+                    int av=d->alias_idx[elem];
+                    if(av>=0)lin_term(&e.els[0],av,1.0);
+                    else e.els[0].constant=d->alias_const[elem];
+                } else {
+                    if(d->base_idx<0){*err=1;return e;}
+                    lin_term(&e.els[0], d->base_idx+elem, 1.0);
+                }
             } else e.els[0].constant = d->par?d->par[elem]:(d->par_int?d->par_int[elem]:0);
             return e;}
         FZDecl*d=find_decl(m,name);
-        if(d){ if(d->is_var){lin_term(&e.els[0],d->base_idx,1.0);} else e.els[0].constant=d->par?d->par[0]:(d->par_int?d->par_int[0]:0); }
+        if(d){
+            if(d->is_var){
+                if(d->alias_idx){
+                    int av=d->alias_idx[0];
+                    if(av>=0)lin_term(&e.els[0],av,1.0);
+                    else e.els[0].constant=d->alias_const[0];
+                } else if(d->base_idx>=0) lin_term(&e.els[0],d->base_idx,1.0);
+                else *err=1;
+            } else e.els[0].constant=d->par?d->par[0]:(d->par_int?d->par_int[0]:0);
+        }
         else { if(strcmp(name,"true")==0)e.els[0].constant=1; else if(strcmp(name,"false")==0)e.els[0].constant=0; else *err=1; }
         return e;}
     if(c=='('){(*pos)++;Expr t=parse_expr(s,pos,m,err);while(isspace((unsigned char)s[*pos]))(*pos)++;if(s[*pos]==')')(*pos)++;free(e.els);e=t;return e;}
@@ -185,12 +201,19 @@ static int parse_array(FZModel*m,const char*s,Lin**out,int*outn)
                         }
                         return 0;
                     }
-                    if(d->is_var && d->base_idx>=0){  /* var array alias */
+                    if(d->is_var && (d->alias_idx || d->base_idx>=0)){
+                        /* A var array can be an exact view of a mixture of
+                           introduced variables and fixed values after MiniZinc
+                           constant propagation (e.g. x = [1,3]). */
                         *outn=d->n;
                         *out=(Lin*)malloc((size_t)(d->n?d->n:1)*sizeof(Lin));
                         for(int i=0;i<d->n;i++){
                             memset(&(*out)[i],0,sizeof(Lin));
-                            lin_term(&(*out)[i], d->base_idx+i, 1.0);
+                            if(d->alias_idx){
+                                int av=d->alias_idx[i];
+                                if(av>=0)lin_term(&(*out)[i],av,1.0);
+                                else (*out)[i].constant=d->alias_const[i];
+                            } else lin_term(&(*out)[i], d->base_idx+i, 1.0);
                         }
                         return 0;
                     }
@@ -433,40 +456,52 @@ int fz_read(const char*path,FZModel*m)
                     while(j<nt&&!(toks[j].kind==TK_SYM&&strcmp(toks[j].text,";")==0)){e=toks[j].end;j++;}
                     char*rhs=strndup(src+s,e-s);
                     if(d->is_array && is_var){
-                        /* var array with initializer: elements are aliases of
-                           already-declared vars (e.g. take = [X0,X1,X2,X3]).
-                           Resolve their indices and alias base_idx to them. */
-                        int nel=1;for(size_t p=0;p<strlen(rhs);p++)if(rhs[p]==',')nel++;
-                        d->n=nel;
-                        Lin*arr;int narr;
-                        if(parse_array(m,rhs,&arr,&narr)==0&&narr==nel){
-                            int alias_ok=1;
-                            d->base_idx=m->nvars;   /* default new vars */
-                            int*alias=(int*)malloc((size_t)nel*sizeof(int));
-                            for(int q=0;q<nel;q++){ if(arr[q].n==1) alias[q]=arr[q].idx[0]; else {alias_ok=0; break;} }
-                            if(alias_ok){
-                                d->base_idx=alias[0];
-                                d->is_alias=1;
-                                for(int q=1;q<nel;q++) if(alias[q]!=alias[0]+q) alias_ok=0;
-                            }
-                            free(alias);
-                            if(!alias_ok){ d->base_idx=m->nvars; m->nvars+=d->n; }
-                            free_lins(arr,narr);
-                        } else {
-                            d->base_idx=m->nvars; m->nvars+=d->n;
+                        /* A FlatZinc var-array initializer is a view, not a
+                           request for fresh unconstrained variables.  Preserve
+                           each element exactly: it can alias an introduced var
+                           or be a constant after compiler propagation. */
+                        Lin*arr=NULL;int narr=0;
+                        if(parse_array(m,rhs,&arr,&narr)!=0 || (d->n>0&&narr!=d->n)){
+                            if(arr)free_lins(arr,narr);
+                            free(rhs);free_toks(toks,nt);free(src);return -1;
                         }
+                        d->n=narr;d->is_alias=1;
+                        d->alias_idx=(int*)calloc((size_t)(narr?narr:1),sizeof(int));
+                        d->alias_const=(double*)calloc((size_t)(narr?narr:1),sizeof(double));
+                        int contiguous=1,first=-1,ok=1;
+                        for(int q=0;q<narr;q++){
+                            if(arr[q].n==0){
+                                d->alias_idx[q]=-1;d->alias_const[q]=arr[q].constant;contiguous=0;
+                            } else if(arr[q].n==1&&fabs(arr[q].coef[0]-1.0)<=1e-12&&fabs(arr[q].constant)<=1e-12){
+                                d->alias_idx[q]=arr[q].idx[0];
+                                if(q==0)first=d->alias_idx[q];
+                                else if(d->alias_idx[q]!=first+q)contiguous=0;
+                            } else {ok=0;break;}
+                        }
+                        if(!ok){free_lins(arr,narr);free(rhs);free_toks(toks,nt);free(src);return -1;}
+                        d->base_idx=contiguous&&first>=0?first:-1;
+                        free_lins(arr,narr);
                     } else if(d->is_array){
                         int nel=1;for(size_t p=0;p<strlen(rhs);p++)if(rhs[p]==',')nel++;
                         d->n=nel;d->par=(double*)calloc((size_t)nel,sizeof(double));d->par_int=(int*)calloc((size_t)nel,sizeof(int));
                         Lin*arr;int narr;
                         if(parse_array(m,rhs,&arr,&narr)==0&&narr==nel){for(int q=0;q<nel;q++){d->par[q]=arr[q].constant;d->par_int[q]=(int)llround(arr[q].constant);}free_lins(arr,narr);}
+                    } else if(is_var){
+                        d->n=1;
+                        Lin l;memset(&l,0,sizeof(l));
+                        if(parse_lin(m,rhs,&l)!=0 ||
+                           !(l.n==0 || (l.n==1&&fabs(l.coef[0]-1.0)<=1e-12&&fabs(l.constant)<=1e-12))){
+                            lin_free(&l);free(rhs);free_toks(toks,nt);free(src);return -1;
+                        }
+                        d->is_alias=1;d->alias_idx=(int*)calloc(1,sizeof(int));d->alias_const=(double*)calloc(1,sizeof(double));
+                        if(l.n==0){d->alias_idx[0]=-1;d->alias_const[0]=l.constant;d->base_idx=-1;}
+                        else {d->alias_idx[0]=l.idx[0];d->base_idx=l.idx[0];}
+                        lin_free(&l);
                     } else {
                         d->n=1;d->par=(double*)calloc(1,sizeof(double));d->par_int=(int*)calloc(1,sizeof(int));
                         Lin l;if(parse_lin(m,rhs,&l)==0){d->par[0]=l.constant;d->par_int[0]=(int)llround(l.constant);lin_free(&l);}
-                        if(is_var){d->base_idx=m->nvars;m->nvars+=1;}
                     }
                     free(rhs);ti=(j<nt?j+1:j);
-                    if(is_var&&!d->is_array){d->base_idx=m->nvars-1;} /* scalar var with init (unusual) */
                     continue;
                 }
                 /* A declaration without an initializer owns one scalar or
@@ -1107,6 +1142,98 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
         free(bs); lin_free(&il);lin_free(&vl);free_lins(arr,narr);
         return 0;
     }
+    /* Extensional integer table: x must equal one complete tuple from a
+       flattened row-major parameter array.  This is the form emitted by the
+       Gecode backend, e.g. gecode_table_int([x1,x2], [1,2,2,3,...]).
+       Select exactly one tuple with binary z_r and set every x_i to its entry.
+       The encoding is exact (not a per-column membership relaxation). */
+    if(strcmp(p,"gecode_table_int")==0||strcmp(p,"fzn_table_int")==0||
+       strcmp(p,"table_int")==0){
+        if(c->nargs<2)return -1;
+        Lin *xs,*tuples; int nx,nt;
+        if(parse_array(m,c->args[0],&xs,&nx)!=0)return -1;
+        if(parse_array(m,c->args[1],&tuples,&nt)!=0){free_lins(xs,nx);return -1;}
+        if(nx<=0||nt<0||nt%nx!=0){free_lins(xs,nx);free_lins(tuples,nt);return -1;}
+        int nrows=nt/nx;
+        /* Bound the deliberately compact MIP encoding on hostile FlatZinc
+           input.  Larger tables remain UNKNOWN rather than allocating an
+           unbounded number of binary selector variables. */
+        if(nrows>1024||nt>65536){free_lins(xs,nx);free_lins(tuples,nt);return 1;}
+        for(int k=0;k<nt;k++){
+            if(tuples[k].n!=0||fabs(tuples[k].constant-round(tuples[k].constant))>1e-12){
+                free_lins(xs,nx);free_lins(tuples,nt);return 1;
+            }
+        }
+        if(nrows==0){
+            /* No permitted tuple: make the model infeasible, exactly. */
+            Lin impossible;memset(&impossible,0,sizeof(impossible));b_put(b,'=',1.0,&impossible);
+            lin_free(&impossible);free_lins(xs,nx);free_lins(tuples,nt);return 0;
+        }
+        int *z=(int*)psolve_malloc((size_t)nrows*sizeof(int));
+        for(int r=0;r<nrows;r++)z[r]=b_newvar(b,0.0,1.0);
+        Lin pick;memset(&pick,0,sizeof(pick));
+        for(int r=0;r<nrows;r++)lin_term(&pick,z[r],1.0);
+        b_put(b,'=',1.0,&pick);lin_free(&pick);
+        for(int i=0;i<nx;i++){
+            Lin eq;memset(&eq,0,sizeof(eq));lin_into(&eq,&xs[i],1.0);
+            for(int r=0;r<nrows;r++)lin_term(&eq,z[r],-tuples[r*nx+i].constant);
+            b_put(b,'=',0.0,&eq);lin_free(&eq);
+        }
+        free(z);free_lins(xs,nx);free_lins(tuples,nt);
+        return 0;
+    }
+    /* Hamiltonian successor circuit.  Gecode emits
+       gecode_circuit(offset, x); standard/other libraries use fzn_circuit(x).
+       z[i,j] selects successor j for node i. Assignment rows make a directed
+       permutation, self arcs are excluded, and MTZ order rows eliminate every
+       subtour not containing node 0, leaving exactly one cycle. */
+    if(strcmp(p,"gecode_circuit")==0||strcmp(p,"fzn_circuit")==0||strcmp(p,"circuit")==0){
+        int offset=1; const char*xarg=NULL; Lin ol;
+        if(strcmp(p,"gecode_circuit")==0){
+            if(c->nargs<2)return -1;
+            if(parse_lin(m,c->args[0],&ol)!=0)return -1;
+            if(ol.n!=0||fabs(ol.constant-round(ol.constant))>1e-12||
+               ol.constant<(double)INT_MIN||ol.constant>(double)INT_MAX){lin_free(&ol);return 1;}
+            offset=(int)llround(ol.constant);xarg=c->args[1];lin_free(&ol);
+        } else {
+            if(c->nargs<1)return -1;
+            xarg=c->args[0];
+        }
+        Lin*xs;int nx;
+        if(parse_array(m,xarg,&xs,&nx)!=0)return -1;
+        if(nx==0){free_lins(xs,nx);return 0;}
+        if(nx>64||offset>INT_MAX-(nx-1)){free_lins(xs,nx);return 1;} /* exact O(n^2) encoding cap */
+        if(nx==1){
+            Lin e;memset(&e,0,sizeof(e));lin_into(&e,&xs[0],1.0);e.constant-=offset;
+            b_put(b,'=',0.0,&e);lin_free(&e);free_lins(xs,nx);return 0;
+        }
+        int *z=(int*)psolve_malloc((size_t)nx*nx*sizeof(int));
+        for(int i=0;i<nx;i++)for(int j=0;j<nx;j++)z[i*nx+j]=(i==j)?-1:b_newvar(b,0.0,1.0);
+        /* one outgoing and one incoming arc per node */
+        for(int i=0;i<nx;i++){
+            Lin out;memset(&out,0,sizeof(out));
+            for(int j=0;j<nx;j++)if(z[i*nx+j]>=0)lin_term(&out,z[i*nx+j],1.0);
+            b_put(b,'=',1.0,&out);lin_free(&out);
+        }
+        for(int j=0;j<nx;j++){
+            Lin in;memset(&in,0,sizeof(in));
+            for(int i=0;i<nx;i++)if(z[i*nx+j]>=0)lin_term(&in,z[i*nx+j],1.0);
+            b_put(b,'=',1.0,&in);lin_free(&in);
+        }
+        for(int i=0;i<nx;i++){
+            Lin eq;memset(&eq,0,sizeof(eq));lin_into(&eq,&xs[i],1.0);
+            for(int j=0;j<nx;j++)if(z[i*nx+j]>=0)lin_term(&eq,z[i*nx+j],-(double)(offset+j));
+            b_put(b,'=',0.0,&eq);lin_free(&eq);
+        }
+        int *ord=(int*)psolve_malloc((size_t)(nx-1)*sizeof(int));
+        for(int i=1;i<nx;i++)ord[i-1]=b_newvar(b,1.0,(double)(nx-1));
+        for(int i=1;i<nx;i++)for(int j=1;j<nx;j++)if(i!=j){
+            Lin mtz;memset(&mtz,0,sizeof(mtz));lin_term(&mtz,ord[i-1],1.0);lin_term(&mtz,ord[j-1],-1.0);
+            lin_term(&mtz,z[i*nx+j],(double)(nx-1));b_put(b,'<',(double)(nx-2),&mtz);lin_free(&mtz);
+        }
+        free(ord);free(z);free_lins(xs,nx);
+        return 0;
+    }
     /* Reified integer relations.  These are exact over the integer lattice:
        r=1 iff the relation holds.  Continuous reification is intentionally
        not accepted here because equality/strict predicates are non-convex or
@@ -1212,13 +1339,17 @@ void fz_solve(const FZModel*m,FZSolution*sol)
     memset(sol,0,sizeof(*sol));
     sol->node_limit = node_limit_in;
     int nv=m->nvars; sol->nvars=nv; sol->x=(double*)calloc((size_t)(nv?nv:1),sizeof(double));
-    if(nv==0){sol->status=3;return;}
-    Builder b;memset(&b,0,sizeof(b));b.nvars=nv;b.varcap=nv?nv:16;
+    /* A compiler can propagate every decision variable to a literal (for
+       example a table call on x = [1,3]).  Keep one fixed dummy column so the
+       LP/MIP bridge can still certify SAT/UNSAT instead of reporting UNKNOWN. */
+    int base_nv=nv?nv:1;
+    Builder b;memset(&b,0,sizeof(b));b.nvars=base_nv;b.varcap=base_nv?base_nv:16;
     b.lo=(double*)malloc((size_t)b.varcap*sizeof(double));b.hi=(double*)malloc((size_t)b.varcap*sizeof(double));
     b.haslo=(int*)calloc((size_t)b.varcap,sizeof(int));b.hashi=(int*)calloc((size_t)b.varcap,sizeof(int));
     /* FlatZinc `var int/float` are unbounded by default; our LP solver needs
        finite bounds, so clamp undecorated variables to a big-M interval. */
-    for(int i=0;i<nv;i++){b.lo[i]=-FZ_BIG_BOUND;b.hi[i]=FZ_BIG_BOUND;}
+    for(int i=0;i<base_nv;i++){b.lo[i]=-FZ_BIG_BOUND;b.hi[i]=FZ_BIG_BOUND;}
+    if(nv==0){b.lo[0]=0.0;b.hi[0]=0.0;b.haslo[0]=1;b.hashi[0]=1;}
     for(int d=0;d<m->ndecl;d++){FZDecl*decl=&m->decls[d];
         if(!decl->is_var||decl->base_idx<0)continue;
         if(decl->is_alias)continue;   /* alias elements get bounds from their own decls */
@@ -1276,7 +1407,7 @@ void fz_solve(const FZModel*m,FZSolution*sol)
        integral; otherwise the LP relaxation is exact. */
     unsigned char *isint=(unsigned char*)psolve_calloc((size_t)(ntot?ntot:1),1);
     int any_int=0;
-    for(int d=0;d<m->ndecl;d++){FZDecl*decl=&m->decls[d];if(!decl->is_var||decl->base_idx<0)continue;
+    for(int d=0;d<m->ndecl;d++){FZDecl*decl=&m->decls[d];if(!decl->is_var||decl->base_idx<0||decl->is_alias)continue;
         int integer = (decl->kind!=FZ_K_FLOAT);   /* int and bool are integer */
         for(int e=0;e<decl->n;e++){int vi=decl->base_idx+e;if(vi>=0&&vi<ntot&&integer){isint[vi]=1;any_int=1;}}}
     /* introduced (auxiliary) variables for big-M encodings (e.g. the binary
@@ -1332,17 +1463,37 @@ static void fz_print_value(FZKind kind,double value)
     }
 }
 
+static int fz_decl_value(const FZDecl*d,const FZSolution*sol,int e,double*out)
+{
+    if(e<0||e>=d->n)return -1;
+    if(d->is_var){
+        if(d->alias_idx){
+            int v=d->alias_idx[e];
+            if(v>=0){if(v>=sol->nvars)return -1;*out=sol->x[v];}
+            else *out=d->alias_const[e];
+            return 0;
+        }
+        if(d->base_idx<0||d->base_idx+e>=sol->nvars)return -1;
+        *out=sol->x[d->base_idx+e];return 0;
+    }
+    if(d->par){*out=d->par[e];return 0;}
+    if(d->par_int){*out=d->par_int[e];return 0;}
+    return -1;
+}
+
 void fz_print_solution(const FZModel*m,const FZSolution*sol)
 {
     if(sol->status==0){
-        for(int d=0;d<m->ndecl;d++){FZDecl*decl=&m->decls[d];if(!decl->is_output||decl->base_idx<0)continue;
+        for(int d=0;d<m->ndecl;d++){FZDecl*decl=&m->decls[d];if(!decl->is_output)continue;
+            double first;
+            if(fz_decl_value(decl,sol,0,&first)!=0)continue;
             if(decl->is_array){
                 int hi=decl->index_lo+decl->n-1;
                 printf("%s = array1d(%d..%d, [",decl->name,decl->index_lo,hi);
-                for(int e=0;e<decl->n;e++){if(e)printf(", ");fz_print_value(decl->kind,sol->x[decl->base_idx+e]);}
+                for(int e=0;e<decl->n;e++){double v;if(e)printf(", ");if(fz_decl_value(decl,sol,e,&v)!=0)v=0;fz_print_value(decl->kind,v);}
                 printf("]);\n");
             } else {
-                printf("%s = ",decl->name);fz_print_value(decl->kind,sol->x[decl->base_idx]);printf(";\n");
+                printf("%s = ",decl->name);fz_print_value(decl->kind,first);printf(";\n");
             }
         }
         printf("----------\n");
@@ -1351,7 +1502,7 @@ void fz_print_solution(const FZModel*m,const FZSolution*sol)
 }
 void fz_solution_free(FZSolution*sol){free(sol->x);memset(sol,0,sizeof(*sol));}
 void fz_model_free(FZModel*m){
-    for(int i=0;i<m->ndecl;i++){FZDecl*d=&m->decls[i];free(d->name);free(d->par);free(d->par_int);free(d->lo);free(d->hi);free(d->setvals);}
+    for(int i=0;i<m->ndecl;i++){FZDecl*d=&m->decls[i];free(d->name);free(d->alias_idx);free(d->alias_const);free(d->par);free(d->par_int);free(d->lo);free(d->hi);free(d->setvals);}
     free(m->decls);
     FZConstr*c=m->constr;while(c){FZConstr*nx=c->next;for(int i=0;i<c->nargs;i++)free(c->args[i]);free(c->args);free(c->pred);free(c);c=nx;}
     free(m->objective.idx);free(m->objective.coef);free(m->file);

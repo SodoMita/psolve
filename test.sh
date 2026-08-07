@@ -84,8 +84,12 @@ echo "(expect a=0 b=1 andr=0 orr=1)"
 echo "(expect x1=4 x2=0, MIP integral)"
 ./fznsolve examples/fzn/float_lin.fzn | grep 'x = array1d'
 echo "(expect float array [1, 1.5])"
+./fznsolve examples/fzn/table.fzn | grep 'x = array1d'
+echo "(expect table tuple [2, 3])"
+./fznsolve examples/fzn/circuit.fzn | grep 's = array1d'
+echo "(expect a Hamiltonian successor cycle)"
 
-echo "[8.25/8] FlatZinc strict/reified-integer + continuous-float semantics..."
+echo "[8.25/8] FlatZinc strict/reified-int + float + table/circuit semantics..."
 python3 tools/fzn_semantics_test.py
 
 if command -v minizinc >/dev/null 2>&1; then

@@ -174,7 +174,9 @@ feature completeness against a huge standard corpus.
 - [x] **Par-array declarations** (`array[1..n] of int: C = [...]`) incl. the
       bare-`array` form MiniZinc emits (no `par` keyword).
 - [x] **Var-array aliasing**: `array[..] of var int: take = [X0,X1,...]` maps
-      `take[e]` to the underlying vars so output arrays print correctly.
+      `take[e]` to the underlying vars so output arrays print correctly. Mixed
+      views and compiler-propagated literals (e.g. `take = [X0,3]`) are retained
+      exactly instead of creating unconstrained replacement variables.
 - [x] **bool vars** bounded to [0,1]; array output uses `array1d(lo..hi,[..])`.
 - [x] More handlers: `bool_and/or/xor/not/clause(+reif)`, `array_bool_and/or`,
       `int_neg` (fixed an `array_bool_and` constraint-sign bug).
@@ -197,8 +199,17 @@ feature completeness against a huge standard corpus.
       constant-denominator division. Strict float comparisons intentionally
       remain `UNKNOWN` (an LP cannot represent their open feasible sets without
       inventing an arbitrary epsilon).
-- [ ] More handlers: nonlinear/reified float relations, `cumulative`, `circuit`,
-      `table`.
+- [x] **Extensional table**: `gecode_table_int`, `fzn_table_int`, and
+      `table_int` use one binary per permitted row, exactly one row selected,
+      and equality rows for every tuple component. The compact exact encoding is
+      bounded to 1,024 rows / 65,536 cells on untrusted input; larger tables
+      return `UNKNOWN` rather than exhausting resources. Real Gecode-generated
+      `.fzn` plus literal-propagation regressions are covered.
+- [x] **Hamiltonian circuit**: `gecode_circuit(offset,x)`, `fzn_circuit(x)`,
+      and `circuit(x)` use a binary successor matrix plus MTZ order rows. This
+      rules out self arcs and disconnected subtours exactly (including Gecode's
+      zero-based offset form); the exact O(n²) model is capped at 64 nodes.
+- [ ] More handlers: nonlinear/reified float relations, `cumulative`.
 - [x] **MIP bridge**: when the model has integer vars, `fz_solve` dispatches to
       the MIP branch-and-bound so answers are integral (objectives match brute
       force, e.g. knapsack=10, prod3=57).
