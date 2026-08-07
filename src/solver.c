@@ -19,6 +19,7 @@ static void *xmalloc(size_t n) {
 static void get_col(const Solver *s, int var, double *out);
 static void refactorize(Solver *s);
 static void recompute_basic(Solver *s);
+static void solver_reset_to_initial(Solver *s);
 
 /* ------------------------------------------------------------------ */
 /* Construction                                                        */
@@ -198,85 +199,9 @@ static Solver *solver_create_internal(const LP *lp)
        value is nonneg and Phase I can drive it to zero. */
     s->needs_phase1 = 0;
     s->negate_obj = maximize ? 0 : 1;
-    {
-        double *S = (double*)calloc((size_t)m, sizeof(double));
-        /* contributions from nonbasic originals at their starting value */
-        for (j = 0; j < n; j++) {
-            double xj = (s->l[j] > -LP_INF) ? s->l[j] : s->u[j];
-            s->x[j] = xj;
-            if (xj == 0.0) continue;
-            for (k = s->colptr[j]; k < s->colptr[j+1]; k++)
-                S[s->row[k]] += s->val[k] * xj;
-        }
-        for (i = 0; i < m; i++) {
-            double resid = s->beq[i] - S[i];
-            int sv = s->slackVar[i];
-            int chosen = -1;
-            if (sv >= 0) {
-                /* slack coeff = mlt_i * (rel=='<' ? +1 : -1) */
-                double scoef = (double)mlt[i] * (lp->rel[i] == '<' ? 1.0 : -1.0);
-                double v = resid / scoef;
-                if (v >= -1e-12) {   /* slack value nonneg => feasible start */
-                    chosen = sv;
-                    s->x[sv] = (v > 0.0) ? v : 0.0;
-                }
-            }
-            if (chosen < 0) {
-                /* use an artificial with sign chosen so its value is nonneg */
-                int av = s->artVar[i];
-                double v = (resid >= 0.0) ? resid : -resid;
-                /* store the artificial sign in mlt-like manner via a per-row
-                   factor; the artificial column value was built as +1, so if
-                   resid < 0 we negate the stored coefficient. */
-                s->basis[i] = av;
-                s->basispos[av] = i;
-                s->status[av] = LP_BASIC;
-                s->x[av] = v;
-                s->needs_phase1 = 1;
-                s->artSign[i] = (resid >= 0.0) ? 1 : -1;
-                /* apply the artificial's sign to its stored column coefficient */
-                for (k = s->colptr[av]; k < s->colptr[av+1]; k++)
-                    s->val[k] = (double)s->artSign[i];
-            } else {
-                s->basis[i] = chosen;
-                s->basispos[chosen] = i;
-                s->status[chosen] = LP_BASIC;
-            }
-        }
-        free(S);
-    }
-
-    for (j = 0; j < n; j++) {
-        s->basispos[j] = -1;
-        if (s->l[j] > -LP_INF) s->status[j] = LP_NBL;
-        else s->status[j] = LP_NBU;
-    }
-    for (j = n; j < n + nslack; j++) {
-        if (s->basispos[j] >= 0) continue;   /* slack already basic */
-        s->basispos[j] = -1;
-        s->status[j] = LP_NBL;
-    }
-    for (i = 0; i < m; i++) {
-        int av = s->artVar[i];
-        if (s->status[av] != LP_BASIC) { s->status[av] = LP_NBL; s->x[av] = 0.0; }
-    }
-
-    /* finalize: every non-basic variable must have basispos = -1 */
-    for (j = 0; j < N; j++)
-        if (s->status[j] != LP_BASIC) s->basispos[j] = -1;
-
-    s->phase = 1;
-    s->lu_valid = 0;
-    s->bland = 0; s->flat = 0; s->last_obj = -LP_INF;
-    s->iters = 0;
-    s->status_out = 0;
-    s->objval = 0.0;
-    s->hyper_tol = 0.0;
+    solver_reset_to_initial(s);
     s->iteration_limit = 2000000;
-
-    /* initial refactorization */
-    refactorize(s);
-        free(mlt);
+    free(mlt);
     return s;
 }
 
@@ -542,6 +467,109 @@ static void btrans(Solver *s, double *y)
     } else {
         if (s->lu_valid) lu_solve_t(s->lu, s->piv, s->M, y, y);
     }
+}
+
+/* Re-initialize the solver to its starting basis: every original variable
+   nonbasic at a bound, and each row served by a slack (if it yields a
+   nonnegative value) or a sign-correct artificial.  This is used both at
+   construction and to retry a solve with a more robust factorization after the
+   sparse LU path diverged.  It preserves the caller-set objective coefficients
+   (cobj is set to the Phase-I objective here; solver_solve re-establishes the
+   true objective after Phase I, exactly as on a fresh solve) and the
+   iteration limit, so a retry behaves like a clean solve. */
+static void solver_reset_to_initial(Solver *s)
+{
+    int n = s->n_core, m = s->M, N = s->N;
+    if (m < 0) { s->status_out = SOLVE_NUMERICAL; return; }   /* defensive: never valid */
+    int nslack = 0;
+    for (int i = 0; i < m; i++) if (s->rel[i] != '=') nslack++;
+    int *mlt = s->mlt;
+    for (int i = 0; i < m; i++) mlt[i] = (s->borig[i] >= 0) ? 1 : -1;
+
+    /* Phase I objective: all zero except -1 for artificials */
+    for (int j = 0; j < N; j++) s->cobj[j] = 0.0;
+    for (int i = 0; i < m; i++) s->cobj[s->artVar[i]] = -1.0;
+
+    /* restore canonical artificial column coefficients (+1) before re-selecting
+       basic artificials and applying their per-row sign */
+    for (int i = 0; i < m; i++) {
+        int av = s->artVar[i];
+        for (int k = s->colptr[av]; k < s->colptr[av+1]; k++) s->val[k] = 1.0;
+    }
+
+    s->needs_phase1 = 0;
+    {
+        double *S = (double*)calloc((size_t)m, sizeof(double));
+        /* contributions from nonbasic originals at their starting value */
+        for (int j = 0; j < n; j++) {
+            double xj = (s->l[j] > -LP_INF) ? s->l[j] : s->u[j];
+            s->x[j] = xj;
+            if (xj == 0.0) continue;
+            for (int k = s->colptr[j]; k < s->colptr[j+1]; k++)
+                S[s->row[k]] += s->val[k] * xj;
+        }
+        for (int i = 0; i < m; i++) {
+            double resid = s->beq[i] - S[i];
+            int sv = s->slackVar[i];
+            int chosen = -1;
+            if (sv >= 0) {
+                double scoef = (double)mlt[i] * (s->rel[i] == '<' ? 1.0 : -1.0);
+                double v = resid / scoef;
+                if (v >= -1e-12) {   /* slack value nonneg => feasible start */
+                    chosen = sv;
+                    s->x[sv] = (v > 0.0) ? v : 0.0;
+                }
+            }
+            if (chosen < 0) {
+                int av = s->artVar[i];
+                double v = (resid >= 0.0) ? resid : -resid;
+                s->basis[i] = av;
+                s->basispos[av] = i;
+                s->status[av] = LP_BASIC;
+                s->x[av] = v;
+                s->needs_phase1 = 1;
+                s->artSign[i] = (resid >= 0.0) ? 1 : -1;
+                for (int k = s->colptr[av]; k < s->colptr[av+1]; k++)
+                    s->val[k] = (double)s->artSign[i];
+            } else {
+                s->basis[i] = chosen;
+                s->basispos[chosen] = i;
+                s->status[chosen] = LP_BASIC;
+            }
+        }
+        free(S);
+    }
+
+    for (int j = 0; j < n; j++) {
+        s->basispos[j] = -1;
+        if (s->l[j] > -LP_INF) s->status[j] = LP_NBL;
+        else s->status[j] = LP_NBU;
+    }
+    for (int j = n; j < n + nslack; j++) {
+        if (s->basispos[j] >= 0) continue;   /* slack already basic */
+        s->basispos[j] = -1;
+        s->status[j] = LP_NBL;
+    }
+    for (int i = 0; i < m; i++) {
+        int av = s->artVar[i];
+        if (s->status[av] != LP_BASIC) { s->status[av] = LP_NBL; s->x[av] = 0.0; }
+    }
+
+    /* finalize: every non-basic variable must have basispos = -1 */
+    for (int j = 0; j < N; j++)
+        if (s->status[j] != LP_BASIC) s->basispos[j] = -1;
+
+    s->phase = 1;
+    s->lu_valid = 0;
+    s->sparse_ok = 0;
+    s->bland = 0; s->flat = 0; s->last_obj = -LP_INF;
+    s->iters = 0;
+    s->status_out = 0;
+    s->objval = 0.0;
+    s->hyper_tol = 0.0;
+
+    /* initial refactorization (honors s->sparse_disabled / use_sparse) */
+    refactorize(s);
 }
 
 /* compute pricing vector y and reduced costs for all nonbasic vars */
@@ -885,7 +913,7 @@ static int solve_phase(Solver *s)
     return r;
 }
 
-int solver_solve(Solver *s)
+static int solver_solve_impl(Solver *s)
 {
     int r = 0;
     /* Phase I: needed if any artificial is in the current basis.  Detecting it
@@ -966,6 +994,24 @@ int solver_solve(Solver *s)
         }
     }
     return 0;
+}
+
+int solver_solve(Solver *s)
+{
+    int r = solver_solve_impl(s);
+    /* Robustness: on ill-conditioned moderately-sparse big-M bases the sparse
+       LU can factorize "successfully" yet diverge, so solver_solve_impl returns
+       SOLVE_NUMERICAL (its solution certificate fails).  When that happens on
+       the sparse path, retry once from a clean starting basis with the robust
+       dense LU — the identical problem, just a more stable factorization.
+       Correctness is preserved either way (never a false OPTIMAL); this only
+       turns a would-be NUMERICAL failure into a certified answer. */
+    if (r == SOLVE_NUMERICAL && s->use_sparse && !s->sparse_disabled) {
+        s->sparse_disabled = 1;
+        solver_reset_to_initial(s);
+        r = solver_solve_impl(s);
+    }
+    return r;
 }
 
 void solver_duals(const Solver *s, double *dual)

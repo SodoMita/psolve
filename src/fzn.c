@@ -1593,6 +1593,98 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
         free(M);free(bs);free(vals);free_lins(arr,narr);
         return 0;
     }
+    /* cumulative(s[], d[], r[], b): task i runs for d_i time units starting
+       at s_i and uses r_i units of a renewable resource; at every integer time
+       point the total resource in use must not exceed the limit b.  We handle
+       the exact, overwhelmingly common case where the durations d, usages r
+       and the limit b are fixed parameters and each start s_i is a bounded
+       integer variable.  For every task i and every integer time point t in
+       the scheduling horizon we introduce binaries a2=[s_i<=t], a1=[s_i+d_i>t]
+       and active=(a1 and a2), then constrain sum_i r_i*active(i,t) <= b at
+       every t.  The horizon is taken from the finite start-variable boxes, so
+       no artificial bound is invented.  Variable durations/usages/limits are
+       not safely linearizable here and return UNHANDLED (=> UNKNOWN at the
+       top level) rather than a possibly wrong answer. */
+    if(strcmp(p,"cumulative")==0||strcmp(p,"fzn_cumulative")==0||strcmp(p,"gecode_cumulative")==0){
+        if(c->nargs<4)return -1;
+        Lin *sarr;int ns;
+        if(parse_array(m,c->args[0],&sarr,&ns)!=0)return -1;
+        Lin *darr;int nd;
+        if(parse_array(m,c->args[1],&darr,&nd)!=0){free_lins(sarr,ns);return -1;}
+        Lin *rarr;int nr;
+        if(parse_array(m,c->args[2],&rarr,&nr)!=0){free_lins(sarr,ns);free_lins(darr,nd);return -1;}
+        Lin bl;memset(&bl,0,sizeof(bl));
+        if(parse_lin(m,c->args[3],&bl)!=0){free_lins(sarr,ns);free_lins(darr,nd);free_lins(rarr,nr);return -1;}
+        if(ns!=nd||ns!=nr){lin_free(&bl);free_lins(sarr,ns);free_lins(darr,nd);free_lins(rarr,nr);return 1;}
+        int n=ns;
+        if(n==0){lin_free(&bl);free_lins(sarr,ns);free_lins(darr,nd);free_lins(rarr,nr);return 0;} /* no tasks: trivially satisfiable */
+        /* limit b must be a fixed non-negative integer */
+        if(bl.n!=0||bl.constant<0.0||fabs(bl.constant-rint(bl.constant))>1e-9){
+            lin_free(&bl);free_lins(sarr,ns);free_lins(darr,nd);free_lins(rarr,nr);return 1;
+        }
+        double B=bl.constant;
+        /* collect the tasks that actually consume the resource and the horizon
+           from their finite start-variable boxes */
+        double minStart=1e18,maxEnd=-1e18;int any=0;
+        for(int i=0;i<n;i++){
+            if(sarr[i].n!=1||fabs(sarr[i].coef[0]-1.0)>1e-12||fabs(sarr[i].constant)>1e-12){
+                lin_free(&bl);free_lins(sarr,ns);free_lins(darr,nd);free_lins(rarr,nr);return 1;
+            }
+            if(darr[i].n!=0||rarr[i].n!=0){
+                lin_free(&bl);free_lins(sarr,ns);free_lins(darr,nd);free_lins(rarr,nr);return 1;
+            }
+            double d=darr[i].constant,r=rarr[i].constant;
+            if(d<0.0||fabs(d-rint(d))>1e-9||r<0.0||fabs(r-rint(r))>1e-9){
+                lin_free(&bl);free_lins(sarr,ns);free_lins(darr,nd);free_lins(rarr,nr);return 1;
+            }
+            if(d==0.0||r==0.0)continue;          /* never consumes resource */
+            int sv=sarr[i].idx[0];
+            if(sv<0||sv>=b->nvars||!b->haslo[sv]||!b->hashi[sv]||b->lo[sv]>b->hi[sv]){
+                lin_free(&bl);free_lins(sarr,ns);free_lins(darr,nd);free_lins(rarr,nr);return 1; /* unbounded start -> UNKNOWN */
+            }
+            if(b->lo[sv]<minStart)minStart=b->lo[sv];
+            if(b->hi[sv]+d>maxEnd)maxEnd=b->hi[sv]+d;
+            any=1;
+        }
+        if(!any){lin_free(&bl);free_lins(sarr,ns);free_lins(darr,nd);free_lins(rarr,nr);return 0;} /* nothing consumes resource */
+        long Tmin=(long)floor(minStart),Tmax=(long)floor(maxEnd)-1;
+        if(Tmax<Tmin){lin_free(&bl);free_lins(sarr,ns);free_lins(darr,nd);free_lins(rarr,nr);return 0;}
+        long pts=Tmax-Tmin+1;
+        /* size cap: guard the O(n*horizon) binary encoding against resource
+           exhaustion on untrusted input; larger models return UNKNOWN. */
+        if(n>32||pts>256||((long)n*pts>1200)){
+            lin_free(&bl);free_lins(sarr,ns);free_lins(darr,nd);free_lins(rarr,nr);return 1;
+        }
+        for(long t=Tmin;t<=Tmax;t++){
+            Lin R;memset(&R,0,sizeof(R));
+            for(int i=0;i<n;i++){
+                if(darr[i].n!=0||rarr[i].n!=0)continue;   /* already checked: all fixed */
+                double d=darr[i].constant,r=rarr[i].constant;
+                if(d==0.0||r==0.0)continue;
+                int sv=sarr[i].idx[0];
+                /* a2 = [s_i <= t]  =  [s_i - t <= 0] */
+                Lin da;memset(&da,0,sizeof(da));lin_term(&da,sv,1.0);da.constant=-(double)t;
+                int a2=b_newvar(b,0.0,1.0);
+                if(add_int_reif(b,&da,a2,1)!=0){lin_free(&da);lin_free(&R);lin_free(&bl);free_lins(sarr,ns);free_lins(darr,nd);free_lins(rarr,nr);return 1;}
+                lin_free(&da);
+                /* a1 = [s_i + d_i > t]  =  [s_i + d_i - t >= 1] */
+                Lin db;memset(&db,0,sizeof(db));lin_term(&db,sv,1.0);db.constant=d-(double)t;
+                int a1=b_newvar(b,0.0,1.0);
+                if(add_int_reif(b,&db,a1,4)!=0){lin_free(&db);lin_free(&R);lin_free(&bl);free_lins(sarr,ns);free_lins(darr,nd);free_lins(rarr,nr);return 1;}
+                lin_free(&db);
+                /* active = a1 AND a2  (active<=a1, active<=a2, active>=a1+a2-1) */
+                int av=b_newvar(b,0.0,1.0);
+                Lin c1;memset(&c1,0,sizeof(c1));lin_term(&c1,av,1.0);lin_term(&c1,a1,-1.0);b_put(b,'<',0.0,&c1);lin_free(&c1);
+                Lin c2;memset(&c2,0,sizeof(c2));lin_term(&c2,av,1.0);lin_term(&c2,a2,-1.0);b_put(b,'<',0.0,&c2);lin_free(&c2);
+                Lin c3;memset(&c3,0,sizeof(c3));lin_term(&c3,av,1.0);lin_term(&c3,a1,-1.0);lin_term(&c3,a2,-1.0);b_put(b,'>',-1.0,&c3);lin_free(&c3);
+                lin_term(&R,av,r);
+            }
+            if(R.n>0)b_put(b,'<',B,&R);
+            lin_free(&R);
+        }
+        lin_free(&bl);free_lins(sarr,ns);free_lins(darr,nd);free_lins(rarr,nr);
+        return 0;
+    }
     /* everything else: unhandled (return UNKNOWN at top level) */
     return 1;
 }

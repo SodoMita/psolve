@@ -248,7 +248,17 @@ feature completeness against a huge standard corpus.
       and `circuit(x)` use a binary successor matrix plus MTZ order rows. This
       rules out self arcs and disconnected subtours exactly (including Gecode's
       zero-based offset form); the exact O(n²) model is capped at 64 nodes.
-- [ ] More handlers: nonlinear/reified float relations, `cumulative`.
+- [x] `cumulative`/`fzn_cumulative`/`gecode_cumulative`: exact handler for
+      fixed durations/usages/limit and bounded integer start times (binary
+      active indicators `[s_i<=t] AND [s_i+d_i>t]` per time point + resource
+      rows); variable durations/usages/limits return UNKNOWN, never a wrong
+      answer. Verified vs brute force (`tools/cumulative_verify.py`, 0
+      wrong).  **Note:** the double LP solver is numerically fragile on the
+      big-M relaxations of larger schedules (see `AUDIT.md` finding A), so
+      many combinatorial instances return `=====UNKNOWN=====`; the exact
+      `fxsolve` solves them.  Follow-up: use the exact solver for MIP
+      relaxations.
+- [ ] More handlers: nonlinear/reified float relations.
 - [x] **MIP bridge**: when the model has integer vars, `fz_solve` dispatches to
       the MIP branch-and-bound so answers are integral (objectives match brute
       force, e.g. knapsack=10, prod3=57).

@@ -1,0 +1,8 @@
+% Three tasks each needing 1 unit of resource for 3 time units, capacity 1,
+% starts forced to {1,2,3}: impossible to schedule without overlap.
+predicate cumulative(array[int] of var int: s, array[int] of var int: d, array[int] of var int: r, var int: b);
+var 1..1: s1 :: output_var;
+var 2..2: s2 :: output_var;
+var 3..3: s3 :: output_var;
+constraint cumulative([s1, s2, s3], [3, 3, 3], [1, 1, 1], 1);
+solve satisfy;

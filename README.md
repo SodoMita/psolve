@@ -329,6 +329,7 @@ are integral):
   `examples/fzn/table.fzn` / `examples/fzn/table_{sat,opt,unsat}.fzn` for exact
   extensional tables, and `examples/fzn/circuit.fzn` for a Hamiltonian
   successor circuit.
+
 - **Solve**: satisfy / minimize / maximize; type-faithful FlatZinc output
   (full-precision float values, declared array indices via `array1d(lo..hi,[..])`,
   status markers), objective always, and `-s` stats

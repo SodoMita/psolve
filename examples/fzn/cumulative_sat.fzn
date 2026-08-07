@@ -1,0 +1,6 @@
+% Two tasks sharing a capacity-1 renewable resource: they must not overlap.
+predicate cumulative(array[int] of var int: s, array[int] of var int: d, array[int] of var int: r, var int: b);
+var 1..4: s1 :: output_var;
+var 1..4: s2 :: output_var;
+constraint cumulative([s1, s2], [2, 2], [1, 1], 1);
+solve satisfy;

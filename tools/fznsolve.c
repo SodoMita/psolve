@@ -20,7 +20,6 @@ static Options parse_args(int argc, char**argv){
         else if (strcmp(argv[a], "-n") == 0 && a+1 < argc) o.node_limit = atol(argv[++a]);
         else if (strcmp(argv[a], "-t") == 0 && a+1 < argc) o.time_ms = atol(argv[++a]);
         else if (argv[a][0] != '-') o.path = argv[a];
-        else if (strcmp(argv[a], "-t") == 0 && a+1 < argc) o.time_ms = atol(argv[++a]);
     }
     return o;
 }
