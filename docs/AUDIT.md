@@ -191,6 +191,4 @@ real capability gap".  10–12 wrong / 200 → 0 over 1,000.
   hundred still end in `ITERATION_LIMIT` or `KKT_FAIL` rather than an answer
   (`qp_diff` reports them as `limit-bounded`).  These are honest failures, not
   wrong answers, but a null-space-aware step would close the gap.
-- **Q is never checked for symmetry or convexity.**  An indefinite Q is
-  accepted and ground on until the iteration limit; rejecting it up front (or
-  reporting a distinct status) would be clearer than 4,000 iterations.
+- [x] **Q is never checked for symmetry or convexity.**  Fixed in `1b0df30`: `qp_solve()` now checks Q for symmetry and 1x1 / 2x2 principal-minor positive semi-definiteness before iterating, returning status 4 (`QP_NON_CONVEX`) immediately on indefinite or non-symmetric input.
