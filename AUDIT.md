@@ -121,9 +121,32 @@ correctly, and the false-INFEASIBLE→UNSAT bug is fixed. Deterministic regressi
 added (`examples/fzn/cumulative_exact.fzn`). All differentials, fuzzing, and the
 OOM-injection suite (7,836 points, 0 failures) stay green; ASan/UBSan/leak clean.
 
+### DONE — CLI `-a` (all solutions) and FlatZinc constraint expansion
+Implemented standard `-a` / `--all-solutions` for `fznsolve`, `fz_solve`, and `mip_solve`:
+- In satisfaction problems (`solve satisfy`), `-a` traverses the branch-and-bound
+  tree to enumerate and print all distinct integer satisfying assignments, each followed
+  by `----------`, and terminates with `==========` when the complete space has been explored.
+- In optimization problems (`solve minimize` / `solve maximize`), `-a` reports all intermediate
+  strictly-improving incumbents, each followed by `----------`, and terminates with `==========`
+  once optimality is proved.
+- In default single-solution mode, optimization problems correctly print the proved optimum
+  followed by `----------` and `==========` per the FlatZinc standard.
+
+Expanded native FlatZinc constraint handlers:
+- `array_var_int_element`, `array_bool_element`, `array_var_bool_element`,
+  `array_float_element`, `array_var_float_element` (exact SOS1 and bounded indicator encodings).
+- `array_float_maximum`, `array_float_minimum` (exact selector formulation for float arrays).
+- `set_in_reif`, `int_in`, `int_in_reif` (exact reified integer set and range membership).
+- `int_div`, `int_mod` (exact linear quotient-remainder formulation for constant divisors).
+- `int_pow` (linear exponentiation for integer constants and bounded lattice domains).
+- `bool_times` / `int_times` (linear boolean conjunction).
+- `count_leq`, `count_geq`, `count_lt`, `count_gt`, `count_ne`, `count_neq`, `among`, `fzn_among`
+  (exact reified count and among constraints).
+- `table_bool`, `fzn_table_bool`, `gecode_table_bool` (extensional boolean table constraints).
+- `int_min_reif`, `int_max_reif`, `int_abs_reif` (reified scalar extrema and absolute value).
+
+All new handlers and options are verified by dedicated regression tests in `tools/fzn_semantics_test.py`.
+
 ## Not done (recommended next steps, in priority order)
-1. **CLI `-a` (all solutions)** for `fznsolve` (FlatZinc standard). Big-M
-   models are now reliable enough to enumerate, so this is unblocked.
-2. Re-run the GLPK and MiniZinc differential suites (need `glpsol`/`minizinc`).
-3. Public C API audit for Phase 4 hardening (documented, bounds-checked, no
-   `exit` in library paths).
+1. Re-run the GLPK and MiniZinc differential suites (when `glpsol`/`minizinc` are installed in the host environment).
+2. Public C API audit for Phase 4 hardening (documented, bounds-checked, no `exit` in library paths).

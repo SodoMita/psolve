@@ -359,6 +359,156 @@ def test_declaration_indices_and_honest_unknown() -> None:
             f"synthetic +/-1e9 bound was reported as an optimum:\n{out}")
 
 
+def test_all_solutions_and_extended_constraints() -> None:
+    # 1. -a satisfaction: enumerate all solutions
+    with tempfile.NamedTemporaryFile("w", suffix=".fzn", delete=False) as f:
+        f.write(
+            """
+            var 1..3: x :: output_var;
+            solve satisfy;
+            """
+        )
+        path = pathlib.Path(f.name)
+    try:
+        res = subprocess.run([str(SOLVER), "-a", str(path)], text=True, capture_output=True, timeout=10)
+        require("x = 1;" in res.stdout and "x = 2;" in res.stdout and "x = 3;" in res.stdout,
+                f"-a satisfaction missed solutions:\n{res.stdout}")
+        require("==========" in res.stdout, f"-a satisfaction missing completion marker:\n{res.stdout}")
+    finally:
+        path.unlink(missing_ok=True)
+
+    # 2. array_var_int_element with variables in the array
+    out = run_model(
+        """
+        var 10..10: v1;
+        var 20..20: v2;
+        var 30..30: v3;
+        array [1..3] of var int: arr = [v1, v2, v3];
+        var 1..3: idx :: output_var;
+        var 0..50: val :: output_var;
+        constraint array_var_int_element(idx, arr, val);
+        constraint int_eq(idx, 2);
+        solve satisfy;
+        """
+    )
+    require("idx = 2;" in out and "val = 20;" in out,
+            f"array_var_int_element with variables failed:\n{out}")
+
+    # 3. array_bool_element
+    out = run_model(
+        """
+        var 1..3: idx :: output_var;
+        var bool: val :: output_var;
+        array [1..3] of bool: arr = [false, true, false];
+        constraint array_bool_element(idx, arr, val);
+        constraint bool_eq(val, true);
+        solve satisfy;
+        """
+    )
+    require("idx = 2;" in out and "val = true;" in out,
+            f"array_bool_element failed:\n{out}")
+
+    # 4. array_float_element and array_float_maximum
+    out = run_model(
+        """
+        var 1..3: idx :: output_var;
+        var float: val :: output_var;
+        array [1..3] of float: arr = [1.5, 3.5, 2.0];
+        constraint array_float_element(idx, arr, val);
+        solve maximize val;
+        """
+    )
+    require("idx = 2;" in out and "val = 3.5;" in out,
+            f"array_float_element failed:\n{out}")
+
+    out = run_model(
+        """
+        var float: mx :: output_var;
+        var 0.0..5.0: a;
+        var 0.0..5.0: b;
+        array [1..2] of var float: arr = [a, b];
+        constraint float_eq(a, 2.5);
+        constraint float_eq(b, 4.25);
+        constraint array_float_maximum(mx, arr);
+        solve satisfy;
+        """
+    )
+    require("mx = 4.25;" in out, f"array_float_maximum failed:\n{out}")
+
+    # 5. int_div and int_mod
+    out = run_model(
+        """
+        var 0..20: a :: output_var;
+        var 0..20: q :: output_var;
+        var 0..20: r :: output_var;
+        constraint int_eq(a, 14);
+        constraint int_div(a, 4, q);
+        constraint int_mod(a, 4, r);
+        solve satisfy;
+        """
+    )
+    require("q = 3;" in out and "r = 2;" in out,
+            f"int_div / int_mod failed:\n{out}")
+
+    # 6. int_pow
+    out = run_model(
+        """
+        var 1..100: z :: output_var;
+        var 1..10: x;
+        constraint int_eq(x, 5);
+        constraint int_pow(x, 2, z);
+        solve satisfy;
+        """
+    )
+    require("z = 25;" in out, f"int_pow failed:\n{out}")
+
+    # 7. set_in_reif and int_in
+    out = run_model(
+        """
+        var 1..10: x :: output_var;
+        var bool: r1 :: output_var;
+        var bool: r2 :: output_var;
+        constraint int_eq(x, 5);
+        constraint set_in_reif(x, 3..7, r1);
+        constraint set_in_reif(x, {1, 2, 8}, r2);
+        solve satisfy;
+        """
+    )
+    require("r1 = true;" in out and "r2 = false;" in out,
+            f"set_in_reif failed:\n{out}")
+
+    # 8. count_leq, count_geq, count_ne
+    out = run_model(
+        """
+        array [1..4] of var 1..3: x :: output_array([1..4]);
+        var 0..4: c1 :: output_var;
+        constraint int_eq(x[1], 2);
+        constraint int_eq(x[2], 2);
+        constraint int_eq(x[3], 1);
+        constraint int_eq(x[4], 3);
+        constraint int_eq(c1, 2);
+        constraint fzn_count_eq(x, 2, c1);
+        solve satisfy;
+        """
+    )
+    require("----------" in out, f"count constraint failed:\n{out}")
+
+    # 9. table_bool
+    out = run_model(
+        """
+        array [1..4] of bool: tuples = [true, false, false, true];
+        var bool: b1 :: output_var;
+        var bool: b2 :: output_var;
+        array [1..2] of var bool: x :: output_array([1..2]) = [b1, b2];
+        constraint fzn_table_bool(x, tuples);
+        constraint bool_eq(b1, true);
+        solve satisfy;
+        """
+    )
+    require("b1 = true;" in out and "b2 = false;" in out,
+            f"table_bool failed:\n{out}")
+
+
 def main() -> int:
     if not SOLVER.exists():
         print(f"missing solver binary: {SOLVER}", file=sys.stderr)
@@ -371,6 +521,7 @@ def main() -> int:
         test_table_and_constant_aliases()
         test_circuit()
         test_declaration_indices_and_honest_unknown()
+        test_all_solutions_and_extended_constraints()
     except AssertionError as exc:
         print(f"FlatZinc semantics test FAILED: {exc}", file=sys.stderr)
         return 1
