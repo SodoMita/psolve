@@ -7,6 +7,10 @@ echo "[0/7] PGS boxed-QP (real-time physics kernel) unit test..."
 gcc -O2 -march=native -I src tools/pgs_test.c src/pgs.c -o /tmp/pgs_test -lm
 /tmp/pgs_test
 
+echo "[0.5/7] Fixed-point PGS (integer) unit test + determinism..."
+gcc -O2 -march=native -I src tools/pgs_fixed_test.c src/pgs_fixed.c src/pgs.c -o /tmp/pgs_fixed_test -lm
+/tmp/pgs_fixed_test
+
 echo "[1/7] Dense LU unit test..."
 gcc -O2 -march=native -I src tools/unit_test.c src/lu.c src/kernels.c -o /tmp/unit_test -lm
 /tmp/unit_test

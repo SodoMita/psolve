@@ -30,14 +30,14 @@ QPOBJ = $(QPSRC:.c=.o)
 #   make lib   ->  libpsolve.a  (all solvers: LP, QP, MIP, PGS)
 #   make liblp ->  libpsolve-lp.a   (LP only)
 #   make libqp ->  libpsolve-qp.a   (QP only)
-LIB_SRC = src/err.c src/kernels.c src/lu.c src/splu.c src/solver.c src/parser.c src/qp.c src/mip.c src/pgs.c
+LIB_SRC = src/err.c src/kernels.c src/lu.c src/splu.c src/solver.c src/parser.c src/qp.c src/mip.c src/pgs.c src/pgs_fixed.c
 LIB_OBJ = $(LIB_SRC:.c=.o)
 LP_LIB_SRC = src/err.c src/kernels.c src/lu.c src/splu.c src/solver.c src/parser.c
 LP_LIB_OBJ = $(LP_LIB_SRC:.c=.o)
-QP_LIB_SRC = src/err.c src/qp.c src/lu.c src/kernels.c src/pgs.c
+QP_LIB_SRC = src/err.c src/qp.c src/lu.c src/kernels.c src/pgs.c src/pgs_fixed.c
 QP_LIB_OBJ = $(QP_LIB_SRC:.c=.o)
 
-all: lpsolve qpsolve mipsolve pgsbench
+all: lpsolve qpsolve mipsolve pgsbench pgfbench
 
 lpsolve: $(OBJ)
 	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -o $@ $(OBJ) $(LDFLAGS) $(LDLIBS)
@@ -56,6 +56,16 @@ src/pgs.o: src/pgs.c src/pgs.h
 	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -I src -c -o $@ $<
 
 tools/pgbench.o: tools/pgbench.c src/pgs.h
+	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -I src -c -o $@ $<
+
+# Fixed-point physics kernel
+pgfbench: src/pgs_fixed.o tools/pgfbench.o
+	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -o $@ $^ $(LDFLAGS) $(LDLIBS)
+
+src/pgs_fixed.o: src/pgs_fixed.c src/pgs_fixed.h src/pgs.h
+	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -I src -c -o $@ $<
+
+tools/pgfbench.o: tools/pgfbench.c src/pgs_fixed.h
 	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -I src -c -o $@ $<
 
 src/mip.o: src/mip.c src/mip.h src/solver.h src/err.h
@@ -93,6 +103,6 @@ asan: clean
 	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -I src -c -o $@ $<
 
 clean:
-	rm -f lpsolve qpsolve mipsolve pgsbench src/*.o tools/*.o libpsolve.a libpsolve-lp.a libpsolve-qp.a
+	rm -f lpsolve qpsolve mipsolve pgsbench pgfbench src/*.o tools/*.o libpsolve.a libpsolve-lp.a libpsolve-qp.a
 
 .PHONY: all asan clean lib liblp libqp

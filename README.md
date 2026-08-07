@@ -1,4 +1,4 @@
-# AVX512-Simplex — a vectorized LP, QP & MIP solver for real-time use
+# psolve — a fixed-point (integer) LP, QP, MIP & physics solver for real-time use
 
 A from-scratch **linear programming** (revised simplex), **quadratic
 programming** (active-set), **mixed-integer programming** (branch-and-bound),
@@ -6,6 +6,12 @@ and **real-time 2D-physics kernel** (projected Gauss-Seidel) library — tuned
 for modern x86 hardware (AVX-512 FMA), cache-friendly sparse data layout, and
 interactive latency.  It has **no third-party dependencies** (only libc/libm),
 is small and auditable, and supports **incremental solving** (warm starts).
+
+**psolve is an integer solver.** The real-time kernels (UI, vector graphics,
+physics) run on **fixed-point arithmetic** for bit-identical determinism across
+platforms (replay / network safety) and predictable, branch-friendly cost on
+integer cores.  Floating-point variants are provided as a reference and
+cross-check; the production path is integer.
 
 See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the long-term plan (real-time UI /
 vector graphics / 2D physics / FlatZinc completeness).
@@ -55,28 +61,41 @@ the number of B&B nodes, and the incumbent solution.
 
 ## Real-time physics kernel (projected Gauss-Seidel)
 
-`src/pgs.c` is the boxed-QP workhorse used by real-time 2D physics engines for
-contact / friction resolution:
+The boxed-QP workhorse used by real-time 2D physics engines for contact /
+friction resolution, in **both float (reference)** and **fixed-point (integer,
+production)** forms:
 
 ```c
-PGSOptions opt = { n, /*iterations*/ 20, /*omega*/ 1.0, /*tol*/ 1e-10 };
+/* float reference (src/pgs.c) */
+PGSOptions opt = { n, /*iters*/ 20, /*omega*/ 1.0, /*tol*/ 1e-10 };
 PGSResult res;
-pgs_solve(&opt, A, b, lo, hi, x, &res);   // x is warm-started in, result out
+pgs_solve(&opt, A, b, lo, hi, x, &res);
+
+/* fixed-point (src/pgs_fixed.c) — bit-identical on every platform */
+const int64_t S = 65536;                    /* Q16.16 scale */
+PGSFixedOptions fopt = { n, /*iters*/ 20, /*w_num*/ 1, /*w_den*/ 1, /*tol*/ 1 };
+PGSResult fres;
+pgsf_solve(&fopt, A, b, lo, hi, x, &fres);  /* all integers, 128-bit accumulators */
 ```
 
-It solves `min ½xᵀAx + bᵀx  s.t.  lo ≤ x ≤ hi` for symmetric PSD A by
-projected Gauss-Seidel with optional SOR.  It is **deterministic** (same input +
-iteration budget ⇒ same result), **zero-malloc in the loop**, and bounded-work.
+Both solve `min ½xᵀAx + bᵀx  s.t.  lo ≤ x ≤ hi` for symmetric PSD A by
+projected Gauss-Seidel with SOR.  The fixed-point kernel uses integer division
+(round-half-away), rational relaxation `ω=w_num/w_den`, and 128-bit
+intermediate sums — **deterministic, zero-malloc, bounded-work**.  It is
+validated against the float solver on thousands of random PSD systems.
+
 Measured on this box (2 CPU cores):
 
 ```
-  n=4   iters=10     0.08 µs/solve
-  n=16  iters=10     0.35 µs/solve
-  n=32  iters=20     0.84 µs/solve
-  n=64  iters=20     2.27 µs/solve
+        float PGS          fixed-point PGS
+  n=4    0.08 µs             0.08 µs
+  n=16   0.35 µs             0.53 µs
+  n=32   0.84 µs             1.60 µs
+  n=64   2.27 µs             6.53 µs   (scalar __int128; float uses AVX-512 FMA)
 ```
 
-Build the benchmark with `make pgsbench`; see `examples/contact_pgs.c`.
+Build benchmarks with `make pgsbench` (float) and `make pgfbench` (fixed);
+see `examples/contact_pgs.c` and `examples/contact_pgs_fixed.c`.
 
 ## Sensitivity analysis (LP)
 
@@ -211,7 +230,8 @@ src/solver.c    revised-simplex driver, two-phase method, steepest-edge pricing,
                 sparse/dense dispatch, incremental (warm-start) solving,
                 shadow prices + iteration limit
 src/mip.c       mixed-integer programming via branch-and-bound
-src/pgs.c       projected Gauss-Seidel boxed-QP (real-time physics kernel)
+src/pgs.c       projected Gauss-Seidel boxed-QP (float reference kernel)
+src/pgs_fixed.c fixed-point (integer) PGS boxed-QP (production physics kernel)
 src/qp.c        convex QP solver (active-set method + Phase-I feasibility)
 src/parser.c    LP file reader
 src/main.c      LP CLI
