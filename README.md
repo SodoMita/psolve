@@ -255,15 +255,20 @@ integration point used by [SmazkaVG](https://github.com/SodoMita/SmazkaVG).
 linear subset it can handle natively with the LP solver (and the MIP solver
 when integer variables are present, so answers are integral):
 
-- **Declarations**: `par`/`var` int/float/bool, scalar + arrays, name→index,
-  annotations, domains in both `var 1..10:` shorthand and `::`-annotation forms.
-- **Constraints**: `int_lin_eq/le`, `int_eq/le/lt/ge/gt`, `bool_eq/le/lt`,
-  `bool_and/or/xor/not/clause`, `array_bool_and/or`, `int_plus/minus/neg`,
-  `int_abs/max/min`, `int_times` (constant operand), `set_in` + set domains,
-  `all_different`, `array_int_element`, `bool2int`/`int2float`, reified
-  `int_eq/le/lt/ge/gt_reif`, `int_lin_ne`, `int_lin_ge`, `count`/`among`.
-- **Solve**: satisfy / minimize / maximize; FlatZinc output (`x = v;`,
-  `array1d(...)`, status markers), objective always, and `-s` stats
+- **Declarations**: `par`/`var` int/float/bool (including bare scalar
+  parameters such as `int: n = 4;`), scalar + arrays with their original index
+  ranges, annotations, and domains in both `var 1..10:` shorthand and
+  `::`-annotation forms. Decimal shorthand domains infer `var float`.
+- **Constraints**: exact integer/bool `*_lin_eq/le/lt/ge/gt` and
+  `*_eq/le/lt/ge/gt` relations; `int_eq/le/lt/ge/gt_reif` and their bool
+  counterparts; `int_lin_ne`, `count`/`among`; boolean logic; `int_abs/max/min`,
+  `int_times` (constant operand), `set_in` + set domains, `all_different`,
+  `array_int_element`, `bool2int`/`int2float`; and the continuous linear float
+  subset `float_lin_eq/le/ge`, `float_eq/le/ge`, `float_plus/minus/neg`,
+  constant-operand `float_times`, and constant-denominator `float_div`; see
+  `examples/fzn/float_lin.fzn` for a runnable continuous model.
+- **Solve**: satisfy / minimize / maximize; type-faithful FlatZinc output
+  (including full-precision float values and declared array indices), objective always, and `-s` stats
   (`nodes`, `objectiveBound`); `-n` node limit and `-t`/SIGINT time limits are
   enforced via a cooperative abort polled in the LP simplex and B&B loops.
   Usage: `fznsolve [-n N] [-t ms] [-s] [-v] <x.fzn>`.
@@ -271,8 +276,12 @@ when integer variables are present, so answers are integral):
   with the MiniZinc compiler and checks fznsolve against Gecode (objectives
   match, e.g. knapsack=10, prod3=57).  See `examples/mzn/`.
 - Nonlinear/unhandled constraints return `=====UNKNOWN=====` (never a wrong
-  answer).  See `docs/ROADMAP.md` for a known Phase-I degeneracy limitation
-  (equality + fixed variables) and the remaining handler list.
+  answer).  In particular, strict continuous `float_lt`/`float_gt` predicates
+  are deliberately not relaxed to non-strict LP rows: their feasible sets are
+  open.  An optimization result that reaches the bridge's synthetic bound for
+  an otherwise unbounded objective-bearing variable is likewise `UNKNOWN`, not
+  a fake optimum.
+  See `docs/ROADMAP.md` for the remaining handler list.
 
 ## Layout
 

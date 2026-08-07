@@ -47,7 +47,7 @@ static int lex(const char*src, Token**out,int*n)
             if(cnt>=cap){cap*=2;t=(Token*)realloc(t,(size_t)cap*sizeof(Token));}
             t[cnt].kind=TK_STRING;t[cnt].text=strndup(src+s+1,i-s-2);t[cnt].start=s;t[cnt].end=i;cnt++;continue;
         }
-        const char*two[]={"::","->","<-","..","{","}","[","]","(",")",",",";",":",".","=",0};
+        const char*two[]={"::","->","<-","..","{","}","[","]","(",")",",",";",":",".","=","+","-",0};
         int matched=0;
         for(int k=0;two[k];k++){ size_t Lk=strlen(two[k]);
             if(i+Lk<=L&&strncmp(src+i,two[k],Lk)==0){
@@ -86,46 +86,57 @@ static void expr_free2(Expr*e);
 static Expr parse_primary(const char*s,size_t*pos,FZModel*m,int*err)
 {
     Expr e; memset(&e,0,sizeof(e)); e.n=1; e.els=(Lin*)malloc(sizeof(Lin)); memset(&e.els[0],0,sizeof(Lin));
-    while(s[*pos]==' ')(*pos)++;
+    while(isspace((unsigned char)s[*pos]))(*pos)++;
     char c=s[*pos];
     if(c=='-'){(*pos)++;Expr t=parse_primary(s,pos,m,err);if(!*err){for(int i=0;i<t.n;i++){for(int k=0;k<t.els[i].n;k++)t.els[i].coef[k]=-t.els[i].coef[k];t.els[i].constant=-t.els[i].constant;}}free(e.els);e=t;return e;}
     if(c=='['){(*pos)++;int cap=8;free(e.els);e.els=(Lin*)malloc((size_t)cap*sizeof(Lin));e.n=0;e.is_array=1;
-        while(1){while(s[*pos]==' ')(*pos)++;if(s[*pos]==']'){(*pos)++;break;}
+        while(1){while(isspace((unsigned char)s[*pos]))(*pos)++;if(s[*pos]==']'){(*pos)++;break;}
             Expr t=parse_expr(s,pos,m,err);if(*err){expr_free2(&t);expr_free2(&e);return e;}
             if(e.n>=cap){cap*=2;e.els=(Lin*)realloc(e.els,(size_t)cap*sizeof(Lin));}
             e.els[e.n]=t.els[0];e.n++;free(t.els);
-            while(s[*pos]==' ')(*pos)++;
+            while(isspace((unsigned char)s[*pos]))(*pos)++;
             if(s[*pos]==','){(*pos)++;continue;}
             if(s[*pos]==']'){(*pos)++;break;}
             *err=1;return e;}
         return e;}
     if(isdigit((unsigned char)c)||(c=='.'&&isdigit((unsigned char)s[*pos+1]))){
-        char num[64];int k=0;
-        while(k<63&&(isdigit((unsigned char)s[*pos])||s[*pos]=='.'||s[*pos]=='e'||s[*pos]=='E'||s[*pos]=='+'||s[*pos]=='-'))num[k++]=s[(*pos)++];
-        num[k]=0; e.els[0].constant=atof(num); return e;}
+        /* Let strtod define the token boundary.  In particular, do not swallow
+           the binary + in `1+2` or the range separator in malformed input. */
+        char*end=NULL;double v=strtod(s+*pos,&end);
+        if(end==s+*pos||!isfinite(v)){*err=1;return e;}
+        *pos+=(size_t)(end-(s+*pos));e.els[0].constant=v;return e;}
     if(isalpha((unsigned char)c)||c=='_'){
         char name[128];int k=0;while(k<127&&is_ident_ch((unsigned char)s[*pos]))name[k++]=s[(*pos)++];name[k]=0;
-        while(s[*pos]==' ')(*pos)++;
+        while(isspace((unsigned char)s[*pos]))(*pos)++;
         if(s[*pos]=='['){/* array element */
             (*pos)++;Expr ix=parse_expr(s,pos,m,err);if(*err){lin_free(&e.els[0]);free(e.els);return e;}
-            long ival=(long)ix.els[0].constant;lin_free(&ix.els[0]);free(ix.els);
+            while(isspace((unsigned char)s[*pos]))(*pos)++;
+            if(s[*pos]!=']'){expr_free2(&ix);*err=1;return e;}
+            (*pos)++;
+            if(ix.is_array||ix.n!=1||ix.els[0].n!=0||fabs(ix.els[0].constant-round(ix.els[0].constant))>1e-12){
+                expr_free2(&ix);*err=1;return e;
+            }
+            long ival=(long)llround(ix.els[0].constant);expr_free2(&ix);
             FZDecl*d=find_decl(m,name);
-            if(!d){*err=1;return e;}
-            if(d->is_var){ lin_term(&e.els[0], d->base_idx+(int)(ival-1), 1.0); }
-            else e.els[0].constant = d->par?d->par[ival-1]:(d->par_int?d->par_int[ival-1]:0);
+            int elem=d?(int)(ival-d->index_lo):-1;
+            if(!d||!d->is_array||elem<0||elem>=d->n){*err=1;return e;}
+            if(d->is_var){
+                if(d->base_idx<0){*err=1;return e;}
+                lin_term(&e.els[0], d->base_idx+elem, 1.0);
+            } else e.els[0].constant = d->par?d->par[elem]:(d->par_int?d->par_int[elem]:0);
             return e;}
         FZDecl*d=find_decl(m,name);
         if(d){ if(d->is_var){lin_term(&e.els[0],d->base_idx,1.0);} else e.els[0].constant=d->par?d->par[0]:(d->par_int?d->par_int[0]:0); }
         else { if(strcmp(name,"true")==0)e.els[0].constant=1; else if(strcmp(name,"false")==0)e.els[0].constant=0; else *err=1; }
         return e;}
-    if(c=='('){(*pos)++;Expr t=parse_expr(s,pos,m,err);while(s[*pos]==' ')(*pos)++;if(s[*pos]==')')(*pos)++;free(e.els);e=t;return e;}
+    if(c=='('){(*pos)++;Expr t=parse_expr(s,pos,m,err);while(isspace((unsigned char)s[*pos]))(*pos)++;if(s[*pos]==')')(*pos)++;free(e.els);e=t;return e;}
     *err=1;return e;
 }
 
 static Expr parse_expr(const char*s,size_t*pos,FZModel*m,int*err)
 {
     Expr e=parse_primary(s,pos,m,err); if(*err){expr_free2(&e);return e;}
-    while(1){ while(s[*pos]==' ')(*pos)++;
+    while(1){ while(isspace((unsigned char)s[*pos]))(*pos)++;
         char op=s[*pos]; if(op!='+'&&op!='-')break; (*pos)++;
         Expr t=parse_primary(s,pos,m,err); if(*err){expr_free2(&t);return e;}
         double sg=(op=='+')?1.0:-1.0;
@@ -144,7 +155,8 @@ static int parse_lin(FZModel*m,const char*s,Lin*out)
 {
     size_t pos=0;int err=0;
     Expr e=parse_expr(s,&pos,m,&err);
-    if(err||e.is_array||e.n!=1){ if(e.n>0){for(int i=0;i<e.n;i++)lin_free(&e.els[i]);free(e.els);} return -1; }
+    while(isspace((unsigned char)s[pos]))pos++;
+    if(err||s[pos]!='\0'||e.is_array||e.n!=1){ if(e.n>0){for(int i=0;i<e.n;i++)lin_free(&e.els[i]);free(e.els);} return -1; }
     *out=e.els[0]; free(e.els);
     return 0;
 }
@@ -156,11 +168,11 @@ static int parse_array(FZModel*m,const char*s,Lin**out,int*outn)
        aliases introduced vars (e.g. x = [X0,X1,..]).  Resolve to elements. */
     {
         char name[256]; int k=0; const char*p=s;
-        while(*p==' ')p++;
+        while(isspace((unsigned char)*p))p++;
         if(isalpha((unsigned char)*p)||*p=='_'){
             while(k<255&&is_ident_ch((unsigned char)*p))name[k++]=*p++;
             name[k]=0;
-            while(*p==' ')p++;
+            while(isspace((unsigned char)*p))p++;
             if(*p=='\0'||*p==';'){   /* it's just an identifier */
                 FZDecl*d=find_decl(m,name);
                 if(d&&d->is_array){
@@ -188,7 +200,8 @@ static int parse_array(FZModel*m,const char*s,Lin**out,int*outn)
     }
     size_t pos=0;int err=0;
     Expr e=parse_expr(s,&pos,m,&err);
-    if(err||!e.is_array){ if(e.n>0){for(int i=0;i<e.n;i++)lin_free(&e.els[i]);free(e.els);} return -1; }
+    while(isspace((unsigned char)s[pos]))pos++;
+    if(err||s[pos]!='\0'||!e.is_array){ if(e.n>0){for(int i=0;i<e.n;i++)lin_free(&e.els[i]);free(e.els);} return -1; }
     *out=e.els;*outn=e.n; return 0;
 }
 static void free_lins(Lin*arr,int n){for(int i=0;i<n;i++)lin_free(&arr[i]);free(arr);}
@@ -198,7 +211,7 @@ static void free_lins(Lin*arr,int n){for(int i=0;i<n;i++)lin_free(&arr[i]);free(
 /* ------------------------------------------------------------------ */
 static FZDecl*add_decl(FZModel*m){
     if(m->ndecl>=m->cap_decl){m->cap_decl=m->cap_decl?m->cap_decl*2:16;m->decls=(FZDecl*)realloc(m->decls,(size_t)m->cap_decl*sizeof(FZDecl));}
-    FZDecl*d=&m->decls[m->ndecl++];memset(d,0,sizeof(*d));d->base_idx=-1;return d;
+    FZDecl*d=&m->decls[m->ndecl++];memset(d,0,sizeof(*d));d->base_idx=-1;d->index_lo=1;return d;
 }
 FZDecl*find_decl(FZModel*m,const char*name){
     for(int i=0;i<m->ndecl;i++)if(m->decls[i].name&&strcmp(m->decls[i].name,name)==0)return &m->decls[i];
@@ -206,6 +219,51 @@ FZDecl*find_decl(FZModel*m,const char*name){
 }
 
 static int is_kw(const char*s,const char*k){return s&&strcmp(s,k)==0;}
+
+/* Extract scalar literals used in declaration domains.  A FlatZinc array
+   extent may also name an already-declared integer parameter (the form the
+   MiniZinc compiler emits for array[1..n]). */
+static int tok_number(const Token*t,double*out)
+{
+    if(t->kind==TK_INT){*out=(double)t->ival;return 0;}
+    if(t->kind==TK_FLOAT){*out=t->fval;return 0;}
+    return -1;
+}
+static int tok_int_value(FZModel*m,const Token*t,long*out)
+{
+    if(t->kind==TK_INT){*out=t->ival;return 0;}
+    if(t->kind==TK_IDENT){
+        FZDecl*d=find_decl(m,t->text);
+        if(d&&!d->is_var&&!d->is_array&&d->par){
+            double v=d->par[0];
+            if(fabs(v-round(v))<=1e-12){*out=(long)llround(v);return 0;}
+        }
+    }
+    return -1;
+}
+
+/* Parse an annotation range without confusing a decimal point with the
+   `..` separator (e.g. 0.25..1.75). */
+static int annotation_range(const char*s,double*lo,double*hi)
+{
+    /* strtod("1..10") is permitted to consume "1." as a number, so find
+       the range delimiter first and parse its two sides independently. */
+    const char*sep=strstr(s,"..");
+    if(!sep)return -1;
+    size_t n=(size_t)(sep-s);
+    if(n==0||n>=128)return -1;
+    char left[128];memcpy(left,s,n);left[n]=0;
+    char *end=NULL,*end2=NULL;
+    double a=strtod(left,&end);
+    if(end==left||!isfinite(a))return -1;
+    while(isspace((unsigned char)*end))end++;
+    if(*end!='\0')return -1;
+    double b=strtod(sep+2,&end2);
+    if(end2==sep+2||!isfinite(b))return -1;
+    while(isspace((unsigned char)*end2))end2++;
+    if(*end2!='\0'||b<a)return -1;
+    *lo=a;*hi=b;return 0;
+}
 
 int fz_read(const char*path,FZModel*m)
 {
@@ -276,14 +334,34 @@ int fz_read(const char*path,FZModel*m)
                 }
                 continue;
             }
-            if(is_kw(kw,"par")||is_kw(kw,"var")||is_kw(kw,"array")){
+            if(is_kw(kw,"par")||is_kw(kw,"var")||is_kw(kw,"array")||
+               is_kw(kw,"int")||is_kw(kw,"float")||is_kw(kw,"bool")){
                 /* Default to a parameter; `var` or `array ... of var` makes it
-                   a decision variable. */
+                   a decision variable.  FlatZinc commonly omits the `par`
+                   keyword for scalar constants (`int: n = 4;`). */
                 int is_var=is_kw(kw,"var");
-                FZDecl*d=add_decl(m); d->is_var=is_var; ti++;
+                FZDecl*d=add_decl(m); d->is_var=is_var;
+                if(is_kw(kw,"int"))d->kind=FZ_K_INT;
+                else if(is_kw(kw,"float"))d->kind=FZ_K_FLOAT;
+                else if(is_kw(kw,"bool"))d->kind=FZ_K_BOOL;
+                ti++;
                 if(is_kw(kw,"array")||(ti<nt&&is_kw(toks[ti].text,"array"))){
                     d->is_array=1;
                     if(!is_kw(kw,"array")) ti++;          /* skip 'array' */
+                    /* Preserve the declared index range.  FlatZinc arrays are
+                       normally one-dimensional, with an extent such as
+                       array[1..n]; MiniZinc often uses a scalar parameter for
+                       n, so resolve that form too. */
+                    if(ti<nt&&toks[ti].kind==TK_SYM&&strcmp(toks[ti].text,"[")==0){
+                        int ai=ti+1; long alo,ahi;
+                        if(ai+2<nt && tok_int_value(m,&toks[ai],&alo)==0 &&
+                           toks[ai+1].kind==TK_SYM&&strcmp(toks[ai+1].text,"..")==0 &&
+                           tok_int_value(m,&toks[ai+2],&ahi)==0 && ahi>=alo &&
+                           ahi-alo+1<=2147483647L){
+                            d->index_lo=(int)alo;
+                            d->n=(int)(ahi-alo+1);
+                        }
+                    }
                     while(ti<nt&&!(toks[ti].kind==TK_SYM&&strcmp(toks[ti].text,"]")==0))ti++;
                     if(ti<nt)ti++;                        /* skip ']' */
                     if(ti<nt&&is_kw(toks[ti].text,"of"))ti++;
@@ -291,9 +369,7 @@ int fz_read(const char*path,FZModel*m)
                 /* optional 'var' before the type (array ... of var int) */
                 if(ti<nt&&is_kw(toks[ti].text,"var")){ is_var=1; d->is_var=1; ti++; }
                 if(ti<nt&&toks[ti].kind==TK_IDENT){if(is_kw(toks[ti].text,"int"))d->kind=FZ_K_INT;else if(is_kw(toks[ti].text,"float"))d->kind=FZ_K_FLOAT;else if(is_kw(toks[ti].text,"bool"))d->kind=FZ_K_BOOL;ti++;}
-                /* FlatZinc set domain: var {1,3,5}: x  — store as bounds only
-                   (min..max); exact membership is enforced by a set_in in the
-                   model body if present, else this is a relaxation. */
+                /* FlatZinc set domain: var {1,3,5}: x. */
                 if(ti<nt&&toks[ti].kind==TK_SYM&&strcmp(toks[ti].text,"{")==0){
                     long vmin=1000000000L,vmax=-1000000000L; int nv=0;
                     long vals[256];
@@ -304,6 +380,7 @@ int fz_read(const char*path,FZModel*m)
                     }
                     if(ti<nt)ti++;  /* skip '}' */
                     if(nv>0){
+                        if(d->kind==FZ_K_NONE)d->kind=FZ_K_INT;
                         d->has_lo=1;d->has_hi=1;
                         d->lo=(double*)malloc(sizeof(double));d->hi=(double*)malloc(sizeof(double));
                         d->lo[0]=(double)vmin; d->hi[0]=(double)vmax;
@@ -312,14 +389,23 @@ int fz_read(const char*path,FZModel*m)
                         for(int q=0;q<nv;q++)d->setvals[q]=vals[q];
                     }
                 }
-                /* FlatZinc shorthand: var 1..10: x  (domain before ':') */
+                /* FlatZinc shorthand: var 1..10: x or var 0.1..10.5: x.
+                   The latter is a float declaration even though no explicit
+                   `float` keyword appears, so retain the token's real value
+                   rather than reading the inactive integer member of Token. */
                 if(ti<nt&&(toks[ti].kind==TK_INT||toks[ti].kind==TK_FLOAT)){
-                    char lo[64],hi[64];snprintf(lo,sizeof(lo),"%ld",(long)toks[ti].ival);ti++;
-                    if(ti<nt&&toks[ti].kind==TK_SYM&&strcmp(toks[ti].text,"..")==0)ti++;
-                    if(ti<nt&&toks[ti].kind==TK_INT){snprintf(hi,sizeof(hi),"%ld",(long)toks[ti].ival);ti++;}
-                    else if(ti<nt&&toks[ti].kind==TK_FLOAT){snprintf(hi,sizeof(hi),"%g",toks[ti].fval);ti++;}
+                    int lo_kind=toks[ti].kind, hi_kind=TK_INT;
+                    double lo,hi;
+                    if(tok_number(&toks[ti],&lo)!=0){free_toks(toks,nt);free(src);return -1;}
+                    ti++;
+                    if(!(ti<nt&&toks[ti].kind==TK_SYM&&strcmp(toks[ti].text,"..")==0)){free_toks(toks,nt);free(src);return -1;}
+                    ti++;
+                    if(ti>=nt||tok_number(&toks[ti],&hi)!=0){free_toks(toks,nt);free(src);return -1;}
+                    hi_kind=toks[ti].kind;ti++;
+                    if(hi<lo){free_toks(toks,nt);free(src);return -1;}
+                    if(d->kind==FZ_K_NONE)d->kind=(lo_kind==TK_FLOAT||hi_kind==TK_FLOAT)?FZ_K_FLOAT:FZ_K_INT;
                     d->has_lo=1;d->has_hi=1;d->lo=(double*)malloc(sizeof(double));d->hi=(double*)malloc(sizeof(double));
-                    d->lo[0]=atof(lo);d->hi[0]=atof(hi);
+                    d->lo[0]=lo;d->hi[0]=hi;
                 }
                 if(ti<nt&&toks[ti].kind==TK_SYM&&strcmp(toks[ti].text,":")==0)ti++;
                 if(ti<nt&&toks[ti].kind==TK_IDENT){d->name=strdup(toks[ti].text);ti++;}
@@ -330,15 +416,14 @@ int fz_read(const char*path,FZModel*m)
                     while(aj<nt&&!(toks[aj].kind==TK_SYM&&(strcmp(toks[aj].text,";")==0||strcmp(toks[aj].text,"=")==0||strcmp(toks[aj].text,"::")==0))){ae=toks[aj].end;aj++;}
                     char*ann=strndup(src+as,ae-as);
                     if(strstr(ann,"output_var")||strstr(ann,"output_array"))d->is_output=1;
-                    /* domain :: lo..hi */
-                    if(!d->has_lo && strchr(ann,'.')){
-                        char lob[64],hib[64];int k=0;
-                        while(ann[k]&&ann[k]!='.'){lob[k]=ann[k];k++;}lob[k]=0;
-                        const char*p=ann+k;while(*p=='.')p++;
-                        k=0;while(p[k]&&p[k]!=' '){hib[k]=p[k];k++;}hib[k]=0;
-                        d->has_lo=1;d->has_hi=1;
-                        d->lo=(double*)malloc(sizeof(double));d->hi=(double*)malloc(sizeof(double));
-                        d->lo[0]=atof(lob);d->hi[0]=atof(hib);
+                    /* domain :: lo..hi (including decimal endpoints) */
+                    if(!d->has_lo){
+                        double lo,hi;
+                        if(annotation_range(ann,&lo,&hi)==0){
+                            d->has_lo=1;d->has_hi=1;
+                            d->lo=(double*)malloc(sizeof(double));d->hi=(double*)malloc(sizeof(double));
+                            d->lo[0]=lo;d->hi[0]=hi;
+                        }
                     }
                     free(ann);
                     ti=aj;
@@ -384,11 +469,15 @@ int fz_read(const char*path,FZModel*m)
                     if(is_var&&!d->is_array){d->base_idx=m->nvars-1;} /* scalar var with init (unusual) */
                     continue;
                 }
-                /* var decl without initializer: count array size from domain
-                   annotation :: lo..hi if array; else n=1. base index assigned. */
-                d->n=1;
-                d->base_idx=m->nvars;
-                m->nvars+=d->n;
+                /* A declaration without an initializer owns one scalar or
+                   the complete declared array extent.  The old reader reset
+                   arrays to one element here, which made float/int arrays
+                   silently lose all but their first variable. */
+                if(!d->is_array||d->n<=0)d->n=1;
+                if(is_var){
+                    d->base_idx=m->nvars;
+                    m->nvars+=d->n;
+                }
                 /* annotations */
                 while(ti<nt&&toks[ti].kind==TK_SYM&&strcmp(toks[ti].text,"::")==0){
                     ti++;
@@ -397,13 +486,14 @@ int fz_read(const char*path,FZModel*m)
                     while(j<nt&&!(toks[j].kind==TK_SYM&&(strcmp(toks[j].text,";")==0||strcmp(toks[j].text,"::")==0))){e=toks[j].end;j++;}
                     char*ann=strndup(src+s,e-s);
                     if(strstr(ann,"output_var")||strstr(ann,"output_array"))d->is_output=1;
-                    /* domain like "lo..hi" */
-                    if(strchr(ann,'.')){
-                        char lo[64],hi[64];int k=0;while(ann[k]&&ann[k]!='.'){lo[k]=ann[k];k++;}lo[k]=0;
-                        const char*p=ann+k;while(*p=='.')p++;k=0;while(p[k]&&p[k]!=' ') {hi[k]=p[k];k++;}hi[k]=0;
-                        d->has_lo=1;d->has_hi=1;
-                        d->lo=(double*)malloc(sizeof(double));d->hi=(double*)malloc(sizeof(double));
-                        d->lo[0]=atof(lo);d->hi[0]=atof(hi);
+                    /* domain like "lo..hi", with decimal endpoints allowed */
+                    {
+                        double lo,hi;
+                        if(annotation_range(ann,&lo,&hi)==0){
+                            d->has_lo=1;d->has_hi=1;
+                            d->lo=(double*)malloc(sizeof(double));d->hi=(double*)malloc(sizeof(double));
+                            d->lo[0]=lo;d->hi[0]=hi;
+                        }
                     }
                     free(ann);
                     ti=(j<nt?j:j); /* advance to '::' or ';' boundary */
@@ -428,6 +518,12 @@ int fz_read(const char*path,FZModel*m)
 /* ------------------------------------------------------------------ */
 typedef struct { int n;int*idx;double*coef;double rhs;char rel; } Row;
 typedef struct { int nvars;int varcap;double*lo,*hi;int*haslo,*hashi;Row*rows;int nrows,cap; } Builder;
+
+/* The LP core needs a finite starting box.  This is only a bridge sentinel,
+   never a mathematical FlatZinc bound; optimization results that rely on it
+   are reported as UNKNOWN rather than a fictitious optimum at +/-1e9. */
+#define FZ_BIG_BOUND 1e9
+#define FZ_BIG_HIT_TOL 1e-5
 static int b_newvar(Builder*b, double lo, double hi){
     if(b->nvars>=b->varcap){
         int nc=b->varcap?b->varcap*2:16;
@@ -448,47 +544,166 @@ static void b_put(Builder*b,char rel,double rhs,const Lin*l){
     for(int i=0;i<l->n;i++){r->idx[i]=l->idx[i];r->coef[i]=l->coef[i];}
 }
 
+/* Tight-enough bounds for a linear form over the builder boxes.  The FlatZinc
+   bridge deliberately gives every variable a finite box, so these are also
+   usable for exact integer big-M encodings. */
+static int lin_bounds(const Builder*b,const Lin*l,double*lo,double*hi)
+{
+    double lval=l->constant, hval=l->constant;
+    for(int i=0;i<l->n;i++){
+        int v=l->idx[i]; double a=l->coef[i];
+        if(v<0||v>=b->nvars||!isfinite(a))return -1;
+        if(a>=0.0){lval+=a*b->lo[v];hval+=a*b->hi[v];}
+        else {lval+=a*b->hi[v];hval+=a*b->lo[v];}
+    }
+    if(!isfinite(lval)||!isfinite(hval))return -1;
+    *lo=lval;*hi=hval;return 0;
+}
+
+static int lin_unit_var(const Lin*l,int*out)
+{
+    if(l->n!=1||fabs(l->coef[0]-1.0)>1e-12||fabs(l->constant)>1e-12)return -1;
+    *out=l->idx[0];return 0;
+}
+
+/* Add d != 0 for an integer linear form.  p/n select its positive/negative
+   side; this is a true disjunction, unlike conjoining d>=1 and d<=-1. */
+static int add_int_ne(Builder*b,const Lin*d)
+{
+    double L,U;
+    if(lin_bounds(b,d,&L,&U)!=0)return -1;
+    int pos=b_newvar(b,0.0,1.0), neg=b_newvar(b,0.0,1.0);
+    Lin sel;memset(&sel,0,sizeof(sel));lin_term(&sel,pos,1.0);lin_term(&sel,neg,1.0);b_put(b,'=',1.0,&sel);lin_free(&sel);
+    /* pos=1 -> d>=1; pos=0 leaves the valid lower bound L. */
+    Lin low;memset(&low,0,sizeof(low));lin_into(&low,d,1.0);lin_term(&low,pos,-(1.0-L));b_put(b,'>',L,&low);lin_free(&low);
+    /* neg=1 -> d<=-1; neg=0 leaves the valid upper bound U. */
+    Lin high;memset(&high,0,sizeof(high));lin_into(&high,d,1.0);lin_term(&high,neg,U+1.0);b_put(b,'<',U,&high);lin_free(&high);
+    return 0;
+}
+
+/* Exact reification r <-> (d rel 0) for an integer-valued d.  `which` is
+   0:eq, 1:le, 2:lt, 3:ge, 4:gt.  Strict integer relations use their adjacent
+   lattice value (+/-1), never the non-strict relaxation. */
+static int add_int_reif(Builder*b,const Lin*d,int r,int which)
+{
+    double L,U;
+    if(r<0||r>=b->nvars||b->lo[r]<-1e-9||b->hi[r]>1.0+1e-9||lin_bounds(b,d,&L,&U)!=0)return -1;
+    if(which==0){
+        /* r=1 => d=0; r=0 selects d>=1 or d<=-1. */
+        int pos=b_newvar(b,0.0,1.0), neg=b_newvar(b,0.0,1.0);
+        Lin sel;memset(&sel,0,sizeof(sel));lin_term(&sel,r,1.0);lin_term(&sel,pos,1.0);lin_term(&sel,neg,1.0);b_put(b,'=',1.0,&sel);lin_free(&sel);
+        Lin up;memset(&up,0,sizeof(up));lin_into(&up,d,1.0);lin_term(&up,r,U);b_put(b,'<',U,&up);lin_free(&up);
+        Lin low0;memset(&low0,0,sizeof(low0));lin_into(&low0,d,1.0);lin_term(&low0,r,L);b_put(b,'>',L,&low0);lin_free(&low0);
+        Lin low;memset(&low,0,sizeof(low));lin_into(&low,d,1.0);lin_term(&low,pos,-(1.0-L));b_put(b,'>',L,&low);lin_free(&low);
+        Lin high;memset(&high,0,sizeof(high));lin_into(&high,d,1.0);lin_term(&high,neg,U+1.0);b_put(b,'<',U,&high);lin_free(&high);
+        return 0;
+    }
+    if(which==1){                 /* r <-> d <= 0 */
+        Lin up;memset(&up,0,sizeof(up));lin_into(&up,d,1.0);lin_term(&up,r,U);b_put(b,'<',U,&up);lin_free(&up);
+        Lin low;memset(&low,0,sizeof(low));lin_into(&low,d,1.0);lin_term(&low,r,1.0-L);b_put(b,'>',1.0,&low);lin_free(&low);
+        return 0;
+    }
+    if(which==2){                 /* r <-> d < 0, i.e. d <= -1 */
+        Lin up;memset(&up,0,sizeof(up));lin_into(&up,d,1.0);lin_term(&up,r,U+1.0);b_put(b,'<',U,&up);lin_free(&up);
+        Lin low;memset(&low,0,sizeof(low));lin_into(&low,d,1.0);lin_term(&low,r,-L);b_put(b,'>',0.0,&low);lin_free(&low);
+        return 0;
+    }
+    if(which==3){                 /* r <-> d >= 0 */
+        Lin low;memset(&low,0,sizeof(low));lin_into(&low,d,1.0);lin_term(&low,r,L);b_put(b,'>',L,&low);lin_free(&low);
+        Lin up;memset(&up,0,sizeof(up));lin_into(&up,d,1.0);lin_term(&up,r,-(U+1.0));b_put(b,'<',-1.0,&up);lin_free(&up);
+        return 0;
+    }
+    if(which==4){                 /* r <-> d > 0, i.e. d >= 1 */
+        Lin low;memset(&low,0,sizeof(low));lin_into(&low,d,1.0);lin_term(&low,r,-(1.0-L));b_put(b,'>',L,&low);lin_free(&low);
+        Lin up;memset(&up,0,sizeof(up));lin_into(&up,d,1.0);lin_term(&up,r,-U);b_put(b,'<',0.0,&up);lin_free(&up);
+        return 0;
+    }
+    return -1;
+}
+
+static int add_int_relation_constant(Builder*b,const Lin*d,int which,int want)
+{
+    if(want){
+        if(which==0)b_put(b,'=',0.0,d);
+        else if(which==1)b_put(b,'<',0.0,d);
+        else if(which==2)b_put(b,'<',-1.0,d);
+        else if(which==3)b_put(b,'>',0.0,d);
+        else if(which==4)b_put(b,'>',1.0,d);
+        else return -1;
+        return 0;
+    }
+    if(which==0)return add_int_ne(b,d);
+    if(which==1)b_put(b,'>',1.0,d);
+    else if(which==2)b_put(b,'>',0.0,d);
+    else if(which==3)b_put(b,'<',-1.0,d);
+    else if(which==4)b_put(b,'<',0.0,d);
+    else return -1;
+    return 0;
+}
+
+static int objective_uses_synthetic_bound(const FZModel*m,const Builder*b,const double*x,int norig)
+{
+    /* A free variable that is irrelevant to the objective may legitimately be
+       printed at an arbitrary finite value for `solve satisfy`/a bounded
+       objective.  Only an objective-bearing original variable at the bridge
+       sentinel means the claimed optimum is not certifiable. */
+    for(int k=0;k<m->objective.n;k++){
+        int v=m->objective.idx[k];
+        if(v<0||v>=norig||fabs(m->objective.coef[k])<=1e-14)continue;
+        if((!b->haslo[v]&&x[v]<=-FZ_BIG_BOUND+FZ_BIG_HIT_TOL)||
+           (!b->hashi[v]&&x[v]>= FZ_BIG_BOUND-FZ_BIG_HIT_TOL))return 1;
+    }
+    return 0;
+}
+
 /* dispatch: 0 handled, 1 unhandled, -1 malformed */
 static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
 {
     const char*p=c->pred; Lin l1,l2,l3;
-    if(strcmp(p,"int_lin_eq")==0||strcmp(p,"int_lin_le")==0||strcmp(p,"int_lin_ge")==0||strcmp(p,"int_lin_gt")==0||
-       strcmp(p,"bool_lin_eq")==0||strcmp(p,"bool_lin_le")==0||strcmp(p,"bool_lin_ge")==0){
+    if(strcmp(p,"int_lin_eq")==0||strcmp(p,"int_lin_le")==0||strcmp(p,"int_lin_lt")==0||
+       strcmp(p,"int_lin_ge")==0||strcmp(p,"int_lin_gt")==0||
+       strcmp(p,"bool_lin_eq")==0||strcmp(p,"bool_lin_le")==0||strcmp(p,"bool_lin_lt")==0||
+       strcmp(p,"bool_lin_ge")==0||strcmp(p,"bool_lin_gt")==0||
+       strcmp(p,"float_lin_eq")==0||strcmp(p,"float_lin_le")==0||strcmp(p,"float_lin_ge")==0){
         if(c->nargs<3)return -1;
         Lin*arr;int narr;
         if(parse_array(m,c->args[0],&arr,&narr)!=0)return -1;
         Lin*parr;int nparr;
         if(parse_array(m,c->args[1],&parr,&nparr)!=0){free_lins(arr,narr);return -1;}
         Lin d; if(parse_lin(m,c->args[2],&d)!=0){free_lins(arr,narr);free_lins(parr,nparr);return -1;}
-        /* sum_i arr[i]*parr[i] - d (rel) 0 */
+        if(narr!=nparr){lin_free(&d);free_lins(arr,narr);free_lins(parr,nparr);return -1;}
+        /* sum_i c_i*x_i - rhs (rel) 0.  Coefficients must be constants;
+           otherwise this is bilinear and must not be silently relaxed. */
         Lin lin;memset(&lin,0,sizeof(lin));
-        for(int i=0;i<narr&&i<nparr;i++){
+        for(int i=0;i<narr;i++){
+            if(arr[i].n!=0){lin_free(&lin);lin_free(&d);free_lins(arr,narr);free_lins(parr,nparr);return 1;}
             lin_into(&lin,&parr[i],arr[i].constant);
         }
-        lin.constant-=d.constant;
-        char rel;
-        if(strcmp(p,"int_lin_le")==0||strcmp(p,"bool_lin_le")==0) rel='<';
-        else if(strcmp(p,"int_lin_ge")==0||strcmp(p,"bool_lin_ge")==0) rel='>';
-        else if(strcmp(p,"int_lin_gt")==0) rel='>';
-        else rel='=';
-        b_put(b,rel,0.0,&lin);
+        lin_into(&lin,&d,-1.0);
+        char rel='='; double rhs=0.0;
+        if(strcmp(p,"int_lin_le")==0||strcmp(p,"bool_lin_le")==0||strcmp(p,"float_lin_le")==0) rel='<';
+        else if(strcmp(p,"int_lin_lt")==0||strcmp(p,"bool_lin_lt")==0){rel='<';rhs=-1.0;}
+        else if(strcmp(p,"int_lin_ge")==0||strcmp(p,"bool_lin_ge")==0||strcmp(p,"float_lin_ge")==0) rel='>';
+        else if(strcmp(p,"int_lin_gt")==0||strcmp(p,"bool_lin_gt")==0){rel='>';rhs=1.0;}
+        b_put(b,rel,rhs,&lin);
         lin_free(&lin);lin_free(&d);free_lins(arr,narr);free_lins(parr,nparr);
         return 0;
     }
     if(strcmp(p,"int_eq")==0||strcmp(p,"bool_eq")==0||strcmp(p,"float_eq")==0||
        strcmp(p,"int_le")==0||strcmp(p,"bool_le")==0||strcmp(p,"float_le")==0||
-       strcmp(p,"int_lt")==0||strcmp(p,"int_ge")==0||strcmp(p,"int_gt")==0||strcmp(p,"bool_lt")==0){
+       strcmp(p,"int_ge")==0||strcmp(p,"bool_ge")==0||strcmp(p,"float_ge")==0||
+       strcmp(p,"int_lt")==0||strcmp(p,"bool_lt")==0||strcmp(p,"int_gt")==0||strcmp(p,"bool_gt")==0){
         if(c->nargs<2)return -1;
         if(parse_lin(m,c->args[0],&l1)!=0)return -1;
         if(parse_lin(m,c->args[1],&l2)!=0){lin_free(&l1);return -1;}
         Lin dd;memset(&dd,0,sizeof(dd));
         lin_into(&dd,&l1,1.0);lin_into(&dd,&l2,-1.0);
-        char rel;
-        if(strcmp(p,"int_eq")==0||strcmp(p,"bool_eq")==0||strcmp(p,"float_eq")==0)rel='=';
-        else if(strcmp(p,"int_le")==0||strcmp(p,"bool_le")==0||strcmp(p,"float_le")==0)rel='<';
-        else if(strcmp(p,"int_lt")==0||strcmp(p,"bool_lt")==0)rel='<';
-        else rel='>';
-        b_put(b,rel,0.0,&dd);
+        char rel='='; double rhs=0.0;
+        if(strcmp(p,"int_le")==0||strcmp(p,"bool_le")==0||strcmp(p,"float_le")==0)rel='<';
+        else if(strcmp(p,"int_ge")==0||strcmp(p,"bool_ge")==0||strcmp(p,"float_ge")==0)rel='>';
+        else if(strcmp(p,"int_lt")==0||strcmp(p,"bool_lt")==0){rel='<';rhs=-1.0;}
+        else if(strcmp(p,"int_gt")==0||strcmp(p,"bool_gt")==0){rel='>';rhs=1.0;}
+        b_put(b,rel,rhs,&dd);
         lin_free(&l1);lin_free(&l2);lin_free(&dd);
         return 0;
     }
@@ -616,8 +831,8 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
         lin_free(&sum);lin_free(&rb);free_lins(arr,narr);
         return 0;
     }
-    /* int_neg(a,b): b = -a */
-    if(strcmp(p,"int_neg")==0){
+    /* int_neg/float_neg(a,b): b = -a */
+    if(strcmp(p,"int_neg")==0||strcmp(p,"float_neg")==0){
         if(c->nargs<2)return -1;
         if(parse_lin(m,c->args[0],&l1)!=0)return -1;
         if(parse_lin(m,c->args[1],&l2)!=0){lin_free(&l1);return -1;}
@@ -636,11 +851,10 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
         if(parse_lin(m,c->args[2],&l3)!=0){lin_free(&l1);lin_free(&l2);return -1;}
         int a_is_const=(l1.n==0), b_is_const=(l2.n==0);
         if(a_is_const && b_is_const){
-            /* c = const*const  ->  c = k  (constant) */
-            if(l3.n!=0){lin_free(&l1);lin_free(&l2);lin_free(&l3);return -1;}
-            b_put(b,'=', l1.constant*l2.constant, &(Lin){0});  /* 0 = c - k */
-            /* redo cleanly: enforce c = k via a row */
-            Lin ck;memset(&ck,0,sizeof(ck));lin_term(&ck,l3.idx[0],1.0);ck.constant=-l1.constant*l2.constant;b_put(b,'=',0.0,&ck);lin_free(&ck);
+            /* c = const*const.  Keep the result expression intact: FlatZinc
+               normally supplies a variable here, but a constant is valid too. */
+            Lin ck;memset(&ck,0,sizeof(ck));lin_into(&ck,&l3,1.0);
+            ck.constant-=l1.constant*l2.constant;b_put(b,'=',0.0,&ck);lin_free(&ck);
             lin_free(&l1);lin_free(&l2);lin_free(&l3);return 0;
         } else if(a_is_const && !b_is_const && l3.n==1){
             /* c = const * b => c - const*b = 0 */
@@ -660,6 +874,18 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
         }
         lin_free(&l1);lin_free(&l2);lin_free(&l3);
         return 1;   /* bilinear -> unhandled */
+    }
+    /* float_div(a, b, c): c = a / b.  Division is linear only when b is a
+       non-zero parameter; otherwise it is nonlinear and stays UNKNOWN. */
+    if(strcmp(p,"float_div")==0){
+        if(c->nargs<3)return -1;
+        if(parse_lin(m,c->args[0],&l1)!=0)return -1;
+        if(parse_lin(m,c->args[1],&l2)!=0){lin_free(&l1);return -1;}
+        if(parse_lin(m,c->args[2],&l3)!=0){lin_free(&l1);lin_free(&l2);return -1;}
+        if(l2.n!=0||fabs(l2.constant)<1e-15){lin_free(&l1);lin_free(&l2);lin_free(&l3);return 1;}
+        Lin dd;memset(&dd,0,sizeof(dd));lin_into(&dd,&l3,1.0);lin_into(&dd,&l1,-1.0/l2.constant);
+        b_put(b,'=',0.0,&dd);lin_free(&dd);
+        lin_free(&l1);lin_free(&l2);lin_free(&l3);return 0;
     }
     /* int_abs(x,y): y = |x|.  y >= x, y >= -x; y <= M*u + ... (big-M) or with
        a bounded x we can do y = x (x>=0) or y=-x (x<=0) but general needs M.
@@ -881,128 +1107,58 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
         free(bs); lin_free(&il);lin_free(&vl);free_lins(arr,narr);
         return 0;
     }
-    /* reified relational constraints: r <-> (a rel b), r in {0,1}.
-       Use big-M: for a <= b: r=1 -> a-b<=0 ; r=0 -> a-b >= M? Use
-       a-b <= M*(1-r)  and  a-b >= -M*r + eps*(1-r)?  Standard encoding with
-       a binary r and big-M, valid for bounded a,b.  We use:
-         (a<=b): a-b <= M*(1-r);  a-b >= eps - (M+eps)*r
-       where eps = -1e-6 is "not (a<=b)" is false => a>b means a-b>=1 (int). */
+    /* Reified integer relations.  These are exact over the integer lattice:
+       r=1 iff the relation holds.  Continuous reification is intentionally
+       not accepted here because equality/strict predicates are non-convex or
+       open and cannot be represented faithfully by this LP/MIP bridge. */
     if(strcmp(p,"int_eq_reif")==0||strcmp(p,"int_le_reif")==0||
        strcmp(p,"int_lt_reif")==0||strcmp(p,"int_ge_reif")==0||
        strcmp(p,"int_gt_reif")==0||strcmp(p,"bool_eq_reif")==0||
-       strcmp(p,"bool_le_reif")==0){
+       strcmp(p,"bool_le_reif")==0||strcmp(p,"bool_lt_reif")==0||
+       strcmp(p,"bool_ge_reif")==0||strcmp(p,"bool_gt_reif")==0){
         if(c->nargs<3)return -1;
-        Lin l1,l2; Lin rb;
+        Lin l1,l2,rb;
         if(parse_lin(m,c->args[0],&l1)!=0)return -1;
         if(parse_lin(m,c->args[1],&l2)!=0){lin_free(&l1);return -1;}
         if(parse_lin(m,c->args[2],&rb)!=0){lin_free(&l1);lin_free(&l2);return -1;}
-        /* If the reification value is a constant, apply the relation directly. */
-        if(rb.n==0){
-            int want = (rb.constant >= 0.5);   /* true/false */
-            /* build d = a - b and apply the relation (or its negation) */
-            Lin d;memset(&d,0,sizeof(d));lin_into(&d,&l1,1.0);lin_into(&d,&l2,-1.0);
-            int neg = !want;
-            if(strcmp(p,"int_le_reif")==0||strcmp(p,"bool_le_reif")==0){
-                /* want: d<=0 ; neg: d>=1 */
-                b_put(b, neg?'>':'<', neg?1.0:0.0, &d);
-            } else if(strcmp(p,"int_lt_reif")==0){
-                b_put(b, neg?'<':'>', neg?0.0:1.0, &d);
-            } else if(strcmp(p,"int_ge_reif")==0){
-                b_put(b, neg?'<':'>', neg?1.0:0.0, &d);
-            } else if(strcmp(p,"int_gt_reif")==0){
-                b_put(b, neg?'>':'<', neg?0.0:1.0, &d);
-            } else { /* eq */
-                if(want){ b_put(b,'=',0.0,&d); }
-                else { /* d != 0: use a binary */
-                    double M=1.0;
-                    for(int i=0;i<d.n;i++){int v=d.idx[i];double dv=fabs(d.coef[i])*fmax(fabs(b->lo[v]),fabs(b->hi[v]));M=fmax(M,dv);}
-                    M=fmax(M,fabs(d.constant))+1.0;
-                    int u=b_newvar(b,0.0,1.0);
-                    /* d != 0  <=>  (d >= 1 AND u=0) OR (d <= -1 AND u=1)
-                       r1: d + M*u >= 1
-                       r2: -d - M*u + M >= 1  => -d - M*u + (M-1) >= 0 */
-                    Lin r1;memset(&r1,0,sizeof(r1));lin_into(&r1,&d,1.0);lin_term(&r1,u,M);r1.constant=-1.0;b_put(b,'>',0.0,&r1);
-                    Lin r2;memset(&r2,0,sizeof(r2));lin_into(&r2,&d,-1.0);lin_term(&r2,u,-M);r2.constant=M-1.0;b_put(b,'>',0.0,&r2);
-                    lin_free(&r1);lin_free(&r2);
-                }
-            }
-            lin_free(&d);lin_free(&l1);lin_free(&l2);lin_free(&rb);
-            return 0;
-        }
-        if(rb.n!=1){lin_free(&l1);lin_free(&l2);lin_free(&rb);return 1;}
-        int r=rb.idx[0];
-        /* build d = a - b (linear expression) */
         Lin d;memset(&d,0,sizeof(d));lin_into(&d,&l1,1.0);lin_into(&d,&l2,-1.0);
-        /* M bound on |d| from var bounds */
-        double M=1.0;
-        for(int i=0;i<d.n;i++){ int v=d.idx[i]; double dv=fabs(d.coef[i])*fmax(fabs(b->lo[v]),fabs(b->hi[v])); M=fmax(M,dv); }
-        M=fmax(M,fabs(d.constant))+1.0;
         int which;
-        if(strcmp(p,"int_eq_reif")==0||strcmp(p,"bool_eq_reif")==0) which=0;      /* a==b */
-        else if(strcmp(p,"int_le_reif")==0||strcmp(p,"bool_le_reif")==0) which=1;/* a<=b */
-        else if(strcmp(p,"int_lt_reif")==0) which=2;                              /* a<b */
-        else if(strcmp(p,"int_ge_reif")==0) which=3;                              /* a>=b */
-        else which=4;                                                             /* a>b */
-        /* Encodings (a,b int):
-           eq:  r=1 => d=0 ; r=0 => |d|>=1
-                d <= M*(1-r) ; d >= -M*(1-r)
-                d >= 1 - (M+1)*r ; -d >= 1 - (M+1)*r   (|d|>=1 when r=0)
-           le:  r=1 => d<=0 ; r=0 => d>=1
-                d <= M*(1-r) ; d >= 1 - (M+1)*r
-           lt:  r=1 => d<=-1 ; r=0 => d>=0
-                d <= -1 + (M+1)*(1-r) ; d >= -M*r
-           ge:  r=1 => d>=0 ; r=0 => d<=-1
-                d >= -M*(1-r) ; d <= -1 + (M+1)*r
-           gt:  r=1 => d>=1 ; r=0 => d<=0
-                d >= 1 - (M+1)*(1-r) ; d <= M*r
-        */
-        if(which==0){ /* eq */
-            Lin r1;memset(&r1,0,sizeof(r1));lin_into(&r1,&d,1.0);lin_term(&r1,r,M);r1.constant=-M;b_put(b,'<',0.0,&r1);
-            Lin r2;memset(&r2,0,sizeof(r2));lin_into(&r2,&d,-1.0);lin_term(&r2,r,M);r2.constant=-M;b_put(b,'<',0.0,&r2);
-            Lin r3;memset(&r3,0,sizeof(r3));lin_into(&r3,&d,1.0);lin_term(&r3,r,M+1.0);r3.constant=-(M+1.0);b_put(b,'>',0.0,&r3);
-            Lin r4;memset(&r4,0,sizeof(r4));lin_into(&r4,&d,-1.0);lin_term(&r4,r,M+1.0);r4.constant=-(M+1.0);b_put(b,'>',0.0,&r4);
-            lin_free(&r1);lin_free(&r2);lin_free(&r3);lin_free(&r4);
-        } else if(which==1){ /* le: d<=M(1-r); d>=1-(M+1)r */
-            Lin r1;memset(&r1,0,sizeof(r1));lin_into(&r1,&d,1.0);lin_term(&r1,r,M);r1.constant=-M;b_put(b,'<',0.0,&r1);
-            Lin r2;memset(&r2,0,sizeof(r2));lin_into(&r2,&d,1.0);lin_term(&r2,r,M+1.0);r2.constant=1.0-(M+1.0);b_put(b,'>',0.0,&r2);
-            lin_free(&r1);lin_free(&r2);
-        } else if(which==2){ /* lt: d<=-1+(M+1)(1-r); d>=-M*r */
-            Lin r1;memset(&r1,0,sizeof(r1));lin_into(&r1,&d,1.0);lin_term(&r1,r,M+1.0);r1.constant=-1.0-(M+1.0);b_put(b,'<',0.0,&r1);
-            Lin r2;memset(&r2,0,sizeof(r2));lin_into(&r2,&d,1.0);lin_term(&r2,r,-M);b_put(b,'>',0.0,&r2);
-            lin_free(&r1);lin_free(&r2);
-        } else if(which==3){ /* ge: d>=-M(1-r); d<=-1+(M+1)r */
-            Lin r1;memset(&r1,0,sizeof(r1));lin_into(&r1,&d,-1.0);lin_term(&r1,r,M);r1.constant=-M;b_put(b,'<',0.0,&r1);
-            Lin r2;memset(&r2,0,sizeof(r2));lin_into(&r2,&d,1.0);lin_term(&r2,r,M+1.0);r2.constant=-1.0;b_put(b,'<',0.0,&r2);
-            lin_free(&r1);lin_free(&r2);
-        } else { /* gt: d>=1-(M+1)(1-r); d<=M*r */
-            Lin r1;memset(&r1,0,sizeof(r1));lin_into(&r1,&d,-1.0);lin_term(&r1,r,M+1.0);r1.constant=-1.0-(M+1.0);b_put(b,'>',0.0,&r1);
-            Lin r2;memset(&r2,0,sizeof(r2));lin_into(&r2,&d,1.0);lin_term(&r2,r,-M);b_put(b,'<',0.0,&r2);
-            lin_free(&r1);lin_free(&r2);
+        if(strcmp(p,"int_eq_reif")==0||strcmp(p,"bool_eq_reif")==0)which=0;
+        else if(strcmp(p,"int_le_reif")==0||strcmp(p,"bool_le_reif")==0)which=1;
+        else if(strcmp(p,"int_lt_reif")==0||strcmp(p,"bool_lt_reif")==0)which=2;
+        else if(strcmp(p,"int_ge_reif")==0||strcmp(p,"bool_ge_reif")==0)which=3;
+        else which=4;
+        int rr;
+        if(rb.n==0){
+            /* The reifier may be a compile-time true/false literal. */
+            if(fabs(rb.constant)>1e-12&&fabs(rb.constant-1.0)>1e-12)rr=1;
+            else rr=add_int_relation_constant(b,&d,which,rb.constant>=0.5);
+        } else {
+            int r;
+            if(lin_unit_var(&rb,&r)!=0)rr=1;
+            else rr=add_int_reif(b,&d,r,which);
         }
         lin_free(&d);lin_free(&l1);lin_free(&l2);lin_free(&rb);
-        return 0;
+        return rr;
     }
-    /* int_lin_ne: sum c_i x_i != d.  SOS1 over c'x - d >= 1 or <= -1 with a
-       binary.  d = sum c_i x_i.  Encode d - d0 >= 1 - M*u, d0 - d >= 1 - M*(1-u)
-       with binary u in {0,1}. */
+    /* int_lin_ne: sum c_i*x_i != d.  Use the same exact positive/negative
+       selector as scalar inequality reification. */
     if(strcmp(p,"int_lin_ne")==0||strcmp(p,"bool_lin_ne")==0){
         if(c->nargs<3)return -1;
         Lin*arr;int narr; Lin*parr;int nparr; Lin dd;
         if(parse_array(m,c->args[0],&arr,&narr)!=0)return -1;
         if(parse_array(m,c->args[1],&parr,&nparr)!=0){free_lins(arr,narr);return -1;}
         if(parse_lin(m,c->args[2],&dd)!=0){free_lins(arr,narr);free_lins(parr,nparr);return -1;}
+        if(narr!=nparr){lin_free(&dd);free_lins(arr,narr);free_lins(parr,nparr);return -1;}
         Lin lin;memset(&lin,0,sizeof(lin));
-        for(int i=0;i<narr&&i<nparr;i++) lin_into(&lin,&parr[i],arr[i].constant);
-        lin.constant -= dd.constant;
-        /* need M on |lin| */
-        double M=1.0;
-        for(int i=0;i<lin.n;i++){int v=lin.idx[i];double dv=fabs(lin.coef[i])*fmax(fabs(b->lo[v]),fabs(b->hi[v]));M=fmax(M,dv);}
-        M=fmax(M,fabs(lin.constant))+1.0;
-        int u=b_newvar(b,0.0,1.0);
-        Lin r1;memset(&r1,0,sizeof(r1));lin_into(&r1,&lin,1.0);lin_term(&r1,u,M);r1.constant=-1.0;b_put(b,'>',0.0,&r1);
-        Lin r2;memset(&r2,0,sizeof(r2));lin_into(&r2,&lin,-1.0);lin_term(&r2,u,-M);r2.constant=M-1.0;b_put(b,'>',0.0,&r2);
-        lin_free(&r1);lin_free(&r2);lin_free(&lin);lin_free(&dd);free_lins(arr,narr);free_lins(parr,nparr);
-        return 0;
+        for(int i=0;i<narr;i++){
+            if(arr[i].n!=0){lin_free(&lin);lin_free(&dd);free_lins(arr,narr);free_lins(parr,nparr);return 1;}
+            lin_into(&lin,&parr[i],arr[i].constant);
+        }
+        lin_into(&lin,&dd,-1.0);
+        int rr=add_int_ne(b,&lin);
+        lin_free(&lin);lin_free(&dd);free_lins(arr,narr);free_lins(parr,nparr);
+        return rr;
     }
     /* fzn_count_eq(x[], v, n): exactly n of the variables x equal value v.
        For small domains use binaries b_i = [x_i == v]: x_i = v + ... (big-M)
@@ -1010,7 +1166,6 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
        x_i >= v - M*(1-b_i), x_i <= v + M*(1-b_i), and for b_i=0 force
        |x_i - v| >= 1: x_i >= v+1 - M*b_i, x_i <= v-1 + M*b_i.
        Then sum_i b_i = n.  (Equivalent to among / count.) */
-    if(strcmp(p,"fzn_count_eq")==0||strcmp(p,"fzn_among_eq")==0||strcmp(p,"int_lin_ne")==0){}
     if(strcmp(p,"fzn_count_eq")==0||strcmp(p,"fzn_among_eq")==0){
         if(c->nargs<3)return -1;
         Lin*arr;int narr;
@@ -1063,8 +1218,7 @@ void fz_solve(const FZModel*m,FZSolution*sol)
     b.haslo=(int*)calloc((size_t)b.varcap,sizeof(int));b.hashi=(int*)calloc((size_t)b.varcap,sizeof(int));
     /* FlatZinc `var int/float` are unbounded by default; our LP solver needs
        finite bounds, so clamp undecorated variables to a big-M interval. */
-    const double BIG = 1e9;
-    for(int i=0;i<nv;i++){b.lo[i]=-BIG;b.hi[i]=BIG;}
+    for(int i=0;i<nv;i++){b.lo[i]=-FZ_BIG_BOUND;b.hi[i]=FZ_BIG_BOUND;}
     for(int d=0;d<m->ndecl;d++){FZDecl*decl=&m->decls[d];
         if(!decl->is_var||decl->base_idx<0)continue;
         if(decl->is_alias)continue;   /* alias elements get bounds from their own decls */
@@ -1140,7 +1294,7 @@ void fz_solve(const FZModel*m,FZSolution*sol)
         mip.lp_iter_limit=2000000;
         MIPResult mr;mip_solve(&mip,&mr);
         sol->nodes=mr.nodes; sol->best_bound=mr.best_bound;
-        if(mr.status==0){memcpy(sol->x,mr.x,(size_t)ntot*sizeof(double));sol->obj=mr.obj;sol->iters=mr.lp_iters;sol->status=0;}
+        if(mr.status==0){memcpy(sol->x,mr.x,(size_t)ntot*sizeof(double));sol->obj=mr.obj+m->objective.constant;sol->iters=mr.lp_iters;sol->status=0;}
         else if(mr.status==1)sol->status=1;
         else if(mr.status==3||mr.status==4||mr.status==5||mr.status==6)sol->status=4;
         else sol->status=2;
@@ -1148,22 +1302,49 @@ void fz_solve(const FZModel*m,FZSolution*sol)
     } else {
         Solver*s=solver_create(&lp);
         int rr=solver_solve(s);
-        if(rr==0){double*xo=(double*)malloc((size_t)nv*sizeof(double));double obj;solver_optimum(s,xo,&obj);memcpy(sol->x,xo,(size_t)nv*sizeof(double));sol->obj=obj;sol->iters=s->iters;sol->status=0;free(xo);}
+        if(rr==0){double*xo=(double*)malloc((size_t)nv*sizeof(double));double obj;solver_optimum(s,xo,&obj);memcpy(sol->x,xo,(size_t)nv*sizeof(double));sol->obj=obj+m->objective.constant;sol->iters=s->iters;sol->status=0;free(xo);}
         else if(rr==1)sol->status=1;
         else sol->status=2;
         solver_destroy(s);
+    }
+    if(sol->status==0 && m->solve_kind!=0 &&
+       objective_uses_synthetic_bound(m,&b,sol->x,nv)){
+        /* The finite bridge box made an actually unbounded (or otherwise
+           unproven) FlatZinc objective look optimal.  Preserve the invariant
+           that fznsolve never prints a fabricated optimum. */
+        sol->status=2;
     }
     free(isint);
     free(lp.c);free(lp.l);free(lp.u);free(lp.b);free(lp.rel);free(lp.Acolptr);free(lp.Arow);free(lp.Aval);
     for(int r=0;r<b.nrows;r++){free(b.rows[r].idx);free(b.rows[r].coef);}free(b.rows);free(b.lo);free(b.hi);free(b.haslo);free(b.hashi);
 }
 
+static void fz_print_value(FZKind kind,double value)
+{
+    if(kind==FZ_K_FLOAT){
+        /* 17 significant digits round-trip an IEEE double and avoid turning
+           a valid continuous solution such as 2.5 into the integer 3. */
+        printf("%.17g",value);
+    } else if(kind==FZ_K_BOOL) {
+        printf("%s",value>=0.5?"true":"false");
+    } else {
+        printf("%lld",(long long)llround(value));
+    }
+}
+
 void fz_print_solution(const FZModel*m,const FZSolution*sol)
 {
     if(sol->status==0){
         for(int d=0;d<m->ndecl;d++){FZDecl*decl=&m->decls[d];if(!decl->is_output||decl->base_idx<0)continue;
-            if(decl->is_array){printf("%s = array1d(1..%d, [",decl->name,decl->n);for(int e=0;e<decl->n;e++){if(e)printf(", ");printf("%d",(int)llround(sol->x[decl->base_idx+e]));}printf("]);\n");}
-            else printf("%s = %d;\n",decl->name,(int)llround(sol->x[decl->base_idx]));}
+            if(decl->is_array){
+                int hi=decl->index_lo+decl->n-1;
+                printf("%s = array1d(%d..%d, [",decl->name,decl->index_lo,hi);
+                for(int e=0;e<decl->n;e++){if(e)printf(", ");fz_print_value(decl->kind,sol->x[decl->base_idx+e]);}
+                printf("]);\n");
+            } else {
+                printf("%s = ",decl->name);fz_print_value(decl->kind,sol->x[decl->base_idx]);printf(";\n");
+            }
+        }
         printf("----------\n");
     } else if(sol->status==1)printf("=====UNSATISFIABLE=====\n");
     else printf("=====UNKNOWN=====\n");

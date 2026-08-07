@@ -24,11 +24,15 @@ echo -n "  diet (expect 1.32):       "; ./lpsolve examples/diet.lp      | grep o
 echo -n "  prodplan (expect 26):     "; ./lpsolve examples/prodplan.lp  | grep objective
 echo -n "  transport (expect 94.5):  "; ./lpsolve examples/transport.lp | grep objective
 
-echo "[3/7] Canonical sweep vs GLPK (bounded, well-conditioned)..."
-python3 tools/sweep.py | tail -1
+if command -v glpsol >/dev/null 2>&1; then
+  echo "[3/7] Canonical sweep vs GLPK (bounded, well-conditioned)..."
+  python3 tools/sweep.py | tail -1
 
-echo "[4/7] Differential test vs GLPK (incl. infeasible/unbounded)..."
-python3 tools/difftest.py 120 0.4 2>&1 | head -1
+  echo "[4/7] Differential test vs GLPK (incl. infeasible/unbounded)..."
+  python3 tools/difftest.py 120 0.4 2>&1 | head -1
+else
+  echo "[3-4/7] GLPK differential tests SKIPPED (glpsol not installed)"
+fi
 
 echo "[5/7] QP solver vs scipy (analytic + randomized)..."
 gcc -O2 -march=native -I src tools/qp_test.c src/qp.c src/err.c src/lu.c src/kernels.c -o /tmp/qp_test -lm
@@ -73,6 +77,11 @@ echo "(expect x1=0 x2=12)"
 echo "(expect a=0 b=1 andr=0 orr=1)"
 ./fznsolve examples/fzn/mip_max.fzn | grep -E "x1 =|x2 =" | tr '\n' ' '
 echo "(expect x1=4 x2=0, MIP integral)"
+./fznsolve examples/fzn/float_lin.fzn | grep 'x = array1d'
+echo "(expect float array [1, 1.5])"
+
+echo "[8.25/8] FlatZinc strict/reified-integer + continuous-float semantics..."
+python3 tools/fzn_semantics_test.py
 
 if command -v minizinc >/dev/null 2>&1; then
   echo "[8.5/8] MiniZinc differential (compile .mzn -> fzn -> psolve vs Gecode)..."

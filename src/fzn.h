@@ -35,6 +35,7 @@ typedef struct {
     int   is_var;      /* 1 = decision variable, 0 = parameter */
     int   is_array;    /* 1 = array decl */
     int   n;           /* number of elements (array) or 1 (scalar) */
+    int   index_lo;    /* FlatZinc lower array index (1 for scalars/default arrays) */
     int   base_idx;    /* first solver index for vars; array element i is base_idx+i */
     int   is_output;   /* ::output_var / ::output_array */
     /* parameter value(s) */
