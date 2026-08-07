@@ -27,8 +27,12 @@ typedef struct {
     const double *x0;   /* optional feasible start (NULL => use x=0) */
 } QP;
 
+#define QP_ITERATION_LIMIT 2  /* active-set iteration cap reached (no cert) */
+#define QP_KKT_FAIL       3  /* KKT solve / stationarity residual not verified */
+
 typedef struct {
-    int status;         /* 0 solved, -1 no feasible start given, 1 unbounded */
+    int status;         /* 0 solved, -1 no feasible start, 1 unbounded,
+                           2 QP_ITERATION_LIMIT, 3 QP_KKT_FAIL */
     int n;
     double *x;          /* solution (n) */
     double *mult;       /* Lagrange multipliers for A x <= b (m) */

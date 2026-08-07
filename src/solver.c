@@ -346,6 +346,7 @@ static void refactorize(Solver *s)
                     s->lu[(size_t)i * M + s->row[k]] = s->val[k];
             }
             s->lu_valid = (lu_factor(s->lu, M, s->piv) == 0);
+            if (!s->lu_valid) s->factor_failed = 1;
         }
     } else {
         for (int i = 0; i < M; i++) {
@@ -355,6 +356,7 @@ static void refactorize(Solver *s)
                 s->lu[(size_t)i * M + s->row[k]] = s->val[k];
         }
         s->lu_valid = (lu_factor(s->lu, M, s->piv) == 0);
+        if (!s->lu_valid) s->factor_failed = 1;
         s->eta_count = 0;
     }
     /* steepest-edge weights: reset to the reference framework */
@@ -365,10 +367,14 @@ static void push_eta(Solver *s, int pslot, const double *d)
 {
     int M = s->M;
     if (s->eta_count >= s->eta_cap) {
-        s->eta_cap *= 2;
-        s->eta_piv = (int*)realloc(s->eta_piv, s->eta_cap * sizeof(int));
-        s->eta = (double**)realloc(s->eta, s->eta_cap * sizeof(double*));
-        for (int i = s->eta_cap / 2; i < s->eta_cap; i++) s->eta[i] = NULL;
+        /* growth is bounded by the iteration limit, but guard against an
+           overflow of the doubling arithmetic regardless. */
+        if (s->eta_cap > 2000000000L / 2) psolve_fail(PSOLVE_ERR_SOLVE);
+        int newcap = s->eta_cap * 2;
+        psolve_realloc((void**)&s->eta_piv, (size_t)newcap * sizeof(int));
+        psolve_realloc((void**)&s->eta, (size_t)newcap * sizeof(double*));
+        for (int i = s->eta_cap; i < newcap; i++) s->eta[i] = NULL;
+        s->eta_cap = newcap;
     }
     if (!s->eta[s->eta_count]) s->eta[s->eta_count] = (double*)xmalloc(M * sizeof(double));
     double *e = s->eta[s->eta_count];
@@ -701,6 +707,19 @@ static void remove_basic_artificials(Solver *s)
     for (int i = 0; i < M; i++) {
         int bv = s->basis[i];
         if (bv < first_art) continue;              /* not an artificial */
+        /* A basic artificial at zero is a degenerate column marking a
+           (numerically) redundant row.  Removing it by swapping in an
+           arbitrary candidate can make the basis SINGULAR (rank-deficient
+           constraint sets, e.g. big-M encodings that produce dependent rows).
+           Leave such artificials basic so their identity column keeps the basis
+           nonsingular, but FIX them at zero (l=u=0): otherwise Phase II would
+           let the artificial absorb infeasibility and report a solution that
+           violates the row (e.g. -3x0=0 solved as x0=20).  Only replace an
+           artificial that is basic at a nonzero value. */
+        if (fabs(s->x[bv]) <= 1e-9) {
+            s->l[bv] = 0.0; s->u[bv] = 0.0;   /* pin the redundant artificial at 0 */
+            continue;
+        }
         int r = bv - first_art;                    /* row it serves */
         int cand = -1;
         for (int j = 0; j < s->N; j++) {
@@ -777,8 +796,10 @@ int solver_solve(Solver *s)
             s->cobj[av] = -1.0;      /* all artificials, basic or not */
         }
         r = solve_phase(s);
+        if (r == SOLVE_NUMERICAL) { s->status_out = SOLVE_NUMERICAL; return SOLVE_NUMERICAL; }
         if (r == SOLVE_STOPPED) { s->status_out = SOLVE_STOPPED; return SOLVE_STOPPED; }
         if (r == 2) { s->status_out = 2; return 2; }
+        if (r == -1) { s->status_out = 3; return 3; }   /* Phase I iteration limit: NOT infeasible */
         if (r != 0) { s->status_out = 1; return 1; }
 
         /* check feasibility: any artificial left basic at positive value */
@@ -803,9 +824,19 @@ int solver_solve(Solver *s)
     recompute_basic(s);
 
     r = solve_phase(s);
+    if (r == SOLVE_NUMERICAL) { s->status_out = SOLVE_NUMERICAL; return SOLVE_NUMERICAL; }
     if (r == SOLVE_STOPPED) { s->status_out = SOLVE_STOPPED; return SOLVE_STOPPED; }
     if (r == 2) { s->status_out = 2; return 2; }
     if (r == -1) { s->status_out = 3; return 3; }   /* iteration limit hit */
+
+    /* Solution certificate: if the claimed optimum does not actually satisfy
+       the variable bounds and constraint rows — or the final basis could not
+       be factorized, so the reduced costs / FTRAN were computed with stale
+       data — the solve has diverged.  Report NUMERICAL_FAILURE rather than a
+       false OPTIMAL.  Transient singular bases that the simplex recovers from
+       are fine; a bad FINAL factorization or a diverged solution is not. */
+    int basis_valid = (s->use_sparse && s->sparse_ok) || (!s->use_sparse && s->lu_valid);
+    if (!basis_valid || !solver_feasible(s)) { s->status_out = SOLVE_NUMERICAL; return SOLVE_NUMERICAL; }
 
     /* objective value */
     double obj = 0.0;

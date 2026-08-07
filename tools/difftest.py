@@ -11,9 +11,15 @@ def run(cmd, **kw):
 
 def glpk_status(out):
     o = out.lower()
-    if 'optimal lp solution found' in o: return 'OPTIMAL'
-    if 'no primal feasible solution' in o: return 'INFEASIBLE'
-    if 'no dual feasible solution' in o: return 'UNBOUNDED'
+    # glpsol uses several phrasings across versions; recognize them all.
+    # Check infeasible/unbounded FIRST so a stray "optimal" in a message or
+    # header cannot override a clear status verdict.
+    if ('no primal feasible solution' in o
+        or 'problem has no primal feasible solution' in o): return 'INFEASIBLE'
+    if ('no dual feasible solution' in o
+        or 'lp has no dual feasible solution' in o
+        or 'unbounded primal solution' in o): return 'UNBOUNDED'
+    if 'optimal' in o: return 'OPTIMAL'
     return '?'
 
 def main():

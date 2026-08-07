@@ -52,6 +52,9 @@ typedef struct {
     int sparse_disabled;   /* permanently fall back to dense (once unstable) */
     int sparse_ok;         /* sparse factorization of current basis succeeded */
     int lu_valid;
+    int factor_failed;     /* a basis factorization failed this solve: the
+                              result cannot be certified, so do not report
+                              OPTIMAL/INFEASIBLE/UNBOUNDED (see solver_solve) */
     /* scratch for building the sparse basis CSC each reinversion */
     int *bBp; int *bBi; double *bBx; long bcap;
 
@@ -82,7 +85,9 @@ typedef struct {
     double hyper_tol;      /* hyper-sparsity skip threshold for PRICE */
     double objval;
     int status_out;        /* 0 ok, 1 infeasible, 2 unbounded, 3 limit hit,
-                              4 SOLVE_STOPPED (cooperative abort) */
+                              4 SOLVE_STOPPED (cooperative abort),
+                              5 SOLVE_NUMERICAL (factorization failure) */
+#define SOLVE_NUMERICAL 5
     long iteration_limit;  /* max simplex iterations before giving up */
     /* anti-cycling */
     int bland;             /* use Bland's rule (lowest-index) entering */

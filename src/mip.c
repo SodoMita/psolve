@@ -151,23 +151,29 @@ void mip_solve(const MIP *mip, MIPResult *res)
 
     long nodes = 0;
     int status = 1;   /* assume infeasible until a feasible integer found */
+    int limit_reached = 0;   /* the search was cut short (node/time/stop/iter) */
 
     while (stack) {
-        if (nodes >= node_limit) { status = 3; break; }
-        if (psolve_stop()) { status = 4; break; }
+        if (nodes >= node_limit) { status = 3; limit_reached = 1; break; }
+        if (psolve_stop()) { status = 4; limit_reached = 1; break; }
         Node *node = pop_node(&stack);
         nodes++;
 
         double obj;
         int r = solve_relaxation(mip, node, x, &obj, lcur, ucur);
         if (r == -1) { free(node->lo); free(node->hi); free(node); continue; } /* infeasible */
-        if (r == 3) { free(node->lo); free(node->hi); free(node); status = 3; break; } /* lp limit */
-        if (r == SOLVE_STOPPED) { free(node->lo); free(node->hi); free(node); status = 4; break; } /* stopped */
-        /* infeasible or unbounded relaxation */
+        if (r == 3) { free(node->lo); free(node->hi); free(node); status = 3; limit_reached = 1; break; } /* lp limit */
+        if (r == SOLVE_STOPPED) { free(node->lo); free(node->hi); free(node); status = 4; limit_reached = 1; break; } /* stopped */
+        if (r == SOLVE_NUMERICAL) { free(node->lo); free(node->hi); free(node); status = 6; limit_reached = 1; break; } /* numerical */
+        /* infeasible relaxation */
         if (r == 1) { free(node->lo); free(node->hi); free(node); continue; }
         if (r == 2) {
-            /* unbounded relaxation: only a problem if it also happens on the
-               whole space (already checked elsewhere); treat as infeasible */
+            /* An unbounded relaxation on the ROOT node (original bounds) means
+               the MIP itself is unbounded.  Branching only tightens bounds, so
+               an unbounded non-root relaxation cannot happen when the root was
+               bounded; if it does (numerical trouble), treat the node as
+               infeasible rather than guess. */
+            if (nodes == 1) { free(node->lo); free(node->hi); free(node); status = 2; break; }
             free(node->lo); free(node->hi); free(node); continue;
         }
 
@@ -260,9 +266,16 @@ void mip_solve(const MIP *mip, MIPResult *res)
     res->nodes = nodes;
     res->best_bound = best_bound;
     if (have_incumbent) {
-        status = 0;
         res->obj = incumbent;
         memcpy(res->x, bestx, (size_t)n * sizeof(double));
+        if (!limit_reached) {
+            /* the tree was exhausted and the incumbent is optimal */
+            status = 0;
+        } else {
+            /* search cut short: the incumbent is FEASIBLE but NOT proven
+               optimal.  Never report OPTIMAL for a truncated search. */
+            status = 5;
+        }
     }
     res->status = status;
 

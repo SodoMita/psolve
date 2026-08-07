@@ -431,20 +431,20 @@ typedef struct { int nvars;int varcap;double*lo,*hi;int*haslo,*hashi;Row*rows;in
 static int b_newvar(Builder*b, double lo, double hi){
     if(b->nvars>=b->varcap){
         int nc=b->varcap?b->varcap*2:16;
-        b->lo=(double*)realloc(b->lo,(size_t)nc*sizeof(double));
-        b->hi=(double*)realloc(b->hi,(size_t)nc*sizeof(double));
-        b->haslo=(int*)realloc(b->haslo,(size_t)nc*sizeof(int));
-        b->hashi=(int*)realloc(b->hashi,(size_t)nc*sizeof(int));
+        psolve_realloc((void**)&b->lo,(size_t)nc*sizeof(double));
+        psolve_realloc((void**)&b->hi,(size_t)nc*sizeof(double));
+        psolve_realloc((void**)&b->haslo,(size_t)nc*sizeof(int));
+        psolve_realloc((void**)&b->hashi,(size_t)nc*sizeof(int));
         b->varcap=nc;
     }
     int v=b->nvars++;
     b->lo[v]=lo;b->hi[v]=hi;b->haslo[v]=1;b->hashi[v]=1;
     return v;
 }
-static void b_add(Builder*b){if(b->nrows>=b->cap){b->cap=b->cap?b->cap*2:16;b->rows=(Row*)realloc(b->rows,(size_t)b->cap*sizeof(Row));}memset(&b->rows[b->nrows],0,sizeof(Row));}
+static void b_add(Builder*b){if(b->nrows>=b->cap){b->cap=b->cap?b->cap*2:16;b->rows=(Row*)psolve_realloc((void**)&b->rows,(size_t)b->cap*sizeof(Row));}memset(&b->rows[b->nrows],0,sizeof(Row));}
 static void b_put(Builder*b,char rel,double rhs,const Lin*l){
     b_add(b);Row*r=&b->rows[b->nrows++];r->rel=rel;r->rhs=rhs-l->constant;
-    r->n=l->n;r->idx=(int*)malloc((size_t)(l->n?l->n:1)*sizeof(int));r->coef=(double*)malloc((size_t)(l->n?l->n:1)*sizeof(double));
+    r->n=l->n;r->idx=(int*)psolve_malloc((size_t)(l->n?l->n:1)*sizeof(int));r->coef=(double*)psolve_malloc((size_t)(l->n?l->n:1)*sizeof(double));
     for(int i=0;i<l->n;i++){r->idx[i]=l->idx[i];r->coef[i]=l->coef[i];}
 }
 
@@ -1100,19 +1100,19 @@ void fz_solve(const FZModel*m,FZSolution*sol)
     int ntot=b.nvars;
     LP lp;memset(&lp,0,sizeof(lp));
     lp.n=ntot;lp.m=b.nrows;lp.maximize=1;
-    lp.c=(double*)calloc((size_t)ntot,sizeof(double));
+    lp.c=(double*)psolve_calloc((size_t)ntot,sizeof(double));
     if(m->solve_kind==2){for(int i=0;i<m->objective.n;i++){int vi=m->objective.idx[i];if(vi>=0&&vi<ntot)lp.c[vi]+=m->objective.coef[i];}}
     else if(m->solve_kind==1){lp.maximize=0;for(int i=0;i<m->objective.n;i++){int vi=m->objective.idx[i];if(vi>=0&&vi<ntot)lp.c[vi]+=m->objective.coef[i];}}
-    lp.l=(double*)malloc((size_t)ntot*sizeof(double));lp.u=(double*)malloc((size_t)ntot*sizeof(double));
+    lp.l=(double*)psolve_malloc((size_t)ntot*sizeof(double));lp.u=(double*)psolve_malloc((size_t)ntot*sizeof(double));
     for(int i=0;i<ntot;i++){lp.l[i]=b.lo[i];lp.u[i]=b.hi[i];}
     long nnz=0;for(int r=0;r<b.nrows;r++)nnz+=b.rows[r].n;
-    lp.b=(double*)malloc((size_t)(b.nrows?b.nrows:1)*sizeof(double));lp.rel=(char*)malloc((size_t)(b.nrows?b.nrows:1));
+    lp.b=(double*)psolve_malloc((size_t)(b.nrows?b.nrows:1)*sizeof(double));lp.rel=(char*)psolve_malloc((size_t)(b.nrows?b.nrows:1));
     for(int r=0;r<b.nrows;r++){lp.b[r]=b.rows[r].rhs;lp.rel[r]=b.rows[r].rel;}
-    lp.Acolptr=(int*)calloc((size_t)(ntot+1),sizeof(int));
-    lp.Arow=(int*)malloc((size_t)(nnz?nnz:1)*sizeof(int));lp.Aval=(double*)malloc((size_t)(nnz?nnz:1)*sizeof(double));
+    lp.Acolptr=(int*)psolve_calloc((size_t)(ntot+1),sizeof(int));
+    lp.Arow=(int*)psolve_malloc((size_t)(nnz?nnz:1)*sizeof(int));lp.Aval=(double*)psolve_malloc((size_t)(nnz?nnz:1)*sizeof(double));
     for(int r=0;r<b.nrows;r++)for(int k=0;k<b.rows[r].n;k++){int j=b.rows[r].idx[k];if(j>=0&&j<ntot)lp.Acolptr[j+1]++;}
     for(int j=0;j<ntot;j++)lp.Acolptr[j+1]+=lp.Acolptr[j];
-    int*ff=(int*)malloc((size_t)ntot*sizeof(int));for(int j=0;j<ntot;j++)ff[j]=lp.Acolptr[j];
+    int*ff=(int*)psolve_malloc((size_t)ntot*sizeof(int));for(int j=0;j<ntot;j++)ff[j]=lp.Acolptr[j];
     for(int r=0;r<b.nrows;r++)for(int k=0;k<b.rows[r].n;k++){int j=b.rows[r].idx[k];if(j>=0&&j<ntot){lp.Arow[ff[j]]=r;lp.Aval[ff[j]]=b.rows[r].coef[k];ff[j]++;}}
     free(ff);
 
@@ -1120,7 +1120,7 @@ void fz_solve(const FZModel*m,FZSolution*sol)
        (bool is 0/1); float vars are continuous.  If any integer variable is
        present, solve with the MIP branch-and-bound solver so the answer is
        integral; otherwise the LP relaxation is exact. */
-    unsigned char *isint=(unsigned char*)calloc((size_t)(ntot?ntot:1),1);
+    unsigned char *isint=(unsigned char*)psolve_calloc((size_t)(ntot?ntot:1),1);
     int any_int=0;
     for(int d=0;d<m->ndecl;d++){FZDecl*decl=&m->decls[d];if(!decl->is_var||decl->base_idx<0)continue;
         int integer = (decl->kind!=FZ_K_FLOAT);   /* int and bool are integer */
@@ -1129,7 +1129,7 @@ void fz_solve(const FZModel*m,FZSolution*sol)
        flag in int_abs) are integer; set them so the MIP keeps them integral. */
     for(int vi=nv;vi<ntot;vi++){isint[vi]=1;any_int=1;}
     sol->nvars=ntot;
-    sol->x=(double*)realloc(sol->x,(size_t)(ntot?ntot:1)*sizeof(double));
+    sol->x=(double*)psolve_realloc((void**)&sol->x,(size_t)(ntot?ntot:1)*sizeof(double));
     if(any_int){
         MIP mip;memset(&mip,0,sizeof(mip));
         mip.n=ntot;mip.m=b.nrows;mip.c=lp.c;mip.Acolptr=lp.Acolptr;mip.Arow=lp.Arow;mip.Aval=lp.Aval;
@@ -1142,7 +1142,7 @@ void fz_solve(const FZModel*m,FZSolution*sol)
         sol->nodes=mr.nodes; sol->best_bound=mr.best_bound;
         if(mr.status==0){memcpy(sol->x,mr.x,(size_t)ntot*sizeof(double));sol->obj=mr.obj;sol->iters=mr.lp_iters;sol->status=0;}
         else if(mr.status==1)sol->status=1;
-        else if(mr.status==3||mr.status==4)sol->status=4;
+        else if(mr.status==3||mr.status==4||mr.status==5||mr.status==6)sol->status=4;
         else sol->status=2;
         mip_result_free(&mr);
     } else {

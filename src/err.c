@@ -1,6 +1,7 @@
 #include "err.h"
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
 
 jmp_buf psolve_env;
 int     psolve_active = 0;
@@ -46,5 +47,34 @@ void *psolve_malloc(size_t n)
         psolve_fail(PSOLVE_ERR_OOM);
         return NULL;   /* unreachable when a handler is installed */
     }
+    return p;
+}
+
+void *psolve_realloc(void **p, size_t n)
+{
+    void *np = realloc(*p, n);
+    if (!np) {
+        free(*p);
+        *p = NULL;
+        psolve_fail(PSOLVE_ERR_OOM);
+        return NULL;   /* unreachable when a handler is installed */
+    }
+    *p = np;
+    return np;
+}
+
+void *psolve_calloc(size_t n, size_t sz)
+{
+    void *p = calloc(n, sz);
+    if (!p) psolve_fail(PSOLVE_ERR_OOM);
+    return p;
+}
+
+char *psolve_strdup(const char *s)
+{
+    size_t l = strlen(s) + 1;
+    char *p = (char*)malloc(l);
+    if (!p) psolve_fail(PSOLVE_ERR_OOM);
+    memcpy(p, s, l);
     return p;
 }

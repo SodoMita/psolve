@@ -41,7 +41,11 @@ typedef struct {
 
 typedef struct {
     int status;            /* 0 optimal, 1 infeasible, 2 unbounded, 3 node limit,
-                              4 stopped (cooperative abort: time limit / Ctrl-C) */
+                              4 stopped (cooperative abort: time limit / Ctrl-C),
+                              5 feasible but not proven optimal (limit reached with
+                                an incumbent; NOT a proof of optimality),
+                              6 numerical failure (an LP relaxation could not be
+                                factorized/certified) */
     double obj;            /* optimal objective value */
     double *x;             /* optimal integer solution (n) */
     int *isint_sol;        /* reported integrality status per var (0/1) */

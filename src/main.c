@@ -59,6 +59,10 @@ int main(int argc, char **argv)
         printf("status: UNBOUNDED\n");
     } else if (r == 3) {
         printf("status: ITERATION_LIMIT\n");
+    } else if (r == SOLVE_STOPPED) {
+        printf("status: STOPPED\n");
+    } else if (r == SOLVE_NUMERICAL) {
+        printf("status: NUMERICAL_FAILURE\n");
     } else {
         double *xo = (double*)malloc((size_t)(lp.n > 0 ? lp.n : 1) * sizeof(double));
         double obj;

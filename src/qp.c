@@ -137,12 +137,13 @@ static void active_set(const QP *qp, const double *xstart, QPResult *res)
     double *xnew = (double*)xmalloc((size_t)n * sizeof(double));
     int maxit = 4000 + 100 * (n + m);
     int it = 0;
+    int status = -1;   /* default: not solved */
 
     for (it = 0; it < maxit; it++) {
         eval_grad(qp, x, g);
         if (solve_kkt(qp, W, k, g, p, mu) != 0) {
             if (k > 0) { k--; build_orth(qp, W, k, orth); continue; }
-            res->status = -1; break;
+            status = QP_KKT_FAIL; break;
         }
         double pnorm = 0.0;
         for (int i = 0; i < n; i++) pnorm += p[i]*p[i];
@@ -152,7 +153,22 @@ static void active_set(const QP *qp, const double *xstart, QPResult *res)
             int drop = -1; double minmu = 0.0;
             for (int c = 0; c < k; c++)
                 if (mu[c] < minmu - 1e-9 * scale) { minmu = mu[c]; drop = c; }
-            if (drop < 0) { for (int c = 0; c < k; c++) res->mult[W[c]] = mu[c]; break; }
+            if (drop < 0) {
+                /* candidate optimum: verify the KKT stationarity residual
+                   before certifying success, so a bad KKT solve cannot be
+                   reported as optimal. */
+                double kkt = 0.0;
+                for (int j = 0; j < n; j++) {
+                    double rj = g[j];
+                    for (int c = 0; c < k; c++)
+                        rj += qp->A[(size_t)W[c]*n + j] * mu[c];
+                    kkt = fmax(kkt, fabs(rj));
+                }
+                double tol = 1e-6 * (1.0 + fabs(eval_obj(qp, x)));
+                if (kkt > tol) { status = QP_KKT_FAIL; break; }
+                for (int c = 0; c < k; c++) res->mult[W[c]] = mu[c];
+                status = 0; break;
+            }
             W[drop] = W[k-1]; k--;
             build_orth(qp, W, k, orth);
             continue;
@@ -184,9 +200,10 @@ static void active_set(const QP *qp, const double *xstart, QPResult *res)
             if (sqrt(nrm) > tolrank) { W[k] = block; k++; build_orth(qp, W, k, orth); }
         }
     }
+    if (status == -1) status = QP_ITERATION_LIMIT;   /* loop exhausted without KKT cert */
     res->iterations = it;
     res->obj = eval_obj(qp, x);
-    res->status = 0;
+    res->status = status;
     free(W); free(orth); free(tmp); free(g); free(p); free(mu); free(xnew);
 }
 

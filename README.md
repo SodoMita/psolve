@@ -7,11 +7,14 @@ for modern x86 hardware (AVX-512 FMA), cache-friendly sparse data layout, and
 interactive latency.  It has **no third-party dependencies** (only libc/libm),
 is small and auditable, and supports **incremental solving** (warm starts).
 
-**psolve is an integer solver.** The real-time kernels (UI, vector graphics,
-physics) run on **fixed-point arithmetic** for bit-identical determinism across
-platforms (replay / network safety) and predictable, branch-friendly cost on
-integer cores.  Floating-point variants are provided as a reference and
-cross-check; the production path is integer.
+**The real-time physics kernel is an integer (fixed-point) solver.** The
+projected-Gauss-Seidel kernel used for contact/friction-style boxed QPs runs on
+**fixed-point arithmetic** (`int64_t` + 128-bit intermediates) for bit-identical
+determinism across platforms (replay / network safety) and predictable,
+branch-friendly cost.  The **LP/QP/MIP solvers are floating-point** (`double`);
+the fixed-point PGS kernel is cross-validated against the float reference.  So:
+fixed-point for the real-time physics hot loop, double precision for the exact
+LP/QP/MIP backbone.
 
 See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the long-term plan (real-time UI /
 vector graphics / 2D physics / FlatZinc completeness).
@@ -48,8 +51,13 @@ with an explicit baseline `ARCH`.
 `--print` also dumps the optimal variable values.
 
 The LP solver handles: **maximize or minimize**, `<`, `>`, and `=` constraints,
-variables with arbitrary finite/infinite bounds (lower, upper, or boxed), and
-correctly reports `OPTIMAL`, `INFEASIBLE`, or `UNBOUNDED`.
+variables with lower, upper, or boxed bounds (each finite bound may be
+`inf`/`-inf`, i.e. unbounded on that side), and correctly reports `OPTIMAL`,
+`INFEASIBLE`, `UNBOUNDED`, `NUMERICAL_FAILURE`, or `ITERATION_LIMIT`.
+
+> Note: a fully free variable (unbounded on *both* sides) is not yet supported —
+> each variable must have at least one finite bound. The `.lp` parser rejects
+> `-inf inf` with a clear error rather than silently producing a wrong answer.
 
 The QP solver handles: **minimize** ½xᵀQx + cᵀx subject to Ax ≤ b with Q
 symmetric positive semi-definite (convex), reporting the optimum, Lagrange
@@ -134,14 +142,21 @@ attacker-controlled.  The parsers are hardened accordingly:
   allocation or indexing (`n`, `m`, `nnz` non-negative and bounded; every
   `row`/`col` triplet in range).  Malformed input is rejected cleanly instead
   of corrupting memory.
+- **The objective sense is validated** (`max`/`minimize` only); malformed
+  senses are rejected rather than silently defaulted to minimization.
+- **Triplets are sorted in linear time** (counting sort), not O(nnz²), so a
+  hostile ordering cannot cause a quadratic-time blowup.
 - **Relation tokens are read into a bounded buffer** (no unbounded `%s`) and
   their characters validated.
-- **Allocations are checked**, and error paths free partial state so a caller
-  can safely `lp_free()`.
+- **Allocations are checked** (the LP solver and FlatZinc path use the
+  `psolve_*` checked allocators), and error paths free partial state so a
+  caller can safely `lp_free()`.
 - **Dense QP dimensions are capped** (`MAX_QPDIM=8192`) so a hostile `n` cannot
   trigger a multi-gigabyte allocation.
 - The **build is hardened**: stack canaries, `_FORTIFY_SOURCE=2`, format
-  security warnings, PIE + full RELRO, non-executable stack.
+  security warnings, PIE + full RELRO, non-executable stack.  `-ffast-math` is
+  **off by default** (`make FAST_MATH=1` to opt in for a non-correctness
+  benchmark build).
 
 Run a memory-safety sweep with:
 

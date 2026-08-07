@@ -59,9 +59,23 @@ int main(int argc, char **argv)
         printf("status: INFEASIBLE\n");
     } else if (res.status == 2) {
         printf("status: UNBOUNDED\n");
-    } else {
+    } else if (res.status == 3) {
         printf("status: NODE_LIMIT\n");
         if (res.obj == res.obj) printf("best objective: %.15g\n", res.obj);
+    } else if (res.status == 4) {
+        printf("status: STOPPED\n");
+        if (res.obj == res.obj) printf("best objective: %.15g\n", res.obj);
+    } else if (res.status == 6) {
+        printf("status: NUMERICAL_FAILURE\n");
+    } else {   /* status 5: feasible incumbent, optimality not proven */
+        printf("status: FEASIBLE_LIMIT\n");
+        if (res.obj == res.obj) {
+            printf("objective: %.15g\n", res.obj);
+            printf("best_bound: %.15g\n", res.best_bound);
+        }
+        if (print)
+            for (int j = 0; j < lp.n; j++)
+                printf("x[%d] = %.10g\n", j, res.x[j]);
     }
 
     mip_result_free(&res);

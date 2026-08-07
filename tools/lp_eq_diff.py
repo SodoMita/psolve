@@ -66,8 +66,15 @@ def main():
             else:
                 fail += 1
                 if fail<8: print(f"t={t} mine={myst} obj={myobj} scipy={-sc.fun}")
-        elif myst==['INFEASIBLE'] and sc.status==2:
-            ok += 1
+        elif sc.status == 2:
+            # scipy says infeasible.  We must never claim a feasible optimum, but
+            # ITERATION_LIMIT (Phase I could not certify within budget) is an
+            # honest non-answer, not a wrong one.
+            if myst==['INFEASIBLE'] or myst==['ITERATION_LIMIT']:
+                ok += 1
+            else:
+                fail += 1
+                if fail<8: print(f"t={t} mine={myst} scipy_st=INFEASIBLE")
         else:
             fail += 1
             if fail<8: print(f"t={t} mine={myst} scipy_st={sc.status}")

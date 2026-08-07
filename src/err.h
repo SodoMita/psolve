@@ -41,6 +41,18 @@ void psolve_end(void);
  * is installed, aborts.  Returns the allocation on success. */
 void *psolve_malloc(size_t n);
 
+/* Checked realloc.  On failure frees *p (if non-NULL), signals PSOLVE_ERR_OOM
+ * (longjmp if a handler is installed, else abort), and returns NULL.  Pass
+ * the address of the pointer; *p is set to NULL on failure so callers never
+ * leak the old block.  Returns the new allocation on success. */
+void *psolve_realloc(void **p, size_t n);
+
+/* Checked calloc: zeroed allocation, signals OOM on failure (see psolve_malloc). */
+void *psolve_calloc(size_t n, size_t sz);
+
+/* Checked strdup: signals OOM on failure (see psolve_malloc). */
+char *psolve_strdup(const char *s);
+
 /* Cooperative abort.  Solvers call psolve_stop() periodically (e.g. once per
  * branch-and-bound node) and, if it returns nonzero, wind down and report a
  * limit status instead of running to completion.  The driver installs a

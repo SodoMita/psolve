@@ -10,7 +10,17 @@ ARCH    ?= -march=native
 # Performance flags.  NOTE: -mavx512f/-mfma are NOT forced here; they are only
 # active if the chosen ARCH enables them.  Forcing them unconditionally would
 # make the binary SIGILL on CPUs without AVX-512.
+#
+# -ffast-math is OFF by default: for a numerically-sensitive LP/QP/MIP solver
+# it can reorder FP ops, change NaN/Inf behaviour, and alter signed zero, all
+# of which matter for feasibility checks and `inf` sentinel bounds.  Enable it
+# only for a non-correctness benchmark build with:  make FAST_MATH=1
+FAST_MATH ?= 0
+ifeq ($(FAST_MATH),1)
 PERF    = -funroll-loops -fno-math-errno -ffast-math
+else
+PERF    = -funroll-loops -fno-math-errno
+endif
 
 # Defensive hardening: stack protector, FORTIFY_SOURCE, format checks,
 # and PIE + RELRO so ROP/GOT-overwrite attacks are harder.

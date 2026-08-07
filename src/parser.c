@@ -44,7 +44,16 @@ int lp_read(const char *path, LP *lp)
     if (!f) { fprintf(stderr, "cannot open %s\n", path); return -1; }
     char sense[32];
     if (fscanf(f, "%31s", sense) != 1) goto err;
-    lp->maximize = (strncmp(sense, "max", 3) == 0);
+    /* Objective sense must be exactly max/maximize or min/minimize.  Reject
+       malformed input instead of silently defaulting to minimize. */
+    if (strcmp(sense, "max") == 0 || strcmp(sense, "maximize") == 0)
+        lp->maximize = 1;
+    else if (strcmp(sense, "min") == 0 || strcmp(sense, "minimize") == 0)
+        lp->maximize = 0;
+    else {
+        fprintf(stderr, "invalid objective sense: '%s' (expected max/min)\n", sense);
+        goto err;
+    }
 
     int n, m;
     if (fscanf(f, "%d %d", &n, &m) != 2) goto err;
@@ -147,27 +156,30 @@ int lp_read(const char *path, LP *lp)
         }
         tr[k] = r; tc[k] = c; tv[k] = v;
     }
-    /* insertion sort by column (triplets usually near-sorted) */
-    for (long i = 1; i < nnz; i++) {
-        int cr = tr[i], cc = tc[i]; double cv = tv[i];
-        long j = i - 1;
-        while (j >= 0 && tc[j] > cc) {
-            tr[j + 1] = tr[j]; tc[j + 1] = tc[j]; tv[j + 1] = tv[j]; j--;
-        }
-        tr[j + 1] = cr; tc[j + 1] = cc; tv[j + 1] = cv;
+    /* Counting sort by column: O(nnz + n), linear in input size (the previous
+       insertion sort was O(nnz^2) on adversarial triplet orderings). */
+    int *colcount = (int*)calloc((size_t)(n + 1), sizeof(int));
+    int *out_r = (int*)malloc((size_t)(nnz ? nnz : 1) * sizeof(int));
+    double *out_v = (double*)malloc((size_t)(nnz ? nnz : 1) * sizeof(double));
+    if (!colcount || !out_r || !out_v) { free(colcount); free(out_r); free(out_v); goto err2; }
+    for (long k = 0; k < nnz; k++) colcount[tc[k] + 1]++;
+    for (int j = 0; j < n; j++) colcount[j + 1] += colcount[j];
+    for (long k = 0; k < nnz; k++) {
+        int pos = colcount[tc[k]]++;
+        out_r[pos] = tr[k];
+        out_v[pos] = tv[k];
     }
-    lp->Acolptr = (int*)calloc((size_t)(n + 1), sizeof(int));
+    free(tr); free(tc); free(tv);
+    tr = NULL; tc = NULL; tv = NULL;
+
+    lp->Acolptr = (int*)malloc((size_t)(n + 1) * sizeof(int));
     lp->Arow = (int*)malloc((size_t)(nnz ? nnz : 1) * sizeof(int));
     lp->Aval = (double*)malloc((size_t)(nnz ? nnz : 1) * sizeof(double));
-    if (!lp->Acolptr || !lp->Arow || !lp->Aval) goto err2;
-
-    for (long k = 0; k < nnz; k++) {
-        lp->Arow[k] = tr[k];
-        lp->Aval[k] = tv[k];
-        lp->Acolptr[tc[k] + 1]++;
-    }
-    for (int j = 0; j < n; j++) lp->Acolptr[j + 1] += lp->Acolptr[j];
-    free(tr); free(tc); free(tv);
+    if (!lp->Acolptr || !lp->Arow || !lp->Aval) { free(colcount); free(out_r); free(out_v); goto err2; }
+    lp->Acolptr[0] = 0;
+    for (int j = 0; j < n; j++) lp->Acolptr[j + 1] = colcount[j];
+    for (long k = 0; k < nnz; k++) { lp->Arow[k] = out_r[k]; lp->Aval[k] = out_v[k]; }
+    free(colcount); free(out_r); free(out_v);
     fclose(f);
     return 0;
 

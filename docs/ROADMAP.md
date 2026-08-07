@@ -56,6 +56,45 @@ is a different algorithm family tuned for that latency.
 - Hardened parsers + fuzzing + sanitizers (untrusted-input safe)
 - OOM/error protocol, sensitivity (duals), iteration limits
 
+### Correctness hardening pass (audit-driven)
+- **No false OPTIMAL/INFEASIBLE/UNBOUNDED.** `solver_solve` now issues a
+  **solution certificate**: after a claimed optimum, it re-checks the variable
+  bounds and constraint rows (and that the final basis factorized).  A diverged
+  or numerically broken solve reports `NUMERICAL_FAILURE` instead of a wrong
+  answer.  The MIP, QP, and CLIs propagate honest statuses.
+- **MIP status correctness**: a node/time-limited search that found an incumbent
+  now reports status `5` (feasible, optimality NOT proven) instead of falsely
+  `OPTIMAL`.  Stopped searches and numerical failures are distinct statuses.
+- **QP status correctness**: the active-set solver no longer unconditionally sets
+  `status=0`; KKT stationarity is verified before success, KKT failures and the
+  iteration cap are reported as `QP_KKT_FAIL` / `QP_ITERATION_LIMIT`.
+- **Phase I iteration limit** is reported as `ITERATION_LIMIT`, not falsely
+  `INFEASIBLE`.
+- **Singular-basis fix**: `remove_basic_artificials` could swap in a candidate
+  that made the basis SINGULAR on rank-deficient constraint sets (e.g. big-M
+  reification encodings), which then produced wrong or divergent answers.  Now a
+  basic artificial at zero (a redundant row) is left basic but *pinned at 0*, so
+  it preserves rank without absorbing infeasibility.
+- **Parser**: objective sense is validated (rejects `garbage`); the O(nnz²)
+  insertion sort for triplets was replaced with a linear counting sort.
+- **Allocation discipline**: added `psolve_realloc` / `psolve_calloc` /
+  `psolve_strdup` checked helpers; the LP eta-growth and the FlatZinc
+  Builder/LP construction now use them (no unchecked `realloc`).
+- **`-ffast-math` is off by default** (`make FAST_MATH=1` to opt in): the default
+  correctness build no longer reorders FP ops or changes NaN/Inf behaviour.
+- **Differential harness fixed**: the GLPK status classifier now recognizes all
+  glpsol phrasings ("LP HAS UNBOUNDED PRIMAL SOLUTION", "PROBLEM HAS NO PRIMAL
+  FEASIBLE SOLUTION", ...), so the GLPK differential actually measures agreement.
+  Differential results after hardening: 0 objective mismatches, 0 infeasible-as-
+  optimal, GLPK canonical sweep 119/119, equality/fixed vs scipy 300/300, QP vs
+  scipy 40/40.
+
+### Known Phase I limitation
+On some genuinely **infeasible** degenerate LPs the Phase-I simplex can iterate
+to the iteration limit without converging to a certified verdict; it then
+reports `ITERATION_LIMIT` (honest) rather than `INFEASIBLE`.  This is a
+convergence weakness in the phase-I pricing, not a wrong-answer path.
+
 ---
 
 ## Phase 1 — Real-time physics kernel (PRIORITY for primary use case)
