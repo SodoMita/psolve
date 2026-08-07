@@ -1,0 +1,12 @@
+% Minimize the makespan m = max(s1, s2) of two jobs starting at s1, s2.
+% Uses the exact array_int_maximum selector (epigraph form: m >= s1, m >= s2,
+% and minimizing m forces equality).  Expect makespan = 5.
+predicate array_int_maximum(var int: m, array[int] of var int: x);
+var 0..10: s1;
+var 0..10: s2;
+var 0..10: makespan :: output_var;
+array [1..2] of var int: s = [s1,s2];
+constraint int_ge(s1,2);
+constraint int_ge(s2,5);
+constraint array_int_maximum(makespan,s);
+solve minimize makespan;

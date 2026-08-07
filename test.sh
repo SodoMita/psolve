@@ -115,11 +115,15 @@ if ./fznsolve examples/fzn/cumulative_unsat.fzn | grep -q "=====UNSATISFIABLE===
 else
   echo "cumulative_unsat: FAIL (expected UNSATISFIABLE)"
 fi
+echo -n "cumulative_verify (randomized, vs brute force): "
+python3 tools/cumulative_verify.py 200 777 | sed 's/.*: //'
 
 echo "[8.25/8] FlatZinc strict/reified-int + float + table/circuit semantics..."
 python3 tools/fzn_semantics_test.py
 echo -n "table_verify (randomized, vs brute force): "
 python3 tools/table_verify.py 250 20240607 | sed 's/.*: //'
+echo -n "extrema_verify (randomized, vs brute force): "
+python3 tools/extrema_verify.py 300 4242 | sed 's/.*: //'
 
 if command -v minizinc >/dev/null 2>&1; then
   echo "[8.5/8] MiniZinc differential (compile .mzn -> fzn -> psolve vs Gecode)..."
