@@ -9,6 +9,7 @@
 
 static volatile sig_atomic_t g_stop = 0;
 static void on_sigint(int s){ (void)s; g_stop = 1; }
+static int stop_requested(void){ return (int)g_stop; }
 
 typedef struct { const char*path; long node_limit; int show_stats; int verbose; long time_ms; } Options;
 static Options parse_args(int argc, char**argv){
@@ -45,7 +46,10 @@ int main(int argc,char**argv)
     }
     psolve_try();
     signal(SIGINT, on_sigint);
+    signal(SIGALRM, on_sigint);            /* alarm() fires this for -t limit */
+    psolve_stop_fn = stop_requested;       /* cooperative abort polled by solver */
     if (opt.time_ms > 0) alarm((unsigned)((opt.time_ms+999)/1000));
+    sol.node_limit = opt.node_limit;       /* wire -n into the MIP node limit */
 
     {
         struct timespec t0,t1; clock_gettime(CLOCK_MONOTONIC,&t0);
@@ -69,8 +73,8 @@ int main(int argc,char**argv)
     }
     if (opt.verbose && sol.status != 0)
         fprintf(stderr, "fznsolve: status=%d nodes=%ld\n", sol.status, sol.nodes);
-    (void)opt.node_limit;
 done:
+    psolve_stop_fn = NULL;
     fz_solution_free(&sol);
     fz_model_free(&m);
     return rc;

@@ -145,16 +145,37 @@ feature completeness against a huge standard corpus.
 - [x] **MIP bridge**: when the model has integer vars, `fz_solve` dispatches to
       the MIP branch-and-bound so answers are integral (objectives match brute
       force, e.g. knapsack=10, prod3=57).
-- [ ] MIP CLI bridge (integer var list, node/time limits, best-bound stats).
+- [x] MIP CLI bridge: `-n` (node limit) is wired through `FZSolution.node_limit`
+      into the MIP `node_limit`; `-t` (wall-clock limit) and Ctrl-C trigger a
+      **cooperative abort** — `psolve_stop()` is polled in the LP simplex loop
+      (every 256 iterations) *and* once per B&B node, so a long run inside a
+      single relaxation can be interrupted, not just between nodes.  Status 4
+      (`stopped`) is returned and printed as `=====UNKNOWN=====` with stats.
+- [x] `solve satisfy` fast path: `stop_at_feasible` returns the first
+      integer-feasible solution instead of proving optimality; an LP-rounding
+      feasibility heuristic produces incumbents at near-lattice nodes.
 - [x] CLI flags: `-n` (node limit), `-t` (time limit via alarm), `-s` (stats),
-      `-v` (verbose), SIGINT handler; `fznsolve` prints objective always and
-      `objectiveBound`/`nodes` in stats.
+      `-v` (verbose), SIGINT/SIGALRM handlers; `fznsolve` prints objective
+      always and `objectiveBound`/`nodes` in stats.
 - [ ] CLI: `-a` (all solutions), `-f` (free search).
 - [x] **MiniZinc differential** (`tools/mzn_diff.py`): compiles real `.mzn`
       models with the MiniZinc compiler and compares fznsolve vs Gecode
       (objectives + feasibility).  Models in `examples/mzn/`.
 - [x] Fuzz the FlatZinc parser (ASan/UBSan), incl. new handlers + MIP path.
+      Added a dedicated `tools/fuzz_fzn.py` (well-formed + malformed `.fzn`
+      generators) and wired it into `test.sh`; several real leaks in the lexer
+      (token text) and the expression parser (unary-minus/paren/array-element
+      error paths) found and fixed.
 - [ ] More MiniZinc-suite coverage; HiGHS round-trip.
+
+### Known Phase 3 limitation
+Pure LP-based B&B has weak relaxations on *combinatorial* feasibility models
+that combine gapped `set` domains, `all_different`, and nonlinear (`!=`)
+constraints (big-M encodings).  Such models solve correctly when they complete
+(never a wrong answer — `UNKNOWN` is returned), but B&B may not reach a
+solution quickly.  Real-time CSPs are better served by a propagation-based
+engine in the consuming project; psolve's LP/QP/MIP backbone targets
+linear/quadratic and well-structured MIP models.
 
 ### Phase 3 first-cut deliverable: `fznsolve <x.fzn>` solves the linear subset,
 with tests in `examples/fzn/` and `test.sh` (incl. the MiniZinc differential).

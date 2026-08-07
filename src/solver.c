@@ -748,8 +748,13 @@ static int solve_phase(Solver *s)
 {
     int r;
     long cap = s->iteration_limit > 0 ? s->iteration_limit : 2000000;
+    long poll = 0;
     while ((r = iterate(s)) == 1) {
         if (s->iters > cap) { r = -1; break; }   /* iteration limit / cycling */
+        /* cooperative abort (time limit / Ctrl-C): check periodically so a
+           long run inside a single relaxation can be interrupted, not just
+           between branch-and-bound nodes. */
+        if ((++poll & 255) == 0 && psolve_stop()) { r = SOLVE_STOPPED; break; }
     }
     return r;
 }
@@ -772,6 +777,7 @@ int solver_solve(Solver *s)
             s->cobj[av] = -1.0;      /* all artificials, basic or not */
         }
         r = solve_phase(s);
+        if (r == SOLVE_STOPPED) { s->status_out = SOLVE_STOPPED; return SOLVE_STOPPED; }
         if (r == 2) { s->status_out = 2; return 2; }
         if (r != 0) { s->status_out = 1; return 1; }
 
@@ -797,6 +803,7 @@ int solver_solve(Solver *s)
     recompute_basic(s);
 
     r = solve_phase(s);
+    if (r == SOLVE_STOPPED) { s->status_out = SOLVE_STOPPED; return SOLVE_STOPPED; }
     if (r == 2) { s->status_out = 2; return 2; }
     if (r == -1) { s->status_out = 3; return 3; }   /* iteration limit hit */
 

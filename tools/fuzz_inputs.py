@@ -24,9 +24,9 @@ def build_asan(bindir):
     os.makedirs(bindir, exist_ok=True)
     base = ['gcc','-O1','-g','-march=native','-fsanitize=address,undefined',
             '-fno-omit-frame-pointer','-I','src']
-    lp = base + ['src/kernels.c','src/lu.c','src/splu.c','src/solver.c',
+    lp = base + ['src/err.c','src/kernels.c','src/lu.c','src/splu.c','src/solver.c',
                  'src/parser.c','src/main.c','-o',os.path.join(bindir,'lpsolve_asan'),'-lm']
-    qp = base + ['tools/qpsolve.c','src/qp.c','src/lu.c','src/kernels.c',
+    qp = base + ['src/err.c','tools/qpsolve.c','src/qp.c','src/lu.c','src/kernels.c',
                  '-o',os.path.join(bindir,'qpsolve_asan'),'-lm']
     subprocess.run(lp, check=True)
     subprocess.run(qp, check=True)

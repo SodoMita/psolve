@@ -6,6 +6,13 @@ jmp_buf psolve_env;
 int     psolve_active = 0;
 int     psolve_code   = PSOLVE_OK;
 
+int (*psolve_stop_fn)(void) = NULL;
+
+int psolve_stop(void)
+{
+    return psolve_stop_fn ? psolve_stop_fn() : 0;
+}
+
 int psolve_try(void)
 {
     if (psolve_active) return 1;      /* a handler is already installed */

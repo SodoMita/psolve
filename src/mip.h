@@ -32,12 +32,16 @@ typedef struct {
     int maximize;
     const unsigned char *isint;  /* 1 if variable j must be integer */
     double mip_gap;        /* relative optimality gap to stop at (e.g. 1e-4) */
+    int    stop_at_feasible; /* 1 = return as soon as any integer-feasible
+                                solution is found (for solve satisfy); do not
+                                keep branching to prove optimality */
     long   node_limit;     /* max branch-and-bound nodes */
     long   lp_iter_limit;  /* simplex iteration limit per relaxation */
 } MIP;
 
 typedef struct {
-    int status;            /* 0 optimal, 1 infeasible, 2 unbounded, 3 node limit */
+    int status;            /* 0 optimal, 1 infeasible, 2 unbounded, 3 node limit,
+                              4 stopped (cooperative abort: time limit / Ctrl-C) */
     double obj;            /* optimal objective value */
     double *x;             /* optimal integer solution (n) */
     int *isint_sol;        /* reported integrality status per var (0/1) */

@@ -16,6 +16,9 @@ typedef struct { TK kind; char*text; long ival; double fval; size_t start,end; }
 
 static int is_ident_ch(int c){ return isalnum(c)||c=='_'; }
 
+/* free a token array and the strdup'd text owned by each token */
+static void free_toks(Token*t,int n){ for(int i=0;i<n;i++) free(t[i].text); free(t); }
+
 static int lex(const char*src, Token**out,int*n)
 {
     int cap=256,cnt=0; Token*t=(Token*)malloc((size_t)cap*sizeof(Token));
@@ -50,7 +53,7 @@ static int lex(const char*src, Token**out,int*n)
             if(i+Lk<=L&&strncmp(src+i,two[k],Lk)==0){
                 if(cnt>=cap){cap*=2;t=(Token*)realloc(t,(size_t)cap*sizeof(Token));}
                 t[cnt].kind=TK_SYM;t[cnt].text=strdup(two[k]);t[cnt].start=i;t[cnt].end=i+Lk;cnt++;i+=Lk;matched=1;break; } }
-        if(!matched){free(t);return -1;}
+        if(!matched){free_toks(t,cnt);return -1;}
     }
     if(cnt>=cap){cap++;t=(Token*)realloc(t,(size_t)cap*sizeof(Token));}
     t[cnt].kind=TK_EOF;t[cnt].text=NULL;t[cnt].start=L;t[cnt].end=L;cnt++;
@@ -85,10 +88,10 @@ static Expr parse_primary(const char*s,size_t*pos,FZModel*m,int*err)
     Expr e; memset(&e,0,sizeof(e)); e.n=1; e.els=(Lin*)malloc(sizeof(Lin)); memset(&e.els[0],0,sizeof(Lin));
     while(s[*pos]==' ')(*pos)++;
     char c=s[*pos];
-    if(c=='-'){(*pos)++;Expr t=parse_primary(s,pos,m,err);if(!*err){for(int i=0;i<t.n;i++){for(int k=0;k<t.els[i].n;k++)t.els[i].coef[k]=-t.els[i].coef[k];t.els[i].constant=-t.els[i].constant;}}e=t;return e;}
+    if(c=='-'){(*pos)++;Expr t=parse_primary(s,pos,m,err);if(!*err){for(int i=0;i<t.n;i++){for(int k=0;k<t.els[i].n;k++)t.els[i].coef[k]=-t.els[i].coef[k];t.els[i].constant=-t.els[i].constant;}}free(e.els);e=t;return e;}
     if(c=='['){(*pos)++;int cap=8;free(e.els);e.els=(Lin*)malloc((size_t)cap*sizeof(Lin));e.n=0;e.is_array=1;
         while(1){while(s[*pos]==' ')(*pos)++;if(s[*pos]==']'){(*pos)++;break;}
-            Expr t=parse_expr(s,pos,m,err);if(*err)return e;
+            Expr t=parse_expr(s,pos,m,err);if(*err){expr_free2(&t);expr_free2(&e);return e;}
             if(e.n>=cap){cap*=2;e.els=(Lin*)realloc(e.els,(size_t)cap*sizeof(Lin));}
             e.els[e.n]=t.els[0];e.n++;free(t.els);
             while(s[*pos]==' ')(*pos)++;
@@ -115,16 +118,16 @@ static Expr parse_primary(const char*s,size_t*pos,FZModel*m,int*err)
         if(d){ if(d->is_var){lin_term(&e.els[0],d->base_idx,1.0);} else e.els[0].constant=d->par?d->par[0]:(d->par_int?d->par_int[0]:0); }
         else { if(strcmp(name,"true")==0)e.els[0].constant=1; else if(strcmp(name,"false")==0)e.els[0].constant=0; else *err=1; }
         return e;}
-    if(c=='('){(*pos)++;Expr t=parse_expr(s,pos,m,err);while(s[*pos]==' ')(*pos)++;if(s[*pos]==')')(*pos)++;e=t;return e;}
+    if(c=='('){(*pos)++;Expr t=parse_expr(s,pos,m,err);while(s[*pos]==' ')(*pos)++;if(s[*pos]==')')(*pos)++;free(e.els);e=t;return e;}
     *err=1;return e;
 }
 
 static Expr parse_expr(const char*s,size_t*pos,FZModel*m,int*err)
 {
-    Expr e=parse_primary(s,pos,m,err); if(*err)return e;
+    Expr e=parse_primary(s,pos,m,err); if(*err){expr_free2(&e);return e;}
     while(1){ while(s[*pos]==' ')(*pos)++;
         char op=s[*pos]; if(op!='+'&&op!='-')break; (*pos)++;
-        Expr t=parse_primary(s,pos,m,err); if(*err)return e;
+        Expr t=parse_primary(s,pos,m,err); if(*err){expr_free2(&t);return e;}
         double sg=(op=='+')?1.0:-1.0;
         /* combine: only handle scalar scalar-compatible; for arrays we take
            elementwise sum when both scalar-expanded */
@@ -134,7 +137,7 @@ static Expr parse_expr(const char*s,size_t*pos,FZModel*m,int*err)
     }
     return e;
 }
-static void expr_free2(Expr*e){ if(e->n>0){for(int i=0;i<e->n;i++)lin_free(&e->els[i]);free(e->els);} }
+static void expr_free2(Expr*e){ if(e->n>0){for(int i=0;i<e->n;i++)lin_free(&e->els[i]);free(e->els);e->els=NULL;e->n=0;} }
 
 /* parse a scalar expression into a Lin */
 static int parse_lin(FZModel*m,const char*s,Lin*out)
@@ -415,7 +418,8 @@ int fz_read(const char*path,FZModel*m)
         }
         ti++;
     }
-    free(toks);free(src);
+    free_toks(toks,nt);
+    free(src);
     return 0;
 }
 
@@ -1049,7 +1053,9 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
 
 void fz_solve(const FZModel*m,FZSolution*sol)
 {
+    long node_limit_in = sol->node_limit;   /* input knob, preserved across memset */
     memset(sol,0,sizeof(*sol));
+    sol->node_limit = node_limit_in;
     int nv=m->nvars; sol->nvars=nv; sol->x=(double*)calloc((size_t)(nv?nv:1),sizeof(double));
     if(nv==0){sol->status=3;return;}
     Builder b;memset(&b,0,sizeof(b));b.nvars=nv;b.varcap=nv?nv:16;
@@ -1128,11 +1134,15 @@ void fz_solve(const FZModel*m,FZSolution*sol)
         MIP mip;memset(&mip,0,sizeof(mip));
         mip.n=ntot;mip.m=b.nrows;mip.c=lp.c;mip.Acolptr=lp.Acolptr;mip.Arow=lp.Arow;mip.Aval=lp.Aval;
         mip.rel=lp.rel;mip.b=lp.b;mip.l=lp.l;mip.u=lp.u;mip.maximize=lp.maximize;
-        mip.isint=isint;mip.mip_gap=1e-4;mip.node_limit=200000;mip.lp_iter_limit=2000000;
+        mip.isint=isint;mip.mip_gap=1e-4;
+        mip.stop_at_feasible = (m->solve_kind==0);   /* satisfy: first feasible is enough */
+        mip.node_limit = (sol->node_limit>0)?sol->node_limit:200000;
+        mip.lp_iter_limit=2000000;
         MIPResult mr;mip_solve(&mip,&mr);
         sol->nodes=mr.nodes; sol->best_bound=mr.best_bound;
         if(mr.status==0){memcpy(sol->x,mr.x,(size_t)ntot*sizeof(double));sol->obj=mr.obj;sol->iters=mr.lp_iters;sol->status=0;}
         else if(mr.status==1)sol->status=1;
+        else if(mr.status==3||mr.status==4)sol->status=4;
         else sol->status=2;
         mip_result_free(&mr);
     } else {

@@ -41,4 +41,13 @@ void psolve_end(void);
  * is installed, aborts.  Returns the allocation on success. */
 void *psolve_malloc(size_t n);
 
+/* Cooperative abort.  Solvers call psolve_stop() periodically (e.g. once per
+ * branch-and-bound node) and, if it returns nonzero, wind down and report a
+ * limit status instead of running to completion.  The driver installs a
+ * callback (e.g. one that reads a SIGINT/SIGALRM flag) to support Ctrl-C and
+ * wall-clock time limits.  When no callback is installed, psolve_stop() is a
+ * no-op returning 0. */
+extern int (*psolve_stop_fn)(void);
+int psolve_stop(void);
+
 #endif

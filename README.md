@@ -249,8 +249,9 @@ when integer variables are present, so answers are integral):
   `int_eq/le/lt/ge/gt_reif`, `int_lin_ne`, `int_lin_ge`, `count`/`among`.
 - **Solve**: satisfy / minimize / maximize; FlatZinc output (`x = v;`,
   `array1d(...)`, status markers), objective always, and `-s` stats
-  (`nodes`, `objectiveBound`); `-n` node limit, `-t` time limit, SIGINT.
-  See `--help`-style usage: `fznsolve [-n N] [-t ms] [-s] [-v] <x.fzn>`.
+  (`nodes`, `objectiveBound`); `-n` node limit and `-t`/SIGINT time limits are
+  enforced via a cooperative abort polled in the LP simplex and B&B loops.
+  Usage: `fznsolve [-n N] [-t ms] [-s] [-v] <x.fzn>`.
 - **MiniZinc differential**: `tools/mzn_diff.py` compiles real `.mzn` models
   with the MiniZinc compiler and checks fznsolve against Gecode (objectives
   match, e.g. knapsack=10, prod3=57).  See `examples/mzn/`.

@@ -9,6 +9,7 @@
 #define LP_REMOVED 3
 
 #define LP_INF 1e30
+#define SOLVE_STOPPED 4   /* cooperative abort requested (time limit / Ctrl-C) */
 
 typedef struct {
     int n, m;              /* original variables, constraints */
@@ -80,7 +81,8 @@ typedef struct {
     int reinvert_interval;
     double hyper_tol;      /* hyper-sparsity skip threshold for PRICE */
     double objval;
-    int status_out;        /* 0 ok, 1 infeasible, 2 unbounded, 3 limit hit */
+    int status_out;        /* 0 ok, 1 infeasible, 2 unbounded, 3 limit hit,
+                              4 SOLVE_STOPPED (cooperative abort) */
     long iteration_limit;  /* max simplex iterations before giving up */
     /* anti-cycling */
     int bland;             /* use Bland's rule (lowest-index) entering */

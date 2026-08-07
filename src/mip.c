@@ -7,6 +7,46 @@
 
 #define MIP_TOL 1e-6
 
+/* LP-rounding feasibility heuristic: round the relaxation solution's integer
+   variables to integer values inside the current node bounds and test the
+   resulting point against every constraint.  This cheaply produces a feasible
+   integer incumbent at nodes where the LP optimum is near a lattice point,
+   which is essential for `solve satisfy` problems (there the first feasible
+   integer point is an answer).  Returns 1 and fills xc on success. */
+static int try_rounding_heuristic(const MIP *mip, const double *x,
+                                  const double *lcur, const double *ucur,
+                                  double *xc)
+{
+    int n = mip->n, m = mip->m;
+    for (int j = 0; j < n; j++) {
+        double v = x[j];
+        if (mip->isint[j]) {
+            double r = floor(v + 0.5);
+            if (r < lcur[j]) r = lcur[j];
+            if (r > ucur[j]) r = ucur[j];
+            v = r;
+        }
+        xc[j] = v;
+    }
+    for (int j = 0; j < n; j++)
+        if (xc[j] < lcur[j] - MIP_TOL || xc[j] > ucur[j] + MIP_TOL) return 0;
+    double *rs = (double*)psolve_malloc((size_t)(m ? m : 1) * sizeof(double));
+    for (int i = 0; i < m; i++) rs[i] = 0.0;
+    for (int j = 0; j < n; j++) {
+        for (int k = mip->Acolptr[j]; k < mip->Acolptr[j + 1]; k++)
+            rs[mip->Arow[k]] += mip->Aval[k] * xc[j];
+    }
+    int ok = 1;
+    for (int i = 0; i < m && ok; i++) {
+        char r = mip->rel[i]; double b = mip->b[i];
+        if (r == '=')      { if (fabs(rs[i] - b) > MIP_TOL) ok = 0; }
+        else if (r == '<') { if (rs[i] > b + MIP_TOL) ok = 0; }
+        else if (r == '>') { if (rs[i] < b - MIP_TOL) ok = 0; }
+    }
+    free(rs);
+    return ok;
+}
+
 typedef struct Node {
     double *lo, *hi;      /* tightened bounds for this node (n) */
     double bound;         /* relaxation objective value (for ordering) */
@@ -94,6 +134,7 @@ void mip_solve(const MIP *mip, MIPResult *res)
     double *lcur = (double*)psolve_malloc((size_t)n * sizeof(double));
     double *ucur = (double*)psolve_malloc((size_t)n * sizeof(double));
     double *bestx = (double*)psolve_malloc((size_t)n * sizeof(double));
+    double *xc = (double*)psolve_malloc((size_t)n * sizeof(double));
 
     double incumbent = mip->maximize ? -1e30 : 1e30;
     int have_incumbent = 0;
@@ -113,6 +154,7 @@ void mip_solve(const MIP *mip, MIPResult *res)
 
     while (stack) {
         if (nodes >= node_limit) { status = 3; break; }
+        if (psolve_stop()) { status = 4; break; }
         Node *node = pop_node(&stack);
         nodes++;
 
@@ -120,6 +162,7 @@ void mip_solve(const MIP *mip, MIPResult *res)
         int r = solve_relaxation(mip, node, x, &obj, lcur, ucur);
         if (r == -1) { free(node->lo); free(node->hi); free(node); continue; } /* infeasible */
         if (r == 3) { free(node->lo); free(node->hi); free(node); status = 3; break; } /* lp limit */
+        if (r == SOLVE_STOPPED) { free(node->lo); free(node->hi); free(node); status = 4; break; } /* stopped */
         /* infeasible or unbounded relaxation */
         if (r == 1) { free(node->lo); free(node->hi); free(node); continue; }
         if (r == 2) {
@@ -137,6 +180,26 @@ void mip_solve(const MIP *mip, MIPResult *res)
             if (!mip->maximize && obj >= incumbent - gap * (1.0 + fabs(incumbent))) { free(node->lo); free(node->hi); free(node); continue; }
         }
 
+        /* LP-rounding feasibility heuristic: if the relaxation is already
+           integral after rounding, grab it as an incumbent immediately
+           (fast path, especially for solve satisfy). */
+        if (try_rounding_heuristic(mip, x, lcur, ucur, xc)) {
+            double objr = 0.0;
+            for (int j = 0; j < n; j++) objr += mip->c[j] * xc[j];
+            if (!have_incumbent ||
+                (mip->maximize && objr > incumbent) ||
+                (!mip->maximize && objr < incumbent)) {
+                have_incumbent = 1;
+                incumbent = objr;
+                memcpy(bestx, xc, (size_t)n * sizeof(double));
+                for (int j = 0; j < n; j++) res->isint_sol[j] = mip->isint[j];
+            }
+        }
+        if (mip->stop_at_feasible && have_incumbent) {
+            free(node->lo); free(node->hi); free(node);
+            break;
+        }
+
         /* check integrality; find a fractional integer variable */
         int frac = -1; double fracval = 0.0;
         int allint = 1;
@@ -151,13 +214,19 @@ void mip_solve(const MIP *mip, MIPResult *res)
 
         if (allint) {
             /* integer-feasible: update incumbent */
-                if (!have_incumbent ||
+            if (!have_incumbent ||
                 (mip->maximize && obj > incumbent) ||
                 (!mip->maximize && obj < incumbent)) {
                 incumbent = obj;
                 memcpy(bestx, x, (size_t)n * sizeof(double));
                 have_incumbent = 1;
                 for (int j = 0; j < n; j++) res->isint_sol[j] = mip->isint[j];
+                if (mip->stop_at_feasible) {
+                    /* solve satisfy: the first feasible integer point is an
+                       answer; stop branching instead of proving optimality. */
+                    free(node->lo); free(node->hi); free(node);
+                    break;
+                }
             }
             free(node->lo); free(node->hi); free(node);
             continue;
@@ -201,7 +270,7 @@ void mip_solve(const MIP *mip, MIPResult *res)
     Node *n2 = stack;
     while (n2) { Node *t = n2; n2 = n2->next; free(t->lo); free(t->hi); free(t); }
 
-    free(x); free(lcur); free(ucur); free(bestx);
+    free(x); free(lcur); free(ucur); free(bestx); free(xc);
 }
 
 void mip_result_free(MIPResult *res)
