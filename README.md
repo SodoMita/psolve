@@ -51,13 +51,12 @@ with an explicit baseline `ARCH`.
 `--print` also dumps the optimal variable values.
 
 The LP solver handles: **maximize or minimize**, `<`, `>`, and `=` constraints,
-variables with lower, upper, or boxed bounds (each finite bound may be
-`inf`/`-inf`, i.e. unbounded on that side), and correctly reports `OPTIMAL`,
-`INFEASIBLE`, `UNBOUNDED`, `NUMERICAL_FAILURE`, or `ITERATION_LIMIT`.
-
-> Note: a fully free variable (unbounded on *both* sides) is not yet supported —
-> each variable must have at least one finite bound. The `.lp` parser rejects
-> `-inf inf` with a clear error rather than silently producing a wrong answer.
+variables with lower, upper, boxed, or fully free bounds (use `-inf inf`), and
+correctly reports `OPTIMAL`, `INFEASIBLE`, `UNBOUNDED`, `NUMERICAL_FAILURE`, or
+`ITERATION_LIMIT`. A free variable is normalized internally as the difference
+of two non-negative variables; the public LP/MIP APIs, printed solution, warm
+starts, and added-row path continue to use the original variable dimension.
+See `examples/free_vars.lp` for a runnable model.
 
 The QP solver handles: **minimize** ½xᵀQx + cᵀx subject to Ax ≤ b with Q
 symmetric positive semi-definite (convex), reporting the optimum, Lagrange
@@ -193,7 +192,7 @@ maximize|minimize
 <rel[0..m-1]>            # one token of m concatenated relation chars, each '<' '>' '='
                         #   (e.g. <<=<< means <, <, =, <, <).  Use single chars
                         #   only: '<' already means "<=" and '>' means ">=".
-<lo_1> <hi_1>            # per variable: bounds, 'inf' for unbounded
+<lo_1> <hi_1>            # per variable: bounds; '-inf inf' is fully free
 ...
 <nnz>
 <row> <col> <value>      # nnz sparse entries (0-indexed), any order

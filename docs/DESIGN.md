@@ -116,6 +116,9 @@ from the previous basis instead of from scratch:
   Phase II directly.  Bound changes can make a basic variable leave its bounds;
   `warm_solve` detects an infeasible warm start and falls back to a clean
   re-solve (via `solver_refresh`, which reconstructs the LP and re-solves).
+  A bound update that changes a variable between fully free and bounded also
+  triggers that clean rebuild, because its internal `x⁺ − x⁻` normalization
+  changes the column count.
 - `solver_add_row` appends a constraint; it reconstructs the LP including the
   new row and does a clean re-solve, guaranteeing the result matches a
   from-scratch solve.
@@ -147,7 +150,9 @@ nonbasic variables at their starting (e.g. positive lower-bound) values, rather
 than assuming every nonbasic is 0.  This makes the solver correctly respect
 positive variable lower bounds and correctly detect infeasible starts (previously
 an infeasible node in branch-and-bound could be mis-reported as a feasible
-fractional point).
+fractional point). A caller-visible fully free variable is first normalized as
+`x = x⁺ − x⁻`, with both components at lower bound zero, so it follows the same
+feasible-start path without weakening the original model.
 
 ## 7. Honest status and known limitations
 

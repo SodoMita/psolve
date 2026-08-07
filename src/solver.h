@@ -25,9 +25,20 @@ typedef struct {
 
 typedef struct {
     /* equality-form problem */
-    int N;                 /* total variables: orig + slack + artificial */
-    int n_orig;            /* original variables */
+    int N;                 /* total variables: normalized decision + slack + artificial */
+    int n_orig;            /* caller-visible/original variable count */
+    int n_core;            /* normalized decision columns before slack/artificial */
     int M;                 /* number of rows (equalities) */
+
+    /* User-variable normalization.  A fully free x_j is represented internally
+       as x_j^+ - x_j^- with both components non-negative.  orig_pos[j] is the
+       direct/positive column and orig_neg[j] is the negative component or -1
+       for a variable that did not need splitting.  The original objective and
+       bounds are retained so incremental APIs can rebuild this mapping if a
+       bound update changes a variable between free and non-free. */
+    int *orig_pos, *orig_neg;       /* len n_orig */
+    double *orig_c, *orig_l, *orig_u; /* len n_orig, user convention */
+    int rebuild_pending;
     long nnz;
     int *colptr;           /* N+1 */
     int *row;              /* nnz */
@@ -136,7 +147,8 @@ int solver_warm_solve(Solver *s);
 void solver_duals(const Solver *s, double *dual);
 
 /* Reduced costs for all original variables (c_j - (dual . A_j)); rc must be
- * an n_orig-vector. */
+ * an n_orig-vector.  For a free x=x+ - x-, this is the reduced cost of the
+ * positive/original direction (the negative component has the opposite one). */
 void solver_reduced_costs(const Solver *s, double *rc);
 
 #endif

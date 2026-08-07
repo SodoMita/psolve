@@ -75,6 +75,12 @@ is a different algorithm family tuned for that latency.
   reification encodings), which then produced wrong or divergent answers.  Now a
   basic artificial at zero (a redundant row) is left basic but *pinned at 0*, so
   it preserves rank without absorbing infeasibility.
+- **Free variables**: LP and MIP inputs may now use `-inf inf`. The simplex
+  normalizes each such caller-visible `x` as `x⁺ − x⁻` with non-negative
+  components, while solution certificates, reduced costs, warm starts, and
+  row additions retain the original API dimension. Free→bounded and
+  bounded→free incremental updates rebuild safely; LP/MIP regressions cover
+  positive/negative optima, unboundedness, and branching.
 - **Parser**: objective sense is validated (rejects `garbage`); the O(nnz²)
   insertion sort for triplets was replaced with a linear counting sort.
 - **Allocation discipline**: added `psolve_realloc` / `psolve_calloc` /

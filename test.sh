@@ -23,6 +23,7 @@ echo "[2/7] Example problems (objective values)..."
 echo -n "  diet (expect 1.32):       "; ./lpsolve examples/diet.lp      | grep objective
 echo -n "  prodplan (expect 26):     "; ./lpsolve examples/prodplan.lp  | grep objective
 echo -n "  transport (expect 94.5):  "; ./lpsolve examples/transport.lp | grep objective
+echo -n "  free variable (expect 3): "; ./lpsolve examples/free_vars.lp | grep objective
 
 if command -v glpsol >/dev/null 2>&1; then
   echo "[3/7] Canonical sweep vs GLPK (bounded, well-conditioned)..."
@@ -50,6 +51,10 @@ gcc -O2 -march=native -I src tools/mip_test.c src/mip.c src/err.c src/solver.c s
 if [ -f /tmp/mip_verify.py ]; then
   python3 tools/mip_verify.py 0 | tail -1
 fi
+
+echo "[5.75/7] Fully free LP/MIP variables + incremental API..."
+gcc -O2 -march=native -I src tools/free_var_test.c src/mip.c src/err.c src/solver.c src/splu.c src/lu.c src/kernels.c -o /tmp/free_var_test -lm
+/tmp/free_var_test
 
 echo "[6/7] Incremental solving (warm starts vs fresh solves)..."
 gcc -O2 -march=native -I src tools/incr_test.c src/err.c src/solver.c src/splu.c src/lu.c src/kernels.c src/parser.c -o /tmp/incr_test -lm

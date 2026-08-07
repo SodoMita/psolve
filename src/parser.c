@@ -123,10 +123,8 @@ int lp_read(const char *path, LP *lp)
             goto err;
         }
         lp->l[j] = lv; lp->u[j] = uv;
-        if (lp->l[j] <= -LP_INF && lp->u[j] >= LP_INF) {
-            fprintf(stderr, "free variables (unbounded both sides) not supported at col %d\n", j);
-            goto err;
-        }
+        /* A fully free variable is normalized by solver_create() as x+ - x-
+           with non-negative components, so it is a supported LP input. */
     }
 
     long nnz;
