@@ -401,6 +401,32 @@ void qp_solve(const QP *qp, QPResult *res)
 {
     memset(res, 0, sizeof(*res));
     res->status = -1;
+    int n = qp->n;
+    /* Check Q for symmetry and 1x1/2x2 principal-minor positive semi-definiteness.
+       Reject indefinite or non-symmetric Q immediately instead of iterating. */
+    for (int i = 0; i < n; i++) {
+        if (qp->Q[i*n+i] < -1e-9) {
+            res->status = QP_NON_CONVEX;
+            return;
+        }
+        for (int j = 0; j < n; j++) {
+            double diff = fabs(qp->Q[i*n+j] - qp->Q[j*n+i]);
+            double scale = fmax(1.0, fmax(fabs(qp->Q[i*n+j]), fabs(qp->Q[j*n+i])));
+            if (diff > 1e-8 * scale) {
+                res->status = QP_NON_CONVEX;
+                return;
+            }
+        }
+        for (int j = i + 1; j < n; j++) {
+            double qii = fmax(0.0, qp->Q[i*n+i]);
+            double qjj = fmax(0.0, qp->Q[j*n+j]);
+            double qij = qp->Q[i*n+j];
+            if (qii * qjj - qij * qij < -1e-8 * fmax(1.0, qii * qjj)) {
+                res->status = QP_NON_CONVEX;
+                return;
+            }
+        }
+    }
     double *x = (double*)xmalloc((size_t)qp->n * sizeof(double));
     memset(x, 0, (size_t)qp->n * sizeof(double));
     if (!find_feasible(qp, qp->x0, x)) { free(x); return; }
