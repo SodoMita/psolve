@@ -4,17 +4,36 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
+#include <unistd.h>
+
+static volatile sig_atomic_t g_stop = 0;
+static void on_stop_signal(int signo) { (void)signo; g_stop = 1; }
+static int stop_requested(void) { return (int)g_stop; }
 
 int main(int argc, char **argv)
 {
-    if (argc < 3) {
-        fprintf(stderr, "usage: %s <problem.lp> <nint> <j0 j1 ...> [--print]\n", argv[0]);
+    const char * volatile path = NULL;
+    volatile int print = 0;
+    volatile long time_ms = 0;
+    volatile int arg_idx = 1;
+    while (arg_idx < argc && argv[arg_idx][0] == '-' && strcmp(argv[arg_idx], "--print") != 0) {
+        if (strcmp(argv[arg_idx], "-t") == 0 || strcmp(argv[arg_idx], "--time-limit") == 0) {
+            if (arg_idx + 1 >= argc) { fprintf(stderr, "missing time limit\n"); return 1; }
+            time_ms = atol(argv[++arg_idx]);
+            if (time_ms <= 0) { fprintf(stderr, "invalid time limit\n"); return 1; }
+        } else {
+            fprintf(stderr, "unknown option: %s\n", argv[arg_idx]); return 1;
+        }
+        arg_idx++;
+    }
+    if (arg_idx + 1 >= argc) {
+        fprintf(stderr, "usage: %s [-t ms|--time-limit ms] <problem.lp> <nint> <j0 j1 ...> [--print]\n", argv[0]);
         return 1;
     }
-    const char *path = argv[1];
-    int nint = atoi(argv[2]);
-    int print = 0;
-    for (int a = 3; a < argc; a++) if (strcmp(argv[a], "--print") == 0) print = 1;
+    path = argv[arg_idx++];
+    volatile int nint = atoi(argv[arg_idx++]);
+    for (int a = arg_idx; a < argc; a++) if (strcmp(argv[a], "--print") == 0) print = 1;
 
     if (setjmp(psolve_env) != 0) {
         fprintf(stderr, "mipsolve: %s\n",
@@ -23,13 +42,19 @@ int main(int argc, char **argv)
     }
     psolve_try();
 
+    signal(SIGINT, on_stop_signal);
+    signal(SIGALRM, on_stop_signal);
+    psolve_stop_fn = stop_requested;
+    if (time_ms > 0) alarm((unsigned)((time_ms + 999) / 1000));
+
     LP lp;
     memset(&lp, 0, sizeof(LP));
-    if (lp_read(path, &lp) != 0) { psolve_end(); return 1; }
+    if (lp_read(path, &lp) != 0) { psolve_stop_fn = NULL; psolve_end(); return 1; }
 
     unsigned char *isint = (unsigned char*)calloc((size_t)lp.n, 1);
     int ni = 0;
-    for (int a = 3; a < 3 + nint && a < argc; a++) {
+    for (int a = arg_idx; a < arg_idx + nint && a < argc; a++) {
+        if (strcmp(argv[a], "--print") == 0) continue;
         int j = atoi(argv[a]);
         if (j >= 0 && j < lp.n) { isint[j] = 1; ni++; }
     }
@@ -81,6 +106,8 @@ int main(int argc, char **argv)
     mip_result_free(&res);
     free(isint);
     lp_free(&lp);
+    alarm(0);
+    psolve_stop_fn = NULL;
     psolve_end();
     return 0;
 }
