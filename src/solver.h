@@ -71,6 +71,7 @@ typedef struct {
     double *beq;           /* scaled rhs |b| (equality form), M */
     double *borig;         /* original rhs (with sign), M */
     int *mlt;              /* row sign: +1 if b>=0 else -1, M */
+    int *artSign;          /* sign of each artificial's coefficient (+1/-1), M */
     char *rel;             /* per row: original relation '<' '>' '=' */
 
     /* controls / stats */
@@ -79,7 +80,8 @@ typedef struct {
     int reinvert_interval;
     double hyper_tol;      /* hyper-sparsity skip threshold for PRICE */
     double objval;
-    int status_out;        /* 0 ok, 1 infeasible, 2 unbounded */
+    int status_out;        /* 0 ok, 1 infeasible, 2 unbounded, 3 limit hit */
+    long iteration_limit;  /* max simplex iterations before giving up */
     /* anti-cycling */
     int bland;             /* use Bland's rule (lowest-index) entering */
     long flat;             /* iterations without objective improvement */
@@ -90,6 +92,7 @@ typedef struct {
     double *w;             /* w[j] ~ ||d_j||^2 for nonbasic j */
     double *vw;            /* scratch: v = B^{-T} d */
     double *piw;           /* scratch: pi_p = B^{-T} e_p */
+    double *duals;         /* dual (shadow-price) vector, B^{-T} c_B, M */
 } Solver;
 
 /* API */
@@ -119,5 +122,14 @@ int solver_add_row(Solver *s, const double *a, double rhs, char rel);
 
 /* Re-solve from the current basis (warm start).  Returns status_out. */
 int solver_warm_solve(Solver *s);
+
+/* Sensitivity analysis: dual / shadow prices for the equality-form rows.
+ * dual must be an M-vector.  The dual of row i gives the marginal change in
+ * the objective per unit change in that constraint's right-hand side. */
+void solver_duals(const Solver *s, double *dual);
+
+/* Reduced costs for all original variables (c_j - (dual . A_j)); rc must be
+ * an n_orig-vector. */
+void solver_reduced_costs(const Solver *s, double *rc);
 
 #endif

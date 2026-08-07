@@ -31,6 +31,7 @@ with an explicit baseline `ARCH`.
 ```sh
 ./lpsolve <problem.lp> [--print]      # LP (revised simplex)
 ./qpsolve <qp.qp>                      # convex QP (active-set)
+./mipsolve <problem.lp> <nint> <j...> [--print]   # MIP (branch-and-bound)
 ```
 
 `--print` also dumps the optimal variable values.
@@ -42,6 +43,24 @@ correctly reports `OPTIMAL`, `INFEASIBLE`, or `UNBOUNDED`.
 The QP solver handles: **minimize** ½xᵀQx + cᵀx subject to Ax ≤ b with Q
 symmetric positive semi-definite (convex), reporting the optimum, Lagrange
 multipliers, and status (solved / infeasible).
+
+The MIP solver (`mipsolve <lp> <nint> <j0 j1 ...>`) solves mixed-integer
+programs by **branch-and-bound** over the revised-simplex LP relaxation: the
+listed variables are required to be integer.  It reports the optimal objective,
+the number of B&B nodes, and the incumbent solution.
+
+## Sensitivity analysis (LP)
+
+The LP solver exposes dual (shadow-price) and reduced-cost values:
+
+```c
+double dual[M];  solver_duals(s, dual);           /* shadow prices per row */
+double rc[n];    solver_reduced_costs(s, rc);     /* reduced costs per var */
+```
+
+It also respects a per-solver simplex iteration limit (`s->iteration_limit`,
+default 2,000,000); hitting it returns status `ITERATION_LIMIT` instead of
+running forever on a pathological input.
 
 ## Security & untrusted input
 
@@ -140,13 +159,17 @@ src/kernels.c   AVX-512/AVX2/scalar dense kernels (daxpy, dot, sparse dot)
 src/lu.c        dense LU factorization + forward/back substitution (BTRAN/FTRAN)
 src/splu.c      sparse LU factorization (fill-reducing order + partial pivoting)
                 with hyper-sparse triangular solves
+src/err.c       error-handling protocol (checked allocation, setjmp/longjmp OOM)
 src/solver.c    revised-simplex driver, two-phase method, steepest-edge pricing,
-                sparse/dense dispatch, incremental (warm-start) solving
+                sparse/dense dispatch, incremental (warm-start) solving,
+                shadow prices + iteration limit
+src/mip.c       mixed-integer programming via branch-and-bound
 src/qp.c        convex QP solver (active-set method + Phase-I feasibility)
 src/parser.c    LP file reader
 src/main.c      LP CLI
 tools/qpsolve.c QP CLI
-tools/          generators, differential tester, unit tests, benchmarks
+tools/mipsolve.c MIP CLI
+tools/          generators, differential tester, unit tests, benchmarks, fuzzer
 examples/       sample LP files
 ```
 

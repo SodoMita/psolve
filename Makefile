@@ -21,18 +21,27 @@ LDFLAGS = -pie -Wl,-z,relro,-z,now -Wl,--as-needed -Wl,-z,noexecstack
 CFLAGS   = -std=gnu11 -Wall -Wextra $(OPT) $(ARCH) $(PERF) $(HARDEN)
 LDLIBS   = -lm
 
-SRC = src/kernels.c src/lu.c src/splu.c src/solver.c src/parser.c src/main.c
+SRC = src/err.c src/kernels.c src/lu.c src/splu.c src/solver.c src/parser.c src/main.c
 OBJ = $(SRC:.c=.o)
-QPSRC = src/qp.c src/lu.c src/kernels.c
+QPSRC = src/err.c src/qp.c src/lu.c src/kernels.c
 QPOBJ = $(QPSRC:.c=.o)
 
-all: lpsolve qpsolve
+all: lpsolve qpsolve mipsolve
 
 lpsolve: $(OBJ)
 	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -o $@ $(OBJ) $(LDFLAGS) $(LDLIBS)
 
-qpsolve: src/qp.o src/lu.o src/kernels.o tools/qpsolve.o
+qpsolve: src/err.o src/qp.o src/lu.o src/kernels.o tools/qpsolve.o
 	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -o $@ $^ $(LDFLAGS) $(LDLIBS)
+
+mipsolve: src/err.o src/mip.o src/lu.o src/splu.o src/solver.o src/kernels.o src/parser.o tools/mipsolve.o
+	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -o $@ $^ $(LDFLAGS) $(LDLIBS)
+
+src/mip.o: src/mip.c src/mip.h src/solver.h src/err.h
+	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -I src -c -o $@ $<
+
+tools/mipsolve.o: tools/mipsolve.c src/mip.h src/parser.h src/err.h
+	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -I src -c -o $@ $<
 
 # AddressSanitizer + UndefinedBehaviorSanitizer debug build (not for
 # production): catches memory-safety and UB bugs on malformed input.
@@ -44,6 +53,6 @@ asan: clean
 	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -I src -c -o $@ $<
 
 clean:
-	rm -f lpsolve qpsolve src/*.o tools/*.o
+	rm -f lpsolve qpsolve mipsolve src/*.o tools/*.o
 
 .PHONY: all asan clean

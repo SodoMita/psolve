@@ -125,6 +125,30 @@ bounded LPs (`tools/incr_rand.c`), and the round-trip LP reconstruction is
 validated (it re-scales the equality-form coefficients back to the original
 problem).
 
+## 6b. Mixed-integer programming, sensitivity, robustness
+
+- **MIP (`src/mip.c`)** — branch-and-bound over the simplex LP relaxation:
+  best-bound node ordering, fractional-integer-variable branching, and
+  bound-based pruning.  Verified against brute-force enumeration on random
+  small all-integer problems.
+- **Sensitivity** — the optimal dual (shadow-price) vector `B⁻ᵀc_B` and reduced
+  costs are exposed via `solver_duals` / `solver_reduced_costs`.
+- **Iteration limit** — `solver_solve` honours `s->iteration_limit` and returns
+  status `ITERATION_LIMIT` rather than cycling forever on pathological input.
+- **Error protocol (`src/err.c`)** — allocation failure (and internal solver
+  errors) now unwind through a setjmp/longjmp handler a caller installs with
+  `psolve_try()`, instead of calling `exit(1)`.  The CLI reports a clean error.
+
+### Correct initial basis (boxed variables)
+
+A subtle correctness fix: the initial slack/artificial basis is now computed
+from the *true* residual of each row, accounting for the contributions of
+nonbasic variables at their starting (e.g. positive lower-bound) values, rather
+than assuming every nonbasic is 0.  This makes the solver correctly respect
+positive variable lower bounds and correctly detect infeasible starts (previously
+an infeasible node in branch-and-bound could be mis-reported as a feasible
+fractional point).
+
 ## 7. Honest status and known limitations
 
 - **Correctness:** verified against GLPK on hundreds of random instances —

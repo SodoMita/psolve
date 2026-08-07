@@ -1,11 +1,12 @@
 #include "qp.h"
 #include "lu.h"
+#include "err.h"
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <stdio.h>
 
-static double *xmalloc(size_t n){ void*p=malloc(n); if(!p){fprintf(stderr,"OOM\n");exit(1);} return p; }
+static double *xmalloc(size_t n){ return psolve_malloc(n); }
 
 /* y = Q x + c  (Q column-major) */
 static void eval_grad(const QP *qp, const double *x, double *g)

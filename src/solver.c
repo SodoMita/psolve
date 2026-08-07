@@ -1,18 +1,18 @@
 #include "solver.h"
 #include "lu.h"
 #include "kernels.h"
+#include "err.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
+#include <limits.h>
 
 #define TOL_FEAS 1e-9
 #define TOL_PIV  1e-12
 
 static void *xmalloc(size_t n) {
-    void *p = malloc(n);
-    if (!p) { fprintf(stderr, "out of memory\n"); exit(1); }
-    return p;
+    return psolve_malloc(n);   /* signals PSOLVE_ERR_OOM instead of exit() */
 }
 
 /* forward decls */
@@ -80,14 +80,16 @@ Solver *solver_create(const LP *lp)
     s->w = (double*)xmalloc(N * sizeof(double));
     s->vw = (double*)xmalloc(m * sizeof(double));
     s->piw = (double*)xmalloc(m * sizeof(double));
+    s->duals = (double*)xmalloc(m * sizeof(double));
     for (j = 0; j < N; j++) s->w[j] = 1.0;
     s->slackVar = (int*)xmalloc(m * sizeof(int));
     s->artVar = (int*)xmalloc(m * sizeof(int));
     s->beq = (double*)xmalloc(m * sizeof(double));
     s->borig = (double*)xmalloc(m * sizeof(double));
     s->mlt = (int*)xmalloc(m * sizeof(int));
+    s->artSign = (int*)xmalloc(m * sizeof(int));
     s->rel = (char*)xmalloc(m);
-    for (i = 0; i < m; i++) { s->beq[i] = fabs(lp->b[i]); s->borig[i] = lp->b[i]; s->mlt[i] = (lp->b[i]>=0)?1:-1; s->rel[i] = lp->rel[i]; }
+    for (i = 0; i < m; i++) { s->beq[i] = fabs(lp->b[i]); s->borig[i] = lp->b[i]; s->mlt[i] = (lp->b[i]>=0)?1:-1; s->artSign[i] = 1; s->rel[i] = lp->rel[i]; }
 
     /* determine mlt and transformed rhs */
     for (i = 0; i < m; i++) mlt[i] = (lp->b[i] >= 0) ? 1 : -1;
@@ -146,6 +148,18 @@ Solver *solver_create(const LP *lp)
     s->colptr[N] = (int)pos;
     s->nnz = pos;
 
+    /* Guard against int truncation of the CSC column counts (the arrays are
+       int-typed, so pos must fit in an int).  Also guard the dense basis
+       matrix m*m against size_t overflow (only when m > 0, to avoid a
+       divide-by-zero). */
+    int basis_ok = 1;
+    if (m > 0 && (size_t)m > (size_t)-1 / (size_t)m / sizeof(double)) basis_ok = 0;
+    if (pos > INT_MAX || !basis_ok) {
+        solver_destroy(s);
+        free(mlt);
+        return NULL;
+    }
+
     /* scratch for building the sparse basis each reinversion */
     s->bBp = (int*)xmalloc((m + 1) * sizeof(int));
     s->bBi = (int*)xmalloc((size_t)s->nnz * sizeof(int));
@@ -169,25 +183,64 @@ Solver *solver_create(const LP *lp)
     for (j = 0; j < N; j++) s->cobj[j] = 0.0;
     for (i = 0; i < m; i++) s->cobj[s->artVar[i]] = -1.0;
 
-    /* Initial basis: a '<=' row's slack is feasible at |b|, use it; otherwise
-       use the artificial column.  Phase I only runs if an artificial enters. */
+    /* Initial basis and values.
+       At this point every original variable is nonbasic at its starting value
+       (lower bound if finite, else upper bound).  These nonbasic values
+       contribute to each row's equality:
+            sum_j (mlt_i A_ij) x_j + (slack/artificial coeff) * x_v = |b_i|
+       so the correct initial basic value for row i is
+            x_v = (|b_i| - S_i) / coeff,  S_i = sum_j (mlt_i A_ij) x_j(start).
+       We compute S_i and choose, per row, the slack if it yields a feasible
+       (nonneg) value, otherwise a sign-correct artificial so the artificial
+       value is nonneg and Phase I can drive it to zero. */
     s->needs_phase1 = 0;
     s->negate_obj = maximize ? 0 : 1;
-    for (i = 0; i < m; i++) {
-        int sv = s->slackVar[i];
-        if (sv >= 0 && lp->rel[i] == '<') {
-            s->basis[i] = sv;
-            s->basispos[sv] = i;
-            s->status[sv] = LP_BASIC;
-            s->x[sv] = fabs(lp->b[i]);
-        } else {
-            int av = s->artVar[i];
-            s->basis[i] = av;
-            s->basispos[av] = i;
-            s->status[av] = LP_BASIC;
-            s->x[av] = fabs(lp->b[i]);
-            s->needs_phase1 = 1;
+    {
+        double *S = (double*)calloc((size_t)m, sizeof(double));
+        /* contributions from nonbasic originals at their starting value */
+        for (j = 0; j < n; j++) {
+            double xj = (s->l[j] > -LP_INF) ? s->l[j] : s->u[j];
+            s->x[j] = xj;
+            if (xj == 0.0) continue;
+            for (k = s->colptr[j]; k < s->colptr[j+1]; k++)
+                S[s->row[k]] += s->val[k] * xj;
         }
+        for (i = 0; i < m; i++) {
+            double resid = s->beq[i] - S[i];
+            int sv = s->slackVar[i];
+            int chosen = -1;
+            if (sv >= 0) {
+                /* slack coeff = mlt_i * (rel=='<' ? +1 : -1) */
+                double scoef = (double)mlt[i] * (lp->rel[i] == '<' ? 1.0 : -1.0);
+                double v = resid / scoef;
+                if (v >= -1e-12) {   /* slack value nonneg => feasible start */
+                    chosen = sv;
+                    s->x[sv] = (v > 0.0) ? v : 0.0;
+                }
+            }
+            if (chosen < 0) {
+                /* use an artificial with sign chosen so its value is nonneg */
+                int av = s->artVar[i];
+                double v = (resid >= 0.0) ? resid : -resid;
+                /* store the artificial sign in mlt-like manner via a per-row
+                   factor; the artificial column value was built as +1, so if
+                   resid < 0 we negate the stored coefficient. */
+                s->basis[i] = av;
+                s->basispos[av] = i;
+                s->status[av] = LP_BASIC;
+                s->x[av] = v;
+                s->needs_phase1 = 1;
+                s->artSign[i] = (resid >= 0.0) ? 1 : -1;
+                /* apply the artificial's sign to its stored column coefficient */
+                for (k = s->colptr[av]; k < s->colptr[av+1]; k++)
+                    s->val[k] = (double)s->artSign[i];
+            } else {
+                s->basis[i] = chosen;
+                s->basispos[chosen] = i;
+                s->status[chosen] = LP_BASIC;
+            }
+        }
+        free(S);
     }
 
     for (j = 0; j < n; j++) {
@@ -216,6 +269,7 @@ Solver *solver_create(const LP *lp)
     s->status_out = 0;
     s->objval = 0.0;
     s->hyper_tol = 0.0;
+    s->iteration_limit = 2000000;
 
     /* initial refactorization */
     refactorize(s);
@@ -232,8 +286,8 @@ void solver_destroy(Solver *s)
     free(s->l); free(s->u); free(s->cobj); free(s->c0); free(s->basis); free(s->basispos);
     free(s->status); free(s->x); free(s->rc); free(s->cB);
     free(s->lu); free(s->piv); free(s->y); free(s->d); free(s->v); free(s->xb);
-    free(s->slackVar); free(s->artVar); free(s->beq); free(s->borig); free(s->mlt); free(s->rel);
-    free(s->w); free(s->vw); free(s->piw);
+    free(s->slackVar); free(s->artVar); free(s->beq); free(s->borig); free(s->mlt); free(s->artSign); free(s->rel);
+    free(s->w); free(s->vw); free(s->piw); free(s->duals);
     free(s->colptr); free(s->row); free(s->val);
     splu_free(&s->splu);
     free(s->bBp); free(s->bBi); free(s->bBx);
@@ -684,9 +738,9 @@ static void recompute_basic(Solver *s)
 static int solve_phase(Solver *s)
 {
     int r;
-    long cap = 2000000;   /* safety cap against degeneracy cycling */
+    long cap = s->iteration_limit > 0 ? s->iteration_limit : 2000000;
     while ((r = iterate(s)) == 1) {
-        if (s->iters > cap) { r = -1; break; }   /* cycling / no convergence */
+        if (s->iters > cap) { r = -1; break; }   /* iteration limit / cycling */
     }
     return r;
 }
@@ -735,6 +789,7 @@ int solver_solve(Solver *s)
 
     r = solve_phase(s);
     if (r == 2) { s->status_out = 2; return 2; }
+    if (r == -1) { s->status_out = 3; return 3; }   /* iteration limit hit */
 
     /* objective value */
     double obj = 0.0;
@@ -743,7 +798,40 @@ int solver_solve(Solver *s)
         if (s->status[j] != LP_BASIC) obj += s->cobj[j] * s->x[j];
     s->objval = obj;
     s->status_out = 0;
+
+    /* save dual (shadow-price) values = B^{-T} c_B at the optimum */
+    for (int i = 0; i < s->M; i++) s->cB[i] = s->cobj[s->basis[i]];
+    memcpy(s->duals, s->cB, (size_t)s->M * sizeof(double));
+    {
+        double *tmp = (double*)malloc((size_t)s->M * sizeof(double));
+        if (tmp) {
+            memcpy(tmp, s->duals, (size_t)s->M * sizeof(double));
+            btrans(s, tmp);
+            memcpy(s->duals, tmp, (size_t)s->M * sizeof(double));
+            free(tmp);
+        }
+    }
     return 0;
+}
+
+void solver_duals(const Solver *s, double *dual)
+{
+    /* duals are computed for the internal maximize form; negate if the user's
+       problem was a minimization so the reported shadow prices have the sign
+       consistent with the original objective. */
+    double sign = s->negate_obj ? -1.0 : 1.0;
+    for (int i = 0; i < s->M; i++) dual[i] = sign * s->duals[i];
+}
+
+void solver_reduced_costs(const Solver *s, double *rc)
+{
+    double ytol = 0.0;
+    for (int j = 0; j < s->n_orig; j++) {
+        if (s->status[j] == LP_REMOVED) { rc[j] = 0.0; continue; }
+        rc[j] = s->cobj[j] - k_dsdot_sparse(s->duals,
+                              s->row + s->colptr[j], s->val + s->colptr[j],
+                              (long)(s->colptr[j+1] - s->colptr[j]), ytol);
+    }
 }
 
 void solver_optimum(const Solver *s, double *x_orig, double *obj)

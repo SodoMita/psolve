@@ -1,0 +1,72 @@
+#include "mip.h"
+#include "parser.h"
+#include "err.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+int main(int argc, char **argv)
+{
+    if (argc < 3) {
+        fprintf(stderr, "usage: %s <problem.lp> <nint> <j0 j1 ...> [--print]\n", argv[0]);
+        return 1;
+    }
+    const char *path = argv[1];
+    int nint = atoi(argv[2]);
+    int print = 0;
+    for (int a = 3; a < argc; a++) if (strcmp(argv[a], "--print") == 0) print = 1;
+
+    if (setjmp(psolve_env) != 0) {
+        fprintf(stderr, "mipsolve: %s\n",
+                psolve_code == PSOLVE_ERR_OOM ? "out of memory" : "internal error");
+        return 2;
+    }
+    psolve_try();
+
+    LP lp;
+    memset(&lp, 0, sizeof(LP));
+    if (lp_read(path, &lp) != 0) { psolve_end(); return 1; }
+
+    unsigned char *isint = (unsigned char*)calloc((size_t)lp.n, 1);
+    int ni = 0;
+    for (int a = 3; a < 3 + nint && a < argc; a++) {
+        int j = atoi(argv[a]);
+        if (j >= 0 && j < lp.n) { isint[j] = 1; ni++; }
+    }
+    if (ni == 0) { fprintf(stderr, "no valid integer variables specified\n"); psolve_end(); return 1; }
+
+    MIP mip;
+    mip.n = lp.n; mip.m = lp.m;
+    mip.c = lp.c; mip.Acolptr = lp.Acolptr; mip.Arow = lp.Arow; mip.Aval = lp.Aval;
+    mip.rel = lp.rel; mip.b = lp.b; mip.l = lp.l; mip.u = lp.u;
+    mip.maximize = lp.maximize;
+    mip.isint = isint;
+    mip.mip_gap = 1e-4;
+    mip.node_limit = 200000;
+    mip.lp_iter_limit = 2000000;
+
+    MIPResult res;
+    mip_solve(&mip, &res);
+
+    if (res.status == 0) {
+        printf("status: OPTIMAL\n");
+        printf("objective: %.15g\n", res.obj);
+        printf("nodes: %ld\n", res.nodes);
+        if (print)
+            for (int j = 0; j < lp.n; j++)
+                printf("x[%d] = %.10g\n", j, res.x[j]);
+    } else if (res.status == 1) {
+        printf("status: INFEASIBLE\n");
+    } else if (res.status == 2) {
+        printf("status: UNBOUNDED\n");
+    } else {
+        printf("status: NODE_LIMIT\n");
+        if (res.obj == res.obj) printf("best objective: %.15g\n", res.obj);
+    }
+
+    mip_result_free(&res);
+    free(isint);
+    lp_free(&lp);
+    psolve_end();
+    return 0;
+}

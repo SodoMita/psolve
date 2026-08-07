@@ -4,3 +4,4 @@ qpsolve
 __pycache__/
 *.pyc
 /tmp/
+mipsolve
