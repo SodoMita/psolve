@@ -44,6 +44,12 @@ for s in $(seq 1 40); do
   if python3 tools/qp_gen.py $s 2>/dev/null | grep -q '^OK'; then ok=$((ok+1)); else fail=$((fail+1)); fi
 done
 echo "  QP vs scipy: OK=$ok FAIL=$fail"
+# qp_gen only builds strictly positive-definite Q.  qp_diff also covers
+# singular PSD Q, Q=0, m=0 and duplicated rows, and certifies the answer with
+# the KKT conditions (necessary AND sufficient for a convex QP) plus an exact
+# recession-direction test, so it catches infeasible/unbounded/non-stationary
+# points that an objective comparison against SLSQP cannot.
+python3 tools/qp_diff.py 200 4242 | head -2
 
 echo "[5.5/7] MIP solver (branch-and-bound) vs brute force..."
 gcc -O2 -march=native -I src tools/mip_test.c src/mip.c src/err.c src/solver.c src/splu.c src/lu.c src/kernels.c src/parser.c -o /tmp/mip_test -lm

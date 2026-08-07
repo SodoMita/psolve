@@ -281,6 +281,50 @@ linear/quadratic and well-structured MIP models.
 ### Phase 3 first-cut deliverable: `fznsolve <x.fzn>` solves the linear subset,
 with tests in `examples/fzn/` and `test.sh` (incl. the MiniZinc differential).
 
+### Fixed: QP returned infeasible / non-optimal points as solved
+`qp.h` promises symmetric **PSD** Q, but every existing test built a strictly
+positive-definite one, so the singular case was unexercised.  A KKT-certificate
+sweep (`tools/qp_diff.py`) over singular PSD Q, `Q = 0`, `m = 0` and duplicated
+rows found ~5% of instances answered wrongly.  Causes and fixes:
+
+- **The ratio test could take a negative step.**  For a constraint that was
+  already numerically violated, `-resid/ap` is negative and it was accepted as
+  the blocking step, moving the iterate backwards along `p` -- uphill, and
+  further outside the feasible region.  Negative ratios are now clamped to a
+  zero-length blocking step (standard degenerate-step handling).
+- **A singular KKT matrix was not detected.**  `lu_factor()` does not always
+  fail on a singular system; it can return a tiny pivot and a wildly wrong
+  solve, which was taken at face value.  The solve is now verified against the
+  original matrix and, if the residual is not small, the Q block is
+  regularized and the system refactorized.
+- **Success was certified from stationarity alone.**  A point could be
+  stationary and still violate a constraint (worst on duplicated/parallel rows,
+  where only one of the pair is rank-independent enough to enter the working
+  set).  Primal feasibility and complementary slackness are now required too,
+  and `find_feasible()` verifies its Phase-I answer against the original rows
+  instead of inferring feasibility from the slack sum.
+- **The stationarity tolerance scaled with the objective value.**  On an
+  unbounded QP the iterate ran to 1e26, the objective to 1e36, and the
+  `1e-6*(1+|obj|)` tolerance with it, so a meaningless point passed as optimal.
+  The tolerance now scales with the magnitude of the terms being cancelled, and
+  a divergence guard stops the loop when the iterate runs away.
+- **Unbounded QPs ground to the iteration limit.**  Added a recession-direction
+  certificate (`Q d = 0`, `A d <= 0`, `g.d < 0`): honest `UNBOUNDED` instead of
+  4,000 wasted iterations.  Its tolerances are deliberately one-sided -- a row
+  with even a rounding-level positive slope disqualifies the ray -- so a failed
+  certificate degrades to the old iteration limit rather than risking a wrong
+  answer.
+- `solve_kkt()` now takes one scratch allocation per call instead of three
+  (Phase 4 wants zero per-frame allocation; this at least moves the right way).
+  A 2-variable indefinite case dropped from 12,917 allocations to 8,617, and a
+  well-posed one from 26 to 23.
+
+`tools/qp_diff.py` verifies with the KKT conditions themselves -- necessary and
+sufficient for a convex QP, so no second optimizer has to converge -- plus an
+exact LP recession test for boundedness and a HiGHS feasibility test for the
+"no feasible start" status.  Old binary: 10-12 wrong per 200.  Now: 0 over
+1,000 instances.
+
 ### Fixed: MIP reported suboptimal points as OPTIMAL
 Two independent defects made branch-and-bound return a feasible-but-suboptimal
 point labelled `OPTIMAL` on roughly 10% of randomly generated instances.
