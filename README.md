@@ -274,14 +274,40 @@ x[3] = 4
 
 ## Correctness & testing
 
+`./test.sh` runs everything.  The individual differential/property tests, each
+of which answers a specific "could this solver lie to me?" question:
+
 ```sh
-python3 tools/sweep.py        # 100+ random bounded LPs vs GLPK (objective match)
-python3 tools/difftest.py 200 0.4   # incl. infeasible/unbounded detection vs GLPK
+python3 tools/sweep.py              # random bounded LPs vs GLPK (objective)
+python3 tools/difftest.py 200 0.4   # LP incl. infeasible/unbounded status vs GLPK
+python3 tools/mip_diff.py 400       # MIP status + objective + returned point vs
+                                    #   exhaustive enumeration
+python3 tools/qp_diff.py 200        # QP answers checked against the KKT conditions
+                                    #   (necessary AND sufficient when convex)
+python3 tools/fx_exact_test.py 200  # exact-rational LP verified in Python Fractions
+python3 tools/table_verify.py 250   # FlatZinc table constraint vs brute force
+python3 tools/fuzz_inputs.py --iters 200   # malformed .lp/.qp under ASan/UBSan
+python3 tools/fuzz_fzn.py --iters 200      # malformed .fzn under ASan/UBSan
+python3 tools/oom_test.py --full    # fail every allocation in turn; no crash
 ```
 
-The solver is verified against GLPK (`glpsol`) on hundreds of randomized
-instances: it matches the objective on all well-conditioned problems and agrees
-on infeasible/unbounded status in the vast majority of cases.
+The design rule these enforce is *never report a wrong answer*: an honest
+`INFEASIBLE`, `UNBOUNDED`, `ITERATION_LIMIT`, `FEASIBLE` (not proven optimal) or
+`UNKNOWN` always beats a fabricated optimum.  So the tests do not just compare
+objectives with a reference solver -- they check the **status** and validate the
+**returned point** independently:
+
+- `mip_diff` requires the printed solution to be integral, inside its bounds,
+  to satisfy every row, and to evaluate to the reported objective, and it
+  compares the status against exhaustive enumeration of the integer box.
+- `qp_diff` certifies with the KKT conditions plus an exact LP recession test,
+  so it does not depend on a second optimizer converging, and it separates
+  "hit the iteration limit on a genuinely unbounded problem" from a real gap.
+- `oom_test` censuses how many allocations a run makes and then fails each one
+  in turn, requiring a clean exit every time.
+
+See [`docs/AUDIT.md`](docs/AUDIT.md) for the wrong-answer bugs this suite was
+written to catch and what each of them was.
 
 ## Design
 
