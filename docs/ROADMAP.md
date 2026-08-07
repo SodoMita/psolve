@@ -75,6 +75,12 @@ is a different algorithm family tuned for that latency.
   reification encodings), which then produced wrong or divergent answers.  Now a
   basic artificial at zero (a redundant row) is left basic but *pinned at 0*, so
   it preserves rank without absorbing infeasibility.
+- **Free variables**: LP and MIP inputs may now use `-inf inf`. The simplex
+  normalizes each such caller-visible `x` as `x⁺ − x⁻` with non-negative
+  components, while solution certificates, reduced costs, warm starts, and
+  row additions retain the original API dimension. Free→bounded and
+  bounded→free incremental updates rebuild safely; LP/MIP regressions cover
+  positive/negative optima, unboundedness, and branching.
 - **Parser**: objective sense is validated (rejects `garbage`); the O(nnz²)
   insertion sort for triplets was replaced with a linear counting sort.
 - **Allocation discipline**: added `psolve_realloc` / `psolve_calloc` /
@@ -154,16 +160,23 @@ feature completeness against a huge standard corpus.
       name→index map, array index ranges, annotations (`::output_var`,
       `::output_array`, `:: domain`), solve item (satisfy/minimize/maximize).
 - [x] **Domain forms**: both `var int: x :: 1..10` (annotation) and
-      `var 1..10: x` (shorthand) are read into variable bounds.
-- [x] **Constraint dispatch**: `int_lin_eq/le` (native), `int_eq/le/lt/ge/gt`,
-      `bool_eq/le/lt`, `bool_not`, `int_plus/minus` — linear subset mapped to
-      the LP solver.
-- [x] **Bridge**: big-M clamping of unbounded `var int`, LP solve, FlatZinc
-      output (`x = v;`, `array1d(...)`, status markers) + `%%%mzn-stat`.
+      `var 1..10: x` (shorthand) are read into variable bounds; decimal
+      shorthand domains infer `var float` correctly.
+- [x] **Constraint dispatch**: exact integer/bool `*_lin_eq/le/lt/ge/gt` and
+      scalar relations, plus the continuous linear float subset
+      (`float_lin_eq/le/ge`, `float_eq/le/ge`, arithmetic linearizations).
+      Integer strict rows use the adjacent lattice value rather than a
+      non-strict relaxation.
+- [x] **Bridge**: finite fallback boxes for otherwise unbounded vars, LP solve,
+      type-faithful FlatZinc output (`x = v;`, `array1d(...)`, status markers)
+      + `%%%mzn-stat`.  A claimed optimization result whose objective-bearing
+      variable reaches a synthetic box bound is `UNKNOWN`, never a fake optimum.
 - [x] **Par-array declarations** (`array[1..n] of int: C = [...]`) incl. the
       bare-`array` form MiniZinc emits (no `par` keyword).
 - [x] **Var-array aliasing**: `array[..] of var int: take = [X0,X1,...]` maps
-      `take[e]` to the underlying vars so output arrays print correctly.
+      `take[e]` to the underlying vars so output arrays print correctly. Mixed
+      views and compiler-propagated literals (e.g. `take = [X0,3]`) are retained
+      exactly instead of creating unconstrained replacement variables.
 - [x] **bool vars** bounded to [0,1]; array output uses `array1d(lo..hi,[..])`.
 - [x] More handlers: `bool_and/or/xor/not/clause(+reif)`, `array_bool_and/or`,
       `int_neg` (fixed an `array_bool_and` constraint-sign bug).
@@ -172,15 +185,31 @@ feature completeness against a huge standard corpus.
       `set_in` + set-domain decls (SOS1), `bool2int`/`int2float`,
       `all_different` (exact domain/permutation encoding),
       `array_int_element` + `gecode_int_element` (SOS1 element lookup).
-- [x] Reified forms: `int_eq_reif`, `int_le_reif`, `int_lt_reif`,
-      `int_ge_reif`, `int_gt_reif`, `bool_eq_reif`, `bool_le_reif` (big-M with a
-      binary, incl. constant reification values); `int_lin_ne`/`bool_lin_ne`
-      (SOS1).  Fixed big-M sign bugs in the != / ne encodings.
+- [x] Reified forms: exact `int_eq/le/lt/ge/gt_reif` and bool counterparts,
+      including constant reifiers.  Equality uses an explicit positive/negative
+      side selector, so `r = false` really means `a != b` rather than an
+      impossible conjunction; the full small-domain truth table is regression
+      tested. `int_lin_ne`/`bool_lin_ne` use the same exact selector.
 - [x] `int_lin_ge`/`int_lin_gt`/`bool_lin_ge`; `fzn_count_eq`/`fzn_among_eq`
       (exact via per-variable `[x_i==v]` binary + a side-selector binary for the
       `x_i!=v` OR; fixed an AND-vs-OR encoding bug).
-- [ ] More handlers: `float_*` relational variants, `cumulative`, `circuit`,
-      `table`.
+- [x] **Continuous linear float subset**: decimal-domain inference, scalar and
+      array float output, `float_lin_eq/le/ge`, `float_eq/le/ge`,
+      `float_plus/minus/neg`, constant-operand multiplication and
+      constant-denominator division. Strict float comparisons intentionally
+      remain `UNKNOWN` (an LP cannot represent their open feasible sets without
+      inventing an arbitrary epsilon).
+- [x] **Extensional table**: `gecode_table_int`, `fzn_table_int`, and
+      `table_int` use one binary per permitted row, exactly one row selected,
+      and equality rows for every tuple component. The compact exact encoding is
+      bounded to 1,024 rows / 65,536 cells on untrusted input; larger tables
+      return `UNKNOWN` rather than exhausting resources. Real Gecode-generated
+      `.fzn` plus literal-propagation regressions are covered.
+- [x] **Hamiltonian circuit**: `gecode_circuit(offset,x)`, `fzn_circuit(x)`,
+      and `circuit(x)` use a binary successor matrix plus MTZ order rows. This
+      rules out self arcs and disconnected subtours exactly (including Gecode's
+      zero-based offset form); the exact O(n²) model is capped at 64 nodes.
+- [ ] More handlers: nonlinear/reified float relations, `cumulative`.
 - [x] **MIP bridge**: when the model has integer vars, `fz_solve` dispatches to
       the MIP branch-and-bound so answers are integral (objectives match brute
       force, e.g. knapsack=10, prod3=57).

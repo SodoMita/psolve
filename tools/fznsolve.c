@@ -28,8 +28,7 @@ static Options parse_args(int argc, char**argv){
 int main(int argc,char**argv)
 {
     Options opt = parse_args(argc, argv);
-    const char* path = opt.path;
-    if (!path) { fprintf(stderr,"usage: %s [options] <problem.fzn>\n",argv[0]);
+    if (!opt.path) { fprintf(stderr,"usage: %s [options] <problem.fzn>\n",argv[0]);
         fprintf(stderr,"  -n N   node limit   -s stats   -v verbose\n"); return 1; }
 
     /* Install error handler inside a helper so local non-volatile vars are
@@ -53,7 +52,7 @@ int main(int argc,char**argv)
 
     {
         struct timespec t0,t1; clock_gettime(CLOCK_MONOTONIC,&t0);
-        if (fz_read(path, &m) != 0) { psolve_end(); rc = 1; goto done; }
+        if (fz_read(opt.path, &m) != 0) { psolve_end(); rc = 1; goto done; }
         fz_solve(&m, &sol);
         clock_gettime(CLOCK_MONOTONIC,&t1);
         secs = (t1.tv_sec-t0.tv_sec)+(t1.tv_nsec-t0.tv_nsec)/1e9;

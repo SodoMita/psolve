@@ -3,6 +3,7 @@ lpsolve
 qpsolve
 __pycache__/
 *.pyc
+*.ozn
 /tmp/
 mipsolve
 pgbench

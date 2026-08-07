@@ -51,13 +51,12 @@ with an explicit baseline `ARCH`.
 `--print` also dumps the optimal variable values.
 
 The LP solver handles: **maximize or minimize**, `<`, `>`, and `=` constraints,
-variables with lower, upper, or boxed bounds (each finite bound may be
-`inf`/`-inf`, i.e. unbounded on that side), and correctly reports `OPTIMAL`,
-`INFEASIBLE`, `UNBOUNDED`, `NUMERICAL_FAILURE`, or `ITERATION_LIMIT`.
-
-> Note: a fully free variable (unbounded on *both* sides) is not yet supported —
-> each variable must have at least one finite bound. The `.lp` parser rejects
-> `-inf inf` with a clear error rather than silently producing a wrong answer.
+variables with lower, upper, boxed, or fully free bounds (use `-inf inf`), and
+correctly reports `OPTIMAL`, `INFEASIBLE`, `UNBOUNDED`, `NUMERICAL_FAILURE`, or
+`ITERATION_LIMIT`. A free variable is normalized internally as the difference
+of two non-negative variables; the public LP/MIP APIs, printed solution, warm
+starts, and added-row path continue to use the original variable dimension.
+See `examples/free_vars.lp` for a runnable model.
 
 The QP solver handles: **minimize** ½xᵀQx + cᵀx subject to Ax ≤ b with Q
 symmetric positive semi-definite (convex), reporting the optimum, Lagrange
@@ -193,7 +192,7 @@ maximize|minimize
 <rel[0..m-1]>            # one token of m concatenated relation chars, each '<' '>' '='
                         #   (e.g. <<=<< means <, <, =, <, <).  Use single chars
                         #   only: '<' already means "<=" and '>' means ">=".
-<lo_1> <hi_1>            # per variable: bounds, 'inf' for unbounded
+<lo_1> <hi_1>            # per variable: bounds; '-inf inf' is fully free
 ...
 <nnz>
 <row> <col> <value>      # nnz sparse entries (0-indexed), any order
@@ -252,18 +251,29 @@ integration point used by [SmazkaVG](https://github.com/SodoMita/SmazkaVG).
 ## FlatZinc (Phase 3, linear subset)
 
 `fznsolve <problem.fzn>` reads a MiniZinc-compiled FlatZinc file and solves the
-linear subset it can handle natively with the LP solver (and the MIP solver
-when integer variables are present, so answers are integral):
+linear plus selected exact finite-domain global-constraint subset natively with
+the LP solver (and the MIP solver when integer variables are present, so answers
+are integral):
 
-- **Declarations**: `par`/`var` int/float/bool, scalar + arrays, name→index,
-  annotations, domains in both `var 1..10:` shorthand and `::`-annotation forms.
-- **Constraints**: `int_lin_eq/le`, `int_eq/le/lt/ge/gt`, `bool_eq/le/lt`,
-  `bool_and/or/xor/not/clause`, `array_bool_and/or`, `int_plus/minus/neg`,
-  `int_abs/max/min`, `int_times` (constant operand), `set_in` + set domains,
-  `all_different`, `array_int_element`, `bool2int`/`int2float`, reified
-  `int_eq/le/lt/ge/gt_reif`, `int_lin_ne`, `int_lin_ge`, `count`/`among`.
-- **Solve**: satisfy / minimize / maximize; FlatZinc output (`x = v;`,
-  `array1d(...)`, status markers), objective always, and `-s` stats
+- **Declarations**: `par`/`var` int/float/bool (including bare scalar
+  parameters such as `int: n = 4;`), scalar + arrays with their original index
+  ranges, annotations, and domains in both `var 1..10:` shorthand and
+  `::`-annotation forms. Decimal shorthand domains infer `var float`; var-array
+  aliases retain compiler-propagated literal elements such as `x = [1,3]`.
+- **Constraints**: exact integer/bool `*_lin_eq/le/lt/ge/gt` and
+  `*_eq/le/lt/ge/gt` relations; `int_eq/le/lt/ge/gt_reif` and their bool
+  counterparts; `int_lin_ne`, `count`/`among`; boolean logic; `int_abs/max/min`,
+  `int_times` (constant operand), `set_in` + set domains, `all_different`,
+  `array_int_element`, exact Gecode/standard integer `table` (up to 1,024 rows)
+  and Hamiltonian `circuit` constraints (up to 64 nodes), `bool2int`/`int2float`;
+  and the continuous linear float
+  subset `float_lin_eq/le/ge`, `float_eq/le/ge`, `float_plus/minus/neg`,
+  constant-operand `float_times`, and constant-denominator `float_div`; see
+  `examples/fzn/float_lin.fzn` for a runnable continuous model,
+  `examples/fzn/table.fzn` for an exact extensional table, and
+  `examples/fzn/circuit.fzn` for a Hamiltonian successor circuit.
+- **Solve**: satisfy / minimize / maximize; type-faithful FlatZinc output
+  (including full-precision float values and declared array indices), objective always, and `-s` stats
   (`nodes`, `objectiveBound`); `-n` node limit and `-t`/SIGINT time limits are
   enforced via a cooperative abort polled in the LP simplex and B&B loops.
   Usage: `fznsolve [-n N] [-t ms] [-s] [-v] <x.fzn>`.
@@ -271,8 +281,12 @@ when integer variables are present, so answers are integral):
   with the MiniZinc compiler and checks fznsolve against Gecode (objectives
   match, e.g. knapsack=10, prod3=57).  See `examples/mzn/`.
 - Nonlinear/unhandled constraints return `=====UNKNOWN=====` (never a wrong
-  answer).  See `docs/ROADMAP.md` for a known Phase-I degeneracy limitation
-  (equality + fixed variables) and the remaining handler list.
+  answer).  In particular, strict continuous `float_lt`/`float_gt` predicates
+  are deliberately not relaxed to non-strict LP rows: their feasible sets are
+  open.  An optimization result that reaches the bridge's synthetic bound for
+  an otherwise unbounded objective-bearing variable is likewise `UNKNOWN`, not
+  a fake optimum.
+  See `docs/ROADMAP.md` for the remaining handler list.
 
 ## Layout
 

@@ -76,6 +76,18 @@ def gen_wellformed(rng):
         L.append(f"constraint all_different([{', '.join(names)}]);")
     if rng.random() < 0.3:
         L.append(f"constraint set_in({names[rng.randint(0,n-1)]}, {{{', '.join(map(str,range(rng.randint(0,8))))}}});")
+    # exact extensional table (the common Gecode-generated flattened form)
+    if n >= 1 and rng.random() < 0.3:
+        k = rng.randint(1, min(n, 3))
+        vs = rng.sample(range(n), k)
+        rows = rng.randint(1, 5)
+        tuples = [rng.randint(-5, 5) for _ in range(rows * k)]
+        L.append(f"constraint gecode_table_int([{', '.join(names[i] for i in vs)}], [{', '.join(map(str, tuples))}]);")
+    # small native Gecode circuit form, including constant-propagated views
+    if rng.random() < 0.15:
+        k = rng.randint(1, 6)
+        cycle = list(range(2, k + 1)) + [1]
+        L.append(f"constraint gecode_circuit(1, [{', '.join(map(str, cycle))}]);")
     # reified
     if n >= 2 and rng.random() < 0.3:
         a, b = rng.sample(range(n), 2)

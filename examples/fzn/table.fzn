@@ -1,0 +1,8 @@
+% Exact extensional table: allowed tuples are (1,2), (2,3), (3,1).
+predicate gecode_table_int(array [int] of var int: x, array [int] of int: t);
+array [1..6] of int: tuples = [1,2,2,3,3,1];
+var 2..3: x1 :: output_var;
+var 1..3: x2 :: output_var;
+array [1..2] of var int: x :: output_array([1..2]) = [x1,x2];
+constraint gecode_table_int(x, tuples);
+solve maximize x2;

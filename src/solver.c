@@ -23,7 +23,10 @@ static void recompute_basic(Solver *s);
 /* ------------------------------------------------------------------ */
 /* Construction                                                        */
 /* ------------------------------------------------------------------ */
-Solver *solver_create(const LP *lp)
+/* Construct the simplex tableau for an LP whose decision variables already
+ * each have at least one finite bound.  The public solver_create() below
+ * normalizes fully free caller variables before reaching this routine. */
+static Solver *solver_create_internal(const LP *lp)
 {
     int i, j, k;
     int n = lp->n, m = lp->m;
@@ -40,7 +43,7 @@ Solver *solver_create(const LP *lp)
 
     Solver *s = (Solver*)xmalloc(sizeof(Solver));
     memset(s, 0, sizeof(Solver));
-    s->N = N; s->n_orig = n; s->M = m;
+    s->N = N; s->n_orig = n; s->n_core = n; s->M = m;
     s->reinvert_interval = 100;
     s->hyper_tol = 0.0;
     s->use_sparse = 0;      /* decided per-basis in refactorize */
@@ -277,12 +280,116 @@ Solver *solver_create(const LP *lp)
     return s;
 }
 
+static int lp_var_is_free(double lo, double hi)
+{
+    return lo <= -LP_INF && hi >= LP_INF;
+}
+
+static void free_normalized_lp(LP *lp)
+{
+    free(lp->c); free(lp->l); free(lp->u);
+    free(lp->Acolptr); free(lp->Arow); free(lp->Aval);
+    memset(lp, 0, sizeof(*lp));
+}
+
+/* Public construction path.  Revised simplex needs every nonbasic variable
+ * to sit at a bound, so normalize a caller-visible free variable x into
+ * x+ - x-, x+,x- >= 0.  This is an exact linear transformation: the positive
+ * column is A_j, the negative column is -A_j, and their costs are c_j/-c_j.
+ * The mapping is retained for solution, sensitivity, and incremental APIs. */
+Solver *solver_create(const LP *lp)
+{
+    if (!lp || lp->n <= 0 || lp->m < 0 || !lp->c || !lp->l || !lp->u ||
+        !lp->Acolptr || (lp->m > 0 && (!lp->b || !lp->rel))) return NULL;
+
+    int n = lp->n;
+    int *orig_pos = (int*)xmalloc((size_t)n * sizeof(int));
+    int *orig_neg = (int*)xmalloc((size_t)n * sizeof(int));
+    int nfree = 0;
+    for (int j = 0; j < n; j++) if (lp_var_is_free(lp->l[j], lp->u[j])) nfree++;
+    /* ncore+1 is stored in an int-sized CSC pointer array. */
+    if (n >= INT_MAX || nfree > INT_MAX - n - 1) {
+        free(orig_pos); free(orig_neg); return NULL;
+    }
+    int ncore = n + nfree;
+    int next = 0;
+    for (int j = 0; j < n; j++) {
+        orig_pos[j] = next++;
+        orig_neg[j] = lp_var_is_free(lp->l[j], lp->u[j]) ? next++ : -1;
+    }
+
+    Solver *s = NULL;
+    if (nfree == 0) {
+        s = solver_create_internal(lp);
+    } else {
+        LP norm; memset(&norm, 0, sizeof(norm));
+        norm.n = ncore; norm.m = lp->m; norm.maximize = lp->maximize;
+        norm.b = lp->b; norm.rel = lp->rel; /* copied by the internal builder */
+        norm.c = (double*)xmalloc((size_t)ncore * sizeof(double));
+        norm.l = (double*)xmalloc((size_t)ncore * sizeof(double));
+        norm.u = (double*)xmalloc((size_t)ncore * sizeof(double));
+
+        long nnz = 0;
+        for (int j = 0; j < n; j++) {
+            long cnt = (long)lp->Acolptr[j+1] - lp->Acolptr[j];
+            long mult = orig_neg[j] >= 0 ? 2L : 1L;
+            if (cnt < 0 || cnt > (LONG_MAX - nnz) / mult) {
+                free_normalized_lp(&norm); free(orig_pos); free(orig_neg); return NULL;
+            }
+            nnz += cnt * mult;
+        }
+        if (nnz > INT_MAX) {
+            free_normalized_lp(&norm); free(orig_pos); free(orig_neg); return NULL;
+        }
+        norm.Acolptr = (int*)xmalloc((size_t)(ncore + 1) * sizeof(int));
+        norm.Arow = (int*)xmalloc((size_t)(nnz ? nnz : 1) * sizeof(int));
+        norm.Aval = (double*)xmalloc((size_t)(nnz ? nnz : 1) * sizeof(double));
+
+        long pos = 0;
+        for (int j = 0; j < n; j++) {
+            int p = orig_pos[j], q = orig_neg[j];
+            norm.c[p] = lp->c[j];
+            norm.l[p] = q >= 0 ? 0.0 : lp->l[j];
+            norm.u[p] = q >= 0 ? LP_INF : lp->u[j];
+            norm.Acolptr[p] = (int)pos;
+            for (int k = lp->Acolptr[j]; k < lp->Acolptr[j+1]; k++) {
+                norm.Arow[pos] = lp->Arow[k]; norm.Aval[pos] = lp->Aval[k]; pos++;
+            }
+            if (q >= 0) {
+                norm.c[q] = -lp->c[j]; norm.l[q] = 0.0; norm.u[q] = LP_INF;
+                norm.Acolptr[q] = (int)pos;
+                for (int k = lp->Acolptr[j]; k < lp->Acolptr[j+1]; k++) {
+                    norm.Arow[pos] = lp->Arow[k]; norm.Aval[pos] = -lp->Aval[k]; pos++;
+                }
+            }
+        }
+        norm.Acolptr[ncore] = (int)pos;
+        s = solver_create_internal(&norm);
+        free_normalized_lp(&norm);
+    }
+    if (!s) { free(orig_pos); free(orig_neg); return NULL; }
+
+    s->n_orig = n;
+    s->n_core = ncore;
+    s->orig_pos = orig_pos;
+    s->orig_neg = orig_neg;
+    s->orig_c = (double*)xmalloc((size_t)n * sizeof(double));
+    s->orig_l = (double*)xmalloc((size_t)n * sizeof(double));
+    s->orig_u = (double*)xmalloc((size_t)n * sizeof(double));
+    memcpy(s->orig_c, lp->c, (size_t)n * sizeof(double));
+    memcpy(s->orig_l, lp->l, (size_t)n * sizeof(double));
+    memcpy(s->orig_u, lp->u, (size_t)n * sizeof(double));
+    s->rebuild_pending = 0;
+    return s;
+}
+
 void solver_destroy(Solver *s)
 {
     if (!s) return;
     for (int i = 0; i < s->eta_cap; i++) free(s->eta[i]);
     free(s->eta); free(s->eta_piv);
     free(s->l); free(s->u); free(s->cobj); free(s->c0); free(s->basis); free(s->basispos);
+    free(s->orig_pos); free(s->orig_neg); free(s->orig_c); free(s->orig_l); free(s->orig_u);
     free(s->status); free(s->x); free(s->rc); free(s->cB);
     free(s->lu); free(s->piv); free(s->y); free(s->d); free(s->v); free(s->xb);
     free(s->slackVar); free(s->artVar); free(s->beq); free(s->borig); free(s->mlt); free(s->artSign); free(s->rel);
@@ -874,71 +981,148 @@ void solver_reduced_costs(const Solver *s, double *rc)
 {
     double ytol = 0.0;
     for (int j = 0; j < s->n_orig; j++) {
-        if (s->status[j] == LP_REMOVED) { rc[j] = 0.0; continue; }
-        rc[j] = s->cobj[j] - k_dsdot_sparse(s->duals,
-                              s->row + s->colptr[j], s->val + s->colptr[j],
-                              (long)(s->colptr[j+1] - s->colptr[j]), ytol);
+        /* The direct/positive component has exactly the user's column A_j
+           and objective coefficient c_j, so its reduced cost is the reduced
+           cost of the original direction even when x_j = x_j+ - x_j-. */
+        int p = s->orig_pos[j];
+        if (s->status[p] == LP_REMOVED) { rc[j] = 0.0; continue; }
+        rc[j] = s->cobj[p] - k_dsdot_sparse(s->duals,
+                              s->row + s->colptr[p], s->val + s->colptr[p],
+                              (long)(s->colptr[p+1] - s->colptr[p]), ytol);
     }
 }
 
 void solver_optimum(const Solver *s, double *x_orig, double *obj)
 {
-    for (int j = 0; j < s->n_orig; j++) x_orig[j] = s->x[j];
+    for (int j = 0; j < s->n_orig; j++) {
+        int p = s->orig_pos[j], q = s->orig_neg[j];
+        x_orig[j] = s->x[p] - (q >= 0 ? s->x[q] : 0.0);
+    }
     *obj = s->negate_obj ? -s->objval : s->objval;
 }
 
 void solver_set_objective(Solver *s, const double *c, int maximize)
 {
     s->negate_obj = maximize ? 0 : 1;
-    for (int j = 0; j < s->n_orig; j++) s->c0[j] = maximize ? c[j] : -c[j];
+    for (int j = 0; j < s->n_orig; j++) {
+        int p = s->orig_pos[j], q = s->orig_neg[j];
+        double cj = maximize ? c[j] : -c[j];
+        s->orig_c[j] = c[j];
+        s->c0[p] = cj;
+        if (q >= 0) s->c0[q] = -cj;
+    }
     memcpy(s->cobj, s->c0, (size_t)s->N * sizeof(double));
     /* slacks/artificials keep zero objective (already 0 after Phase II) */
 }
 
 void solver_set_bounds(Solver *s, const double *l, const double *u)
 {
-    for (int j = 0; j < s->n_orig; j++) { s->l[j] = l[j]; s->u[j] = u[j]; }
+    int topology_changed = s->rebuild_pending;
+    for (int j = 0; j < s->n_orig; j++) {
+        int was_free = s->orig_neg[j] >= 0;
+        int now_free = lp_var_is_free(l[j], u[j]);
+        if (was_free != now_free) topology_changed = 1;
+        s->orig_l[j] = l[j]; s->orig_u[j] = u[j];
+    }
+    if (topology_changed) {
+        /* Switching a variable between free and bounded changes the number of
+           normalized columns.  Rebuild on the next warm solve rather than
+           corrupting the live basis with an incompatible mapping. */
+        s->rebuild_pending = 1;
+        return;
+    }
+    for (int j = 0; j < s->n_orig; j++) {
+        int p = s->orig_pos[j];
+        if (s->orig_neg[j] < 0) { s->l[p] = l[j]; s->u[p] = u[j]; }
+    }
 }
 
-/* Reconstruct the original LP from the current solver state and do a clean
- * full re-solve, swapping the result into *s.  Used as a robust fallback when
- * an incremental change makes the warm-start basis infeasible. */
-static void solver_refresh(Solver *s)
+/* Export the caller-visible LP from the normalized tableau.  The positive
+ * component of every mapped variable is the original A column, so the original
+ * sparse CSC can be recovered without retaining a second matrix copy. */
+static void free_exported_lp(LP *lp)
+{
+    free(lp->c); free(lp->l); free(lp->u); free(lp->b); free(lp->rel);
+    free(lp->Acolptr); free(lp->Arow); free(lp->Aval);
+    memset(lp, 0, sizeof(*lp));
+}
+
+static int solver_export_lp(const Solver *s, const double *new_a,
+                            double new_rhs, char new_rel, LP *lp)
 {
     int n = s->n_orig, m = s->M;
-    LP lp; memset(&lp, 0, sizeof(lp));
-    lp.n = n; lp.m = m; lp.maximize = !s->negate_obj;
-    lp.c  = (double*)xmalloc(n * sizeof(double));
-    lp.l  = (double*)xmalloc(n * sizeof(double));
-    lp.u  = (double*)xmalloc(n * sizeof(double));
-    lp.b  = (double*)xmalloc(m * sizeof(double));
-    lp.rel = (char*)xmalloc(m);
+    int add = new_a != NULL;
+    int mout = m + add;
+    if (n <= 0 || m < 0 || (add && (new_rel != '<' && new_rel != '>' && new_rel != '=')))
+        return -1;
+    memset(lp, 0, sizeof(*lp));
+    lp->n = n; lp->m = mout; lp->maximize = !s->negate_obj;
+    lp->c = (double*)xmalloc((size_t)n * sizeof(double));
+    lp->l = (double*)xmalloc((size_t)n * sizeof(double));
+    lp->u = (double*)xmalloc((size_t)n * sizeof(double));
+    lp->b = (double*)xmalloc((size_t)(mout ? mout : 1) * sizeof(double));
+    lp->rel = (char*)xmalloc((size_t)(mout ? mout : 1));
     for (int j = 0; j < n; j++) {
-        lp.c[j] = s->negate_obj ? -s->c0[j] : s->c0[j];
-        lp.l[j] = s->l[j]; lp.u[j] = s->u[j];
+        lp->c[j] = s->orig_c[j];
+        lp->l[j] = s->orig_l[j]; lp->u[j] = s->orig_u[j];
     }
-    for (int i = 0; i < m; i++) { lp.b[i] = s->borig[i]; lp.rel[i] = s->rel[i]; }
+    for (int i = 0; i < m; i++) { lp->b[i] = s->borig[i]; lp->rel[i] = s->rel[i]; }
+    if (add) { lp->b[m] = new_rhs; lp->rel[m] = new_rel; }
+
     long nnz = 0;
-    for (int j = 0; j < n; j++) nnz += (long)(s->colptr[j+1] - s->colptr[j]);
-    lp.Acolptr = (int*)calloc((size_t)(n + 1), sizeof(int));
-    lp.Arow = (int*)malloc((size_t)nnz * sizeof(int));
-    lp.Aval = (double*)malloc((size_t)nnz * sizeof(double));
-    long pos = 0;
     for (int j = 0; j < n; j++) {
-        lp.Acolptr[j] = (int)pos;
-        for (int k = s->colptr[j]; k < s->colptr[j+1]; k++) {
-            int row = s->row[k];
-            double v = s->val[k] / s->mlt[row];
-            if (v != 0.0) { lp.Arow[pos] = row; lp.Aval[pos] = v; pos++; }
+        int p = s->orig_pos[j];
+        long cnt = (long)(s->colptr[p+1] - s->colptr[p]);
+        if (cnt < 0 || cnt > LONG_MAX - nnz) { free_exported_lp(lp); return -1; }
+        nnz += cnt;
+        if (add && new_a[j] != 0.0) {
+            if (nnz == LONG_MAX) { free_exported_lp(lp); return -1; }
+            nnz++;
         }
     }
-    lp.Acolptr[n] = (int)pos;
+    if (nnz > INT_MAX) { free_exported_lp(lp); return -1; }
+    lp->Acolptr = (int*)xmalloc((size_t)(n + 1) * sizeof(int));
+    lp->Arow = (int*)xmalloc((size_t)(nnz ? nnz : 1) * sizeof(int));
+    lp->Aval = (double*)xmalloc((size_t)(nnz ? nnz : 1) * sizeof(double));
+    long pos = 0;
+    for (int j = 0; j < n; j++) {
+        int p = s->orig_pos[j];
+        lp->Acolptr[j] = (int)pos;
+        for (int k = s->colptr[p]; k < s->colptr[p+1]; k++) {
+            int row = s->row[k];
+            if (row < 0 || row >= m) { free_exported_lp(lp); return -1; }
+            double v = s->val[k] / s->mlt[row];  /* undo equality row scaling */
+            if (v != 0.0) { lp->Arow[pos] = row; lp->Aval[pos] = v; pos++; }
+        }
+        if (add && new_a[j] != 0.0) { lp->Arow[pos] = m; lp->Aval[pos] = new_a[j]; pos++; }
+    }
+    lp->Acolptr[n] = (int)pos;
+    return 0;
+}
+
+/* Reconstruct the caller-visible LP and do a clean full re-solve.  Used when
+ * an incremental bound update changes the free-variable normalization or the
+ * current basis is no longer a safe warm start. */
+static void solver_refresh(Solver *s)
+{
+    LP lp;
+    if (solver_export_lp(s, NULL, 0.0, 0, &lp) != 0) {
+        s->status_out = SOLVE_NUMERICAL;
+        return;
+    }
     Solver *fresh = solver_create(&lp);
+    if (!fresh) {
+        free_exported_lp(&lp);
+        s->status_out = SOLVE_NUMERICAL;
+        return;
+    }
+    fresh->iteration_limit = s->iteration_limit;
+    fresh->reinvert_interval = s->reinvert_interval;
+    fresh->hyper_tol = s->hyper_tol;
     solver_solve(fresh);
     Solver hold = *fresh; *fresh = *s; *s = hold;
     solver_destroy(fresh);
-    free(lp.c); free(lp.b); free(lp.rel); free(lp.l); free(lp.u);
-    free(lp.Acolptr); free(lp.Arow); free(lp.Aval);
+    free_exported_lp(&lp);
 }
 
 /* Re-solve from the current basis (warm start).  Assumes Phase I has been
@@ -947,6 +1131,10 @@ static void solver_refresh(Solver *s)
  * infeasible, falls back to a clean re-solve. */
 int solver_warm_solve(Solver *s)
 {
+    if (s->rebuild_pending) {
+        solver_refresh(s);
+        return s->status_out;
+    }
     s->phase = 2;
     s->bland = 0; s->flat = 0; s->last_obj = -LP_INF;
     refactorize(s);
@@ -965,54 +1153,22 @@ int solver_warm_solve(Solver *s)
 
 int solver_add_row(Solver *s, const double *a, double rhs, char rel)
 {
-    int n = s->n_orig, m = s->M;
-    /* F-06: guard against dimension overflow / abuse before allocating */
-    if (n <= 0 || m < 0 || m >= 1000000) return -1;
+    int m = s->M;
+    /* F-06: guard against dimension overflow / abuse before allocating. */
+    if (!a || s->n_orig <= 0 || m < 0 || m >= 1000000) return -1;
     if (rel != '<' && rel != '>' && rel != '=') return -1;
-    /* Reconstruct the current LP (original constraints) from the solver state,
-       add the new row, and do a clean full re-solve.  This is guaranteed to
-       match a from-scratch solve regardless of the solver's prior state. */
-    LP lp; memset(&lp, 0, sizeof(lp));
-    lp.n = n; lp.m = m + 1; lp.maximize = !s->negate_obj;
-    lp.c  = (double*)xmalloc(n * sizeof(double));
-    lp.l  = (double*)xmalloc(n * sizeof(double));
-    lp.u  = (double*)xmalloc(n * sizeof(double));
-    lp.b  = (double*)xmalloc((m + 1) * sizeof(double));
-    lp.rel = (char*)xmalloc(m + 1);
-    for (int j = 0; j < n; j++) {
-        lp.c[j] = s->negate_obj ? -s->c0[j] : s->c0[j];
-        lp.l[j] = s->l[j]; lp.u[j] = s->u[j];
-    }
-    for (int i = 0; i < m; i++) { lp.b[i] = s->borig[i]; lp.rel[i] = s->rel[i]; }
-    lp.b[m] = rhs; lp.rel[m] = rel;
 
-    /* count nnz: original columns + new-row entries in the original columns */
-    long nnz = 0;
-    for (int j = 0; j < n; j++) nnz += (long)(s->colptr[j+1] - s->colptr[j]);
-    for (int j = 0; j < n; j++) if (a[j] != 0.0) nnz++;
-
-    lp.Acolptr = (int*)calloc((size_t)(n + 1), sizeof(int));
-    lp.Arow = (int*)malloc((size_t)nnz * sizeof(int));
-    lp.Aval = (double*)malloc((size_t)nnz * sizeof(double));
-    long pos = 0;
-    for (int j = 0; j < n; j++) {
-        lp.Acolptr[j] = (int)pos;
-        for (int k = s->colptr[j]; k < s->colptr[j+1]; k++) {
-            int row = s->row[k];
-            double v = s->val[k] / s->mlt[row];     /* unscale to original A */
-            if (v != 0.0) { lp.Arow[pos] = row; lp.Aval[pos] = v; pos++; }
-        }
-        if (a[j] != 0.0) { lp.Arow[pos] = m; lp.Aval[pos] = a[j]; pos++; }
-    }
-    lp.Acolptr[n] = (int)pos;
-
-    /* clean full re-solve and swap the result into *s */
+    LP lp;
+    if (solver_export_lp(s, a, rhs, rel, &lp) != 0) return -1;
     Solver *fresh = solver_create(&lp);
+    if (!fresh) { free_exported_lp(&lp); return -1; }
+    fresh->iteration_limit = s->iteration_limit;
+    fresh->reinvert_interval = s->reinvert_interval;
+    fresh->hyper_tol = s->hyper_tol;
     int r = solver_solve(fresh);
     Solver hold = *fresh; *fresh = *s; *s = hold;
-    solver_destroy(fresh);     /* frees the old *s data that now lives in fresh */
-    free(lp.c); free(lp.b); free(lp.rel); free(lp.l); free(lp.u);
-    free(lp.Acolptr); free(lp.Arow); free(lp.Aval);
+    solver_destroy(fresh);     /* frees the old *s data now living in fresh */
+    free_exported_lp(&lp);
     return r;
 }
 
