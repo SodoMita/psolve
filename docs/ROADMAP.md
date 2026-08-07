@@ -226,6 +226,11 @@ feature completeness against a huge standard corpus.
       predicates are parsed but reported as `UNKNOWN` at solve time: an LP
       cannot represent their open feasible sets without inventing an arbitrary
       epsilon, and we refuse to silently relax an open constraint to closed.
+- [x] **Array extrema**: `array_int_maximum/minimum` use an exact selector
+      encoding and tighten their result bounds. When the extremum is the sole
+      correctly-directed objective, the epigraph/hypograph is exact at optimum
+      without extra selector binaries.
+
 - [x] **Extensional table**: `gecode_table_int`, `fzn_table_int`, and
       `table_int` use one binary per permitted row, exactly one row selected
       (`sum b_j = 1`), and big-M equality `x_i = T[j][i]` implications whose
