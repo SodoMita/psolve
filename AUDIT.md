@@ -4,6 +4,22 @@ This is a working audit document. It records what was reviewed, what was
 changed on this branch, and the prioritized list of the most important things to
 do next. It is intended to be updated as work progresses.
 
+> **Update — integrated `arena/exactness-and-status-audit`.** This branch has
+> been merged with the parallel correctness-hardening effort on
+> `arena/exactness-and-status-audit`, which found and fixed six further classes
+> of "solver lied" / crash bugs (false LP `UNBOUNDED`/`INFEASIBLE` statuses,
+> silently wrong exact-rational answers from `int64` overflow, PGS `SIGFPE` on a
+> zero diagonal, un-checked allocations proven by OOM-injection testing, MIP
+> labelling suboptimal points `OPTIMAL`, and QP returning infeasible/non-optimal
+> points as solved). See `docs/AUDIT.md` (from that branch) for the full
+> write-up. The combined branch now has both the new FlatZinc handlers
+> (`cumulative`, `array_int_maximum`/`array_int_minimum`) *and* the full
+> correctness/OOM hardening. Conflict resolution in `src/solver.c`: kept the
+> exactness branch's `build_initial_basis` + Phase-I restart logic alongside
+> this branch's dense-LU retry wrapper; routed my `solver_reset_to_initial`'s
+> scratch allocation through `psolve_calloc` so the OOM-injection suite passes
+> (7,542 injection points, 0 failures).
+
 ## Baseline state (start of this pass)
 
 - Clean build with the default flags (`-O3 -march=native`, hardening on,

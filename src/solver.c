@@ -203,6 +203,9 @@ static Solver *solver_create_internal(const LP *lp)
        (nonneg) value, otherwise a sign-correct artificial so the artificial
        value is nonneg and Phase I can drive it to zero. */
     s->negate_obj = maximize ? 0 : 1;
+    /* Build the canonical starting basis and reset the phase state (a full
+       reset: basis + phase + refactorize).  Also used by the dense-LU retry
+       in solver_solve() after a sparse solve diverges. */
     solver_reset_to_initial(s);
     s->iteration_limit = 2000000;
     free(mlt);
@@ -585,7 +588,7 @@ static void solver_reset_to_initial(Solver *s)
 
     s->needs_phase1 = 0;
     {
-        double *S = (double*)psolve_calloc((size_t)m, sizeof(double));
+        double *S = (double*)psolve_calloc((size_t)(m > 0 ? m : 1), sizeof(double));
         /* contributions from nonbasic originals at their starting value */
         for (int j = 0; j < n; j++) {
             double xj = (s->l[j] > -LP_INF) ? s->l[j] : s->u[j];
