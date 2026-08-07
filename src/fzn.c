@@ -448,8 +448,8 @@ static void b_put(Builder*b,char rel,double rhs,const Lin*l){
 static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
 {
     const char*p=c->pred; Lin l1,l2,l3;
-    if(strcmp(p,"int_lin_eq")==0||strcmp(p,"int_lin_le")==0||
-       strcmp(p,"bool_lin_eq")==0||strcmp(p,"bool_lin_le")==0){
+    if(strcmp(p,"int_lin_eq")==0||strcmp(p,"int_lin_le")==0||strcmp(p,"int_lin_ge")==0||strcmp(p,"int_lin_gt")==0||
+       strcmp(p,"bool_lin_eq")==0||strcmp(p,"bool_lin_le")==0||strcmp(p,"bool_lin_ge")==0){
         if(c->nargs<3)return -1;
         Lin*arr;int narr;
         if(parse_array(m,c->args[0],&arr,&narr)!=0)return -1;
@@ -462,7 +462,11 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
             lin_into(&lin,&parr[i],arr[i].constant);
         }
         lin.constant-=d.constant;
-        char rel=(strcmp(p,"int_lin_le")==0||strcmp(p,"bool_lin_le")==0)?'<':'=';
+        char rel;
+        if(strcmp(p,"int_lin_le")==0||strcmp(p,"bool_lin_le")==0) rel='<';
+        else if(strcmp(p,"int_lin_ge")==0||strcmp(p,"bool_lin_ge")==0) rel='>';
+        else if(strcmp(p,"int_lin_gt")==0) rel='>';
+        else rel='=';
         b_put(b,rel,0.0,&lin);
         lin_free(&lin);lin_free(&d);free_lins(arr,narr);free_lins(parr,nparr);
         return 0;
@@ -996,6 +1000,49 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
         lin_free(&r1);lin_free(&r2);lin_free(&lin);lin_free(&dd);free_lins(arr,narr);free_lins(parr,nparr);
         return 0;
     }
+    /* fzn_count_eq(x[], v, n): exactly n of the variables x equal value v.
+       For small domains use binaries b_i = [x_i == v]: x_i = v + ... (big-M)
+       and sum b_i = n.  With bounded integer vars, encode [x_i == v] via
+       x_i >= v - M*(1-b_i), x_i <= v + M*(1-b_i), and for b_i=0 force
+       |x_i - v| >= 1: x_i >= v+1 - M*b_i, x_i <= v-1 + M*b_i.
+       Then sum_i b_i = n.  (Equivalent to among / count.) */
+    if(strcmp(p,"fzn_count_eq")==0||strcmp(p,"fzn_among_eq")==0||strcmp(p,"int_lin_ne")==0){}
+    if(strcmp(p,"fzn_count_eq")==0||strcmp(p,"fzn_among_eq")==0){
+        if(c->nargs<3)return -1;
+        Lin*arr;int narr;
+        if(parse_array(m,c->args[0],&arr,&narr)!=0)return -1;
+        Lin vl; if(parse_lin(m,c->args[1],&vl)!=0){free_lins(arr,narr);return -1;}
+        Lin nl; if(parse_lin(m,c->args[2],&nl)!=0){free_lins(arr,narr);lin_free(&vl);return -1;}
+        double v = vl.constant, ntarget = nl.constant;
+        /* b_i = [x_i == v], s_i = [x_i > v] (side selector when x_i != v). */
+        int *bs=(int*)malloc((size_t)(narr?narr:1)*sizeof(int));
+        for(int i=0;i<narr;i++){
+            if(arr[i].n!=1){free(bs);free_lins(arr,narr);lin_free(&vl);lin_free(&nl);return 1;}
+            int x=arr[i].idx[0];
+            double xlo=b->lo[x], xhi=b->hi[x];
+            double M = fmax(fabs(xlo),fabs(xhi)); M=fmax(M,1.0)+1.0;
+            int bi=b_newvar(b,0.0,1.0);
+            int si=b_newvar(b,0.0,1.0);
+            bs[i]=bi;
+            /* b=1 -> x==v :  x >= v - M*(1-b) ;  x <= v + M*(1-b)
+               => x + M*b >= v ;  x - M*b <= v */
+            Lin r1;memset(&r1,0,sizeof(r1));lin_term(&r1,x,1.0);lin_term(&r1,bi,M);b_put(b,'>',v,&r1);
+            Lin r2;memset(&r2,0,sizeof(r2));lin_term(&r2,x,1.0);lin_term(&r2,bi,-M);b_put(b,'<',v,&r2);
+            /* b=0 -> x != v via side s:
+               x >= v+1 - M*s      (s=0 -> x>=v+1 ; s=1 -> loose)
+               x <= v-1 + M*(1-s)  (s=1 -> x<=v-1 ; s=0 -> loose)
+               => x + M*s >= v+1 ;  x - M*s <= v-1 + M */
+            Lin r3;memset(&r3,0,sizeof(r3));lin_term(&r3,x,1.0);lin_term(&r3,si,M);b_put(b,'>',v+1.0,&r3);
+            Lin r4;memset(&r4,0,sizeof(r4));lin_term(&r4,x,1.0);lin_term(&r4,si,-M);b_put(b,'<',v-1.0+M,&r4);
+            lin_free(&r1);lin_free(&r2);lin_free(&r3);lin_free(&r4);
+        }
+        /* sum b_i = ntarget */
+        Lin s;memset(&s,0,sizeof(s));
+        for(int i=0;i<narr;i++) lin_term(&s,bs[i],1.0);
+        s.constant=-ntarget; b_put(b,'=',0.0,&s);
+        lin_free(&s);free(bs);free_lins(arr,narr);lin_free(&vl);lin_free(&nl);
+        return 0;
+    }
     /* everything else: unhandled (return UNKNOWN at top level) */
     return 1;
 }
@@ -1040,7 +1087,7 @@ void fz_solve(const FZModel*m,FZSolution*sol)
         sum.constant=-1.0; b_put(&b,'=',0.0,&sum);
         lin_free(&eq);lin_free(&sum);free(bs);
     }
-    for(FZConstr*c=m->constr;c;c=c->next){int r=handle_constraint((FZModel*)m,&b,c);if(getenv("HD"))fprintf(stderr,"constr %s -> %d\n",c->pred,r);if(r!=0)unhandled=1;}
+    for(FZConstr*c=m->constr;c;c=c->next){int r=handle_constraint((FZModel*)m,&b,c);if(r!=0)unhandled=1;}
 
     if(unhandled){for(int r=0;r<b.nrows;r++){free(b.rows[r].idx);free(b.rows[r].coef);}free(b.rows);free(b.lo);free(b.hi);free(b.haslo);free(b.hashi);sol->status=2;return;}
 

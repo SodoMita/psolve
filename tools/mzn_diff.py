@@ -95,6 +95,17 @@ MODELS = [
         constraint x + y != 7;
         solve maximize x;
     """, "max"),
+    ("count", """
+        array[1..4] of var 1..3: x :: output_array([1..4]);
+        constraint count(x, 2) = 2;
+        solve satisfy;
+    """, "sat"),
+    ("lin_ge", """
+        var 0..10: x :: output_var;
+        var 0..10: y :: output_var;
+        constraint x - y >= 5;
+        solve maximize x;
+    """, "max"),
 ]
 
 def run(cmd, timeout=120):
@@ -145,6 +156,7 @@ def main():
             elif name == 'reif_eq': bobj = 6
             elif name == 'not_eq': bobj = 10
             elif name == 'lin_ne': bobj = 10
+            elif name == 'lin_ge': bobj = 10
             if mstat == 'UNKNOWN' or mstat == '?':
                 print(f"[{name}] MINE={mstat} -> FAIL (handled model must solve)"); fail += 1
             elif mstat == 'UNSAT':

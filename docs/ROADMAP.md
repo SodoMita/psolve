@@ -137,8 +137,11 @@ feature completeness against a huge standard corpus.
       `int_ge_reif`, `int_gt_reif`, `bool_eq_reif`, `bool_le_reif` (big-M with a
       binary, incl. constant reification values); `int_lin_ne`/`bool_lin_ne`
       (SOS1).  Fixed big-M sign bugs in the != / ne encodings.
-- [ ] More handlers: `float_*` relational variants, `count`/`among`,
-      `cumulative`, `circuit`, `table`.
+- [x] `int_lin_ge`/`int_lin_gt`/`bool_lin_ge`; `fzn_count_eq`/`fzn_among_eq`
+      (exact via per-variable `[x_i==v]` binary + a side-selector binary for the
+      `x_i!=v` OR; fixed an AND-vs-OR encoding bug).
+- [ ] More handlers: `float_*` relational variants, `cumulative`, `circuit`,
+      `table`.
 - [x] **MIP bridge**: when the model has integer vars, `fz_solve` dispatches to
       the MIP branch-and-bound so answers are integral (objectives match brute
       force, e.g. knapsack=10, prod3=57).
