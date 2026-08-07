@@ -13,3 +13,5 @@ libpsolve-lp.a
 libpsolve-qp.a
 pgs_vs_lp
 fznsolve
+fxsolve
+fx_bench

@@ -92,4 +92,18 @@ else
   echo "[8.5/8] MiniZinc differential SKIPPED (minizinc not installed)"
 fi
 
+echo "[9/9] Fixed-point exact-rational LP solver (fxsolve) vs double lpsolve..."
+make fxsolve >/dev/null 2>&1
+./fxsolve examples/prodplan.lp | grep -E "objective \(dec\):" | tr '\n' ' '; echo "(expect 26)"
+./fxsolve examples/diet.lp | grep -E "objective \(dec\):" | tr '\n' ' '; echo "(expect 1.32 exact)"
+./fxsolve examples/transport.lp | grep -E "objective \(dec\):" | tr '\n' ' '; echo "(expect 94.5 exact)"
+echo -n "  exact demo (double vs fixed): "
+echo -n "double="; ./lpsolve examples/exact.lp | grep -oE "objective:.*"
+echo -n "  fixed="; ./fxsolve examples/exact.lp | grep -oE "objective \(exact\):.*"
+echo -n "fx_verify (random feasible+arbitrary LPs vs double, incl. status): "
+python3 tools/fx_verify.py 300 99 | sed 's/.*: //'
+echo -n "fx_bench (examples): "
+make fx_bench >/dev/null 2>&1
+./fx_bench examples/prodplan.lp examples/diet.lp examples/transport.lp | tail -1
+
 echo "Done."

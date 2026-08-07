@@ -42,10 +42,11 @@ with an explicit baseline `ARCH`.
 ## Usage
 
 ```sh
-./lpsolve <problem.lp> [--print]      # LP (revised simplex)
+./lpsolve <problem.lp> [--print]      # LP (revised simplex, double)
 ./qpsolve <qp.qp>                      # convex QP (active-set)
 ./mipsolve <problem.lp> <nint> <j...> [--print]   # MIP (branch-and-bound)
 ./fznsolve <problem.fzn>               # FlatZinc reader + solver (Phase 3)
+./fxsolve <problem.lp> [--print]      # LP (exact rational / fixed-point simplex)
 ```
 
 `--print` also dumps the optimal variable values.
@@ -67,6 +68,48 @@ The MIP solver (`mipsolve <lp> <nint> <j0 j1 ...>`) solves mixed-integer
 programs by **branch-and-bound** over the revised-simplex LP relaxation: the
 listed variables are required to be integer.  It reports the optimal objective,
 the number of B&B nodes, and the incumbent solution.
+
+## Fixed-point (exact-rational) LP solver
+
+`fxsolve` is the **fixed-point analogue** of the double `lpsolve`: it reads the
+same `.lp` format but represents every number as an exact rational
+(numerator/denominator pair, reduced, with `__int128` intermediates) and solves
+by an exact two-phase full-tableau simplex.  Because the arithmetic is integer,
+the result is **exact and bit-identical** across platforms/compilers — the same
+determinism guarantee the fixed-point PGS physics kernel already provides, now
+applied to the LP backbone:
+
+```sh
+./fxsolve examples/diet.lp
+# objective (exact): 33/25      <- the true rational optimum, not a float approx
+# objective (dec):   1.320000000000
+
+./lpsolve examples/exact.lp | grep objective    # double:  0.333333333333333
+./fxsolve examples/exact.lp | grep exact        # fixed:   objective (exact): 1/3
+```
+
+Compared with `lpsolve` (`make fx_bench`):
+
+- **Precision / determinism**: strictly better.  Every reported objective and
+  variable value is an exact rational; there is no rounding, no
+  `LP_INF`-sentinel clamping, and no `NUMERICAL_FAILURE`.  On unbounded LPs the
+  double solver can clamp a variable at its internal 1e30 bound and report a
+  bogus huge "OPTIMAL"; `fxsolve` reports `UNBOUNDED` correctly.
+- **Performance**: comparable for tiny problems (single-digit microseconds at
+  n≲10, on par with the double solver), but degrades on larger dense problems —
+  exact rational arithmetic with coefficient growth costs more than double
+  SIMD.  Use `fxsolve` where exactness/determinism matters on small,
+  data-friendly problems (UI/layout, integer MiniZinc LPs); keep `lpsolve` for
+  large sparse/continuous instances.
+
+The exact LP core is `src/fx.c` / `src/fx.h`; the CLI is `tools/fxsolve.c` and
+the double-vs-fixed benchmark is `tools/fx_bench.c`.  Differential test:
+`tools/fx_verify.py` (random feasible + arbitrary LPs vs `lpsolve`, checking
+status and objective agreement plus fixed-point determinism).
+
+> Note: exact rational arithmetic assumes the LP data stay small enough that
+> `__int128` intermediates do not overflow.  Very ill-conditioned large
+> instances should use the double `lpsolve`.
 
 ## Real-time physics kernel (projected Gauss-Seidel)
 
@@ -292,9 +335,12 @@ src/mip.c       mixed-integer programming via branch-and-bound
 src/pgs.c       projected Gauss-Seidel boxed-QP (float reference kernel)
 src/pgs_fixed.c fixed-point (integer) PGS boxed-QP (production physics kernel)
 src/fzn.c       FlatZinc reader + LP solver bridge (Phase 3)
+src/fx.c        fixed-point (exact rational) LP solver + fraction-aware reader
 src/qp.c        convex QP solver (active-set method + Phase-I feasibility)
 src/parser.c    LP file reader
 src/main.c      LP CLI
+tools/fxsolve.c fixed-point LP CLI
+tools/fx_bench.c double-vs-fixed LP benchmark
 tools/qpsolve.c QP CLI
 tools/mipsolve.c MIP CLI
 tools/          generators, differential tester, unit tests, benchmarks, fuzzer

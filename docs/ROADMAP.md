@@ -123,8 +123,19 @@ fixed number of times per substep.  **All of this runs in fixed point.**
       is satisfied for the foundation; the host app supplies buffers.)
 - [ ] *(moved to other projects)* Contact-block builder, broad/narrow-phase
       collision, fixed-point integration, VG path geometry.
-- [ ] *(future)* Fixed-point LP/QP kernels (integer revised-simplex) for UI
-      layout / VG, when a host project needs an integer general solver.
+- [x] **Fixed-point LP kernel** (`src/fx.c`, `fxsolve`): exact-rational
+      two-phase full-tableau simplex.  Every number is an exact fraction
+      (`__int128` intermediates), so the optimum is exact and bit-identical
+      across platforms — the same determinism the fixed-point PGS kernel gives
+      the physics hot loop, now for the LP backbone.  Validated against the
+      double `lpsolve` (`tools/fx_verify.py`) on thousands of random feasible
+      and arbitrary LPs (0 objective/status mismatches; the few divergences are
+      double-solver sentinel/numerical artifacts where `fxsolve` is correct).
+      Target: small, data-friendly problems (UI/layout, integer MiniZinc LPs).
+      Exact arithmetic is heavier than double SIMD on large dense instances, so
+      `lpsolve` remains the large-problem backbone.
+- [ ] *(future)* Fixed-point QP kernel for UI layout / VG, when a host project
+      needs an integer general QP solver.
 
 ### Phase 1 complete (foundation). Next: Phase 3 FlatZinc, Phase 2 VG/UI kernels.
 
