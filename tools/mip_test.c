@@ -19,7 +19,7 @@ static void t1(void){
     int Arow[4]={0,1, 0, 1};
     double Aval[4]={1,3, 2, 2};
     unsigned char isint[3]={1,1,1};
-    MIP mip; mip.n=n;mip.m=m;mip.c=c;mip.Acolptr=Acolptr;mip.Arow=Arow;mip.Aval=Aval;
+    MIP mip; memset(&mip,0,sizeof(mip)); mip.n=n;mip.m=m;mip.c=c;mip.Acolptr=Acolptr;mip.Arow=Arow;mip.Aval=Aval;
     mip.rel=rel;mip.b=b;mip.l=l;mip.u=u;mip.maximize=1;mip.isint=isint;mip.mip_gap=0;mip.node_limit=100000;mip.lp_iter_limit=2000000;
     MIPResult r; mip_solve(&mip,&r);
     printf("T1: status=%d obj=%g x=[%g %g %g] (expect x=[0 2 2] obj=12)\n",r.status,r.obj,r.x[0],r.x[1],r.x[2]);
@@ -41,7 +41,7 @@ static void t2(void){
     int Arow[2]={0,0};
     double Aval[2]={1,1};
     unsigned char isint[2]={1,0};
-    MIP mip; mip.n=n;mip.m=m;mip.c=c;mip.Acolptr=Acolptr;mip.Arow=Arow;mip.Aval=Aval;
+    MIP mip; memset(&mip,0,sizeof(mip)); mip.n=n;mip.m=m;mip.c=c;mip.Acolptr=Acolptr;mip.Arow=Arow;mip.Aval=Aval;
     mip.rel=rel;mip.b=b;mip.l=l;mip.u=u;mip.maximize=1;mip.isint=isint;mip.mip_gap=0;mip.node_limit=100000;mip.lp_iter_limit=2000000;
     MIPResult r; mip_solve(&mip,&r);
     printf("T2: status=%d obj=%g x=[%g %g] (expect obj=4)\n",r.status,r.obj,r.x[0],r.x[1]);

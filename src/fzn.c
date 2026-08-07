@@ -1564,7 +1564,12 @@ void fz_solve(const FZModel*m,FZSolution*sol)
         mip.lp_iter_limit=2000000;
         MIPResult mr;mip_solve(&mip,&mr);
         sol->nodes=mr.nodes; sol->best_bound=mr.best_bound;
-        if(mr.status==0){memcpy(sol->x,mr.x,(size_t)ntot*sizeof(double));sol->obj=mr.obj+m->objective.constant;sol->iters=mr.lp_iters;sol->status=0;}
+        /* An optimisation model may only report an objective the search
+           actually proved.  mip.stop_at_feasible is off for those, but check
+           the proof flag anyway so a future change cannot leak a merely
+           feasible point out as an optimum. */
+        if(mr.status==0 && m->solve_kind!=0 && !mr.proven_optimal) sol->status=4;
+        else if(mr.status==0){memcpy(sol->x,mr.x,(size_t)ntot*sizeof(double));sol->obj=mr.obj+m->objective.constant;sol->iters=mr.lp_iters;sol->status=0;}
         else if(mr.status==1)sol->status=1;
         else if(mr.status==3||mr.status==4||mr.status==5||mr.status==6)sol->status=4;
         else sol->status=2;

@@ -281,6 +281,38 @@ linear/quadratic and well-structured MIP models.
 ### Phase 3 first-cut deliverable: `fznsolve <x.fzn>` solves the linear subset,
 with tests in `examples/fzn/` and `test.sh` (incl. the MiniZinc differential).
 
+### Fixed: MIP reported suboptimal points as OPTIMAL
+Two independent defects made branch-and-bound return a feasible-but-suboptimal
+point labelled `OPTIMAL` on roughly 10% of randomly generated instances.
+
+1. **Uninitialised `MIP` struct in the driver.**  `tools/mipsolve.c` filled in
+   the fields it cared about and left the rest -- including
+   `stop_at_feasible` -- as whatever was on the stack.  A garbage nonzero value
+   made the search stop at the first integer-feasible point, and because
+   nothing had set `limit_reached`, that point came back as status 0.
+   `mip.h` now documents that the struct must be zeroed, the drivers do it, and
+   `MIPResult` grew a `proven_optimal` flag that is 1 only when the tree was
+   actually exhausted.  `mipsolve` prints `FEASIBLE` (not `OPTIMAL`) when the
+   flag is clear, and the FlatZinc bridge refuses to print an objective for an
+   optimisation model unless it is set.
+2. **The rounding heuristic could emit a fractional "integer" value.**  It
+   rounded the relaxation value and then clamped it into the node box with the
+   raw bounds, so an integer variable with a fractional upper bound
+   (`u = 1.875`) produced `x = 1.875`, which passed the row check and became
+   the incumbent.  Clamping now snaps to the lattice (`ceil(l)`/`floor(u)`) and
+   the heuristic fails outright if no lattice point remains; integer bounds are
+   additionally rounded inward once at the root, and accepted incumbents are
+   snapped with the objective recomputed from the returned point.
+
+New test `tools/mip_diff.py` (wired into `test.sh`) generates small fully
+bounded all-integer models -- half feasible by construction, a third with
+fractional bounds -- and checks the *status*, the objective, and the returned
+point (integral, in bounds, satisfies every row, matches the reported
+objective) against exhaustive enumeration.  Old binary: 33-45 wrong per 400.
+Now: 0 over 2,000+ instances.  It also replaces a dead
+`if [ -f /tmp/mip_verify.py ]` guard in `test.sh` under which the MIP
+verification had never actually run.
+
 ### Fixed: LP Phase I degeneracy
 The revised-simplex Phase I previously mis-declared INFEASIBLE on degenerate
 problems combining an equality constraint with a variable fixed to a value.

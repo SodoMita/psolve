@@ -22,9 +22,16 @@ static int try_rounding_heuristic(const MIP *mip, const double *x,
         double v = x[j];
         if (mip->isint[j]) {
             double r = floor(v + 0.5);
-            if (r < lcur[j]) r = lcur[j];
-            if (r > ucur[j]) r = ucur[j];
-            v = r;
+            /* Clamping into the node box must land on a LATTICE point.  The
+               old code clamped to the raw bound, so a fractional bound (say
+               u = 1.875) produced xc[j] = 1.875 for a variable declared
+               integer -- and that fractional point was then accepted as an
+               integer incumbent and reported as the optimum. */
+            if (r < lcur[j]) r = ceil(lcur[j] - MIP_TOL);
+            if (r > ucur[j]) r = floor(ucur[j] + MIP_TOL);
+            if (r < lcur[j] - MIP_TOL || r > ucur[j] + MIP_TOL) return 0;
+            if (fabs(r - floor(r + 0.5)) > MIP_TOL) return 0;
+            v = floor(r + 0.5);
         }
         xc[j] = v;
     }
@@ -143,7 +150,17 @@ void mip_solve(const MIP *mip, MIPResult *res)
     Node *stack = NULL;
     double *lo0 = (double*)psolve_malloc((size_t)n * sizeof(double));
     double *hi0 = (double*)psolve_malloc((size_t)n * sizeof(double));
-    for (int j = 0; j < n; j++) { lo0[j] = mip->l[j]; hi0[j] = mip->u[j]; }
+    /* Presolve: an integer variable's bounds can be rounded inward to the
+       lattice.  Besides tightening every relaxation, this removes fractional
+       bounds, which are a trap for anything that clamps a rounded value into
+       the box.  ceil/floor leave the +-LP_INF sentinels unchanged. */
+    for (int j = 0; j < n; j++) {
+        lo0[j] = mip->l[j]; hi0[j] = mip->u[j];
+        if (mip->isint[j]) {
+            if (lo0[j] > -LP_INF) lo0[j] = ceil(lo0[j] - MIP_TOL);
+            if (hi0[j] <  LP_INF) hi0[j] = floor(hi0[j] + MIP_TOL);
+        }
+    }
     Node *root = (Node*)psolve_malloc(sizeof(Node));
     root->lo = lo0; root->hi = hi0; root->bound = 0.0; root->feasible = 0;
     root->next = NULL;
@@ -152,6 +169,7 @@ void mip_solve(const MIP *mip, MIPResult *res)
     long nodes = 0;
     int status = 1;   /* assume infeasible until a feasible integer found */
     int limit_reached = 0;   /* the search was cut short (node/time/stop/iter) */
+    int stopped_early = 0;   /* stop_at_feasible fired: feasible, not optimal */
 
     while (stack) {
         if (nodes >= node_limit) { status = 3; limit_reached = 1; break; }
@@ -203,6 +221,7 @@ void mip_solve(const MIP *mip, MIPResult *res)
         }
         if (mip->stop_at_feasible && have_incumbent) {
             free(node->lo); free(node->hi); free(node);
+            stopped_early = 1;
             break;
         }
 
@@ -219,7 +238,16 @@ void mip_solve(const MIP *mip, MIPResult *res)
         }
 
         if (allint) {
-            /* integer-feasible: update incumbent */
+            /* Integer-feasible.  Snap the integer components to the lattice:
+               the LP returns them within MIP_TOL of an integer, and callers
+               must never see 2.9999999997 for a variable declared integer. */
+            for (int j = 0; j < n; j++)
+                if (mip->isint[j]) x[j] = floor(x[j] + 0.5);
+            /* ...and report the objective OF THE POINT WE RETURN, so
+               res->obj == c . res->x exactly rather than to within the
+               integrality tolerance. */
+            obj = 0.0;
+            for (int j = 0; j < n; j++) obj += mip->c[j] * x[j];
             if (!have_incumbent ||
                 (mip->maximize && obj > incumbent) ||
                 (!mip->maximize && obj < incumbent)) {
@@ -231,6 +259,7 @@ void mip_solve(const MIP *mip, MIPResult *res)
                     /* solve satisfy: the first feasible integer point is an
                        answer; stop branching instead of proving optimality. */
                     free(node->lo); free(node->hi); free(node);
+                    stopped_early = 1;
                     break;
                 }
             }
@@ -265,6 +294,9 @@ void mip_solve(const MIP *mip, MIPResult *res)
 
     res->nodes = nodes;
     res->best_bound = best_bound;
+    /* `obj` is a proven optimum only if nothing cut the search short: no node
+       or iteration limit, no cooperative stop, and no stop_at_feasible. */
+    res->proven_optimal = (!limit_reached && !stopped_early && have_incumbent);
     if (have_incumbent) {
         res->obj = incumbent;
         memcpy(res->x, bestx, (size_t)n * sizeof(double));

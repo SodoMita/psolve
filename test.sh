@@ -48,9 +48,12 @@ echo "  QP vs scipy: OK=$ok FAIL=$fail"
 echo "[5.5/7] MIP solver (branch-and-bound) vs brute force..."
 gcc -O2 -march=native -I src tools/mip_test.c src/mip.c src/err.c src/solver.c src/splu.c src/lu.c src/kernels.c src/parser.c -o /tmp/mip_test -lm
 /tmp/mip_test
-if [ -f /tmp/mip_verify.py ]; then
-  python3 tools/mip_verify.py 0 | tail -1
-fi
+# NOTE: this used to read `if [ -f /tmp/mip_verify.py ]`, a path that never
+# exists, so the MIP verification silently never ran.  mip_diff.py replaces it
+# and additionally checks statuses and the returned point, not just the
+# objective of runs that happened to come back OPTIMAL.
+python3 tools/mip_diff.py 400 12345 | head -2
+python3 tools/mip_verify.py 0 | tail -1
 
 echo "[5.75/7] Fully free LP/MIP variables + incremental API..."
 gcc -O2 -march=native -I src tools/free_var_test.c src/mip.c src/err.c src/solver.c src/splu.c src/lu.c src/kernels.c -o /tmp/free_var_test -lm
