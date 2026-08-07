@@ -73,15 +73,14 @@ int lp_read(const char *path, LP *lp)
     for (int j = 0; j < n; j++) if (fscanf(f, "%lf", &lp->c[j]) != 1) goto err;
     for (int i = 0; i < m; i++) if (fscanf(f, "%lf", &lp->b[i]) != 1) goto err;
 
-    /* F-01: relation token.  The relations are concatenated without
-       delimiters, each being 1 char ('<','>','=') or 2 chars ('<=','>='),
-       so the token can be up to 2*m chars.  Read it into a bounded buffer
-       and decode into m single-char relations, disambiguating by m.
-       The solver treats '<' as "<=" (slack) and '>' as ">=" (surplus). */
+    /* F-01: relation token.  Each relation is a single char ('<','>','=');
+       the token is the m chars concatenated (e.g. "<<=<<").  The solver
+       treats '<' as "<=" (slack) and '>' as ">=" (surplus), so the two-char
+       '<= '/'>= ' spellings are redundant and are NOT supported (they would
+       be ambiguous with '<' then '=').  Read into a bounded buffer of
+       exactly m chars and validate. */
     if (m > 0) {
-        /* Read one whitespace-delimited token manually (no dynamic %s format)
-           into a buffer sized for the maximum possible token, 2*m chars. */
-        size_t rel_len = 2 * (size_t)m;               /* max token length */
+        size_t rel_len = (size_t)m;               /* exactly m chars */
         char *relbuf = (char*)malloc(rel_len + 1);
         if (!relbuf) goto err;
         int got = 0;
@@ -91,23 +90,17 @@ int lp_read(const char *path, LP *lp)
         do { c = fgetc(f); } while (c != EOF && (c==' '||c=='\t'||c=='\n'||c=='\r'));
         for (; c != EOF && c!=' ' && c!='\t' && c!='\n' && c!='\r'; c = fgetc(f)) {
             if (pos < rel_len) { relbuf[pos++] = (char)c; got = 1; }
-            else { /* token longer than any valid relation string */
-                free(relbuf); goto err;
-            }
+            else { free(relbuf); goto err; }       /* token longer than m */
         }
         relbuf[pos] = '\0';
-        if (!got) { free(relbuf); goto err; }
-        size_t rp = 0;
+        if (!got || pos != rel_len) { free(relbuf); goto err; }
         for (int i = 0; i < m; i++) {
-            char ch = relbuf[rp];
-            if (ch == '=') { lp->rel[i] = '='; rp += 1; }
-            else if (ch == '<') { lp->rel[i] = '<'; rp += (relbuf[rp+1] == '=') ? 2 : 1; }
-            else if (ch == '>') { lp->rel[i] = '>'; rp += (relbuf[rp+1] == '=') ? 2 : 1; }
-            else {
+            char ch = relbuf[i];
+            if (ch != '<' && ch != '>' && ch != '=') {
                 fprintf(stderr, "invalid relation at index %d\n", i);
                 free(relbuf); goto err;
             }
-            if (rp > rel_len) { free(relbuf); goto err; }
+            lp->rel[i] = ch;
         }
         free(relbuf);
     }

@@ -136,16 +136,24 @@ feature completeness against a huge standard corpus.
 ### Phase 3 first-cut deliverable: `fznsolve <x.fzn>` solves the linear subset,
 with tests in `examples/fzn/` and `test.sh`.
 
-### Known limitation (LP Phase I degeneracy)
-The revised-simplex **Phase I can mis-declare INFEASIBLE** on degenerate
-problems combining an **equality constraint with a variable fixed to a value**
-(lower==upper).  Phase I then stalls with an artificial basic at a positive
-value even though a feasible point exists, which also makes MIP suboptimal on
-such instances.  Reproducible with `tools/fzn_verify.py` (seed 1, t=10).
-This is a genuine pre-existing simplex Phase-I degeneracy bug that needs a
-dedicated fix (more robust artificial-drive-out / perturbation); it is tracked
-here rather than rushed.  Common (non-degenerate) LP/QP/MIP/FZ cases are
-correct (canonical GLPK sweep 119/119, QP vs scipy, MIP vs brute on non-degen).
+### Fixed: LP Phase I degeneracy
+The revised-simplex Phase I previously mis-declared INFEASIBLE on degenerate
+problems combining an equality constraint with a variable fixed to a value.
+Root cause: only *basic* artificials were given the Phase I objective cost,
+so the reduced costs were wrong and Phase I stalled with a basic artificial at
+a positive value even though a feasible point existed.  **Fix:** give **all**
+artificials (basic and non-basic) a Phase I cost of -1.  Validated with a new
+differential test (`tools/lp_eq_diff.py`) on 1,800 random equality/fixed-
+variable problems vs scipy (0 failures) and the FZ->MIP verifier now passes
+100% (was ~20% failing).  This also fixed the equality-constrained MIP path.
+
+### Fixed: LP relation-token ambiguity
+The `.lp` relation token previously allowed a redundant two-char `<=`/`>=`
+form that was ambiguous with a `<` or `>` immediately followed by `=` (e.g.
+`<==` could be `<` `=` `=` or `<=` `=`).  Since `<` already means "<=" (slack)
+and `>` means ">=" (surplus), the format now uses **single relation chars
+only**, removing all ambiguity.  Examples and generators updated; parser fuzzed
+(2,000 malformed inputs) clean under ASan/UBSan.
 
 ---
 

@@ -2,7 +2,7 @@ maximize
 4 3
 5 4 6 3
 10 12 15
-<=<=<
+<<<
 0 inf
 0 inf
 0 inf

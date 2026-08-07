@@ -175,8 +175,9 @@ maximize|minimize
 <n> <m>
 <c_1 ... c_n>            # objective coefficients
 <b_1 ... b_m>            # right-hand sides
-<rel[0..m-1]>            # one token of concatenated relations, each '<' '>' '=' '<='
-                        #   or '>='  (e.g. <<=<< means <, <, =, <, <;  <=<=< is <=, <=, <)
+<rel[0..m-1]>            # one token of m concatenated relation chars, each '<' '>' '='
+                        #   (e.g. <<=<< means <, <, =, <, <).  Use single chars
+                        #   only: '<' already means "<=" and '>' means ">=".
 <lo_1> <hi_1>            # per variable: bounds, 'inf' for unbounded
 ...
 <nnz>

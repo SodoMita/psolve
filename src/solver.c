@@ -599,7 +599,7 @@ static int iterate(Solver *s)
     ftran(s, s->d);
 
     int dir = (s->status[q] == LP_NBL) ? 1 : -1;
-
+    
     double theta; int blocker, blockSlot;
     int rr = ratio_test(s, q, dir, s->d, &theta, &blocker, &blockSlot);
     if (rr == 2) {
@@ -642,6 +642,16 @@ static int iterate(Solver *s)
     if (rr == 1) {
         /* q flips to its other bound, no basis change */
         s->status[q] = (dir > 0) ? LP_NBU : LP_NBL;
+        return 1;
+    }
+
+    /* Degenerate guard: if the ratio test reports a normal pivot (rr==0) but
+       no basic variable actually blocks (blockSlot<0), the basis exchange would
+       read/write basis[-1].  This can happen in Phase I with an artificial
+       stuck at a positive value.  Reinitialize the basic values and continue. */
+    if (rr == 0 && blockSlot < 0) {
+        refactorize(s);
+        recompute_basic(s);
         return 1;
     }
 
@@ -755,13 +765,14 @@ int solver_solve(Solver *s)
     for (int i = 0; i < s->M; i++)
         if (s->basis[i] >= first_art) { need_p1 = 1; break; }
     if (need_p1) {
-        s->phase = 1;
+                s->phase = 1;
         for (int j = 0; j < s->N; j++) s->cobj[j] = 0.0;
         for (int i = 0; i < s->M; i++) {
             int av = s->artVar[i];
-            if (s->status[av] == LP_BASIC) s->cobj[av] = -1.0;
+            s->cobj[av] = -1.0;      /* all artificials, basic or not */
         }
         r = solve_phase(s);
+                if(getenv("PD"))fprintf(stderr,"P1END2 r=%d\n", r);
         if (r == 2) { s->status_out = 2; return 2; }
         if (r != 0) { s->status_out = 1; return 1; }
 
