@@ -264,8 +264,9 @@ are integral):
   `*_eq/le/lt/ge/gt` relations; `int_eq/le/lt/ge/gt_reif` and their bool
   counterparts; `int_lin_ne`, `count`/`among`; boolean logic; `int_abs/max/min`,
   `int_times` (constant operand), `set_in` + set domains, `all_different`,
-  `array_int_element`, exact Gecode/standard integer `table` (up to 1,024 rows)
-  and Hamiltonian `circuit` constraints (up to 64 nodes), `bool2int`/`int2float`;
+  `array_int_element`, `array_int_maximum/minimum`, exact Gecode/standard
+  integer `table` (up to 1,024 rows) and Hamiltonian `circuit` constraints
+  (up to 64 nodes), `bool2int`/`int2float`;
   and the continuous linear float
   subset `float_lin_eq/le/ge`, `float_eq/le/ge`, `float_plus/minus/neg`,
   constant-operand `float_times`, and constant-denominator `float_div`; see

@@ -69,6 +69,40 @@ def test_integer_strict() -> None:
     require("x = 6;" in out, f"constant multiplication was not enforced:\n{out}")
 
 
+def test_array_extrema() -> None:
+    out = run_model(
+        """
+        var 0..5: a;
+        var 0..5: b;
+        var 0..10: mx :: output_var;
+        var 0..10: mn :: output_var;
+        array [1..2] of var int: x = [a,b];
+        constraint int_eq(a,2);
+        constraint int_eq(b,3);
+        constraint array_int_maximum(mx,x);
+        constraint array_int_minimum(mn,x);
+        solve satisfy;
+        """
+    )
+    require("mx = 3;" in out and "mn = 2;" in out,
+            f"array extrema selector encoding failed:\n{out}")
+
+    out = run_model(
+        """
+        var 0..5: a;
+        var 0..5: b;
+        var 0..10: mx :: output_var;
+        array [1..2] of var int: x = [a,b];
+        constraint int_ge(a,2);
+        constraint int_ge(b,3);
+        constraint array_int_maximum(mx,x);
+        solve minimize mx;
+        """
+    )
+    require("mx = 3;" in out and "objective=3" in out,
+            f"objective-tightened array maximum failed:\n{out}")
+
+
 def test_integer_reification_truth_table() -> None:
     predicates = {
         "int_eq_reif": lambda a, b: a == b,
@@ -308,6 +342,7 @@ def main() -> int:
         return 2
     try:
         test_integer_strict()
+        test_array_extrema()
         test_integer_reification_truth_table()
         test_float_linear_subset()
         test_table_and_constant_aliases()
@@ -316,7 +351,7 @@ def main() -> int:
     except AssertionError as exc:
         print(f"FlatZinc semantics test FAILED: {exc}", file=sys.stderr)
         return 1
-    print("FlatZinc semantics: strict/reified int + float + table/circuit subset PASSED")
+    print("FlatZinc semantics: strict/reified int + extrema + float + table/circuit subset PASSED")
     return 0
 
 
