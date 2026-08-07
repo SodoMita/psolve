@@ -28,11 +28,13 @@ typedef struct {
 } QP;
 
 #define QP_ITERATION_LIMIT 2  /* active-set iteration cap reached (no cert) */
-#define QP_KKT_FAIL       3  /* KKT solve / stationarity residual not verified */
+#define QP_KKT_FAIL        3  /* KKT solve / stationarity residual not verified */
+#define QP_NON_CONVEX      4  /* Q is not positive semi-definite / symmetric */
 
 typedef struct {
     int status;         /* 0 solved, -1 no feasible start, 1 unbounded,
-                           2 QP_ITERATION_LIMIT, 3 QP_KKT_FAIL */
+                           2 QP_ITERATION_LIMIT, 3 QP_KKT_FAIL,
+                           4 QP_NON_CONVEX */
     int n;
     double *x;          /* solution (n) */
     double *mult;       /* Lagrange multipliers for A x <= b (m) */
