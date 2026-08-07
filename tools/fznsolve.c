@@ -31,8 +31,15 @@ int main(int argc,char**argv)
     if (!opt.path) { fprintf(stderr,"usage: %s [options] <problem.fzn>\n",argv[0]);
         fprintf(stderr,"  -n N   node limit   -s stats   -v verbose\n"); return 1; }
 
-    /* Install error handler inside a helper so local non-volatile vars are
-       not read after a longjmp (avoids -Wclobbered and UB). */
+    /* Resolve the path into a volatile-qualified copy before setjmp so the
+       compiler cannot hold the pointer in a callee-saved register that
+       longjmp clobbers.  Also avoids -Wclobbered. */
+    volatile char pathbuf[4096];
+    /* safe bounded copy — opt.path lives for the process lifetime in argv */
+    size_t plen = strlen(opt.path);
+    if (plen >= sizeof(pathbuf)) { fprintf(stderr,"fznsolve: path too long\n"); return 1; }
+    memcpy((void*)pathbuf, opt.path, plen+1);
+
     int rc = 0;
     FZSolution sol; memset(&sol, 0, sizeof(sol));
     FZModel m; memset(&m, 0, sizeof(m));
@@ -52,7 +59,7 @@ int main(int argc,char**argv)
 
     {
         struct timespec t0,t1; clock_gettime(CLOCK_MONOTONIC,&t0);
-        if (fz_read(opt.path, &m) != 0) { psolve_end(); rc = 1; goto done; }
+        if (fz_read((const char*)pathbuf, &m) != 0) { psolve_end(); rc = 1; goto done; }
         fz_solve(&m, &sol);
         clock_gettime(CLOCK_MONOTONIC,&t1);
         secs = (t1.tv_sec-t0.tv_sec)+(t1.tv_nsec-t0.tv_nsec)/1e9;
