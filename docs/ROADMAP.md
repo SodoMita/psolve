@@ -64,19 +64,30 @@ a **projected Gauss-Seidel / sequential-impulse** solver on boxed
 complementarity constraints. Small (m ≤ ~256), dense, warm-started, iterated a
 fixed number of times per substep.  **All of this runs in fixed point.**
 
+> Note: the physics-engine-specific layer (contact-point gathering, integration,
+> collision broad/narrow phase, VG path geometry) belongs in *other* projects
+> that consume this library.  psolve's job here is the **solver foundation** —
+> kernels that are deterministic, zero-malloc, warm-start friendly, and fast.
+
 - [x] `src/pgs.c`: floating-point projected Gauss-Seidel boxed-QP solver
       `min ½xᵀAx + bᵀx  s.t.  lo ≤ x ≤ hi` (reference / cross-check).
-- [x] `src/pgs_fixed.c`: **fixed-point (integer)** PGS boxed-QP solver
-      `min ½xᵀAx + bᵀx  s.t.  lo ≤ x ≤ hi`, all-integer arithmetic with 128-bit
-      accumulation, round-half-away division, rational SOR (`w_num/w_den`),
-      bit-identical determinism.  Validated against the float reference.
-- [ ] Contact block helper: build the LCP/A-matrix from contact points
-      (friction + normal) as integer, solve impulses in fixed point.
-- [ ] Pre-sized row storage for the banded/diagonal-dominant contact-cluster
-      matrices.
-- [ ] Fixed-point QP / LP kernels (integer revised-simplex for VG/UI layout).
+- [x] `src/pgs_fixed.c`: **fixed-point (integer)** PGS boxed-QP solver,
+      all-integer with 128-bit accumulation, round-half-away division, rational
+      SOR, bit-identical determinism.  Validated against the float reference.
+- [x] **PGS-vs-LP benchmark** (`make pgs_vs_lp`): shows PGS-fixed is ~60–600×
+      faster than the general LP simplex and ~10–30× faster than exact
+      active-set QP on identical warm-started physics boxed problems — i.e. PGS
+      is the correct foundation for a per-frame hot loop; the LP/QP solvers are
+      the correctness backbone for everything else.
+- [x] **Zero-malloc**: both PGS kernels already use only caller-provided arrays
+      and stack (alloca) — no heap in the solve loop.  (The arena requirement
+      is satisfied for the foundation; the host app supplies buffers.)
+- [ ] *(moved to other projects)* Contact-block builder, broad/narrow-phase
+      collision, fixed-point integration, VG path geometry.
+- [ ] *(future)* Fixed-point LP/QP kernels (integer revised-simplex) for UI
+      layout / VG, when a host project needs an integer general solver.
 
-### Phase 1 progress: float + fixed-point PGS kernels, tests, bench — done this turn.
+### Phase 1 complete (foundation). Next: Phase 3 FlatZinc, Phase 2 VG/UI kernels.
 
 ---
 
@@ -96,13 +107,29 @@ convex problems. Two specialized kernels, **all in fixed point**:
 Implement per `docs/psolve_todo_fzn.md` — a FlatZinc reader + redefinitions so
 the full MiniZinc suite can be run against psolve. This validates LP/QP/MIP
 feature completeness against a huge standard corpus.
-- [ ] FlatZinc lexer + parser (name→index map, ranges, annotations, solve item)
-- [ ] Constraint dispatch: int_lin_* (native), element/all_different/count/
-      table/circuit/cumulative/regular (rejected or linearized)
-- [ ] MIP CLI bridge (integer var list, node/time limits, best-bound stats)
-- [ ] Output format + stats (`===UNKNOWN===`, `%%%mzn-stat:*`)
-- [ ] Differential validation vs HiGHS; round-trip .mzn→.fzn→solve→verify
-- [ ] Fuzz the FlatZinc parser
+
+### Status (started this session — linear subset working)
+- [x] **Lexer**: identifiers, ints, floats, strings, keywords, symbols,
+      comments; handles `1..10` ranges (decimal-point fix).
+- [x] **Parser**: predicate decls (skipped), `par`/`var` scalar + array decls,
+      name→index map, array index ranges, annotations (`::output_var`,
+      `::output_array`, `:: domain`), solve item (satisfy/minimize/maximize).
+- [x] **Domain forms**: both `var int: x :: 1..10` (annotation) and
+      `var 1..10: x` (shorthand) are read into variable bounds.
+- [x] **Constraint dispatch**: `int_lin_eq/le` (native), `int_eq/le/lt/ge/gt`,
+      `bool_eq/le/lt`, `bool_not`, `int_plus/minus` — linear subset mapped to
+      the LP solver.
+- [x] **Bridge**: big-M clamping of unbounded `var int`, LP solve, FlatZinc
+      output (`x = v;`, `----------`, status markers) + `%%%mzn-stat`.
+- [ ] More handlers: `bool_and/or/xor/clause`, `all_different`, `element`,
+      `set_in`, `int_abs/max/min`, `float_*`, `int2float`, etc.
+- [ ] MIP CLI bridge (integer var list, node/time limits, best-bound stats).
+- [ ] CLI flags (`-a`, `-n`, `-t`, `-s`, `-v`, SIGINT), time-limit signal.
+- [ ] Differential validation vs HiGHS; round-trip .mzn→.fzn→solve→verify.
+- [ ] Fuzz the FlatZinc parser (ASan/UBSan).
+
+### Phase 3 first-cut deliverable: `fznsolve <x.fzn>` solves the linear subset,
+with tests in `examples/fzn/` and `test.sh`.
 
 ---
 

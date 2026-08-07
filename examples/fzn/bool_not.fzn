@@ -1,0 +1,10 @@
+predicate int_lin_le(array[int] of int: c, array[int] of var int: x, int: d);
+predicate bool2int(var bool: b, var int: i);
+predicate bool_not(var bool: a, var bool: b);
+var 0..1: b :: output_var;
+var 0..1: nb :: output_var;
+var 0..10: y :: output_var;
+constraint bool_not(b, nb);
+constraint int_lin_le([1], [nb], 0);
+constraint int_lin_le([1, 1], [b, y], 10);
+solve satisfy;

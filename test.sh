@@ -60,4 +60,13 @@ else
   echo "  (skipped: gcc not available)"
 fi
 
+echo "[8/8] FlatZinc reader + solver bridge (Phase 3, linear subset)..."
+make fznsolve >/dev/null 2>&1
+./fznsolve examples/fzn/satisfy_lin.fzn | grep -E "x1 =|x2 =" | tr '\n' ' '
+echo "(expect x1=6 x2=4)"
+./fznsolve examples/fzn/min_lin.fzn | grep -E "x1 =|x2 =" | tr '\n' ' '
+echo "(expect x1=1 x2=1)"
+./fznsolve examples/fzn/max_lin.fzn | grep -E "x1 =|x2 =" | tr '\n' ' '
+echo "(expect x1=0 x2=12)"
+
 echo "Done."

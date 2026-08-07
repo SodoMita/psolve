@@ -42,6 +42,7 @@ with an explicit baseline `ARCH`.
 ./lpsolve <problem.lp> [--print]      # LP (revised simplex)
 ./qpsolve <qp.qp>                      # convex QP (active-set)
 ./mipsolve <problem.lp> <nint> <j...> [--print]   # MIP (branch-and-bound)
+./fznsolve <problem.fzn>               # FlatZinc reader + solver (Phase 3)
 ```
 
 `--print` also dumps the optimal variable values.
@@ -96,6 +97,20 @@ Measured on this box (2 CPU cores):
 
 Build benchmarks with `make pgsbench` (float) and `make pgfbench` (fixed);
 see `examples/contact_pgs.c` and `examples/contact_pgs_fixed.c`.
+
+**PGS vs LP/QP** (`make pgs_vs_lp`) quantifies the foundation choice: on
+identical warm-started physics boxed-QP problems, PGS-fixed is ~60–600× faster
+than the general LP simplex and ~10–30× faster than the exact active-set QP:
+
+```
+ n   PGS-fixed  active-setQP  LPsimplex
+ 8    0.23 us     1.3 us       13.6 us
+32    1.93 us    15.0 us      929   us
+64    6.83 us    70.4 us     4039   us
+```
+
+So PGS is the right foundation for a per-frame physics hot loop; the LP/QP/MIP
+solvers are the exact correctness backbone for everything else.
 
 ## Sensitivity analysis (LP)
 
@@ -232,6 +247,7 @@ src/solver.c    revised-simplex driver, two-phase method, steepest-edge pricing,
 src/mip.c       mixed-integer programming via branch-and-bound
 src/pgs.c       projected Gauss-Seidel boxed-QP (float reference kernel)
 src/pgs_fixed.c fixed-point (integer) PGS boxed-QP (production physics kernel)
+src/fzn.c       FlatZinc reader + LP solver bridge (Phase 3)
 src/qp.c        convex QP solver (active-set method + Phase-I feasibility)
 src/parser.c    LP file reader
 src/main.c      LP CLI

@@ -30,14 +30,14 @@ QPOBJ = $(QPSRC:.c=.o)
 #   make lib   ->  libpsolve.a  (all solvers: LP, QP, MIP, PGS)
 #   make liblp ->  libpsolve-lp.a   (LP only)
 #   make libqp ->  libpsolve-qp.a   (QP only)
-LIB_SRC = src/err.c src/kernels.c src/lu.c src/splu.c src/solver.c src/parser.c src/qp.c src/mip.c src/pgs.c src/pgs_fixed.c
+LIB_SRC = src/err.c src/kernels.c src/lu.c src/splu.c src/solver.c src/parser.c src/qp.c src/mip.c src/pgs.c src/pgs_fixed.c src/fzn.c
 LIB_OBJ = $(LIB_SRC:.c=.o)
 LP_LIB_SRC = src/err.c src/kernels.c src/lu.c src/splu.c src/solver.c src/parser.c
 LP_LIB_OBJ = $(LP_LIB_SRC:.c=.o)
 QP_LIB_SRC = src/err.c src/qp.c src/lu.c src/kernels.c src/pgs.c src/pgs_fixed.c
 QP_LIB_OBJ = $(QP_LIB_SRC:.c=.o)
 
-all: lpsolve qpsolve mipsolve pgsbench pgfbench
+all: lpsolve qpsolve mipsolve pgsbench pgfbench fznsolve
 
 lpsolve: $(OBJ)
 	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -o $@ $(OBJ) $(LDFLAGS) $(LDLIBS)
@@ -56,6 +56,23 @@ src/pgs.o: src/pgs.c src/pgs.h
 	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -I src -c -o $@ $<
 
 tools/pgbench.o: tools/pgbench.c src/pgs.h
+	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -I src -c -o $@ $<
+
+# PGS vs LP/QP benchmark (which solver foundation fits real-time physics)
+pgs_vs_lp: tools/pgs_vs_lp.o src/err.o src/pgs.o src/pgs_fixed.o src/qp.o src/lu.o src/kernels.o src/splu.o src/solver.o src/parser.o
+	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -o $@ $^ $(LDFLAGS) $(LDLIBS)
+
+tools/pgs_vs_lp.o: tools/pgs_vs_lp.c src/pgs.h src/pgs_fixed.h src/qp.h src/solver.h
+	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -I src -c -o $@ $<
+
+# FlatZinc reader + solver bridge (Phase 3)
+fznsolve: src/fzn.o src/err.o src/solver.o src/splu.o src/lu.o src/kernels.o src/parser.o tools/fznsolve.o
+	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -o $@ $^ $(LDFLAGS) $(LDLIBS)
+
+src/fzn.o: src/fzn.c src/fzn.h src/solver.h src/err.h
+	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -I src -c -o $@ $<
+
+tools/fznsolve.o: tools/fznsolve.c src/fzn.h src/err.h
 	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -I src -c -o $@ $<
 
 # Fixed-point physics kernel
@@ -103,6 +120,6 @@ asan: clean
 	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -I src -c -o $@ $<
 
 clean:
-	rm -f lpsolve qpsolve mipsolve pgsbench pgfbench src/*.o tools/*.o libpsolve.a libpsolve-lp.a libpsolve-qp.a
+	rm -f lpsolve qpsolve mipsolve pgsbench pgfbench pgs_vs_lp fznsolve src/*.o tools/*.o libpsolve.a libpsolve-lp.a libpsolve-qp.a
 
 .PHONY: all asan clean lib liblp libqp

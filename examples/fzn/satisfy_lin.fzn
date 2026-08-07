@@ -1,0 +1,8 @@
+predicate int_lin_eq(array[int] of int: c, array[int] of var int: x, int: d);
+predicate int_lin_le(array[int] of int: c, array[int] of var int: x, int: d);
+var int: x1 :: output_var;
+var int: x2 :: output_var;
+constraint int_lin_eq([1, 1], [x1, x2], 10);
+constraint int_lin_le([1], [x1], 6);
+constraint int_lin_le([1], [x2], 8);
+solve satisfy;
