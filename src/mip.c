@@ -116,7 +116,6 @@ void mip_solve(const MIP *mip, MIPResult *res)
 
         double obj;
         int r = solve_relaxation(mip, node, x, &obj, lcur, ucur);
-        if(getenv("MDBG")){fprintf(stderr,"node %ld r=%d obj=%g bounds lo=[",nodes,r,obj);for(int j=0;j<n;j++)fprintf(stderr,"%.3g ",lcur[j]);fprintf(stderr,"] hi=[");for(int j=0;j<n;j++)fprintf(stderr,"%.3g ",ucur[j]);fprintf(stderr,"] x=[");for(int j=0;j<n;j++)fprintf(stderr,"%.3g ",x[j]);fprintf(stderr,"]\n");}
         if (r == -1) { free(node->lo); free(node->hi); free(node); continue; } /* infeasible */
         if (r == 3) { free(node->lo); free(node->hi); free(node); status = 3; break; } /* lp limit */
         /* infeasible or unbounded relaxation */
@@ -147,7 +146,7 @@ void mip_solve(const MIP *mip, MIPResult *res)
 
         if (allint) {
             /* integer-feasible: update incumbent */
-            if (!have_incumbent ||
+                if (!have_incumbent ||
                 (mip->maximize && obj > incumbent) ||
                 (!mip->maximize && obj < incumbent)) {
                 incumbent = obj;

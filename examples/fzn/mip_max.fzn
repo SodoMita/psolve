@@ -1,0 +1,5 @@
+predicate int_lin_le(array[int] of int: c, array[int] of var int: x, int: d);
+var 0..10: x1 :: output_var;
+var 0..10: x2 :: output_var;
+constraint int_lin_le([2, 1], [x1, x2], 9);
+solve maximize x1;

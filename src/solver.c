@@ -273,7 +273,6 @@ Solver *solver_create(const LP *lp)
 
     /* initial refactorization */
     refactorize(s);
-
     free(mlt);
     return s;
 }

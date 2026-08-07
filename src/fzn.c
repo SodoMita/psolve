@@ -1,5 +1,6 @@
 #include "fzn.h"
 #include "solver.h"
+#include "mip.h"
 #include "err.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -379,6 +380,73 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
         lin_free(&l1);lin_free(&l2);lin_free(&l3);lin_free(&dd);
         return 0;
     }
+    /* boolean conjunctions / disjunctions / xor (exact, bool vars are 0/1) */
+    if(strcmp(p,"bool_and")==0||strcmp(p,"bool_or")==0||strcmp(p,"bool_xor")==0){
+        if(c->nargs<3)return -1;
+        if(parse_lin(m,c->args[0],&l1)!=0)return -1;
+        if(parse_lin(m,c->args[1],&l2)!=0){lin_free(&l1);return -1;}
+        if(parse_lin(m,c->args[2],&l3)!=0){lin_free(&l1);lin_free(&l2);return -1;}
+        /* result var r in l3 (coefficient 1 on some var) */
+        int r = l3.n==1 ? l3.idx[0] : -1;
+        int a = l1.n==1 ? l1.idx[0] : -1;
+        int be = l2.n==1 ? l2.idx[0] : -1;
+        if(r<0||a<0||be<0){lin_free(&l1);lin_free(&l2);lin_free(&l3);return -1;}
+        if(strcmp(p,"bool_and")==0){
+            /* r <= a, r <= b, r >= a+b-1 */
+            Lin d1;memset(&d1,0,sizeof(d1));lin_term(&d1,r,1.0);lin_term(&d1,a,-1.0);b_put(b,'<',0.0,&d1);
+            Lin d2;memset(&d2,0,sizeof(d2));lin_term(&d2,r,1.0);lin_term(&d2,be,-1.0);b_put(b,'<',0.0,&d2);
+            Lin d3;memset(&d3,0,sizeof(d3));lin_term(&d3,r,1.0);lin_term(&d3,a,-1.0);lin_term(&d3,be,-1.0);d3.constant=1.0;b_put(b,'>',0.0,&d3);
+            lin_free(&d1);lin_free(&d2);lin_free(&d3);
+        } else if(strcmp(p,"bool_or")==0){
+            Lin d1;memset(&d1,0,sizeof(d1));lin_term(&d1,r,1.0);lin_term(&d1,a,-1.0);b_put(b,'>',0.0,&d1);
+            Lin d2;memset(&d2,0,sizeof(d2));lin_term(&d2,r,1.0);lin_term(&d2,be,-1.0);b_put(b,'>',0.0,&d2);
+            Lin d3;memset(&d3,0,sizeof(d3));lin_term(&d3,r,1.0);lin_term(&d3,a,-1.0);lin_term(&d3,be,-1.0);b_put(b,'<',0.0,&d3);
+            lin_free(&d1);lin_free(&d2);lin_free(&d3);
+        } else { /* xor: r=a XOR b */
+            Lin d1;memset(&d1,0,sizeof(d1));lin_term(&d1,r,1.0);lin_term(&d1,a,-1.0);lin_term(&d1,be,-1.0);b_put(b,'<',0.0,&d1);
+            Lin d2;memset(&d2,0,sizeof(d2));lin_term(&d2,r,1.0);lin_term(&d2,a,-1.0);lin_term(&d2,be,1.0);b_put(b,'>',0.0,&d2);
+            Lin d3;memset(&d3,0,sizeof(d3));lin_term(&d3,r,1.0);lin_term(&d3,a,1.0);lin_term(&d3,be,-1.0);b_put(b,'>',0.0,&d3);
+            Lin d4;memset(&d4,0,sizeof(d4));lin_term(&d4,r,1.0);lin_term(&d4,a,1.0);lin_term(&d4,be,1.0);d4.constant=2.0;b_put(b,'<',0.0,&d4);
+            lin_free(&d1);lin_free(&d2);lin_free(&d3);lin_free(&d4);
+        }
+        lin_free(&l1);lin_free(&l2);lin_free(&l3);
+        return 0;
+    }
+    /* bool_clause(pos[], neg[], b): b = OR(positives) OR OR(not negatives) */
+    if(strcmp(p,"bool_clause")==0){
+        if(c->nargs<3)return -1;
+        Lin*pos;int np; Lin*neg;int ng;
+        if(parse_array(m,c->args[0],&pos,&np)!=0)return -1;
+        if(parse_array(m,c->args[1],&neg,&ng)!=0){free_lins(pos,np);return -1;}
+        Lin rb; if(parse_lin(m,c->args[2],&rb)!=0){free_lins(pos,np);free_lins(neg,ng);return -1;}
+        int r = rb.n==1?rb.idx[0]:-1;
+        if(r<0){free_lins(pos,np);free_lins(neg,ng);lin_free(&rb);return -1;}
+        /* t = sum(pos) - sum(neg) + n_neg = number of true literals */
+        Lin t;memset(&t,0,sizeof(t));
+        int nli=0;
+        for(int i=0;i<np;i++){if(pos[i].n==1){lin_term(&t,pos[i].idx[0],1.0);nli++;}}
+        for(int i=0;i<ng;i++){if(neg[i].n==1){lin_term(&t,neg[i].idx[0],-1.0);nli++;t.constant+=1.0;}}
+        /* b <= t ;  b >= t/nli */
+        Lin d1;memset(&d1,0,sizeof(d1));lin_term(&d1,r,1.0);lin_into(&d1,&t,-1.0);b_put(b,'<',0.0,&d1);
+        Lin d2;memset(&d2,0,sizeof(d2));lin_term(&d2,r,1.0);
+        if(nli>0)for(int i=0;i<t.n;i++)lin_term(&d2,t.idx[i],-1.0/(double)nli);
+        d2.constant = -t.constant/(double)nli;
+        b_put(b,'>',0.0,&d2);
+        lin_free(&t);lin_free(&d1);lin_free(&d2);lin_free(&rb);
+        free_lins(pos,np);free_lins(neg,ng);
+        return 0;
+    }
+    /* int_neg(a,b): b = -a */
+    if(strcmp(p,"int_neg")==0){
+        if(c->nargs<2)return -1;
+        if(parse_lin(m,c->args[0],&l1)!=0)return -1;
+        if(parse_lin(m,c->args[1],&l2)!=0){lin_free(&l1);return -1;}
+        Lin dd;memset(&dd,0,sizeof(dd));
+        lin_into(&dd,&l2,1.0);lin_into(&dd,&l1,1.0); /* result + a = 0 */
+        b_put(b,'=',0.0,&dd);
+        lin_free(&l1);lin_free(&l2);lin_free(&dd);
+        return 0;
+    }
     /* everything else: unhandled (return UNKNOWN at top level) */
     return 1;
 }
@@ -421,12 +489,34 @@ void fz_solve(const FZModel*m,FZSolution*sol)
     for(int r=0;r<b.nrows;r++)for(int k=0;k<b.rows[r].n;k++){int j=b.rows[r].idx[k];if(j>=0&&j<nv){lp.Arow[ff[j]]=r;lp.Aval[ff[j]]=b.rows[r].coef[k];ff[j]++;}}
     free(ff);
 
-    Solver*s=solver_create(&lp);
-    int rr=solver_solve(s);
-    if(rr==0){double*xo=(double*)malloc((size_t)nv*sizeof(double));double obj;solver_optimum(s,xo,&obj);memcpy(sol->x,xo,(size_t)nv*sizeof(double));sol->obj=obj;sol->iters=s->iters;sol->status=0;free(xo);}
-    else if(rr==1)sol->status=1;
-    else sol->status=2;
-    solver_destroy(s);
+    /* decide integer vs continuous: FlatZinc int/bool vars are integer
+       (bool is 0/1); float vars are continuous.  If any integer variable is
+       present, solve with the MIP branch-and-bound solver so the answer is
+       integral; otherwise the LP relaxation is exact. */
+    unsigned char *isint=(unsigned char*)calloc((size_t)(nv?nv:1),1);
+    int any_int=0;
+    for(int d=0;d<m->ndecl;d++){FZDecl*decl=&m->decls[d];if(!decl->is_var||decl->base_idx<0)continue;
+        int integer = (decl->kind!=FZ_K_FLOAT);   /* int and bool are integer */
+        for(int e=0;e<decl->n;e++){int vi=decl->base_idx+e;if(vi>=0&&vi<nv&&integer){isint[vi]=1;any_int=1;}}}
+    if(any_int){
+        MIP mip;memset(&mip,0,sizeof(mip));
+        mip.n=nv;mip.m=b.nrows;mip.c=lp.c;mip.Acolptr=lp.Acolptr;mip.Arow=lp.Arow;mip.Aval=lp.Aval;
+        mip.rel=lp.rel;mip.b=lp.b;mip.l=lp.l;mip.u=lp.u;mip.maximize=lp.maximize;
+        mip.isint=isint;mip.mip_gap=1e-4;mip.node_limit=200000;mip.lp_iter_limit=2000000;
+        MIPResult mr;mip_solve(&mip,&mr);
+        if(mr.status==0){memcpy(sol->x,mr.x,(size_t)nv*sizeof(double));sol->obj=mr.obj;sol->iters=mr.lp_iters;sol->status=0;}
+        else if(mr.status==1)sol->status=1;
+        else sol->status=2;
+        mip_result_free(&mr);
+    } else {
+        Solver*s=solver_create(&lp);
+        int rr=solver_solve(s);
+        if(rr==0){double*xo=(double*)malloc((size_t)nv*sizeof(double));double obj;solver_optimum(s,xo,&obj);memcpy(sol->x,xo,(size_t)nv*sizeof(double));sol->obj=obj;sol->iters=s->iters;sol->status=0;free(xo);}
+        else if(rr==1)sol->status=1;
+        else sol->status=2;
+        solver_destroy(s);
+    }
+    free(isint);
     free(lp.c);free(lp.l);free(lp.u);free(lp.b);free(lp.rel);free(lp.Acolptr);free(lp.Arow);free(lp.Aval);
     for(int r=0;r<b.nrows;r++){free(b.rows[r].idx);free(b.rows[r].coef);}free(b.rows);free(b.lo);free(b.hi);free(b.haslo);free(b.hashi);
 }

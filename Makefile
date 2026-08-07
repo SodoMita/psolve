@@ -66,7 +66,7 @@ tools/pgs_vs_lp.o: tools/pgs_vs_lp.c src/pgs.h src/pgs_fixed.h src/qp.h src/solv
 	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -I src -c -o $@ $<
 
 # FlatZinc reader + solver bridge (Phase 3)
-fznsolve: src/fzn.o src/err.o src/solver.o src/splu.o src/lu.o src/kernels.o src/parser.o tools/fznsolve.o
+fznsolve: src/fzn.o src/mip.o src/err.o src/solver.o src/splu.o src/lu.o src/kernels.o src/parser.o tools/fznsolve.o
 	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -o $@ $^ $(LDFLAGS) $(LDLIBS)
 
 src/fzn.o: src/fzn.c src/fzn.h src/solver.h src/err.h

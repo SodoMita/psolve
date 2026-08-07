@@ -68,5 +68,9 @@ echo "(expect x1=6 x2=4)"
 echo "(expect x1=1 x2=1)"
 ./fznsolve examples/fzn/max_lin.fzn | grep -E "x1 =|x2 =" | tr '\n' ' '
 echo "(expect x1=0 x2=12)"
+./fznsolve examples/fzn/bool_logic.fzn | grep -E "a =|b =|andr|orr" | tr '\n' ' '
+echo "(expect a=0 b=1 andr=0 orr=1)"
+./fznsolve examples/fzn/mip_max.fzn | grep -E "x1 =|x2 =" | tr '\n' ' '
+echo "(expect x1=4 x2=0, MIP integral)"
 
 echo "Done."

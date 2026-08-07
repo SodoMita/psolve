@@ -1,0 +1,11 @@
+predicate bool_and(var bool: a, var bool: b, var bool: r);
+predicate bool_or(var bool: a, var bool: b, var bool: r);
+predicate bool_not(var bool: a, var bool: b);
+var 0..1: a :: output_var;
+var 0..1: b :: output_var;
+var 0..1: andr :: output_var;
+var 0..1: orr :: output_var;
+constraint bool_and(a, b, andr);
+constraint bool_or(a, b, orr);
+constraint bool_not(a, b);
+solve satisfy;

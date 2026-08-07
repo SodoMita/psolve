@@ -121,8 +121,13 @@ feature completeness against a huge standard corpus.
       the LP solver.
 - [x] **Bridge**: big-M clamping of unbounded `var int`, LP solve, FlatZinc
       output (`x = v;`, `----------`, status markers) + `%%%mzn-stat`.
-- [ ] More handlers: `bool_and/or/xor/clause`, `all_different`, `element`,
-      `set_in`, `int_abs/max/min`, `float_*`, `int2float`, etc.
+- [x] More handlers: `bool_and`, `bool_or`, `bool_xor`, `bool_clause`
+      (exact 0/1 linearizations), `int_neg`.
+- [ ] More handlers: `all_different`, `element`, `set_in`, `int_abs/max/min`,
+      `float_*`, `int2float`, reified forms, etc.
+- [x] **MIP bridge**: when the model has integer vars, `fz_solve` dispatches to
+      the MIP branch-and-bound so answers are integral (verified vs brute
+      force on random non-degenerate problems).
 - [ ] MIP CLI bridge (integer var list, node/time limits, best-bound stats).
 - [ ] CLI flags (`-a`, `-n`, `-t`, `-s`, `-v`, SIGINT), time-limit signal.
 - [ ] Differential validation vs HiGHS; round-trip .mzn→.fzn→solve→verify.
@@ -130,6 +135,17 @@ feature completeness against a huge standard corpus.
 
 ### Phase 3 first-cut deliverable: `fznsolve <x.fzn>` solves the linear subset,
 with tests in `examples/fzn/` and `test.sh`.
+
+### Known limitation (LP Phase I degeneracy)
+The revised-simplex **Phase I can mis-declare INFEASIBLE** on degenerate
+problems combining an **equality constraint with a variable fixed to a value**
+(lower==upper).  Phase I then stalls with an artificial basic at a positive
+value even though a feasible point exists, which also makes MIP suboptimal on
+such instances.  Reproducible with `tools/fzn_verify.py` (seed 1, t=10).
+This is a genuine pre-existing simplex Phase-I degeneracy bug that needs a
+dedicated fix (more robust artificial-drive-out / perturbation); it is tracked
+here rather than rushed.  Common (non-degenerate) LP/QP/MIP/FZ cases are
+correct (canonical GLPK sweep 119/119, QP vs scipy, MIP vs brute on non-degen).
 
 ---
 

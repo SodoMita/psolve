@@ -233,6 +233,22 @@ sensitivity analysis (`solver_duals`, `solver_reduced_costs`).  The QP API
 feasibility search (variable bounds are expressed as rows).  This is the
 integration point used by [SmazkaVG](https://github.com/SodoMita/SmazkaVG).
 
+## FlatZinc (Phase 3, linear subset)
+
+`fznsolve <problem.fzn>` reads a MiniZinc-compiled FlatZinc file and solves the
+linear subset it can handle natively with the LP solver (and the MIP solver
+when integer variables are present, so answers are integral):
+
+- **Declarations**: `par`/`var` int/float/bool, scalar + arrays, name→index,
+  annotations, domains in both `var 1..10:` shorthand and `::`-annotation forms.
+- **Constraints**: `int_lin_eq/le`, `int_eq/le/lt/ge/gt`, `bool_eq/le/lt`,
+  `bool_and/or/xor/not/clause`, `int_plus/minus/neg`.
+- **Solve**: satisfy / minimize / maximize; FlatZinc output (`x = v;`,
+  `----------`, status markers) and `%%%mzn-stat`.
+- Nonlinear/unhandled constraints return `=====UNKNOWN=====` (never a wrong
+  answer).  See `docs/ROADMAP.md` for a known Phase-I degeneracy limitation
+  (equality + fixed variables) and the remaining handler list.
+
 ## Layout
 
 ```
