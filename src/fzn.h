@@ -107,6 +107,8 @@ typedef struct {
     long  nodes;
     double best_bound;
     long  node_limit;
+    int   all_solutions; /* 1 = output all solutions / intermediate incumbents */
+    int   num_solutions; /* number of solutions output */
 } FZSolution;
 
 /* Build + solve the LP from the model.  Unhandled constraints -> UNKNOWN. */

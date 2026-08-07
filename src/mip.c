@@ -279,7 +279,7 @@ void mip_solve(const MIP *mip, MIPResult *res)
         /* track best bound over solved (not pruned) nodes */
         if (mip->maximize) { if (obj > best_bound) best_bound = obj; }
         else { if (obj < best_bound) best_bound = obj; }
-        if (have_incumbent) {
+        if (have_incumbent && !mip->stop_at_feasible) {
             if (mip->maximize && obj <= incumbent + gap * (1.0 + fabs(incumbent))) { free(node->lo); free(node->hi); free(node); continue; }
             if (!mip->maximize && obj >= incumbent - gap * (1.0 + fabs(incumbent))) { free(node->lo); free(node->hi); free(node); continue; }
         }
@@ -287,7 +287,7 @@ void mip_solve(const MIP *mip, MIPResult *res)
         /* LP-rounding feasibility heuristic: if the relaxation is already
            integral after rounding, grab it as an incumbent immediately
            (fast path, especially for solve satisfy). */
-        if (try_rounding_heuristic(mip, x, lcur, ucur, xc)) {
+        if (!mip->all_solutions && try_rounding_heuristic(mip, x, lcur, ucur, xc)) {
             double objr = 0.0;
             for (int j = 0; j < n; j++) objr += mip->c[j] * xc[j];
             if (!have_incumbent ||
@@ -299,7 +299,7 @@ void mip_solve(const MIP *mip, MIPResult *res)
                 for (int j = 0; j < n; j++) res->isint_sol[j] = mip->isint[j];
             }
         }
-        if (mip->stop_at_feasible && have_incumbent) {
+        if (mip->stop_at_feasible && have_incumbent && !mip->all_solutions) {
             free(node->lo); free(node->hi); free(node);
             stopped_early = 1;
             break;
@@ -318,6 +318,42 @@ void mip_solve(const MIP *mip, MIPResult *res)
         }
 
         if (allint) {
+            /* In all-solutions satisfaction mode, if any integer variable is
+               not yet fixed to a single value, branch on it to enumerate all
+               lattice points rather than stopping at the first point. */
+            if (mip->all_solutions && mip->stop_at_feasible) {
+                int unfixed = -1;
+                for (int j = 0; j < n; j++) {
+                    if (mip->isint[j] && (ucur[j] - lcur[j] > 0.5)) {
+                        unfixed = j; break;
+                    }
+                }
+                if (unfixed >= 0) {
+                    double v = floor(x[unfixed] + 0.5);
+                    if (v < lcur[unfixed]) v = lcur[unfixed];
+                    if (v >= ucur[unfixed]) v = ucur[unfixed] - 1.0;
+
+                    Node *c1 = (Node*)psolve_malloc(sizeof(Node));
+                    c1->lo = (double*)psolve_malloc((size_t)n * sizeof(double));
+                    c1->hi = (double*)psolve_malloc((size_t)n * sizeof(double));
+                    for (int j = 0; j < n; j++) { c1->lo[j] = lcur[j]; c1->hi[j] = ucur[j]; }
+                    c1->hi[unfixed] = v;
+                    c1->bound = obj; c1->feasible = 0; c1->next = NULL;
+                    push_node(&stack, c1, mip->maximize);
+
+                    Node *c2 = (Node*)psolve_malloc(sizeof(Node));
+                    c2->lo = (double*)psolve_malloc((size_t)n * sizeof(double));
+                    c2->hi = (double*)psolve_malloc((size_t)n * sizeof(double));
+                    for (int j = 0; j < n; j++) { c2->lo[j] = lcur[j]; c2->hi[j] = ucur[j]; }
+                    c2->lo[unfixed] = v + 1.0;
+                    c2->bound = obj; c2->feasible = 0; c2->next = NULL;
+                    push_node(&stack, c2, mip->maximize);
+
+                    free(node->lo); free(node->hi); free(node);
+                    continue;
+                }
+            }
+
             /* Integer-feasible.  Snap the integer components to the lattice:
                the LP returns them within MIP_TOL of an integer, and callers
                must never see 2.9999999997 for a variable declared integer. */
@@ -335,13 +371,17 @@ void mip_solve(const MIP *mip, MIPResult *res)
                 memcpy(bestx, x, (size_t)n * sizeof(double));
                 have_incumbent = 1;
                 for (int j = 0; j < n; j++) res->isint_sol[j] = mip->isint[j];
-                if (mip->stop_at_feasible) {
+                if (mip->all_solutions && mip->on_solution)
+                    mip->on_solution(x, obj, mip->solution_user_data);
+                if (mip->stop_at_feasible && !mip->all_solutions) {
                     /* solve satisfy: the first feasible integer point is an
                        answer; stop branching instead of proving optimality. */
                     free(node->lo); free(node->hi); free(node);
                     stopped_early = 1;
                     break;
                 }
+            } else if (mip->all_solutions && mip->stop_at_feasible && mip->on_solution) {
+                mip->on_solution(x, obj, mip->solution_user_data);
             }
             free(node->lo); free(node->hi); free(node);
             continue;
