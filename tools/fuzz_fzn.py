@@ -80,6 +80,16 @@ def gen_wellformed(rng):
     if n >= 2 and rng.random() < 0.3:
         a, b = rng.sample(range(n), 2)
         L.append(f"constraint int_eq_reif({names[a]}, {names[b]}, {names[rng.randint(0,n-1)]});")
+    # table constraint: tuple of a random subset of vars must be one of the rows
+    if n >= 1 and rng.random() < 0.4:
+        k = rng.randint(1, min(3, n))
+        sel = rng.sample(range(n), k)
+        rows = rng.randint(1, 5)
+        vals = []
+        for _ in range(rows * k):
+            vals.append(str(rng.randint(-5, 9)))
+        xs = ", ".join(names[i] for i in sel)
+        L.append(f"constraint table([{xs}], array2d(1, {rows}, 1, {k}, [{', '.join(vals)}]));")
     # solve
     kind = rng.randint(0,2)
     if kind == 0:

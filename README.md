@@ -261,7 +261,10 @@ when integer variables are present, so answers are integral):
   `bool_and/or/xor/not/clause`, `array_bool_and/or`, `int_plus/minus/neg`,
   `int_abs/max/min`, `int_times` (constant operand), `set_in` + set domains,
   `all_different`, `array_int_element`, `bool2int`/`int2float`, reified
-  `int_eq/le/lt/ge/gt_reif`, `int_lin_ne`, `int_lin_ge`, `count`/`among`.
+  `int_eq/le/lt/ge/gt_reif`, `int_lin_ne`, `int_lin_ge`, `count`/`among`,
+  `table` (tuple must be one of a list of allowed rows; exact MIP encoding with
+  one binary selector per row and a per-column big-M), plus the
+  `float_lt/le/ge/gt` and `bool_ge/gt` relational variants.
 - **Solve**: satisfy / minimize / maximize; FlatZinc output (`x = v;`,
   `array1d(...)`, status markers), objective always, and `-s` stats
   (`nodes`, `objectiveBound`); `-n` node limit and `-t`/SIGINT time limits are

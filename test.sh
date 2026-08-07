@@ -73,6 +73,17 @@ echo "(expect x1=0 x2=12)"
 echo "(expect a=0 b=1 andr=0 orr=1)"
 ./fznsolve examples/fzn/mip_max.fzn | grep -E "x1 =|x2 =" | tr '\n' ' '
 echo "(expect x1=4 x2=0, MIP integral)"
+./fznsolve examples/fzn/table_sat.fzn | grep -E "x1 =|x2 =" | tr '\n' ' '
+echo "(expect a table row, e.g. x1=1 x2=2)"
+./fznsolve examples/fzn/table_opt.fzn | grep -E "x1 =|x2 =|x3 =|obj =" | tr '\n' ' '
+echo "(expect row (6,5,3) with obj=14)"
+if ./fznsolve examples/fzn/table_unsat.fzn | grep -q "=====UNSATISFIABLE====="; then
+  echo "table_unsat: UNSATISFIABLE (expect UNSATISFIABLE)  OK"
+else
+  echo "table_unsat: FAIL (expected UNSATISFIABLE)"
+fi
+echo -n "table_verify (randomized, vs brute force): "
+python3 tools/table_verify.py 250 20240607 | sed 's/.*: //'
 
 if command -v minizinc >/dev/null 2>&1; then
   echo "[8.5/8] MiniZinc differential (compile .mzn -> fzn -> psolve vs Gecode)..."

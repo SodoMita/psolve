@@ -179,8 +179,16 @@ feature completeness against a huge standard corpus.
 - [x] `int_lin_ge`/`int_lin_gt`/`bool_lin_ge`; `fzn_count_eq`/`fzn_among_eq`
       (exact via per-variable `[x_i==v]` binary + a side-selector binary for the
       `x_i!=v` OR; fixed an AND-vs-OR encoding bug).
-- [ ] More handlers: `float_*` relational variants, `cumulative`, `circuit`,
-      `table`.
+- [x] `table` (tuple of vars must equal one of a list of rows): exact MIP
+      encoding with one binary selector per row (`sum b_j = 1` plus big-M
+      `x_i = T[j][i]` implications).  The big-M per variable is taken over the
+      actual table column values (`max(maxCol-lo, hi-minCol)`), not the domain
+      span, so rows whose values fall outside a variable's domain are safely
+      excluded.  An empty table is reported UNSATISFIABLE.  Validated against a
+      Python brute-force enumerator (`tools/table_verify.py`, 1500+ random
+      instances, 0 wrong answers) and fuzzed under ASan/UBSan.
+- [x] More relational variants: `float_lt/le/ge/gt`, `bool_ge/gt`.
+- [ ] More handlers: `cumulative`, `circuit`.
 - [x] **MIP bridge**: when the model has integer vars, `fz_solve` dispatches to
       the MIP branch-and-bound so answers are integral (objectives match brute
       force, e.g. knapsack=10, prod3=57).
