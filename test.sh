@@ -118,6 +118,8 @@ make fxsolve >/dev/null 2>&1
 echo -n "  exact demo (double vs fixed): "
 echo -n "double="; ./lpsolve examples/exact.lp | grep -oE "objective:.*"
 echo -n "  fixed="; ./fxsolve examples/exact.lp | grep -oE "objective \(exact\):.*"
+echo -n "fx_exact_test (exact feasibility/objective in Fractions, 64-vs-128-bit): "
+python3 tools/fx_exact_test.py 200 7 | head -1 | sed 's/.*: //'
 echo -n "fx_verify (random feasible+arbitrary LPs vs double, incl. status): "
 python3 tools/fx_verify.py 300 99 | sed 's/.*: //'
 echo -n "fx_bench (examples): "
