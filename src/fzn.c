@@ -91,7 +91,10 @@ static Expr parse_primary(const char*s,size_t*pos,FZModel*m,int*err)
             Expr t=parse_expr(s,pos,m,err);if(*err)return e;
             if(e.n>=cap){cap*=2;e.els=(Lin*)realloc(e.els,(size_t)cap*sizeof(Lin));}
             e.els[e.n]=t.els[0];e.n++;free(t.els);
-            while(s[*pos]==' ')(*pos)++;if(s[*pos]==','){(*pos)++;continue;}if(s[*pos]==']'){(*pos)++;break;}*err=1;return e;}
+            while(s[*pos]==' ')(*pos)++;
+            if(s[*pos]==','){(*pos)++;continue;}
+            if(s[*pos]==']'){(*pos)++;break;}
+            *err=1;return e;}
         return e;}
     if(isdigit((unsigned char)c)||(c=='.'&&isdigit((unsigned char)s[*pos+1]))){
         char num[64];int k=0;
@@ -145,6 +148,29 @@ static int parse_lin(FZModel*m,const char*s,Lin*out)
 /* parse an array expression into an array of Lin */
 static int parse_array(FZModel*m,const char*s,Lin**out,int*outn)
 {
+    /* An array argument may be a bare identifier naming a previously-declared
+       par array (e.g. X_INTRODUCED_1_ = [1,1]).  Resolve it to its elements. */
+    {
+        char name[256]; int k=0; const char*p=s;
+        while(*p==' ')p++;
+        if(isalpha((unsigned char)*p)||*p=='_'){
+            while(k<255&&is_ident_ch((unsigned char)*p))name[k++]=*p++;
+            name[k]=0;
+            while(*p==' ')p++;
+            if(*p=='\0'||*p==';'){   /* it's just an identifier */
+                FZDecl*d=find_decl(m,name);
+                if(d&&d->is_array&&d->par){
+                    *outn=d->n;
+                    *out=(Lin*)malloc((size_t)(d->n?d->n:1)*sizeof(Lin));
+                    for(int i=0;i<d->n;i++){
+                        memset(&(*out)[i],0,sizeof(Lin));
+                        (*out)[i].constant=d->par[i];
+                    }
+                    return 0;
+                }
+            }
+        }
+    }
     size_t pos=0;int err=0;
     Expr e=parse_expr(s,&pos,m,&err);
     if(err||!e.is_array){ if(e.n>0){for(int i=0;i<e.n;i++)lin_free(&e.els[i]);free(e.els);} return -1; }
@@ -235,9 +261,20 @@ int fz_read(const char*path,FZModel*m)
                 }
                 continue;
             }
-            if(is_kw(kw,"par")||is_kw(kw,"var")){
-                int is_var=is_kw(kw,"var");FZDecl*d=add_decl(m);d->is_var=is_var;ti++;
-                if(ti<nt&&is_kw(toks[ti].text,"array")){d->is_array=1;ti++;while(ti<nt&&!(toks[ti].kind==TK_SYM&&strcmp(toks[ti].text,"]")==0))ti++;if(ti<nt)ti++;if(ti<nt&&is_kw(toks[ti].text,"of"))ti++;}
+            if(is_kw(kw,"par")||is_kw(kw,"var")||is_kw(kw,"array")){
+                /* Default to a parameter; `var` or `array ... of var` makes it
+                   a decision variable. */
+                int is_var=is_kw(kw,"var");
+                FZDecl*d=add_decl(m); d->is_var=is_var; ti++;
+                if(is_kw(kw,"array")||(ti<nt&&is_kw(toks[ti].text,"array"))){
+                    d->is_array=1;
+                    if(!is_kw(kw,"array")) ti++;          /* skip 'array' */
+                    while(ti<nt&&!(toks[ti].kind==TK_SYM&&strcmp(toks[ti].text,"]")==0))ti++;
+                    if(ti<nt)ti++;                        /* skip ']' */
+                    if(ti<nt&&is_kw(toks[ti].text,"of"))ti++;
+                }
+                /* optional 'var' before the type (array ... of var int) */
+                if(ti<nt&&is_kw(toks[ti].text,"var")){ is_var=1; d->is_var=1; ti++; }
                 if(ti<nt&&toks[ti].kind==TK_IDENT){if(is_kw(toks[ti].text,"int"))d->kind=FZ_K_INT;else if(is_kw(toks[ti].text,"float"))d->kind=FZ_K_FLOAT;else if(is_kw(toks[ti].text,"bool"))d->kind=FZ_K_BOOL;ti++;}
                 /* FlatZinc shorthand: var 1..10: x  (domain before ':') */
                 if(ti<nt&&(toks[ti].kind==TK_INT||toks[ti].kind==TK_FLOAT)){
@@ -250,11 +287,56 @@ int fz_read(const char*path,FZModel*m)
                 }
                 if(ti<nt&&toks[ti].kind==TK_SYM&&strcmp(toks[ti].text,":")==0)ti++;
                 if(ti<nt&&toks[ti].kind==TK_IDENT){d->name=strdup(toks[ti].text);ti++;}
+                /* annotations may appear before the '=' (e.g. :: output_array).
+                   Handle output markers and integer domain (:: lo..hi). */
+                while(ti<nt&&toks[ti].kind==TK_SYM&&strcmp(toks[ti].text,"::")==0){
+                    size_t as=toks[ti].end;int aj=ti+1;size_t ae=(ti+1<nt)?toks[ti+1].end:as;
+                    while(aj<nt&&!(toks[aj].kind==TK_SYM&&(strcmp(toks[aj].text,";")==0||strcmp(toks[aj].text,"=")==0||strcmp(toks[aj].text,"::")==0))){ae=toks[aj].end;aj++;}
+                    char*ann=strndup(src+as,ae-as);
+                    if(strstr(ann,"output_var")||strstr(ann,"output_array"))d->is_output=1;
+                    /* domain :: lo..hi */
+                    if(!d->has_lo && strchr(ann,'.')){
+                        char lob[64],hib[64];int k=0;
+                        while(ann[k]&&ann[k]!='.'){lob[k]=ann[k];k++;}lob[k]=0;
+                        const char*p=ann+k;while(*p=='.')p++;
+                        k=0;while(p[k]&&p[k]!=' '){hib[k]=p[k];k++;}hib[k]=0;
+                        d->has_lo=1;d->has_hi=1;
+                        d->lo=(double*)malloc(sizeof(double));d->hi=(double*)malloc(sizeof(double));
+                        d->lo[0]=atof(lob);d->hi[0]=atof(hib);
+                    }
+                    free(ann);
+                    ti=aj;
+                }
                 if(ti<nt&&toks[ti].kind==TK_SYM&&strcmp(toks[ti].text,"=")==0){
                     ti++;size_t s=toks[ti].start;int j=ti;size_t e=toks[ti].end;
                     while(j<nt&&!(toks[j].kind==TK_SYM&&strcmp(toks[j].text,";")==0)){e=toks[j].end;j++;}
                     char*rhs=strndup(src+s,e-s);
-                    if(d->is_array){
+                    if(d->is_array && is_var){
+                        /* var array with initializer: elements are aliases of
+                           already-declared vars (e.g. take = [X0,X1,X2,X3]).
+                           Resolve their indices and alias base_idx to them. */
+                        int nel=1;for(size_t p=0;p<strlen(rhs);p++)if(rhs[p]==',')nel++;
+                        d->n=nel;
+                        Lin*arr;int narr;
+                        if(parse_array(m,rhs,&arr,&narr)==0&&narr==nel){
+                            int alias_ok=1;
+                            d->base_idx=m->nvars;   /* default new vars */
+                            int*alias=(int*)malloc((size_t)nel*sizeof(int));
+                            for(int q=0;q<nel;q++){ if(arr[q].n==1) alias[q]=arr[q].idx[0]; else {alias_ok=0; break;} }
+                            if(alias_ok){
+                                d->base_idx=alias[0];
+                                /* do not allocate new vars; but ensure they're
+                                   contiguous -> base_idx is the first alias and
+                                   m->nvars unchanged.  Validate contiguity. */
+                                for(int q=1;q<nel;q++) if(alias[q]!=alias[0]+q) alias_ok=0;
+                            }
+                            free(alias);
+                            if(!alias_ok){ d->base_idx=m->nvars; m->nvars+=d->n; }
+                            free_lins(arr,narr);
+                        } else {
+                            d->base_idx=m->nvars; m->nvars+=d->n;
+                        }
+                    } else if(d->is_array){
                         int nel=1;for(size_t p=0;p<strlen(rhs);p++)if(rhs[p]==',')nel++;
                         d->n=nel;d->par=(double*)calloc((size_t)nel,sizeof(double));d->par_int=(int*)calloc((size_t)nel,sizeof(int));
                         Lin*arr;int narr;
@@ -262,9 +344,10 @@ int fz_read(const char*path,FZModel*m)
                     } else {
                         d->n=1;d->par=(double*)calloc(1,sizeof(double));d->par_int=(int*)calloc(1,sizeof(int));
                         Lin l;if(parse_lin(m,rhs,&l)==0){d->par[0]=l.constant;d->par_int[0]=(int)llround(l.constant);lin_free(&l);}
+                        if(is_var){d->base_idx=m->nvars;m->nvars+=1;}
                     }
                     free(rhs);ti=(j<nt?j+1:j);
-                    if(is_var){d->base_idx=m->nvars;m->nvars+=d->n;}
+                    if(is_var&&!d->is_array){d->base_idx=m->nvars-1;} /* scalar var with init (unusual) */
                     continue;
                 }
                 /* var decl without initializer: count array size from domain
@@ -274,7 +357,7 @@ int fz_read(const char*path,FZModel*m)
                 m->nvars+=d->n;
                 /* annotations */
                 while(ti<nt&&toks[ti].kind==TK_SYM&&strcmp(toks[ti].text,"::")==0){
-                    ti++; int got_domain=0;
+                    ti++;
                     /* capture annotation: identifier or expression; detect output_var/output_array */
                     size_t s=toks[ti].start; int j=ti; size_t e=toks[ti].end;
                     while(j<nt&&!(toks[j].kind==TK_SYM&&(strcmp(toks[j].text,";")==0||strcmp(toks[j].text,"::")==0))){e=toks[j].end;j++;}
@@ -287,7 +370,6 @@ int fz_read(const char*path,FZModel*m)
                         d->has_lo=1;d->has_hi=1;
                         d->lo=(double*)malloc(sizeof(double));d->hi=(double*)malloc(sizeof(double));
                         d->lo[0]=atof(lo);d->hi[0]=atof(hi);
-                        got_domain=1;
                     }
                     free(ann);
                     ti=(j<nt?j:j); /* advance to '::' or ';' boundary */
@@ -296,7 +378,9 @@ int fz_read(const char*path,FZModel*m)
                 continue;
             }
             /* unknown: skip to ';' */
-            while(ti<nt&&!(toks[ti].kind==TK_SYM&&strcmp(toks[ti].text,";")==0))ti++; if(ti<nt)ti++; continue;
+            while(ti<nt&&!(toks[ti].kind==TK_SYM&&strcmp(toks[ti].text,";")==0))ti++;
+            if(ti<nt)ti++;
+            continue;
         }
         ti++;
     }
@@ -324,7 +408,8 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
        strcmp(p,"bool_lin_eq")==0||strcmp(p,"bool_lin_le")==0){
         if(c->nargs<3)return -1;
         Lin*arr;int narr;
-        if(parse_array(m,c->args[0],&arr,&narr)!=0)return -1;
+        if(parse_array(m,c->args[0],&arr,&narr)!=0){if(getenv("FZDBG"))fprintf(stderr,"  parse_array coeff FAIL\n");return -1;}
+        if(getenv("FZDBG"))fprintf(stderr,"  coeff array narr=%d\n",narr);
         Lin*parr;int nparr;
         if(parse_array(m,c->args[1],&parr,&nparr)!=0){free_lins(arr,narr);return -1;}
         Lin d; if(parse_lin(m,c->args[2],&d)!=0){free_lins(arr,narr);free_lins(parr,nparr);return -1;}
@@ -412,28 +497,72 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
         lin_free(&l1);lin_free(&l2);lin_free(&l3);
         return 0;
     }
-    /* bool_clause(pos[], neg[], b): b = OR(positives) OR OR(not negatives) */
-    if(strcmp(p,"bool_clause")==0){
-        if(c->nargs<3)return -1;
+    /* bool_clause(pos[], neg[]) : clause asserted true (2-arg form)
+       bool_clause_reif(pos[], neg[], r) : r <-> clause (3-arg reified form) */
+    if(strcmp(p,"bool_clause")==0||strcmp(p,"bool_clause_reif")==0){
+        if(c->nargs<2)return -1;
         Lin*pos;int np; Lin*neg;int ng;
         if(parse_array(m,c->args[0],&pos,&np)!=0)return -1;
         if(parse_array(m,c->args[1],&neg,&ng)!=0){free_lins(pos,np);return -1;}
-        Lin rb; if(parse_lin(m,c->args[2],&rb)!=0){free_lins(pos,np);free_lins(neg,ng);return -1;}
-        int r = rb.n==1?rb.idx[0]:-1;
-        if(r<0){free_lins(pos,np);free_lins(neg,ng);lin_free(&rb);return -1;}
+        int reified = (strcmp(p,"bool_clause_reif")==0 && c->nargs>=3);
+        int r = -1; Lin rb;
+        if(reified){
+            if(parse_lin(m,c->args[2],&rb)!=0){free_lins(pos,np);free_lins(neg,ng);return -1;}
+            r = rb.n==1?rb.idx[0]:-1;
+            if(r<0){free_lins(pos,np);free_lins(neg,ng);lin_free(&rb);return -1;}
+        }
         /* t = sum(pos) - sum(neg) + n_neg = number of true literals */
         Lin t;memset(&t,0,sizeof(t));
         int nli=0;
         for(int i=0;i<np;i++){if(pos[i].n==1){lin_term(&t,pos[i].idx[0],1.0);nli++;}}
         for(int i=0;i<ng;i++){if(neg[i].n==1){lin_term(&t,neg[i].idx[0],-1.0);nli++;t.constant+=1.0;}}
-        /* b <= t ;  b >= t/nli */
-        Lin d1;memset(&d1,0,sizeof(d1));lin_term(&d1,r,1.0);lin_into(&d1,&t,-1.0);b_put(b,'<',0.0,&d1);
-        Lin d2;memset(&d2,0,sizeof(d2));lin_term(&d2,r,1.0);
-        if(nli>0)for(int i=0;i<t.n;i++)lin_term(&d2,t.idx[i],-1.0/(double)nli);
-        d2.constant = -t.constant/(double)nli;
-        b_put(b,'>',0.0,&d2);
-        lin_free(&t);lin_free(&d1);lin_free(&d2);lin_free(&rb);
-        free_lins(pos,np);free_lins(neg,ng);
+        if(reified){
+            /* r <= t ;  r >= t/nli */
+            Lin d1;memset(&d1,0,sizeof(d1));lin_term(&d1,r,1.0);lin_into(&d1,&t,-1.0);b_put(b,'<',0.0,&d1);
+            Lin d2;memset(&d2,0,sizeof(d2));lin_term(&d2,r,1.0);
+            if(nli>0)for(int i=0;i<t.n;i++)lin_term(&d2,t.idx[i],-1.0/(double)nli);
+            d2.constant = -t.constant/(double)nli;
+            b_put(b,'>',0.0,&d2);
+            lin_free(&d1);lin_free(&d2);lin_free(&rb);
+        } else {
+            /* assert t >= 1 */
+            t.constant -= 1.0;
+            b_put(b,'>',0.0,&t);
+        }
+        lin_free(&t);free_lins(pos,np);free_lins(neg,ng);
+        return 0;
+    }
+    /* array_bool_and(x[], r) and array_bool_or(x[], r): conjunction/disjunction
+       over an array of booleans (0/1), r is 0/1. */
+    if(strcmp(p,"array_bool_and")==0||strcmp(p,"array_bool_or")==0){
+        int is_and = (strcmp(p,"array_bool_and")==0);
+        if(c->nargs<2)return -1;
+        Lin*arr;int narr;
+        if(parse_array(m,c->args[0],&arr,&narr)!=0)return -1;
+        Lin rb; if(parse_lin(m,c->args[1],&rb)!=0){free_lins(arr,narr);return -1;}
+        int r = rb.n==1?rb.idx[0]:-1;
+        if(r<0){free_lins(arr,narr);lin_free(&rb);return -1;}
+        /* sum x = s ; for AND: r <= x_i (all), r >= sum-(n-1)
+           for OR:  r >= x_i (all), r <= sum */
+        Lin sum;memset(&sum,0,sizeof(sum));lin_term(&sum,r,0.0);
+        int nvars=0;
+        for(int i=0;i<narr;i++){ if(arr[i].n==1){lin_term(&sum,arr[i].idx[0],1.0);nvars++;} }
+        if(is_and){
+            for(int i=0;i<narr;i++){ if(arr[i].n==1){ Lin d;memset(&d,0,sizeof(d));lin_term(&d,r,1.0);lin_term(&d,arr[i].idx[0],-1.0);b_put(b,'<',0.0,&d);lin_free(&d);} }
+            /* r >= sum - (n-1)  =>  r - sum + (n-1) >= 0 */
+            Lin d2;memset(&d2,0,sizeof(d2));lin_term(&d2,r,1.0);
+            for(int i=0;i<sum.n;i++) if(sum.idx[i]!=r) lin_term(&d2,sum.idx[i],-1.0);
+            d2.constant = (double)(nvars-1);
+            b_put(b,'>',0.0,&d2);
+            lin_free(&d2);
+        } else {
+            for(int i=0;i<narr;i++){ if(arr[i].n==1){ Lin d;memset(&d,0,sizeof(d));lin_term(&d,r,1.0);lin_term(&d,arr[i].idx[0],-1.0);b_put(b,'>',0.0,&d);lin_free(&d);} }
+            Lin d2;memset(&d2,0,sizeof(d2));lin_term(&d2,r,1.0);
+            for(int i=0;i<sum.n;i++) if(sum.idx[i]!=r) lin_term(&d2,sum.idx[i],-1.0);
+            b_put(b,'<',0.0,&d2);
+            lin_free(&d2);
+        }
+        lin_free(&sum);lin_free(&rb);free_lins(arr,narr);
         return 0;
     }
     /* int_neg(a,b): b = -a */
@@ -465,6 +594,8 @@ void fz_solve(const FZModel*m,FZSolution*sol)
     for(int i=0;i<nv;i++){b.lo[i]=-BIG;b.hi[i]=BIG;}
     for(int d=0;d<m->ndecl;d++){FZDecl*decl=&m->decls[d];if(!decl->is_var||decl->base_idx<0)continue;
         for(int e=0;e<decl->n;e++){int vi=decl->base_idx+e;
+            /* bool variables are implicitly 0..1 in FlatZinc */
+            if(decl->kind==FZ_K_BOOL){ b.lo[vi]=0; b.hi[vi]=1; b.haslo[vi]=1; b.hashi[vi]=1; continue; }
             if(decl->has_lo){b.lo[vi]=decl->lo[0];b.haslo[vi]=1;}
             if(decl->has_hi){b.hi[vi]=decl->hi[0];b.hashi[vi]=1;}}}
     int unhandled=0;
@@ -525,7 +656,7 @@ void fz_print_solution(const FZModel*m,const FZSolution*sol)
 {
     if(sol->status==0){
         for(int d=0;d<m->ndecl;d++){FZDecl*decl=&m->decls[d];if(!decl->is_output||decl->base_idx<0)continue;
-            if(decl->is_array){printf("%s = [",decl->name);for(int e=0;e<decl->n;e++){if(e)printf(", ");printf("%d",(int)llround(sol->x[decl->base_idx+e]));}printf("];\n");}
+            if(decl->is_array){printf("%s = array1d(1..%d, [",decl->name,decl->n);for(int e=0;e<decl->n;e++){if(e)printf(", ");printf("%d",(int)llround(sol->x[decl->base_idx+e]));}printf("]);\n");}
             else printf("%s = %d;\n",decl->name,(int)llround(sol->x[decl->base_idx]));}
         printf("----------\n");
     } else if(sol->status==1)printf("=====UNSATISFIABLE=====\n");

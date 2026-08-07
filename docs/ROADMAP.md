@@ -120,21 +120,29 @@ feature completeness against a huge standard corpus.
       `bool_eq/le/lt`, `bool_not`, `int_plus/minus` — linear subset mapped to
       the LP solver.
 - [x] **Bridge**: big-M clamping of unbounded `var int`, LP solve, FlatZinc
-      output (`x = v;`, `----------`, status markers) + `%%%mzn-stat`.
-- [x] More handlers: `bool_and`, `bool_or`, `bool_xor`, `bool_clause`
-      (exact 0/1 linearizations), `int_neg`.
+      output (`x = v;`, `array1d(...)`, status markers) + `%%%mzn-stat`.
+- [x] **Par-array declarations** (`array[1..n] of int: C = [...]`) incl. the
+      bare-`array` form MiniZinc emits (no `par` keyword).
+- [x] **Var-array aliasing**: `array[..] of var int: take = [X0,X1,...]` maps
+      `take[e]` to the underlying vars so output arrays print correctly.
+- [x] **bool vars** bounded to [0,1]; array output uses `array1d(lo..hi,[..])`.
+- [x] More handlers: `bool_and/or/xor/not/clause(+reif)`, `array_bool_and/or`,
+      `int_neg` (fixed an `array_bool_and` constraint-sign bug).
 - [ ] More handlers: `all_different`, `element`, `set_in`, `int_abs/max/min`,
       `float_*`, `int2float`, reified forms, etc.
 - [x] **MIP bridge**: when the model has integer vars, `fz_solve` dispatches to
-      the MIP branch-and-bound so answers are integral (verified vs brute
-      force on random non-degenerate problems).
+      the MIP branch-and-bound so answers are integral (objectives match brute
+      force, e.g. knapsack=10, prod3=57).
 - [ ] MIP CLI bridge (integer var list, node/time limits, best-bound stats).
 - [ ] CLI flags (`-a`, `-n`, `-t`, `-s`, `-v`, SIGINT), time-limit signal.
-- [ ] Differential validation vs HiGHS; round-trip .mzn→.fzn→solve→verify.
-- [ ] Fuzz the FlatZinc parser (ASan/UBSan).
+- [x] **MiniZinc differential** (`tools/mzn_diff.py`): compiles real `.mzn`
+      models with the MiniZinc compiler and compares fznsolve vs Gecode
+      (objectives + feasibility).  Models in `examples/mzn/`.
+- [x] Fuzz the FlatZinc parser (ASan/UBSan), incl. new handlers + MIP path.
+- [ ] More MiniZinc-suite coverage; HiGHS round-trip.
 
 ### Phase 3 first-cut deliverable: `fznsolve <x.fzn>` solves the linear subset,
-with tests in `examples/fzn/` and `test.sh`.
+with tests in `examples/fzn/` and `test.sh` (incl. the MiniZinc differential).
 
 ### Fixed: LP Phase I degeneracy
 The revised-simplex Phase I previously mis-declared INFEASIBLE on degenerate

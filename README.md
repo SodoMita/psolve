@@ -243,9 +243,12 @@ when integer variables are present, so answers are integral):
 - **Declarations**: `par`/`var` int/float/bool, scalar + arrays, name→index,
   annotations, domains in both `var 1..10:` shorthand and `::`-annotation forms.
 - **Constraints**: `int_lin_eq/le`, `int_eq/le/lt/ge/gt`, `bool_eq/le/lt`,
-  `bool_and/or/xor/not/clause`, `int_plus/minus/neg`.
+  `bool_and/or/xor/not/clause`, `array_bool_and/or`, `int_plus/minus/neg`.
 - **Solve**: satisfy / minimize / maximize; FlatZinc output (`x = v;`,
-  `----------`, status markers) and `%%%mzn-stat`.
+  `array1d(...)`, status markers) and `%%%mzn-stat`.
+- **MiniZinc differential**: `tools/mzn_diff.py` compiles real `.mzn` models
+  with the MiniZinc compiler and checks fznsolve against Gecode (objectives
+  match, e.g. knapsack=10, prod3=57).  See `examples/mzn/`.
 - Nonlinear/unhandled constraints return `=====UNKNOWN=====` (never a wrong
   answer).  See `docs/ROADMAP.md` for a known Phase-I degeneracy limitation
   (equality + fixed variables) and the remaining handler list.

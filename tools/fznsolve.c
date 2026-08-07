@@ -15,6 +15,8 @@ int main(int argc,char**argv)
     fz_solve(&m,&sol);
     fz_print_solution(&m,&sol);
     printf("%%%%mzn-stat: intVariables=%d\n", sol.nvars);
+    if (m.solve_kind != 0 && sol.status == 0)
+        printf("%%%%mzn-stat: objective=%.15g\n", sol.obj);
     printf("%%%%mzn-stat: solveTime=%.3f\n", 0.0);
     printf("%%%%mzn-stat-end\n");
     fz_solution_free(&sol);

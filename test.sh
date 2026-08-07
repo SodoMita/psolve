@@ -73,4 +73,11 @@ echo "(expect a=0 b=1 andr=0 orr=1)"
 ./fznsolve examples/fzn/mip_max.fzn | grep -E "x1 =|x2 =" | tr '\n' ' '
 echo "(expect x1=4 x2=0, MIP integral)"
 
+if command -v minizinc >/dev/null 2>&1; then
+  echo "[8.5/8] MiniZinc differential (compile .mzn -> fzn -> psolve vs Gecode)..."
+  python3 tools/mzn_diff.py | tail -1
+else
+  echo "[8.5/8] MiniZinc differential SKIPPED (minizinc not installed)"
+fi
+
 echo "Done."
