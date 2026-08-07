@@ -1,4 +1,5 @@
 #include "splu.h"
+#include "err.h"
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -28,25 +29,25 @@ typedef struct {
 static void work_init(Work *w, int m, int cap)
 {
     w->m = m; w->n = 0; w->cap = cap;
-    w->row_of  = (int*)malloc((size_t)cap * sizeof(int));
-    w->col_of  = (int*)malloc((size_t)cap * sizeof(int));
-    w->row_next= (int*)malloc((size_t)cap * sizeof(int));
-    w->col_next= (int*)malloc((size_t)cap * sizeof(int));
-    w->val_of  = (double*)malloc((size_t)cap * sizeof(double));
-    w->row_head= (int*)malloc((size_t)m * sizeof(int));
-    w->col_head= (int*)malloc((size_t)m * sizeof(int));
-    w->elim_row= (char*)calloc((size_t)m, 1);
+    w->row_of  = (int*)psolve_malloc((size_t)cap * sizeof(int));
+    w->col_of  = (int*)psolve_malloc((size_t)cap * sizeof(int));
+    w->row_next= (int*)psolve_malloc((size_t)cap * sizeof(int));
+    w->col_next= (int*)psolve_malloc((size_t)cap * sizeof(int));
+    w->val_of  = (double*)psolve_malloc((size_t)cap * sizeof(double));
+    w->row_head= (int*)psolve_malloc((size_t)m * sizeof(int));
+    w->col_head= (int*)psolve_malloc((size_t)m * sizeof(int));
+    w->elim_row= (char*)psolve_calloc((size_t)m, 1);
     for (int i = 0; i < m; i++) { w->row_head[i] = -1; w->col_head[i] = -1; }
 }
 
 static void work_grow(Work *w)
 {
     int ncap = w->cap * 2 + 16;
-    w->row_of   = (int*)realloc(w->row_of,   (size_t)ncap * sizeof(int));
-    w->col_of   = (int*)realloc(w->col_of,   (size_t)ncap * sizeof(int));
-    w->row_next = (int*)realloc(w->row_next, (size_t)ncap * sizeof(int));
-    w->col_next = (int*)realloc(w->col_next, (size_t)ncap * sizeof(int));
-    w->val_of   = (double*)realloc(w->val_of,(size_t)ncap * sizeof(double));
+    w->row_of   = (int*)psolve_realloc((void**)&w->row_of,   (size_t)ncap * sizeof(int));
+    w->col_of   = (int*)psolve_realloc((void**)&w->col_of,   (size_t)ncap * sizeof(int));
+    w->row_next = (int*)psolve_realloc((void**)&w->row_next, (size_t)ncap * sizeof(int));
+    w->col_next = (int*)psolve_realloc((void**)&w->col_next, (size_t)ncap * sizeof(int));
+    w->val_of   = (double*)psolve_realloc((void**)&w->val_of,(size_t)ncap * sizeof(double));
     w->cap = ncap;
 }
 
@@ -98,8 +99,8 @@ int splu_factor(SPLU *s, const int *Bp, const int *Bi, const double *Bx, int m)
     double tol = s->pivot_tol > 0 ? s->pivot_tol : 1e-14;
 
     /* column order by increasing column degree */
-    int *colorder = (int*)malloc((size_t)m * sizeof(int));
-    int *colpos   = (int*)malloc((size_t)m * sizeof(int));
+    int *colorder = (int*)psolve_malloc((size_t)m * sizeof(int));
+    int *colpos   = (int*)psolve_malloc((size_t)m * sizeof(int));
     for (int c = 0; c < m; c++) colorder[c] = c;
     for (int i = 1; i < m; i++) {
         int key = colorder[i];
@@ -129,18 +130,18 @@ int splu_factor(SPLU *s, const int *Bp, const int *Bi, const double *Bx, int m)
     double growth_limit = 1e10;       /* max allowable multiplier magnitude */
 
     s->m = m;
-    s->piv  = (int*)malloc((size_t)m * sizeof(int));   /* rperm */
-    s->qinv = (int*)malloc((size_t)m * sizeof(int));
-    s->udiag= (double*)malloc((size_t)m * sizeof(double));
-    int *Lp  = (int*)malloc((size_t)(m+1) * sizeof(int));
-    int *Urp = (int*)malloc((size_t)(m+1) * sizeof(int));
+    s->piv  = (int*)psolve_malloc((size_t)m * sizeof(int));   /* rperm */
+    s->qinv = (int*)psolve_malloc((size_t)m * sizeof(int));
+    s->udiag= (double*)psolve_malloc((size_t)m * sizeof(double));
+    int *Lp  = (int*)psolve_malloc((size_t)(m+1) * sizeof(int));
+    int *Urp = (int*)psolve_malloc((size_t)(m+1) * sizeof(int));
     int lcap = cap, ucap = cap, liN = 0, urN = 0;
-    int *Li  = (int*)malloc((size_t)lcap * sizeof(int));
-    double *Lx  = (double*)malloc((size_t)lcap * sizeof(double));
-    int *Urj  = (int*)malloc((size_t)ucap * sizeof(int));
-    double *Urx = (double*)malloc((size_t)ucap * sizeof(double));
-#define GROW_L() do { if (liN >= lcap) { int nc=lcap*2+16; Li=(int*)realloc(Li,(size_t)nc*sizeof(int)); Lx=(double*)realloc(Lx,(size_t)nc*sizeof(double)); lcap=nc; } } while (0)
-#define GROW_U() do { if (urN >= ucap) { int nc=ucap*2+16; Urj=(int*)realloc(Urj,(size_t)nc*sizeof(int)); Urx=(double*)realloc(Urx,(size_t)nc*sizeof(double)); ucap=nc; } } while (0)
+    int *Li  = (int*)psolve_malloc((size_t)lcap * sizeof(int));
+    double *Lx  = (double*)psolve_malloc((size_t)lcap * sizeof(double));
+    int *Urj  = (int*)psolve_malloc((size_t)ucap * sizeof(int));
+    double *Urx = (double*)psolve_malloc((size_t)ucap * sizeof(double));
+#define GROW_L() do { if (liN >= lcap) { int nc=lcap*2+16; Li=(int*)psolve_realloc((void**)&Li,(size_t)nc*sizeof(int)); Lx=(double*)psolve_realloc((void**)&Lx,(size_t)nc*sizeof(double)); lcap=nc; } } while (0)
+#define GROW_U() do { if (urN >= ucap) { int nc=ucap*2+16; Urj=(int*)psolve_realloc((void**)&Urj,(size_t)nc*sizeof(int)); Urx=(double*)psolve_realloc((void**)&Urx,(size_t)nc*sizeof(double)); ucap=nc; } } while (0)
 
     int ok = 0;
     for (int k = 0; k < m && ok == 0; k++) {
@@ -200,15 +201,15 @@ int splu_factor(SPLU *s, const int *Bp, const int *Bi, const double *Bx, int m)
 
     if (ok == 0) {
         /* build U column storage from U rows */
-        int *colcnt = (int*)calloc((size_t)m, sizeof(int));
+        int *colcnt = (int*)psolve_calloc((size_t)m, sizeof(int));
         for (int k = 0; k < m; k++)
             for (int t = Urp[k]; t < Urp[k+1]; t++) colcnt[Urj[t]]++;
-        int *Ucp = (int*)malloc((size_t)(m+1) * sizeof(int));
+        int *Ucp = (int*)psolve_malloc((size_t)(m+1) * sizeof(int));
         Ucp[0] = 0;
         for (int j = 0; j < m; j++) Ucp[j+1] = Ucp[j] + colcnt[j];
-        int *Uci = (int*)malloc((size_t)(urN+1) * sizeof(int));
-        double *Ucx = (double*)malloc((size_t)(urN+1) * sizeof(double));
-        int *fill = (int*)malloc((size_t)(m+1) * sizeof(int));
+        int *Uci = (int*)psolve_malloc((size_t)(urN+1) * sizeof(int));
+        double *Ucx = (double*)psolve_malloc((size_t)(urN+1) * sizeof(double));
+        int *fill = (int*)psolve_malloc((size_t)(m+1) * sizeof(int));
         memcpy(fill, Ucp, (size_t)(m+1) * sizeof(int));
         for (int k = 0; k < m; k++)
             for (int t = Urp[k]; t < Urp[k+1]; t++) {
@@ -258,7 +259,7 @@ void splu_solve(const SPLU *s, const double *b, double *x)
 {
     int m = s->m;
     const double tol = 1e-14;
-    int *rinv = (int*)malloc((size_t)m * sizeof(int));
+    int *rinv = (int*)psolve_malloc((size_t)m * sizeof(int));
     build_rinv(s->piv, m, rinv);
     /* y = P b : y[i] = b[rperm[i]] */
     for (int i = 0; i < m; i++) x[i] = b[s->piv[i]];
@@ -280,7 +281,7 @@ void splu_solve(const SPLU *s, const double *b, double *x)
     }
     /* x = Q w : x[qinv[j]] = w[j] */
     {
-        double *w = (double*)malloc((size_t)m * sizeof(double));
+        double *w = (double*)psolve_malloc((size_t)m * sizeof(double));
         memcpy(w, x, (size_t)m * sizeof(double));
         for (int j = 0; j < m; j++) x[s->qinv[j]] = w[j];
         free(w);
@@ -291,7 +292,7 @@ void splu_solve(const SPLU *s, const double *b, double *x)
 void splu_solve_t(const SPLU *s, const double *b, double *x)
 {
     int m = s->m;
-    int *rinv = (int*)malloc((size_t)m * sizeof(int));
+    int *rinv = (int*)psolve_malloc((size_t)m * sizeof(int));
     build_rinv(s->piv, m, rinv);
     /* a = Q^T c : a[j] = c[qinv[j]] */
     for (int j = 0; j < m; j++) x[j] = b[s->qinv[j]];
@@ -313,7 +314,7 @@ void splu_solve_t(const SPLU *s, const double *b, double *x)
     }
     /* y = P^T v : y[piv[i]] = v[i] */
     {
-        double *v = (double*)malloc((size_t)m * sizeof(double));
+        double *v = (double*)psolve_malloc((size_t)m * sizeof(double));
         memcpy(v, x, (size_t)m * sizeof(double));
         for (int i = 0; i < m; i++) x[s->piv[i]] = v[i];
         free(v);

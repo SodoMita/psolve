@@ -1,4 +1,5 @@
 #include "qp.h"
+#include "err.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,6 +12,15 @@
 
 int main(int argc, char **argv){
     if (argc < 2) { fprintf(stderr, "usage: %s <qp>\n", argv[0]); return 1; }
+    /* Install the solver error handler: without it an out-of-memory inside the
+       QP core reached psolve_fail() with no handler and abort()ed the process
+       (SIGABRT) instead of reporting a clean failure. */
+    if (setjmp(psolve_env) != 0) {
+        fprintf(stderr, "qpsolve: %s\n",
+                psolve_code == PSOLVE_ERR_OOM ? "out of memory" : "internal error");
+        return 2;
+    }
+    psolve_try();
     FILE *f = fopen(argv[1], "r");
     if (!f) { fprintf(stderr, "cannot open %s\n", argv[1]); return 1; }
     int n, m;

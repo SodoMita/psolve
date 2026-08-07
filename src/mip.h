@@ -17,6 +17,15 @@
  *
  * rel in {'<','>','='} per row.  The LP is specified through the same LP struct
  * the simplex solver uses, plus an array marking integer variables.
+ *
+ * IMPORTANT: zero the MIP struct before filling it in
+ *
+ *     MIP mip; memset(&mip, 0, sizeof(mip));
+ *
+ * The struct carries optional fields (stop_at_feasible, limits) whose absence
+ * must read as 0.  Leaving them uninitialised is undefined behaviour: a
+ * garbage stop_at_feasible aborts branch-and-bound at the first integer point
+ * found, which is feasible but almost never optimal.
  */
 
 typedef struct {
@@ -34,7 +43,10 @@ typedef struct {
     double mip_gap;        /* relative optimality gap to stop at (e.g. 1e-4) */
     int    stop_at_feasible; /* 1 = return as soon as any integer-feasible
                                 solution is found (for solve satisfy); do not
-                                keep branching to prove optimality */
+                                keep branching to prove optimality.  The result
+                                is then feasible but NOT proven optimal --
+                                res->proven_optimal is 0, and callers that care
+                                about the objective must check it. */
     long   node_limit;     /* max branch-and-bound nodes */
     long   lp_iter_limit;  /* simplex iteration limit per relaxation */
 } MIP;
@@ -52,6 +64,13 @@ typedef struct {
     long nodes;            /* nodes explored */
     long lp_iters;         /* total simplex iterations across all nodes */
     double best_bound;     /* best LP-relaxation bound over open nodes */
+    int    proven_optimal; /* 1 only if the branch-and-bound tree was exhausted
+                              (or emptied by pruning), so `obj` is a proven
+                              optimum.  0 whenever the search was cut short --
+                              node/iteration limit, cooperative stop, or
+                              stop_at_feasible.  status==0 with
+                              proven_optimal==0 means "this point is feasible",
+                              never "this point is optimal". */
 } MIPResult;
 
 void mip_solve(const MIP *mip, MIPResult *res);

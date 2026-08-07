@@ -37,12 +37,10 @@ void pgs_solve(const PGSOptions *opt,
         else if (x[i] > hi[i]) x[i] = hi[i];
     }
 
-    /* diagonal reciprocals (precomputed) */
-    double *invdiag = (double*)__builtin_alloca((size_t)n * sizeof(double));
-    for (int i = 0; i < n; i++) {
-        double d = A[i*n + i];
-        invdiag[i] = (d > 1e-14) ? (1.0 / d) : 0.0;
-    }
+    /* The diagonal is read from A inside the sweep rather than precomputed
+       into an alloca'd scratch array: a caller-sized alloca in a library
+       kernel is a stack-overflow primitive, and this kernel guarantees zero
+       allocation of any kind (heap or stack-variable). */
 
     /* Gauss-Seidel sweeps: always use current (updated) x for all but the
        pivot variable to maximize progress */
@@ -53,9 +51,12 @@ void pgs_solve(const PGSOptions *opt,
                    = b_i + (A x)_i - A_{i,i} x_i */
             double ax = 0.0;
             for (int j = 0; j < n; j++) { ax += A[i*n + j] * x[j]; res->flops++; }
-            double r = b[i] + (ax - A[i*n + i] * x[i]);
+            double d = A[i*n + i];
+            double r = b[i] + (ax - d * x[i]);
 
-            double xnew = (1.0 - omega) * x[i] + omega * (-r * invdiag[i]);
+            /* a non-positive diagonal contributes no step (1/d treated as 0) */
+            double xnew = (d > 1e-14) ? ((1.0 - omega) * x[i] + omega * (-r / d))
+                                      : ((1.0 - omega) * x[i]);
             /* project onto box */
             if (xnew < lo[i]) xnew = lo[i];
             else if (xnew > hi[i]) xnew = hi[i];

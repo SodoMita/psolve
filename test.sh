@@ -16,7 +16,7 @@ gcc -O2 -march=native -I src tools/unit_test.c src/lu.c src/kernels.c -o /tmp/un
 /tmp/unit_test
 
 echo "[1.5/7] Sparse LU unit test..."
-gcc -O2 -march=native -I src tools/splu_test.c src/splu.c src/lu.c src/kernels.c -o /tmp/splu_test -lm
+gcc -O2 -march=native -I src tools/splu_test.c src/splu.c src/lu.c src/kernels.c src/err.c -o /tmp/splu_test -lm
 /tmp/splu_test
 
 echo "[2/7] Example problems (objective values)..."
@@ -44,13 +44,22 @@ for s in $(seq 1 40); do
   if python3 tools/qp_gen.py $s 2>/dev/null | grep -q '^OK'; then ok=$((ok+1)); else fail=$((fail+1)); fi
 done
 echo "  QP vs scipy: OK=$ok FAIL=$fail"
+# qp_gen only builds strictly positive-definite Q.  qp_diff also covers
+# singular PSD Q, Q=0, m=0 and duplicated rows, and certifies the answer with
+# the KKT conditions (necessary AND sufficient for a convex QP) plus an exact
+# recession-direction test, so it catches infeasible/unbounded/non-stationary
+# points that an objective comparison against SLSQP cannot.
+python3 tools/qp_diff.py 200 4242 | head -2
 
 echo "[5.5/7] MIP solver (branch-and-bound) vs brute force..."
 gcc -O2 -march=native -I src tools/mip_test.c src/mip.c src/err.c src/solver.c src/splu.c src/lu.c src/kernels.c src/parser.c -o /tmp/mip_test -lm
 /tmp/mip_test
-if [ -f /tmp/mip_verify.py ]; then
-  python3 tools/mip_verify.py 0 | tail -1
-fi
+# NOTE: this used to read `if [ -f /tmp/mip_verify.py ]`, a path that never
+# exists, so the MIP verification silently never ran.  mip_diff.py replaces it
+# and additionally checks statuses and the returned point, not just the
+# objective of runs that happened to come back OPTIMAL.
+python3 tools/mip_diff.py 400 12345 | head -2
+python3 tools/mip_verify.py 0 | tail -1
 
 echo "[5.75/7] Fully free LP/MIP variables + incremental API..."
 gcc -O2 -march=native -I src tools/free_var_test.c src/mip.c src/err.c src/solver.c src/splu.c src/lu.c src/kernels.c -o /tmp/free_var_test -lm
@@ -119,7 +128,7 @@ else
   echo "[8.5/8] MiniZinc differential SKIPPED (minizinc not installed)"
 fi
 
-echo "[9/9] Fixed-point exact-rational LP solver (fxsolve) vs double lpsolve..."
+echo "[9/10] Fixed-point exact-rational LP solver (fxsolve) vs double lpsolve..."
 make fxsolve >/dev/null 2>&1
 ./fxsolve examples/prodplan.lp | grep -E "objective \(dec\):" | tr '\n' ' '; echo "(expect 26)"
 ./fxsolve examples/diet.lp | grep -E "objective \(dec\):" | tr '\n' ' '; echo "(expect 1.32 exact)"
@@ -127,10 +136,15 @@ make fxsolve >/dev/null 2>&1
 echo -n "  exact demo (double vs fixed): "
 echo -n "double="; ./lpsolve examples/exact.lp | grep -oE "objective:.*"
 echo -n "  fixed="; ./fxsolve examples/exact.lp | grep -oE "objective \(exact\):.*"
+echo -n "fx_exact_test (exact feasibility/objective in Fractions, 64-vs-128-bit): "
+python3 tools/fx_exact_test.py 200 7 | head -1 | sed 's/.*: //'
 echo -n "fx_verify (random feasible+arbitrary LPs vs double, incl. status): "
 python3 tools/fx_verify.py 300 99 | sed 's/.*: //'
 echo -n "fx_bench (examples): "
 make fx_bench >/dev/null 2>&1
 ./fx_bench examples/prodplan.lp examples/diet.lp examples/transport.lp | tail -1
+
+echo "[10/10] Out-of-memory injection (every allocation made to fail in turn)..."
+python3 tools/oom_test.py | tail -3
 
 echo "Done."

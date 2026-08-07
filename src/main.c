@@ -124,7 +124,7 @@ int main(int argc, char **argv)
         printf("objective: %.15g\n", obj);
         if (print) {
             for (int j = 0; j < lp.n; j++)
-                printf("x[%d] = %.10g\n", j, xo[j]);
+                printf("x[%d] = %.17g\n", j, xo[j]);
         }
         free(xo);
     }
