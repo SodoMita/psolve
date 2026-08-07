@@ -152,6 +152,24 @@ See [`docs/DESIGN.md`](docs/DESIGN.md) for the algorithm, the hardware
 optimizations, how it compares with existing open-source solvers (and the
 weaknesses it attacks), and an honest performance discussion.
 
+## Using as a library
+
+`make lib` produces **`libpsolve.a`** (LP + QP + MIP cores; no `main()`), and
+`make liblp` / `make libqp` produce LP-only / QP-only archives.  Headers live in
+`src/`:
+
+```sh
+make lib
+cc -I psolve/src -o app app.c psolve/libpsolve.a -lm
+```
+
+The LP API (`src/solver.h`) takes a sparse-CSC matrix with per-variable bounds
+and `<`/`>`/`=` rows, supports warm starts (`solver_warm_solve`) and
+sensitivity analysis (`solver_duals`, `solver_reduced_costs`).  The QP API
+(`src/qp.h`) solves convex `min ½xᵀQx + cᵀx s.t. Ax ≤ b` with a Phase-I
+feasibility search (variable bounds are expressed as rows).  This is the
+integration point used by [SmazkaVG](https://github.com/SodoMita/SmazkaVG).
+
 ## Layout
 
 ```
