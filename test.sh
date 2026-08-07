@@ -3,26 +3,30 @@
 set -e
 cd "$(dirname "$0")"
 
-echo "[1/6] Dense LU unit test..."
+echo "[0/7] PGS boxed-QP (real-time physics kernel) unit test..."
+gcc -O2 -march=native -I src tools/pgs_test.c src/pgs.c -o /tmp/pgs_test -lm
+/tmp/pgs_test
+
+echo "[1/7] Dense LU unit test..."
 gcc -O2 -march=native -I src tools/unit_test.c src/lu.c src/kernels.c -o /tmp/unit_test -lm
 /tmp/unit_test
 
-echo "[1.5/6] Sparse LU unit test..."
+echo "[1.5/7] Sparse LU unit test..."
 gcc -O2 -march=native -I src tools/splu_test.c src/splu.c src/lu.c src/kernels.c -o /tmp/splu_test -lm
 /tmp/splu_test
 
-echo "[2/6] Example problems (objective values)..."
+echo "[2/7] Example problems (objective values)..."
 echo -n "  diet (expect 1.32):       "; ./lpsolve examples/diet.lp      | grep objective
 echo -n "  prodplan (expect 26):     "; ./lpsolve examples/prodplan.lp  | grep objective
 echo -n "  transport (expect 94.5):  "; ./lpsolve examples/transport.lp | grep objective
 
-echo "[3/6] Canonical sweep vs GLPK (bounded, well-conditioned)..."
+echo "[3/7] Canonical sweep vs GLPK (bounded, well-conditioned)..."
 python3 tools/sweep.py | tail -1
 
-echo "[4/6] Differential test vs GLPK (incl. infeasible/unbounded)..."
+echo "[4/7] Differential test vs GLPK (incl. infeasible/unbounded)..."
 python3 tools/difftest.py 120 0.4 2>&1 | head -1
 
-echo "[5/6] QP solver vs scipy (analytic + randomized)..."
+echo "[5/7] QP solver vs scipy (analytic + randomized)..."
 gcc -O2 -march=native -I src tools/qp_test.c src/qp.c src/err.c src/lu.c src/kernels.c -o /tmp/qp_test -lm
 /tmp/qp_test
 gcc -O2 -march=native -I src tools/qpsolve.c src/qp.c src/err.c src/lu.c src/kernels.c -o /tmp/qpsolve -lm

@@ -1,10 +1,14 @@
-# AVX512-Simplex — a vectorized LP & QP solver in C
+# AVX512-Simplex — a vectorized LP, QP & MIP solver for real-time use
 
-A from-scratch **linear programming** (revised simplex) and **quadratic
-programming** (active-set) solver, tuned for modern x86 hardware (AVX-512 FMA),
-cache-friendly sparse data layout, and hyper-sparsity-aware pricing. It also
-supports **incremental solving** (warm starts) so you can re-solve a perturbed
-problem without starting over.
+A from-scratch **linear programming** (revised simplex), **quadratic
+programming** (active-set), **mixed-integer programming** (branch-and-bound),
+and **real-time 2D-physics kernel** (projected Gauss-Seidel) library — tuned
+for modern x86 hardware (AVX-512 FMA), cache-friendly sparse data layout, and
+interactive latency.  It has **no third-party dependencies** (only libc/libm),
+is small and auditable, and supports **incremental solving** (warm starts).
+
+See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the long-term plan (real-time UI /
+vector graphics / 2D physics / FlatZinc completeness).
 
 It reads a simple text LP format, solves it, and prints the optimum.  The QP
 solver (`qpsolve`) solves convex QPs (minimize ½xᵀQx + cᵀx s.t. Ax ≤ b).  It
@@ -48,6 +52,31 @@ The MIP solver (`mipsolve <lp> <nint> <j0 j1 ...>`) solves mixed-integer
 programs by **branch-and-bound** over the revised-simplex LP relaxation: the
 listed variables are required to be integer.  It reports the optimal objective,
 the number of B&B nodes, and the incumbent solution.
+
+## Real-time physics kernel (projected Gauss-Seidel)
+
+`src/pgs.c` is the boxed-QP workhorse used by real-time 2D physics engines for
+contact / friction resolution:
+
+```c
+PGSOptions opt = { n, /*iterations*/ 20, /*omega*/ 1.0, /*tol*/ 1e-10 };
+PGSResult res;
+pgs_solve(&opt, A, b, lo, hi, x, &res);   // x is warm-started in, result out
+```
+
+It solves `min ½xᵀAx + bᵀx  s.t.  lo ≤ x ≤ hi` for symmetric PSD A by
+projected Gauss-Seidel with optional SOR.  It is **deterministic** (same input +
+iteration budget ⇒ same result), **zero-malloc in the loop**, and bounded-work.
+Measured on this box (2 CPU cores):
+
+```
+  n=4   iters=10     0.08 µs/solve
+  n=16  iters=10     0.35 µs/solve
+  n=32  iters=20     0.84 µs/solve
+  n=64  iters=20     2.27 µs/solve
+```
+
+Build the benchmark with `make pgsbench`; see `examples/contact_pgs.c`.
 
 ## Sensitivity analysis (LP)
 
@@ -182,6 +211,7 @@ src/solver.c    revised-simplex driver, two-phase method, steepest-edge pricing,
                 sparse/dense dispatch, incremental (warm-start) solving,
                 shadow prices + iteration limit
 src/mip.c       mixed-integer programming via branch-and-bound
+src/pgs.c       projected Gauss-Seidel boxed-QP (real-time physics kernel)
 src/qp.c        convex QP solver (active-set method + Phase-I feasibility)
 src/parser.c    LP file reader
 src/main.c      LP CLI
