@@ -5,7 +5,8 @@
  *
  * Parses a FlatZinc (.fzn) file produced by the MiniZinc compiler and solves
  * the subset of constraints it can handle natively (linear int/bool/float
- * constraints, int_lin_*, bool_*, set_in, all_different, table, circuit, ...)
+ * constraints, int_lin_*, bool_*, set_in, all_different, table, circuit,
+ * cumulative, ...)
  * with the LP
  * solver.  Nonlinear/unhandled constraints are reported so the driver can
  * return =====UNKNOWN===== rather than silently giving a wrong answer.

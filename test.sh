@@ -97,6 +97,15 @@ if ./fznsolve examples/fzn/table_unsat.fzn | grep -q "=====UNSATISFIABLE====="; 
 else
   echo "table_unsat: FAIL (expected UNSATISFIABLE)"
 fi
+echo "  cumulative_sat:"
+./fznsolve examples/fzn/cumulative_sat.fzn | grep -E "s1 =|s2 =" | tr '\n' ' '
+echo "(expect two non-overlapping 2-timestep tasks on a capacity-1 resource)"
+echo "  cumulative_unsat:"
+if ./fznsolve examples/fzn/cumulative_unsat.fzn | grep -q "=====UNSATISFIABLE====="; then
+  echo "cumulative_unsat: UNSATISFIABLE (expect UNSATISFIABLE)  OK"
+else
+  echo "cumulative_unsat: FAIL (expected UNSATISFIABLE)"
+fi
 
 echo "[8.25/8] FlatZinc strict/reified-int + float + table/circuit semantics..."
 python3 tools/fzn_semantics_test.py
