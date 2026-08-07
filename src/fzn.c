@@ -1220,6 +1220,73 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
         free(bs); lin_free(&il);lin_free(&vl);free_lins(arr,narr);
         return 0;
     }
+    /* array_int_maximum/minimum(m, x[]): exact selector formulation.  The
+       selected element equals m while the remaining inequalities make m the
+       true extremum; this also works when compiler propagation leaves constants
+       inside a var-array view. */
+    if(strcmp(p,"array_int_maximum")==0||strcmp(p,"array_int_minimum")==0||
+       strcmp(p,"fzn_array_int_maximum")==0||strcmp(p,"fzn_array_int_minimum")==0){
+        int ismax=(strcmp(p,"array_int_maximum")==0||strcmp(p,"fzn_array_int_maximum")==0);
+        if(c->nargs<2)return -1;
+        Lin ml;Lin*arr;int narr;
+        if(parse_lin(m,c->args[0],&ml)!=0)return -1;
+        if(parse_array(m,c->args[1],&arr,&narr)!=0){lin_free(&ml);return -1;}
+        if(narr<=0||narr>1024){lin_free(&ml);free_lins(arr,narr);return 1;}
+        double *xlo=(double*)psolve_malloc((size_t)narr*sizeof(double));
+        double *xhi=(double*)psolve_malloc((size_t)narr*sizeof(double));
+        double implied_lo=ismax?-LP_INF:LP_INF, implied_hi=ismax?-LP_INF:LP_INF;
+        for(int i=0;i<narr;i++){
+            if(lin_bounds(b,&arr[i],&xlo[i],&xhi[i])!=0){free(xlo);free(xhi);lin_free(&ml);free_lins(arr,narr);return 1;}
+            if(ismax){if(xlo[i]>implied_lo)implied_lo=xlo[i];if(xhi[i]>implied_hi)implied_hi=xhi[i];}
+            else {if(xlo[i]<implied_lo)implied_lo=xlo[i];if(xhi[i]<implied_hi)implied_hi=xhi[i];}
+        }
+        /* Tighten a canonical result variable before choosing big-M values.
+           Apart from propagation, this avoids a huge relaxation when a compiler
+           gave the maximum/minimum an intentionally loose introductory domain. */
+        int mv;
+        if(lin_unit_var(&ml,&mv)==0&&mv>=0&&mv<b->nvars){
+            if(b->lo[mv]<implied_lo)b->lo[mv]=implied_lo;
+            if(b->hi[mv]>implied_hi)b->hi[mv]=implied_hi;
+        }
+        double mlo,mhi;
+        if(lin_bounds(b,&ml,&mlo,&mhi)!=0){free(xlo);free(xhi);lin_free(&ml);free_lins(arr,narr);return 1;}
+        /* When m is itself the sole correctly-directed objective, the epigraph
+           (or hypograph for minimum) inequalities force equality at optimum.
+           Avoid selector binaries in this common MiniZinc makespan pattern. */
+        int objective_forces=0;
+        if(lin_unit_var(&ml,&mv)==0&&m->objective.n==1&&m->objective.idx[0]==mv&&m->objective.coef[0]>0.0){
+            if((ismax&&m->solve_kind==1)||(!ismax&&m->solve_kind==2))objective_forces=1;
+        }
+        if(objective_forces){
+            for(int i=0;i<narr;i++){
+                Lin d;memset(&d,0,sizeof(d));lin_into(&d,&ml,1.0);lin_into(&d,&arr[i],-1.0);
+                b_put(b,ismax?'>':'<',0.0,&d);lin_free(&d);
+            }
+            free(xlo);free(xhi);lin_free(&ml);free_lins(arr,narr);return 0;
+        }
+        int *z=(int*)psolve_malloc((size_t)narr*sizeof(int));
+        for(int i=0;i<narr;i++)z[i]=b_newvar(b,0.0,1.0);
+        Lin pick;memset(&pick,0,sizeof(pick));
+        for(int i=0;i<narr;i++)lin_term(&pick,z[i],1.0);
+        b_put(b,'=',1.0,&pick);lin_free(&pick);
+        for(int i=0;i<narr;i++){
+            Lin d;memset(&d,0,sizeof(d));lin_into(&d,&ml,1.0);lin_into(&d,&arr[i],-1.0);
+            if(ismax){
+                /* m >= x_i; z_i=1 additionally gives m <= x_i. */
+                b_put(b,'>',0.0,&d);
+                double M=fmax(0.0,mhi-xlo[i]);
+                lin_term(&d,z[i],M);b_put(b,'<',M,&d);
+            } else {
+                /* m <= x_i; z_i=1 additionally gives m >= x_i. */
+                b_put(b,'<',0.0,&d);
+                double M=fmax(0.0,xhi[i]-mlo);
+                lin_term(&d,z[i],-M);b_put(b,'>',-M,&d);
+            }
+            lin_free(&d);
+        }
+        free(z);free(xlo);free(xhi);lin_free(&ml);free_lins(arr,narr);
+        return 0;
+    }
     /* Extensional integer table: x must equal one complete tuple from a
        flattened row-major parameter array.  This is the form emitted by the
        Gecode backend, e.g. gecode_table_int([x1,x2], [1,2,2,3,...]).

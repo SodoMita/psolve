@@ -317,7 +317,7 @@ are integral):
   counterparts; `int_lin_ne`, `int_lin_ge/gt`, `count`/`among`; boolean logic
   (`bool_and/or/xor/not/clause`, `array_bool_and/or`); `int_plus/minus/neg`,
   `int_abs/max/min`, `int_times` (constant operand), `set_in` + set domains,
-  `all_different`, `array_int_element`, `bool2int`/`int2float`; exact
+  `all_different`, `array_int_element`, `array_int_maximum/minimum`, `bool2int`/`int2float`; exact
   Gecode/standard integer `table` (one binary per allowed row, tight per-column
   big-M, up to 1,024 rows, empty table ⇒ UNSAT) and Hamiltonian `circuit`
   constraints (binary successor matrix + MTZ order rows, up to 64 nodes); plus
