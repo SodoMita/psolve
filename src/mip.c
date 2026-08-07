@@ -129,7 +129,7 @@ void mip_solve(const MIP *mip, MIPResult *res)
 
     memset(res, 0, sizeof(*res));
     res->x = (double*)psolve_malloc((size_t)n * sizeof(double));
-    res->isint_sol = (int*)calloc((size_t)n, sizeof(int));
+    res->isint_sol = (int*)psolve_calloc((size_t)n, sizeof(int));
     double *x = (double*)psolve_malloc((size_t)n * sizeof(double));
     double *lcur = (double*)psolve_malloc((size_t)n * sizeof(double));
     double *ucur = (double*)psolve_malloc((size_t)n * sizeof(double));

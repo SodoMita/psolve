@@ -16,7 +16,7 @@ gcc -O2 -march=native -I src tools/unit_test.c src/lu.c src/kernels.c -o /tmp/un
 /tmp/unit_test
 
 echo "[1.5/7] Sparse LU unit test..."
-gcc -O2 -march=native -I src tools/splu_test.c src/splu.c src/lu.c src/kernels.c -o /tmp/splu_test -lm
+gcc -O2 -march=native -I src tools/splu_test.c src/splu.c src/lu.c src/kernels.c src/err.c -o /tmp/splu_test -lm
 /tmp/splu_test
 
 echo "[2/7] Example problems (objective values)..."
@@ -110,7 +110,7 @@ else
   echo "[8.5/8] MiniZinc differential SKIPPED (minizinc not installed)"
 fi
 
-echo "[9/9] Fixed-point exact-rational LP solver (fxsolve) vs double lpsolve..."
+echo "[9/10] Fixed-point exact-rational LP solver (fxsolve) vs double lpsolve..."
 make fxsolve >/dev/null 2>&1
 ./fxsolve examples/prodplan.lp | grep -E "objective \(dec\):" | tr '\n' ' '; echo "(expect 26)"
 ./fxsolve examples/diet.lp | grep -E "objective \(dec\):" | tr '\n' ' '; echo "(expect 1.32 exact)"
@@ -125,5 +125,8 @@ python3 tools/fx_verify.py 300 99 | sed 's/.*: //'
 echo -n "fx_bench (examples): "
 make fx_bench >/dev/null 2>&1
 ./fx_bench examples/prodplan.lp examples/diet.lp examples/transport.lp | tail -1
+
+echo "[10/10] Out-of-memory injection (every allocation made to fail in turn)..."
+python3 tools/oom_test.py | tail -3
 
 echo "Done."

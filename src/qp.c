@@ -48,7 +48,7 @@ static int solve_kkt(const QP *qp, const int *W, int k,
 {
     int n = qp->n;
     int N = n + k;
-    double *K = (double*)calloc((size_t)N * N, sizeof(double));   /* zeroed: bottom-right block must be 0 */
+    double *K = (double*)psolve_calloc((size_t)N * N, sizeof(double));   /* zeroed: bottom-right block must be 0 */
     int *piv = (int*)xmalloc((size_t)N * sizeof(int));
     double *rhs = (double*)xmalloc((size_t)N * sizeof(double));
     for (int j = 0; j < n; j++)
@@ -224,16 +224,16 @@ static int find_feasible(const QP *qp, const double *x0, double *x)
 
     int N = n + m;
     double eps = 1e-6;
-    double *Q1 = (double*)calloc((size_t)N*N, sizeof(double));
-    double *c1 = (double*)calloc((size_t)N, sizeof(double));
+    double *Q1 = (double*)psolve_calloc((size_t)N*N, sizeof(double));
+    double *c1 = (double*)psolve_calloc((size_t)N, sizeof(double));
     /* minimize  sum s  +  eps/2*(||x||^2 + ||s||^2).  The linear term on s
        dominates (eps tiny), so s -> 0 whenever a feasible x exists; the
        tiny quadratic keeps the problem strictly convex and bounded. */
     for (int j = 0; j < N; j++) Q1[j*N + j] = eps;
     for (int i = 0; i < m; i++) c1[n+i] = 1.0;
     int m1 = 2 * m;
-    double *A1 = (double*)calloc((size_t)m1*N, sizeof(double));
-    double *b1 = (double*)calloc((size_t)m1, sizeof(double));
+    double *A1 = (double*)psolve_calloc((size_t)m1*N, sizeof(double));
+    double *b1 = (double*)psolve_calloc((size_t)m1, sizeof(double));
     for (int i = 0; i < m; i++) {
         for (int j = 0; j < n; j++) A1[i*N + j] = qp->A[i*n + j];
         A1[i*N + (n+i)] = -1.0;
@@ -242,7 +242,7 @@ static int find_feasible(const QP *qp, const double *x0, double *x)
         b1[m+i] = 0.0;
     }
     QP q1; q1.n = N; q1.m = m1; q1.Q = Q1; q1.c = c1; q1.A = A1; q1.b = b1;
-    double *z0 = (double*)calloc((size_t)N, sizeof(double));
+    double *z0 = (double*)psolve_calloc((size_t)N, sizeof(double));
     for (int i = 0; i < m; i++) z0[n+i] = (qp->b[i] < 0) ? -qp->b[i] : 0.0;
     q1.x0 = z0;
     QPResult r1; memset(&r1, 0, sizeof(r1));

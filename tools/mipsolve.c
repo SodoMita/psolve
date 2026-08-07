@@ -27,7 +27,7 @@ int main(int argc, char **argv)
     memset(&lp, 0, sizeof(LP));
     if (lp_read(path, &lp) != 0) { psolve_end(); return 1; }
 
-    unsigned char *isint = (unsigned char*)calloc((size_t)lp.n, 1);
+    unsigned char *isint = (unsigned char*)psolve_calloc((size_t)lp.n, 1);
     int ni = 0;
     for (int a = 3; a < 3 + nint && a < argc; a++) {
         int j = atoi(argv[a]);

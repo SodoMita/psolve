@@ -1030,7 +1030,7 @@ int solver_solve(Solver *s)
     for (int i = 0; i < s->M; i++) s->cB[i] = s->cobj[s->basis[i]];
     memcpy(s->duals, s->cB, (size_t)s->M * sizeof(double));
     {
-        double *tmp = (double*)malloc((size_t)s->M * sizeof(double));
+        double *tmp = (double*)psolve_malloc((size_t)s->M * sizeof(double));
         if (tmp) {
             memcpy(tmp, s->duals, (size_t)s->M * sizeof(double));
             btrans(s, tmp);
@@ -1255,7 +1255,7 @@ int solver_feasible(const Solver *s)
         if (s->x[j] < s->l[j] - tol || s->x[j] > s->u[j] + tol) return 0;
     }
     /* A_eq x == beq */
-    double *res = (double*)calloc((size_t)M, sizeof(double));
+    double *res = (double*)psolve_calloc((size_t)M, sizeof(double));
     for (int j = 0; j < N; j++) {
         if (s->status[j] == LP_REMOVED) continue;
         double xj = s->x[j];

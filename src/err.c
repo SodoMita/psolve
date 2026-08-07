@@ -70,6 +70,16 @@ void *psolve_calloc(size_t n, size_t sz)
     return p;
 }
 
+char *psolve_strndup(const char *s, size_t n)
+{
+    size_t l = strnlen(s, n);
+    char *p = (char*)malloc(l + 1);
+    if (!p) { psolve_fail(PSOLVE_ERR_OOM); return NULL; }
+    memcpy(p, s, l);
+    p[l] = 0;
+    return p;
+}
+
 char *psolve_strdup(const char *s)
 {
     size_t l = strlen(s) + 1;

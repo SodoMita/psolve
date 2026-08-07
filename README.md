@@ -196,9 +196,17 @@ attacker-controlled.  The parsers are hardened accordingly:
   hostile ordering cannot cause a quadratic-time blowup.
 - **Relation tokens are read into a bounded buffer** (no unbounded `%s`) and
   their characters validated.
-- **Allocations are checked** (the LP solver and FlatZinc path use the
-  `psolve_*` checked allocators), and error paths free partial state so a
-  caller can safely `lp_free()`.
+- **Every allocation is checked.**  All of `src/` and the CLI drivers allocate
+  through the `psolve_*` helpers, which report out-of-memory through the
+  `psolve_try()`/`psolve_fail()` protocol (a `longjmp` back to the caller's
+  handler) instead of dereferencing `NULL` or calling `exit()`.  This includes
+  allocating libc calls: `strndup()` allocates inside libc, so the FlatZinc
+  tokenizer uses `psolve_strndup()` instead.  The claim is *tested*, not
+  asserted -- `tools/oom_test.py` makes the Nth allocation (and every one after
+  it) fail via an `LD_PRELOAD` shim and replays each CLI once per N over the
+  full census of its allocations; a run passes only if the process exits by
+  itself, with no `SIGSEGV`, no `abort()`, and no hang.  The suite covers
+  ~5.8k injection points (`--full` covers all ~19k).
 - **Dense QP dimensions are capped** (`MAX_QPDIM=8192`) so a hostile `n` cannot
   trigger a multi-gigabyte allocation.
 - The **build is hardened**: stack canaries, `_FORTIFY_SOURCE=2`, format
@@ -211,6 +219,8 @@ Run a memory-safety sweep with:
 ```sh
 make asan                                   # AddressSanitizer + UBSan binaries
 python3 tools/fuzz_inputs.py --iters 200 --seed 1   # fuzz malformed .lp/.qp
+python3 tools/fuzz_fzn.py   --iters 200 --seed 1    # fuzz malformed .fzn
+python3 tools/oom_test.py --full                    # fail every allocation in turn
 ```
 
 ## Incremental solving
