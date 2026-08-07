@@ -106,11 +106,24 @@ answer, but a completeness gap. (Roadmap notes this; no change here.)
 - Removed a dead duplicate `-t` branch in `tools/fznsolve.c` arg parsing.
 - `-Wshadow` warnings in `src/fzn.c` are benign re-declarations; left as-is.
 
+### DONE — exact-solver fallback for MIP relaxations (was finding A)
+Implemented. `src/mip.c` now cross-checks a relaxation with the fixed-point
+exact-rational simplex (`src/fx.c`) whenever the double revised-simplex returns
+`SOLVE_NUMERICAL` **or** a false `INFEASIBLE` — both of which it does on the
+ill-conditioned big-M bases of combinatorial MIPs. `fx_from_double` /
+`FX_INF_SENT` are exported; `mip_build_fxlp()` converts the double MIP + per-node
+bounds into an exact FxLP. When the data are integral and the exact solve
+succeeds its verdict wins; otherwise the honest double verdict is kept.
+
+Impact: `cumulative_verify` went from **OK=145 UNKNOWN=105** to **OK=300
+UNKNOWN=0 MISMATCH=0** — every previously-unresolved big-M schedule now solves
+correctly, and the false-INFEASIBLE→UNSAT bug is fixed. Deterministic regression
+added (`examples/fzn/cumulative_exact.fzn`). All differentials, fuzzing, and the
+OOM-injection suite (7,836 points, 0 failures) stay green; ASan/UBSan/leak clean.
+
 ## Not done (recommended next steps, in priority order)
-1. **Exact-solver fallback for MIP relaxations** (fixes A) — makes cumulative
-   and all big-M models reliable and unlocks `-a` all-solutions enumeration.
-2. **CLI `-a` (all solutions)** for `fznsolve` (FlatZinc standard; gated on #1
-   being reliable).
-3. Re-run the GLPK and MiniZinc differential suites (need `glpsol`/`minizinc`).
-4. Public C API audit for Phase 4 hardening (documented, bounds-checked, no
+1. **CLI `-a` (all solutions)** for `fznsolve` (FlatZinc standard). Big-M
+   models are now reliable enough to enumerate, so this is unblocked.
+2. Re-run the GLPK and MiniZinc differential suites (need `glpsol`/`minizinc`).
+3. Public C API audit for Phase 4 hardening (documented, bounds-checked, no
    `exit` in library paths).
