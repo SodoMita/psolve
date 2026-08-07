@@ -53,6 +53,12 @@ void *psolve_calloc(size_t n, size_t sz);
 /* Checked strdup: signals OOM on failure (see psolve_malloc). */
 char *psolve_strdup(const char *s);
 
+/* Checked strndup: copies at most n bytes and NUL-terminates; signals OOM on
+ * failure (see psolve_malloc).  Note that plain strndup() allocates inside
+ * libc, so its failure cannot be caught by the psolve_* protocol -- always use
+ * this one. */
+char *psolve_strndup(const char *s, size_t n);
+
 /* Cooperative abort.  Solvers call psolve_stop() periodically (e.g. once per
  * branch-and-bound node) and, if it returns nonzero, wind down and report a
  * limit status instead of running to completion.  The driver installs a

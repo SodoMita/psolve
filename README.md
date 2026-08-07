@@ -199,9 +199,17 @@ attacker-controlled.  The parsers are hardened accordingly:
   hostile ordering cannot cause a quadratic-time blowup.
 - **Relation tokens are read into a bounded buffer** (no unbounded `%s`) and
   their characters validated.
-- **Allocations are checked** (the LP solver and FlatZinc path use the
-  `psolve_*` checked allocators), and error paths free partial state so a
-  caller can safely `lp_free()`.
+- **Every allocation is checked.**  All of `src/` and the CLI drivers allocate
+  through the `psolve_*` helpers, which report out-of-memory through the
+  `psolve_try()`/`psolve_fail()` protocol (a `longjmp` back to the caller's
+  handler) instead of dereferencing `NULL` or calling `exit()`.  This includes
+  allocating libc calls: `strndup()` allocates inside libc, so the FlatZinc
+  tokenizer uses `psolve_strndup()` instead.  The claim is *tested*, not
+  asserted -- `tools/oom_test.py` makes the Nth allocation (and every one after
+  it) fail via an `LD_PRELOAD` shim and replays each CLI once per N over the
+  full census of its allocations; a run passes only if the process exits by
+  itself, with no `SIGSEGV`, no `abort()`, and no hang.  The suite covers
+  ~5.8k injection points (`--full` covers all ~19k).
 - **Dense QP dimensions are capped** (`MAX_QPDIM=8192`) so a hostile `n` cannot
   trigger a multi-gigabyte allocation.
 - The **build is hardened**: stack canaries, `_FORTIFY_SOURCE=2`, format
@@ -214,6 +222,8 @@ Run a memory-safety sweep with:
 ```sh
 make asan                                   # AddressSanitizer + UBSan binaries
 python3 tools/fuzz_inputs.py --iters 200 --seed 1   # fuzz malformed .lp/.qp
+python3 tools/fuzz_fzn.py   --iters 200 --seed 1    # fuzz malformed .fzn
+python3 tools/oom_test.py --full                    # fail every allocation in turn
 ```
 
 ## Incremental solving
@@ -267,14 +277,40 @@ x[3] = 4
 
 ## Correctness & testing
 
+`./test.sh` runs everything.  The individual differential/property tests, each
+of which answers a specific "could this solver lie to me?" question:
+
 ```sh
-python3 tools/sweep.py        # 100+ random bounded LPs vs GLPK (objective match)
-python3 tools/difftest.py 200 0.4   # incl. infeasible/unbounded detection vs GLPK
+python3 tools/sweep.py              # random bounded LPs vs GLPK (objective)
+python3 tools/difftest.py 200 0.4   # LP incl. infeasible/unbounded status vs GLPK
+python3 tools/mip_diff.py 400       # MIP status + objective + returned point vs
+                                    #   exhaustive enumeration
+python3 tools/qp_diff.py 200        # QP answers checked against the KKT conditions
+                                    #   (necessary AND sufficient when convex)
+python3 tools/fx_exact_test.py 200  # exact-rational LP verified in Python Fractions
+python3 tools/table_verify.py 250   # FlatZinc table constraint vs brute force
+python3 tools/fuzz_inputs.py --iters 200   # malformed .lp/.qp under ASan/UBSan
+python3 tools/fuzz_fzn.py --iters 200      # malformed .fzn under ASan/UBSan
+python3 tools/oom_test.py --full    # fail every allocation in turn; no crash
 ```
 
-The solver is verified against GLPK (`glpsol`) on hundreds of randomized
-instances: it matches the objective on all well-conditioned problems and agrees
-on infeasible/unbounded status in the vast majority of cases.
+The design rule these enforce is *never report a wrong answer*: an honest
+`INFEASIBLE`, `UNBOUNDED`, `ITERATION_LIMIT`, `FEASIBLE` (not proven optimal) or
+`UNKNOWN` always beats a fabricated optimum.  So the tests do not just compare
+objectives with a reference solver -- they check the **status** and validate the
+**returned point** independently:
+
+- `mip_diff` requires the printed solution to be integral, inside its bounds,
+  to satisfy every row, and to evaluate to the reported objective, and it
+  compares the status against exhaustive enumeration of the integer box.
+- `qp_diff` certifies with the KKT conditions plus an exact LP recession test,
+  so it does not depend on a second optimizer converging, and it separates
+  "hit the iteration limit on a genuinely unbounded problem" from a real gap.
+- `oom_test` censuses how many allocations a run makes and then fails each one
+  in turn, requiring a clean exit every time.
+
+See [`docs/AUDIT.md`](docs/AUDIT.md) for the wrong-answer bugs this suite was
+written to catch and what each of them was.
 
 ## Design
 

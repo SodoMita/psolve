@@ -1,5 +1,4 @@
 import subprocess, random, sys
-sys.path.insert(0,'/home/user/lpsolve/tools')
 import numpy as np
 from scipy.optimize import linprog  # for LP bound sanity
 random.seed(int(sys.argv[1]) if len(sys.argv)>1 else 0)

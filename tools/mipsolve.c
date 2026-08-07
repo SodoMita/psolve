@@ -51,7 +51,7 @@ int main(int argc, char **argv)
     memset(&lp, 0, sizeof(LP));
     if (lp_read(path, &lp) != 0) { psolve_stop_fn = NULL; psolve_end(); return 1; }
 
-    unsigned char *isint = (unsigned char*)calloc((size_t)lp.n, 1);
+    unsigned char *isint = (unsigned char*)psolve_calloc((size_t)lp.n, 1);
     int ni = 0;
     for (int a = arg_idx; a < arg_idx + nint && a < argc; a++) {
         if (strcmp(argv[a], "--print") == 0) continue;
@@ -60,7 +60,12 @@ int main(int argc, char **argv)
     }
     if (ni == 0) { fprintf(stderr, "no valid integer variables specified\n"); psolve_end(); return 1; }
 
-    MIP mip;
+    /* Zero the whole struct first: MIP has optional fields (stop_at_feasible,
+       ...) that this driver does not set.  Leaving them uninitialised is
+       undefined behaviour -- and it bit: a garbage stop_at_feasible made
+       branch-and-bound return the first integer-feasible point it stumbled
+       on, which was then reported as OPTIMAL. */
+    MIP mip; memset(&mip, 0, sizeof(mip));
     mip.n = lp.n; mip.m = lp.m;
     mip.c = lp.c; mip.Acolptr = lp.Acolptr; mip.Arow = lp.Arow; mip.Aval = lp.Aval;
     mip.rel = lp.rel; mip.b = lp.b; mip.l = lp.l; mip.u = lp.u;
@@ -73,7 +78,16 @@ int main(int argc, char **argv)
     MIPResult res;
     mip_solve(&mip, &res);
 
-    if (res.status == 0) {
+    if (res.status == 0 && !res.proven_optimal) {
+        /* Feasible, but the tree was not exhausted (e.g. stop_at_feasible).
+           Never print OPTIMAL for a point whose optimality was not proven. */
+        printf("status: FEASIBLE\n");
+        printf("objective: %.15g\n", res.obj);
+        printf("nodes: %ld\n", res.nodes);
+        if (print)
+            for (int j = 0; j < lp.n; j++)
+                printf("x[%d] = %.10g\n", j, res.x[j]);
+    } else if (res.status == 0) {
         printf("status: OPTIMAL\n");
         printf("objective: %.15g\n", res.obj);
         printf("nodes: %ld\n", res.nodes);
