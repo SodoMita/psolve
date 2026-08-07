@@ -38,6 +38,8 @@ def parse_x(path, n):
     return x, obj
 
 def check(lp, x):
+    # Absolute tolerances are meaningless once row activities reach 1e4+, so
+    # scale the row tolerance by the magnitude of the terms that make it up.
     tolx = 1e-6
     res = []
     ok = True
@@ -49,13 +51,16 @@ def check(lp, x):
             res.append(f"var {j} value {v:.6g} outside [{lp['lo'][j]:.4g},{lp['hi'][j]:.4g}]"); ok=False
     # constraints
     for i in range(lp['m']):
-        lhs = sum(lp['A'][i][j]*x[j] for j in range(lp['n']) if x[j] is not None)
+        terms = [lp['A'][i][j]*x[j] for j in range(lp['n']) if x[j] is not None]
+        lhs = sum(terms)
         rhs = lp['b'][i]; r = lp['rel'][i]
-        if r == '<' and lhs > rhs + tolx:
+        scale = 1.0 + abs(rhs) + max([abs(t) for t in terms], default=0.0)
+        tolr = tolx * scale
+        if r == '<' and lhs > rhs + tolr:
             res.append(f"row {i}: {lhs:.6g} <= {rhs:.4g} violated"); ok=False
-        if r == '>' and lhs < rhs - tolx:
+        if r == '>' and lhs < rhs - tolr:
             res.append(f"row {i}: {lhs:.6g} >= {rhs:.4g} violated"); ok=False
-        if r == '=' and abs(lhs-rhs) > tolx:
+        if r == '=' and abs(lhs-rhs) > tolr:
             res.append(f"row {i}: {lhs:.6g} = {rhs:.4g} violated"); ok=False
     return ok, res
 

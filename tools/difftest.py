@@ -16,9 +16,13 @@ def glpk_status(out):
     # header cannot override a clear status verdict.
     if ('no primal feasible solution' in o
         or 'problem has no primal feasible solution' in o): return 'INFEASIBLE'
+    if 'unbounded primal solution' in o: return 'UNBOUNDED'
+    # "LP HAS NO DUAL FEASIBLE SOLUTION" is a *dual* infeasibility verdict from
+    # the presolver: the primal is then unbounded OR infeasible, and glpsol
+    # does not distinguish.  Treat it as either (verified against HiGHS: e.g.
+    # difftest seed 156 is genuinely INFEASIBLE while glpsol prints this).
     if ('no dual feasible solution' in o
-        or 'lp has no dual feasible solution' in o
-        or 'unbounded primal solution' in o): return 'UNBOUNDED'
+        or 'lp has no dual feasible solution' in o): return 'UNBOUNDED_OR_INFEASIBLE'
     if 'optimal' in o: return 'OPTIMAL'
     return '?'
 
@@ -49,6 +53,9 @@ def main():
             if abs(myobj-gobj) <= 1e-5*max(1,abs(gobj)): opt += 1
             else:
                 bad_obj.append((seed, myobj, gobj))
+        elif gst=='UNBOUNDED_OR_INFEASIBLE' and myst in ('UNBOUNDED','INFEASIBLE'):
+            if myst=='UNBOUNDED': unb += 1
+            else: inf += 1
         elif myst==gst:
             if myst=='OPTIMAL': opt+=1
             elif myst=='INFEASIBLE': inf+=1

@@ -1,4 +1,5 @@
 #include "parser.h"
+#include "err.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -72,11 +73,11 @@ int lp_read(const char *path, LP *lp)
     }
     lp->n = n; lp->m = m;
 
-    lp->c = (double*)malloc((size_t)n * sizeof(double));
-    lp->b = (double*)malloc((size_t)(m ? m : 1) * sizeof(double));
-    lp->l = (double*)malloc((size_t)n * sizeof(double));
-    lp->u = (double*)malloc((size_t)n * sizeof(double));
-    lp->rel = (char*)malloc((size_t)(m ? m : 1) * sizeof(char));
+    lp->c = (double*)psolve_malloc((size_t)n * sizeof(double));
+    lp->b = (double*)psolve_malloc((size_t)(m ? m : 1) * sizeof(double));
+    lp->l = (double*)psolve_malloc((size_t)n * sizeof(double));
+    lp->u = (double*)psolve_malloc((size_t)n * sizeof(double));
+    lp->rel = (char*)psolve_malloc((size_t)(m ? m : 1) * sizeof(char));
     if (!lp->c || !lp->b || !lp->l || !lp->u || !lp->rel) goto err;
 
     for (int j = 0; j < n; j++) if (fscanf(f, "%lf", &lp->c[j]) != 1) goto err;
@@ -90,7 +91,7 @@ int lp_read(const char *path, LP *lp)
        exactly m chars and validate. */
     if (m > 0) {
         size_t rel_len = (size_t)m;               /* exactly m chars */
-        char *relbuf = (char*)malloc(rel_len + 1);
+        char *relbuf = (char*)psolve_malloc(rel_len + 1);
         if (!relbuf) goto err;
         int got = 0;
         size_t pos = 0;
@@ -139,9 +140,9 @@ int lp_read(const char *path, LP *lp)
     int *tr = NULL, *tc = NULL;
     double *tv = NULL;
     if (nnz > 0) {
-        tr = (int*)malloc((size_t)nnz * sizeof(int));
-        tc = (int*)malloc((size_t)nnz * sizeof(int));
-        tv = (double*)malloc((size_t)nnz * sizeof(double));
+        tr = (int*)psolve_malloc((size_t)nnz * sizeof(int));
+        tc = (int*)psolve_malloc((size_t)nnz * sizeof(int));
+        tv = (double*)psolve_malloc((size_t)nnz * sizeof(double));
         if (!tr || !tc || !tv) goto err;
     }
     for (long k = 0; k < nnz; k++) {
@@ -156,9 +157,9 @@ int lp_read(const char *path, LP *lp)
     }
     /* Counting sort by column: O(nnz + n), linear in input size (the previous
        insertion sort was O(nnz^2) on adversarial triplet orderings). */
-    int *colcount = (int*)calloc((size_t)(n + 1), sizeof(int));
-    int *out_r = (int*)malloc((size_t)(nnz ? nnz : 1) * sizeof(int));
-    double *out_v = (double*)malloc((size_t)(nnz ? nnz : 1) * sizeof(double));
+    int *colcount = (int*)psolve_calloc((size_t)(n + 1), sizeof(int));
+    int *out_r = (int*)psolve_malloc((size_t)(nnz ? nnz : 1) * sizeof(int));
+    double *out_v = (double*)psolve_malloc((size_t)(nnz ? nnz : 1) * sizeof(double));
     if (!colcount || !out_r || !out_v) { free(colcount); free(out_r); free(out_v); goto err2; }
     for (long k = 0; k < nnz; k++) colcount[tc[k] + 1]++;
     for (int j = 0; j < n; j++) colcount[j + 1] += colcount[j];
@@ -170,9 +171,9 @@ int lp_read(const char *path, LP *lp)
     free(tr); free(tc); free(tv);
     tr = NULL; tc = NULL; tv = NULL;
 
-    lp->Acolptr = (int*)malloc((size_t)(n + 1) * sizeof(int));
-    lp->Arow = (int*)malloc((size_t)(nnz ? nnz : 1) * sizeof(int));
-    lp->Aval = (double*)malloc((size_t)(nnz ? nnz : 1) * sizeof(double));
+    lp->Acolptr = (int*)psolve_malloc((size_t)(n + 1) * sizeof(int));
+    lp->Arow = (int*)psolve_malloc((size_t)(nnz ? nnz : 1) * sizeof(int));
+    lp->Aval = (double*)psolve_malloc((size_t)(nnz ? nnz : 1) * sizeof(double));
     if (!lp->Acolptr || !lp->Arow || !lp->Aval) { free(colcount); free(out_r); free(out_v); goto err2; }
     lp->Acolptr[0] = 0;
     for (int j = 0; j < n; j++) lp->Acolptr[j + 1] = colcount[j];

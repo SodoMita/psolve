@@ -105,7 +105,7 @@ tools/mipsolve.o: tools/mipsolve.c src/mip.h src/parser.h src/err.h
 fxsolve: src/fx.o tools/fxsolve.o
 	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -o $@ $^ $(LDFLAGS) $(LDLIBS)
 
-src/fx.o: src/fx.c src/fx.h
+src/fx.o: src/fx.c src/fx.h src/fx_core.inc
 	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -I src -c -o $@ $<
 
 tools/fxsolve.o: tools/fxsolve.c src/fx.h

@@ -48,9 +48,16 @@ static int solve_kkt(const QP *qp, const int *W, int k,
 {
     int n = qp->n;
     int N = n + k;
-    double *K = (double*)calloc((size_t)N * N, sizeof(double));   /* zeroed: bottom-right block must be 0 */
+    /* One scratch block for K, its pristine copy, and the two right-hand
+       sides: this runs once per active-set iteration, and the solver is meant
+       for per-frame use, so keep it to a single allocation. */
+    size_t nd = 2 * (size_t)N * N + 2 * (size_t)N;
+    double *blk = (double*)psolve_calloc(nd, sizeof(double));  /* zeroed: the bottom-right block must be 0 */
+    double *K    = blk;
+    double *K0   = blk + (size_t)N * N;
+    double *rhs  = blk + 2 * (size_t)N * N;
+    double *rhs0 = rhs + N;
     int *piv = (int*)xmalloc((size_t)N * sizeof(int));
-    double *rhs = (double*)xmalloc((size_t)N * sizeof(double));
     for (int j = 0; j < n; j++)
         for (int i = 0; i < n; i++) K[j*N + i] = qp->Q[j*n + i];
     for (int c = 0; c < k; c++) {
@@ -63,17 +70,49 @@ static int solve_kkt(const QP *qp, const int *W, int k,
     for (int i = 0; i < n; i++) rhs[i] = -g[i];
     for (int c = 0; c < k; c++) rhs[n+c] = 0.0;
 
+    /* Keep a pristine copy: LU overwrites K, and the residual check below
+       needs the original matrix. */
+    memcpy(K0, K, (size_t)N * N * sizeof(double));
+    memcpy(rhs0, rhs, (size_t)N * sizeof(double));
+    double rhsnorm = 0.0;
+    for (int i = 0; i < N; i++) rhsnorm = fmax(rhsnorm, fabs(rhs0[i]));
+
+    /* A singular Q (only PSD is promised, not PD) makes the KKT matrix
+       singular.  lu_factor() does not always *fail* on it -- it can come back
+       with a tiny pivot and a wildly inaccurate solve, which used to be taken
+       at face value.  The step then left the working-set constraints, and the
+       iterate drifted out of the feasible region while still being reported as
+       solved.  So: solve, measure the residual, and if it is not small,
+       regularize the Q block and try again. */
     int r = lu_factor(K, N, piv);
-    if (r != 0) {   /* regularize Q block (handles PSD) */
-        for (int i = 0; i < n; i++) K[i*N + i] += 1e-8;
-        r = lu_factor(K, N, piv);
+    int good = 0;
+    for (int attempt = 0; attempt < 2 && !good; attempt++) {
+        if (r == 0) {
+            lu_solve(K, piv, N, rhs, rhs);
+            double resid = 0.0;
+            for (int i = 0; i < N; i++) {
+                double sum = -rhs0[i];
+                for (int j = 0; j < N; j++) sum += K0[j*N + i] * rhs[j];
+                resid = fmax(resid, fabs(sum));
+            }
+            double xnorm = 0.0;
+            for (int i = 0; i < N; i++) xnorm = fmax(xnorm, fabs(rhs[i]));
+            if (resid <= 1e-8 * (1.0 + rhsnorm + xnorm)) good = 1;
+        }
+        if (!good && attempt == 0) {
+            /* regularize the Q block (handles singular PSD Q) and retry */
+            memcpy(K, K0, (size_t)N * N * sizeof(double));
+            for (int i = 0; i < n; i++) K[i*N + i] += 1e-8;
+            memcpy(K0, K, (size_t)N * N * sizeof(double));
+            memcpy(rhs, rhs0, (size_t)N * sizeof(double));
+            r = lu_factor(K, N, piv);
+        }
     }
-    if (r != 0) { free(K); free(piv); free(rhs); return -1; }
-    lu_solve(K, piv, N, rhs, rhs);
+    if (!good) { free(blk); free(piv); return -1; }
     for (int i = 0; i < n; i++) p[i] = rhs[i];
     for (int c = 0; c < k; c++) mu[c] = rhs[n+c];
 
-    free(K); free(piv); free(rhs);
+    free(blk); free(piv);
     return 0;
 }
 
@@ -149,6 +188,14 @@ static void active_set(const QP *qp, const double *xstart, QPResult *res)
         for (int i = 0; i < n; i++) pnorm += p[i]*p[i];
         pnorm = sqrt(pnorm);
         double scale = 1.0 + fabs(eval_obj(qp, x));
+        /* Divergence guard: the iterate has run away (typically an unbounded
+           ray we could not certify).  Stop instead of letting the objective --
+           and every objective-relative tolerance with it -- blow up. */
+        {
+            double xmax = 0.0;
+            for (int i = 0; i < n; i++) xmax = fmax(xmax, fabs(x[i]));
+            if (!(xmax < 1e14)) { status = QP_ITERATION_LIMIT; break; }
+        }
         if (pnorm < 1e-9 * scale) {
             int drop = -1; double minmu = 0.0;
             for (int c = 0; c < k; c++)
@@ -157,15 +204,44 @@ static void active_set(const QP *qp, const double *xstart, QPResult *res)
                 /* candidate optimum: verify the KKT stationarity residual
                    before certifying success, so a bad KKT solve cannot be
                    reported as optimal. */
-                double kkt = 0.0;
+                double kkt = 0.0, gmax = 0.0, tmax = 0.0;
                 for (int j = 0; j < n; j++) {
                     double rj = g[j];
-                    for (int c = 0; c < k; c++)
-                        rj += qp->A[(size_t)W[c]*n + j] * mu[c];
+                    gmax = fmax(gmax, fabs(g[j]));
+                    for (int c = 0; c < k; c++) {
+                        double t = qp->A[(size_t)W[c]*n + j] * mu[c];
+                        rj += t;
+                        tmax = fmax(tmax, fabs(t));
+                    }
                     kkt = fmax(kkt, fabs(rj));
                 }
-                double tol = 1e-6 * (1.0 + fabs(eval_obj(qp, x)));
+                /* Scale the stationarity tolerance by the size of the terms
+                   being cancelled, NOT by the objective value.  The old
+                   1e-6*(1+|obj|) grew with a diverging iterate: on an
+                   unbounded QP the objective ran to 1e36, the tolerance with
+                   it, and a meaningless point passed as optimal. */
+                double tol = 1e-7 * (1.0 + gmax + tmax);
                 if (kkt > tol) { status = QP_KKT_FAIL; break; }
+                /* Complementary slackness: a multiplier may only be attached
+                   to a constraint that is actually active at x. */
+                int comp_ok = 1;
+                for (int c = 0; c < k; c++) {
+                    double rr = row_resid(qp, W[c], x);
+                    if (fabs(rr) > 1e-7 * (1.0 + fabs(qp->b[W[c]]))) { comp_ok = 0; break; }
+                }
+                if (!comp_ok) { status = QP_KKT_FAIL; break; }
+                /* Stationarity alone is not a solution: the point must also be
+                   PRIMAL FEASIBLE.  Rounding drift in the KKT steps (worst on
+                   a singular Q, or on duplicated/parallel rows where only one
+                   of the pair is rank-independent enough to enter the working
+                   set) can leave a constraint violated.  Report a failure
+                   rather than a stationary point outside the feasible set. */
+                int infeas = 0;
+                for (int i = 0; i < m; i++) {
+                    double rr = row_resid(qp, i, x);
+                    if (rr > 1e-7 * (1.0 + fabs(qp->b[i]))) { infeas = 1; break; }
+                }
+                if (infeas) { status = QP_KKT_FAIL; break; }
                 for (int c = 0; c < k; c++) res->mult[W[c]] = mu[c];
                 status = 0; break;
             }
@@ -173,6 +249,51 @@ static void active_set(const QP *qp, const double *xstart, QPResult *res)
             build_orth(qp, W, k, orth);
             continue;
         }
+        /* Unboundedness certificate.  For a convex QP the objective is
+           unbounded below exactly when some direction d satisfies
+           Q d = 0, A d <= 0 and g.d < 0.  Without this test the loop simply
+           walks along such a ray until the iteration cap and reports
+           ITERATION_LIMIT -- honest, but uninformative and ~4000 wasted
+           iterations (measurably: a 2-variable Q=0 case did 12917 mallocs).
+           Tolerances are deliberately strict: if the ray cannot be certified
+           we fall through to the old behaviour rather than risk a wrong
+           UNBOUNDED. */
+        {
+            double gp = 0.0, pQp = 0.0, pinf = 0.0;
+            for (int j = 0; j < n; j++) {
+                gp += g[j] * p[j];
+                pinf = fmax(pinf, fabs(p[j]));
+            }
+            if (gp < -1e-9 * scale && pinf > 0.0) {
+                for (int i = 0; i < n; i++) {
+                    double qi = 0.0;
+                    for (int j = 0; j < n; j++) qi += qp->Q[(size_t)j*n + i] * p[j];
+                    pQp += qi * p[i];
+                }
+                double qnorm = 0.0;
+                for (int i = 0; i < n*n; i++) qnorm = fmax(qnorm, fabs(qp->Q[i]));
+                if (pQp <= 1e-12 * (1.0 + qnorm) * pinf * pinf) {
+                    int ray = 1;
+                    for (int i = 0; i < m && ray; i++) {
+                        const double *Ai = qp->A + (size_t)i * n;
+                        double ap = 0.0, anorm = 0.0;
+                        for (int j = 0; j < n; j++) {
+                            ap += Ai[j] * p[j];
+                            anorm = fmax(anorm, fabs(Ai[j]));
+                        }
+                        /* No tolerance here on purpose: a row with even a
+                           rounding-level positive slope does eventually block
+                           the ray, so claiming UNBOUNDED would be a wrong
+                           answer.  Failing the test just falls back to the
+                           iteration limit, which is never wrong. */
+                        (void)anorm;
+                        if (ap > 0.0) ray = 0;
+                    }
+                    if (ray) { status = 1; break; }   /* certified unbounded */
+                }
+            }
+        }
+
         double alpha = 1.0; int block = -1;
         for (int i = 0; i < m; i++) {
             int inW = 0;
@@ -183,6 +304,13 @@ static void active_set(const QP *qp, const double *xstart, QPResult *res)
             for (int j = 0; j < n; j++) ap += Ai[j] * p[j];
             if (ap > 1e-12) {
                 double r = -row_resid(qp, i, x) / ap;
+                /* A constraint that is already (numerically) violated gives a
+                   negative ratio.  Taking that step would move the iterate
+                   BACKWARDS along p -- uphill, and deeper out of the feasible
+                   region.  Clamp to a zero-length blocking step, which is the
+                   standard degenerate-step handling: the constraint enters the
+                   working set and the next KKT solve moves along it. */
+                if (r < 0.0) r = 0.0;
                 if (r < alpha - 1e-10) { alpha = r; block = i; }
             }
         }
@@ -224,16 +352,16 @@ static int find_feasible(const QP *qp, const double *x0, double *x)
 
     int N = n + m;
     double eps = 1e-6;
-    double *Q1 = (double*)calloc((size_t)N*N, sizeof(double));
-    double *c1 = (double*)calloc((size_t)N, sizeof(double));
+    double *Q1 = (double*)psolve_calloc((size_t)N*N, sizeof(double));
+    double *c1 = (double*)psolve_calloc((size_t)N, sizeof(double));
     /* minimize  sum s  +  eps/2*(||x||^2 + ||s||^2).  The linear term on s
        dominates (eps tiny), so s -> 0 whenever a feasible x exists; the
        tiny quadratic keeps the problem strictly convex and bounded. */
     for (int j = 0; j < N; j++) Q1[j*N + j] = eps;
     for (int i = 0; i < m; i++) c1[n+i] = 1.0;
     int m1 = 2 * m;
-    double *A1 = (double*)calloc((size_t)m1*N, sizeof(double));
-    double *b1 = (double*)calloc((size_t)m1, sizeof(double));
+    double *A1 = (double*)psolve_calloc((size_t)m1*N, sizeof(double));
+    double *b1 = (double*)psolve_calloc((size_t)m1, sizeof(double));
     for (int i = 0; i < m; i++) {
         for (int j = 0; j < n; j++) A1[i*N + j] = qp->A[i*n + j];
         A1[i*N + (n+i)] = -1.0;
@@ -242,7 +370,7 @@ static int find_feasible(const QP *qp, const double *x0, double *x)
         b1[m+i] = 0.0;
     }
     QP q1; q1.n = N; q1.m = m1; q1.Q = Q1; q1.c = c1; q1.A = A1; q1.b = b1;
-    double *z0 = (double*)calloc((size_t)N, sizeof(double));
+    double *z0 = (double*)psolve_calloc((size_t)N, sizeof(double));
     for (int i = 0; i < m; i++) z0[n+i] = (qp->b[i] < 0) ? -qp->b[i] : 0.0;
     q1.x0 = z0;
     QPResult r1; memset(&r1, 0, sizeof(r1));
@@ -251,7 +379,17 @@ static int find_feasible(const QP *qp, const double *x0, double *x)
     if (r1.status == 0) {
         double ssum = 0.0;
         for (int i = 0; i < m; i++) ssum += r1.x[n+i];
-        if (ssum <= 1e-7) { for (int j = 0; j < n; j++) x[j] = r1.x[j]; ok = 1; }
+        if (ssum <= 1e-7) {
+            /* Trust but verify: check the candidate against the ORIGINAL rows
+               instead of inferring feasibility from the slack sum. */
+            int feas2 = 1;
+            for (int i = 0; i < m; i++) {
+                double rr = -qp->b[i];
+                for (int j = 0; j < n; j++) rr += qp->A[(size_t)i*n + j] * r1.x[j];
+                if (rr > 1e-7 * (1.0 + fabs(qp->b[i]))) { feas2 = 0; break; }
+            }
+            if (feas2) { for (int j = 0; j < n; j++) x[j] = r1.x[j]; ok = 1; }
+        }
     }
 
     qp_result_free(&r1);

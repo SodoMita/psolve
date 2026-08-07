@@ -10,6 +10,11 @@
 
 #define TOL_FEAS 1e-9
 #define TOL_PIV  1e-12
+/* Dual (reduced-cost) tolerance.  A reduced cost at rounding level is *not* an
+   improving direction: pivoting on one produces a meaningless search direction
+   that can end in a bogus "unbounded" ray or in cycling.  Only a reduced cost
+   that clears this tolerance counts as improving. */
+#define TOL_DJ   1e-9
 
 static void *xmalloc(size_t n) {
     return psolve_malloc(n);   /* signals PSOLVE_ERR_OOM instead of exit() */
@@ -19,6 +24,7 @@ static void *xmalloc(size_t n) {
 static void get_col(const Solver *s, int var, double *out);
 static void refactorize(Solver *s);
 static void recompute_basic(Solver *s);
+static void solver_reset_to_initial(Solver *s);
 
 /* ------------------------------------------------------------------ */
 /* Construction                                                        */
@@ -196,88 +202,96 @@ static Solver *solver_create_internal(const LP *lp)
        We compute S_i and choose, per row, the slack if it yields a feasible
        (nonneg) value, otherwise a sign-correct artificial so the artificial
        value is nonneg and Phase I can drive it to zero. */
-    s->needs_phase1 = 0;
     s->negate_obj = maximize ? 0 : 1;
-    {
-        double *S = (double*)calloc((size_t)m, sizeof(double));
-        /* contributions from nonbasic originals at their starting value */
-        for (j = 0; j < n; j++) {
-            double xj = (s->l[j] > -LP_INF) ? s->l[j] : s->u[j];
-            s->x[j] = xj;
-            if (xj == 0.0) continue;
-            for (k = s->colptr[j]; k < s->colptr[j+1]; k++)
-                S[s->row[k]] += s->val[k] * xj;
-        }
-        for (i = 0; i < m; i++) {
-            double resid = s->beq[i] - S[i];
-            int sv = s->slackVar[i];
-            int chosen = -1;
-            if (sv >= 0) {
-                /* slack coeff = mlt_i * (rel=='<' ? +1 : -1) */
-                double scoef = (double)mlt[i] * (lp->rel[i] == '<' ? 1.0 : -1.0);
-                double v = resid / scoef;
-                if (v >= -1e-12) {   /* slack value nonneg => feasible start */
-                    chosen = sv;
-                    s->x[sv] = (v > 0.0) ? v : 0.0;
-                }
-            }
-            if (chosen < 0) {
-                /* use an artificial with sign chosen so its value is nonneg */
-                int av = s->artVar[i];
-                double v = (resid >= 0.0) ? resid : -resid;
-                /* store the artificial sign in mlt-like manner via a per-row
-                   factor; the artificial column value was built as +1, so if
-                   resid < 0 we negate the stored coefficient. */
-                s->basis[i] = av;
-                s->basispos[av] = i;
-                s->status[av] = LP_BASIC;
-                s->x[av] = v;
-                s->needs_phase1 = 1;
-                s->artSign[i] = (resid >= 0.0) ? 1 : -1;
-                /* apply the artificial's sign to its stored column coefficient */
-                for (k = s->colptr[av]; k < s->colptr[av+1]; k++)
-                    s->val[k] = (double)s->artSign[i];
-            } else {
-                s->basis[i] = chosen;
-                s->basispos[chosen] = i;
-                s->status[chosen] = LP_BASIC;
-            }
-        }
-        free(S);
+    /* Build the canonical starting basis and reset the phase state (a full
+       reset: basis + phase + refactorize).  Also used by the dense-LU retry
+       in solver_solve() after a sparse solve diverges. */
+    solver_reset_to_initial(s);
+    s->iteration_limit = 2000000;
+    free(mlt);
+    return s;
+}
+
+/* (Re)build the canonical starting basis from the stored problem data:
+ * every structural variable nonbasic at a finite bound, and per row either the
+ * slack (when that gives a non-negative slack value) or a sign-corrected
+ * artificial, so the starting point is *exactly* primal feasible for the
+ * Phase I problem.
+ *
+ * It is used twice: once by solver_create_internal(), and again by the Phase I
+ * restart in solver_solve() when a Phase I run ends in a state that cannot be
+ * certified (an artificial driven outside its bounds by a refactorization, or
+ * a mathematically impossible "unbounded" Phase I).  Restarting from a clean
+ * feasible basis with Bland's rule turns those into a real verdict instead of
+ * a wrong one.  Only stored solver state is used (s->mlt / s->rel / s->beq),
+ * never the caller's LP, so it is safe to call at any time. */
+static void build_initial_basis(Solver *s)
+{
+    int n = s->n_core, N = s->N, M = s->M;
+
+    s->needs_phase1 = 0;
+
+    /* all columns start nonbasic at a bound */
+    for (int j = 0; j < N; j++) { s->basispos[j] = -1; s->w[j] = 1.0; }
+    for (int j = 0; j < n; j++) {
+        double xj = (s->l[j] > -LP_INF) ? s->l[j] : s->u[j];
+        s->x[j] = xj;
+        s->status[j] = (s->l[j] > -LP_INF) ? LP_NBL : LP_NBU;
+    }
+    for (int j = n; j < N; j++) { s->x[j] = 0.0; s->status[j] = LP_NBL; }
+
+    /* artificial columns are stored with coefficient +1; the per-row sign is
+       (re)applied below so every artificial starts at a non-negative value. */
+    for (int i = 0; i < M; i++) {
+        int av = s->artVar[i];
+        s->artSign[i] = 1;
+        for (int k = s->colptr[av]; k < s->colptr[av+1]; k++) s->val[k] = 1.0;
     }
 
-    for (j = 0; j < n; j++) {
-        s->basispos[j] = -1;
-        if (s->l[j] > -LP_INF) s->status[j] = LP_NBL;
-        else s->status[j] = LP_NBU;
+    double *S = (double*)psolve_calloc((size_t)(M > 0 ? M : 1), sizeof(double));
+
+    /* contributions of the nonbasic structural variables at their start value */
+    for (int j = 0; j < n; j++) {
+        double xj = s->x[j];
+        if (xj == 0.0) continue;
+        for (int k = s->colptr[j]; k < s->colptr[j+1]; k++)
+            S[s->row[k]] += s->val[k] * xj;
     }
-    for (j = n; j < n + nslack; j++) {
-        if (s->basispos[j] >= 0) continue;   /* slack already basic */
-        s->basispos[j] = -1;
-        s->status[j] = LP_NBL;
+    for (int i = 0; i < M; i++) {
+        double resid = s->beq[i] - S[i];
+        int sv = s->slackVar[i];
+        int chosen = -1;
+        if (sv >= 0) {
+            /* slack coeff = mlt_i * (rel=='<' ? +1 : -1) */
+            double scoef = (double)s->mlt[i] * (s->rel[i] == '<' ? 1.0 : -1.0);
+            double v = resid / scoef;
+            if (v >= -1e-12) {   /* slack value nonneg => feasible start */
+                chosen = sv;
+                s->x[sv] = (v > 0.0) ? v : 0.0;
+            }
+        }
+        if (chosen < 0) {
+            int av = s->artVar[i];
+            double v = (resid >= 0.0) ? resid : -resid;
+            s->basis[i] = av;
+            s->basispos[av] = i;
+            s->status[av] = LP_BASIC;
+            s->x[av] = v;
+            s->needs_phase1 = 1;
+            s->artSign[i] = (resid >= 0.0) ? 1 : -1;
+            for (int k = s->colptr[av]; k < s->colptr[av+1]; k++)
+                s->val[k] = (double)s->artSign[i];
+        } else {
+            s->basis[i] = chosen;
+            s->basispos[chosen] = i;
+            s->status[chosen] = LP_BASIC;
+        }
     }
-    for (i = 0; i < m; i++) {
-        int av = s->artVar[i];
-        if (s->status[av] != LP_BASIC) { s->status[av] = LP_NBL; s->x[av] = 0.0; }
-    }
+    free(S);
 
     /* finalize: every non-basic variable must have basispos = -1 */
-    for (j = 0; j < N; j++)
+    for (int j = 0; j < N; j++)
         if (s->status[j] != LP_BASIC) s->basispos[j] = -1;
-
-    s->phase = 1;
-    s->lu_valid = 0;
-    s->bland = 0; s->flat = 0; s->last_obj = -LP_INF;
-    s->iters = 0;
-    s->status_out = 0;
-    s->objval = 0.0;
-    s->hyper_tol = 0.0;
-    s->iteration_limit = 2000000;
-
-    /* initial refactorization */
-    refactorize(s);
-        free(mlt);
-    return s;
 }
 
 static int lp_var_is_free(double lo, double hi)
@@ -544,6 +558,109 @@ static void btrans(Solver *s, double *y)
     }
 }
 
+/* Re-initialize the solver to its starting basis: every original variable
+   nonbasic at a bound, and each row served by a slack (if it yields a
+   nonnegative value) or a sign-correct artificial.  This is used both at
+   construction and to retry a solve with a more robust factorization after the
+   sparse LU path diverged.  It preserves the caller-set objective coefficients
+   (cobj is set to the Phase-I objective here; solver_solve re-establishes the
+   true objective after Phase I, exactly as on a fresh solve) and the
+   iteration limit, so a retry behaves like a clean solve. */
+static void solver_reset_to_initial(Solver *s)
+{
+    int n = s->n_core, m = s->M, N = s->N;
+    if (m < 0) { s->status_out = SOLVE_NUMERICAL; return; }   /* defensive: never valid */
+    int nslack = 0;
+    for (int i = 0; i < m; i++) if (s->rel[i] != '=') nslack++;
+    int *mlt = s->mlt;
+    for (int i = 0; i < m; i++) mlt[i] = (s->borig[i] >= 0) ? 1 : -1;
+
+    /* Phase I objective: all zero except -1 for artificials */
+    for (int j = 0; j < N; j++) s->cobj[j] = 0.0;
+    for (int i = 0; i < m; i++) s->cobj[s->artVar[i]] = -1.0;
+
+    /* restore canonical artificial column coefficients (+1) before re-selecting
+       basic artificials and applying their per-row sign */
+    for (int i = 0; i < m; i++) {
+        int av = s->artVar[i];
+        for (int k = s->colptr[av]; k < s->colptr[av+1]; k++) s->val[k] = 1.0;
+    }
+
+    s->needs_phase1 = 0;
+    {
+        double *S = (double*)psolve_calloc((size_t)(m > 0 ? m : 1), sizeof(double));
+        /* contributions from nonbasic originals at their starting value */
+        for (int j = 0; j < n; j++) {
+            double xj = (s->l[j] > -LP_INF) ? s->l[j] : s->u[j];
+            s->x[j] = xj;
+            if (xj == 0.0) continue;
+            for (int k = s->colptr[j]; k < s->colptr[j+1]; k++)
+                S[s->row[k]] += s->val[k] * xj;
+        }
+        for (int i = 0; i < m; i++) {
+            double resid = s->beq[i] - S[i];
+            int sv = s->slackVar[i];
+            int chosen = -1;
+            if (sv >= 0) {
+                double scoef = (double)mlt[i] * (s->rel[i] == '<' ? 1.0 : -1.0);
+                double v = resid / scoef;
+                if (v >= -1e-12) {   /* slack value nonneg => feasible start */
+                    chosen = sv;
+                    s->x[sv] = (v > 0.0) ? v : 0.0;
+                }
+            }
+            if (chosen < 0) {
+                int av = s->artVar[i];
+                double v = (resid >= 0.0) ? resid : -resid;
+                s->basis[i] = av;
+                s->basispos[av] = i;
+                s->status[av] = LP_BASIC;
+                s->x[av] = v;
+                s->needs_phase1 = 1;
+                s->artSign[i] = (resid >= 0.0) ? 1 : -1;
+                for (int k = s->colptr[av]; k < s->colptr[av+1]; k++)
+                    s->val[k] = (double)s->artSign[i];
+            } else {
+                s->basis[i] = chosen;
+                s->basispos[chosen] = i;
+                s->status[chosen] = LP_BASIC;
+            }
+        }
+        free(S);
+    }
+
+    for (int j = 0; j < n; j++) {
+        s->basispos[j] = -1;
+        if (s->l[j] > -LP_INF) s->status[j] = LP_NBL;
+        else s->status[j] = LP_NBU;
+    }
+    for (int j = n; j < n + nslack; j++) {
+        if (s->basispos[j] >= 0) continue;   /* slack already basic */
+        s->basispos[j] = -1;
+        s->status[j] = LP_NBL;
+    }
+    for (int i = 0; i < m; i++) {
+        int av = s->artVar[i];
+        if (s->status[av] != LP_BASIC) { s->status[av] = LP_NBL; s->x[av] = 0.0; }
+    }
+
+    /* finalize: every non-basic variable must have basispos = -1 */
+    for (int j = 0; j < N; j++)
+        if (s->status[j] != LP_BASIC) s->basispos[j] = -1;
+
+    s->phase = 1;
+    s->lu_valid = 0;
+    s->sparse_ok = 0;
+    s->bland = 0; s->flat = 0; s->last_obj = -LP_INF;
+    s->iters = 0;
+    s->status_out = 0;
+    s->objval = 0.0;
+    s->hyper_tol = 0.0;
+
+    /* initial refactorization (honors s->sparse_disabled / use_sparse) */
+    refactorize(s);
+}
+
 /* compute pricing vector y and reduced costs for all nonbasic vars */
 static void price(Solver *s)
 {
@@ -579,7 +696,7 @@ static int pick_entering(const Solver *s)
             if (st == LP_BASIC || st == LP_REMOVED) continue;
             if (s->u[j] - s->l[j] <= TOL_FEAS) continue;
             double rc = s->rc[j];
-            int cand = (st == LP_NBL && rc > 0.0) || (st == LP_NBU && rc < 0.0);
+            int cand = (st == LP_NBL && rc > TOL_DJ) || (st == LP_NBU && rc < -TOL_DJ);
             if (cand) return j;   /* lowest index */
         }
         return -1;
@@ -591,10 +708,10 @@ static int pick_entering(const Solver *s)
         double rc = s->rc[j];
         double score;   /* improving reduced cost normalized by sqrt(weight) */
         if (st == LP_NBL) {
-            if (rc <= 0.0) continue;
+            if (rc <= TOL_DJ) continue;
             score = rc / sqrt(s->w[j] < 1e-30 ? 1e-30 : s->w[j]);
         } else { /* NBU */
-            if (rc >= 0.0) continue;
+            if (rc >= -TOL_DJ) continue;
             score = (-rc) / sqrt(s->w[j] < 1e-30 ? 1e-30 : s->w[j]);
         }
         if (score > best) { best = score; q = j; }
@@ -623,13 +740,21 @@ static int ratio_test(const Solver *s, int q, int dir, const double *d,
     double qlim = (dir > 0) ? (s->u[q] - s->l[q]) : (s->u[q] - s->l[q]);
     if (s->u[q] - s->l[q] < LP_INF) { theta = qlim; }
 
+    /* A basic variable only blocks the step if the bound it moves toward is
+       genuinely finite.  LP_INF (1e30) is the *sentinel* for "no bound": using
+       it as a numeric bound made the ratio test return a huge-but-finite theta
+       (e.g. 1e30/|v| when |v|>1), so a truly unbounded LP was pushed to
+       x = 1e30 and then reported as a bogus OPTIMAL / NUMERICAL_FAILURE
+       instead of UNBOUNDED. */
     for (int i = 0; i < M; i++) {
         int bv = s->basis[i];
         double vv = v[i];
         if (vv > TOL_PIV) {
+            if (s->u[bv] >= LP_INF) continue;         /* no finite upper bound */
             double r = (s->u[bv] - s->x[bv]) / vv;
             if (r < theta) { theta = r; *blocker = bv; *blockSlot = i; blockIsBasic = 1; }
         } else if (vv < -TOL_PIV) {
+            if (s->l[bv] <= -LP_INF) continue;        /* no finite lower bound */
             double r = (s->x[bv] - s->l[bv]) / (-vv);
             if (r < theta) { theta = r; *blocker = bv; *blockSlot = i; blockIsBasic = 1; }
         }
@@ -644,8 +769,13 @@ static int ratio_test(const Solver *s, int q, int dir, const double *d,
             int bv = s->basis[i];
             double vv = v[i];
             double r;
-            if (vv > TOL_PIV) r = (s->u[bv] - s->x[bv]) / vv;
-            else if (vv < -TOL_PIV) r = (s->x[bv] - s->l[bv]) / (-vv);
+            if (vv > TOL_PIV) {
+                if (s->u[bv] >= LP_INF) continue;     /* sentinel = no bound */
+                r = (s->u[bv] - s->x[bv]) / vv;
+            } else if (vv < -TOL_PIV) {
+                if (s->l[bv] <= -LP_INF) continue;
+                r = (s->x[bv] - s->l[bv]) / (-vv);
+            }
             else continue;
             if (r <= theta + relax && fabs(vv) > bestv) { bestv = fabs(vv); bestslot = i; }
         }
@@ -885,7 +1015,7 @@ static int solve_phase(Solver *s)
     return r;
 }
 
-int solver_solve(Solver *s)
+static int solver_solve_impl(Solver *s)
 {
     int r = 0;
     /* Phase I: needed if any artificial is in the current basis.  Detecting it
@@ -896,26 +1026,64 @@ int solver_solve(Solver *s)
     for (int i = 0; i < s->M; i++)
         if (s->basis[i] >= first_art) { need_p1 = 1; break; }
     if (need_p1) {
-                s->phase = 1;
-        for (int j = 0; j < s->N; j++) s->cobj[j] = 0.0;
-        for (int i = 0; i < s->M; i++) {
-            int av = s->artVar[i];
-            s->cobj[av] = -1.0;      /* all artificials, basic or not */
-        }
-        r = solve_phase(s);
-        if (r == SOLVE_NUMERICAL) { s->status_out = SOLVE_NUMERICAL; return SOLVE_NUMERICAL; }
-        if (r == SOLVE_STOPPED) { s->status_out = SOLVE_STOPPED; return SOLVE_STOPPED; }
-        if (r == 2) { s->status_out = 2; return 2; }
-        if (r == -1) { s->status_out = 3; return 3; }   /* Phase I iteration limit: NOT infeasible */
-        if (r != 0) { s->status_out = 1; return 1; }
+        /* Phase I verdicts are only trustworthy when the final point is a
+           genuine point of the Phase I problem.  Two ways that used to fail:
+             (1) Phase I reporting "unbounded" — impossible in exact arithmetic
+                 (its objective -sum(artificials) is bounded above by 0), so it
+                 only ever signals numerical trouble.  It was reported as
+                 UNBOUNDED for the *user's* LP: a false status.
+             (2) a refactorization/recompute pushing a basic artificial far
+                 negative (outside its [0, inf) bound).  The feasibility test
+                 `sum(artificials) > tol` then reads a *negative* sum as
+                 "feasible", and Phase II ran from an infeasible basis and
+                 reported OPTIMAL/UNBOUNDED for an INFEASIBLE LP.
+           Both are now detected; the solve restarts once from a clean, exactly
+           feasible basis under Bland's rule (finite termination) and only
+           reports NUMERICAL_FAILURE if that also fails to certify. */
+        int attempt = 0;
+        for (;;) {
+            s->phase = 1;
+            for (int j = 0; j < s->N; j++) s->cobj[j] = 0.0;
+            for (int i = 0; i < s->M; i++) {
+                int av = s->artVar[i];
+                s->cobj[av] = -1.0;      /* all artificials, basic or not */
+            }
+            r = solve_phase(s);
+            if (r == SOLVE_NUMERICAL) { s->status_out = SOLVE_NUMERICAL; return SOLVE_NUMERICAL; }
+            if (r == SOLVE_STOPPED) { s->status_out = SOLVE_STOPPED; return SOLVE_STOPPED; }
+            if (r == -1) { s->status_out = 3; return 3; }   /* Phase I iteration limit: NOT infeasible */
 
-        /* check feasibility: any artificial left basic at positive value */
-        double sum = 0.0;
-        for (int i = 0; i < s->M; i++) {
-            int av = s->artVar[i];
-            if (s->status[av] == LP_BASIC) sum += s->x[av];
+            /* r == 0 (optimal) is the only certifiable outcome; r == 2 means
+               the ratio test lost a blocking bound to rounding. */
+            int certified = (r == 0);
+            double artsum = 0.0;
+            if (certified) {
+                double worst = 0.0;
+                for (int j = 0; j < s->N; j++) {
+                    if (s->status[j] == LP_REMOVED) continue;
+                    double viol = 0.0;
+                    if (s->x[j] < s->l[j]) viol = s->l[j] - s->x[j];
+                    else if (s->x[j] > s->u[j]) viol = s->x[j] - s->u[j];
+                    if (viol > worst) worst = viol;
+                }
+                for (int i = 0; i < s->M; i++) {
+                    int av = s->artVar[i];
+                    if (s->status[av] == LP_BASIC) artsum += s->x[av];
+                }
+                if (worst > 1e-6 * (1.0 + fabs(artsum))) certified = 0;
+            }
+            if (certified) {
+                if (artsum > 1e-6) { s->status_out = 1; return 1; }  /* infeasible */
+                break;                                               /* feasible */
+            }
+            if (attempt++ >= 1) { s->status_out = SOLVE_NUMERICAL; return SOLVE_NUMERICAL; }
+
+            build_initial_basis(s);
+            s->sparse_disabled = 1; s->use_sparse = 0;   /* prefer dense stability */
+            s->lu_valid = 0;
+            refactorize(s);
+            s->bland = 1; s->flat = 0; s->last_obj = -LP_INF;
         }
-        if (sum > 1e-6) { s->status_out = 1; return 1; }  /* infeasible */
         remove_basic_artificials(s);
     }
 
@@ -957,7 +1125,7 @@ int solver_solve(Solver *s)
     for (int i = 0; i < s->M; i++) s->cB[i] = s->cobj[s->basis[i]];
     memcpy(s->duals, s->cB, (size_t)s->M * sizeof(double));
     {
-        double *tmp = (double*)malloc((size_t)s->M * sizeof(double));
+        double *tmp = (double*)psolve_malloc((size_t)s->M * sizeof(double));
         if (tmp) {
             memcpy(tmp, s->duals, (size_t)s->M * sizeof(double));
             btrans(s, tmp);
@@ -966,6 +1134,24 @@ int solver_solve(Solver *s)
         }
     }
     return 0;
+}
+
+int solver_solve(Solver *s)
+{
+    int r = solver_solve_impl(s);
+    /* Robustness: on ill-conditioned moderately-sparse big-M bases the sparse
+       LU can factorize "successfully" yet diverge, so solver_solve_impl returns
+       SOLVE_NUMERICAL (its solution certificate fails).  When that happens on
+       the sparse path, retry once from a clean starting basis with the robust
+       dense LU — the identical problem, just a more stable factorization.
+       Correctness is preserved either way (never a false OPTIMAL); this only
+       turns a would-be NUMERICAL failure into a certified answer. */
+    if (r == SOLVE_NUMERICAL && s->use_sparse && !s->sparse_disabled) {
+        s->sparse_disabled = 1;
+        solver_reset_to_initial(s);
+        r = solver_solve_impl(s);
+    }
+    return r;
 }
 
 void solver_duals(const Solver *s, double *dual)
@@ -1182,7 +1368,7 @@ int solver_feasible(const Solver *s)
         if (s->x[j] < s->l[j] - tol || s->x[j] > s->u[j] + tol) return 0;
     }
     /* A_eq x == beq */
-    double *res = (double*)calloc((size_t)M, sizeof(double));
+    double *res = (double*)psolve_calloc((size_t)M, sizeof(double));
     for (int j = 0; j < N; j++) {
         if (s->status[j] == LP_REMOVED) continue;
         double xj = s->x[j];

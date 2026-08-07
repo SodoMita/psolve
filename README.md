@@ -42,14 +42,17 @@ with an explicit baseline `ARCH`.
 ## Usage
 
 ```sh
-./lpsolve <problem.lp> [--print]      # LP (revised simplex, double)
+./lpsolve [-t ms|--time-limit ms] <problem.lp> [--print]  # LP (revised simplex, double)
 ./qpsolve <qp.qp>                      # convex QP (active-set)
-./mipsolve <problem.lp> <nint> <j...> [--print]   # MIP (branch-and-bound)
+./mipsolve [-t ms|--time-limit ms] <problem.lp> <nint> <j...> [--print]   # MIP (branch-and-bound)
 ./fznsolve <problem.fzn>               # FlatZinc reader + solver (Phase 3)
 ./fxsolve <problem.lp> [--print]      # LP (exact rational / fixed-point simplex)
 ```
 
-`--print` also dumps the optimal variable values.
+`--print` also dumps the optimal variable values. `-t` / `--time-limit` sets a
+cooperative wall-clock limit in milliseconds; `Ctrl-C` also stops the double LP
+or MIP solve cleanly. Both return `STOPPED` rather than presenting a partial
+solution as optimal.
 
 The LP solver handles: **maximize or minimize**, `<`, `>`, and `=` constraints,
 variables with lower, upper, boxed, or fully free bounds (use `-inf inf`), and
@@ -196,9 +199,17 @@ attacker-controlled.  The parsers are hardened accordingly:
   hostile ordering cannot cause a quadratic-time blowup.
 - **Relation tokens are read into a bounded buffer** (no unbounded `%s`) and
   their characters validated.
-- **Allocations are checked** (the LP solver and FlatZinc path use the
-  `psolve_*` checked allocators), and error paths free partial state so a
-  caller can safely `lp_free()`.
+- **Every allocation is checked.**  All of `src/` and the CLI drivers allocate
+  through the `psolve_*` helpers, which report out-of-memory through the
+  `psolve_try()`/`psolve_fail()` protocol (a `longjmp` back to the caller's
+  handler) instead of dereferencing `NULL` or calling `exit()`.  This includes
+  allocating libc calls: `strndup()` allocates inside libc, so the FlatZinc
+  tokenizer uses `psolve_strndup()` instead.  The claim is *tested*, not
+  asserted -- `tools/oom_test.py` makes the Nth allocation (and every one after
+  it) fail via an `LD_PRELOAD` shim and replays each CLI once per N over the
+  full census of its allocations; a run passes only if the process exits by
+  itself, with no `SIGSEGV`, no `abort()`, and no hang.  The suite covers
+  ~5.8k injection points (`--full` covers all ~19k).
 - **Dense QP dimensions are capped** (`MAX_QPDIM=8192`) so a hostile `n` cannot
   trigger a multi-gigabyte allocation.
 - The **build is hardened**: stack canaries, `_FORTIFY_SOURCE=2`, format
@@ -211,6 +222,8 @@ Run a memory-safety sweep with:
 ```sh
 make asan                                   # AddressSanitizer + UBSan binaries
 python3 tools/fuzz_inputs.py --iters 200 --seed 1   # fuzz malformed .lp/.qp
+python3 tools/fuzz_fzn.py   --iters 200 --seed 1    # fuzz malformed .fzn
+python3 tools/oom_test.py --full                    # fail every allocation in turn
 ```
 
 ## Incremental solving
@@ -264,14 +277,40 @@ x[3] = 4
 
 ## Correctness & testing
 
+`./test.sh` runs everything.  The individual differential/property tests, each
+of which answers a specific "could this solver lie to me?" question:
+
 ```sh
-python3 tools/sweep.py        # 100+ random bounded LPs vs GLPK (objective match)
-python3 tools/difftest.py 200 0.4   # incl. infeasible/unbounded detection vs GLPK
+python3 tools/sweep.py              # random bounded LPs vs GLPK (objective)
+python3 tools/difftest.py 200 0.4   # LP incl. infeasible/unbounded status vs GLPK
+python3 tools/mip_diff.py 400       # MIP status + objective + returned point vs
+                                    #   exhaustive enumeration
+python3 tools/qp_diff.py 200        # QP answers checked against the KKT conditions
+                                    #   (necessary AND sufficient when convex)
+python3 tools/fx_exact_test.py 200  # exact-rational LP verified in Python Fractions
+python3 tools/table_verify.py 250   # FlatZinc table constraint vs brute force
+python3 tools/fuzz_inputs.py --iters 200   # malformed .lp/.qp under ASan/UBSan
+python3 tools/fuzz_fzn.py --iters 200      # malformed .fzn under ASan/UBSan
+python3 tools/oom_test.py --full    # fail every allocation in turn; no crash
 ```
 
-The solver is verified against GLPK (`glpsol`) on hundreds of randomized
-instances: it matches the objective on all well-conditioned problems and agrees
-on infeasible/unbounded status in the vast majority of cases.
+The design rule these enforce is *never report a wrong answer*: an honest
+`INFEASIBLE`, `UNBOUNDED`, `ITERATION_LIMIT`, `FEASIBLE` (not proven optimal) or
+`UNKNOWN` always beats a fabricated optimum.  So the tests do not just compare
+objectives with a reference solver -- they check the **status** and validate the
+**returned point** independently:
+
+- `mip_diff` requires the printed solution to be integral, inside its bounds,
+  to satisfy every row, and to evaluate to the reported objective, and it
+  compares the status against exhaustive enumeration of the integer box.
+- `qp_diff` certifies with the KKT conditions plus an exact LP recession test,
+  so it does not depend on a second optimizer converging, and it separates
+  "hit the iteration limit on a genuinely unbounded problem" from a real gap.
+- `oom_test` censuses how many allocations a run makes and then fails each one
+  in turn, requiring a clean exit every time.
+
+See [`docs/AUDIT.md`](docs/AUDIT.md) for the wrong-answer bugs this suite was
+written to catch and what each of them was.
 
 ## Design
 
@@ -309,12 +348,13 @@ are integral):
   ranges, annotations, and domains in both `var 1..10:` shorthand and
   `::`-annotation forms. Decimal shorthand domains infer `var float`; var-array
   aliases retain compiler-propagated literal elements such as `x = [1,3]`.
-- **Constraints**: exact integer/bool `*_lin_eq/le/lt/ge/gt` and
-  `*_eq/le/lt/ge/gt` relations; `int_eq/le/lt/ge/gt_reif` and their bool
-  counterparts; `int_lin_ne`, `int_lin_ge/gt`, `count`/`among`; boolean logic
+- **Constraints**: exact integer/bool `*_lin_eq/le/lt/ge/gt/ne` and
+  `*_eq/le/lt/ge/gt/ne` relations; `int_eq/le/lt/ge/gt/ne_reif`, reified linear
+  `int_lin_*_reif`/`bool_lin_*_reif`, and their bool counterparts;
+  `count`/`among`; boolean logic
   (`bool_and/or/xor/not/clause`, `array_bool_and/or`); `int_plus/minus/neg`,
   `int_abs/max/min`, `int_times` (constant operand), `set_in` + set domains,
-  `all_different`, `array_int_element`, `bool2int`/`int2float`; exact
+  `all_different`, `array_int_element`, `array_int_maximum/minimum`, `bool2int`/`int2float`; exact
   Gecode/standard integer `table` (one binary per allowed row, tight per-column
   big-M, up to 1,024 rows, empty table ⇒ UNSAT) and Hamiltonian `circuit`
   constraints (binary successor matrix + MTZ order rows, up to 64 nodes); plus
@@ -325,6 +365,7 @@ are integral):
   `examples/fzn/table.fzn` / `examples/fzn/table_{sat,opt,unsat}.fzn` for exact
   extensional tables, and `examples/fzn/circuit.fzn` for a Hamiltonian
   successor circuit.
+
 - **Solve**: satisfy / minimize / maximize; type-faithful FlatZinc output
   (full-precision float values, declared array indices via `array1d(lo..hi,[..])`,
   status markers), objective always, and `-s` stats

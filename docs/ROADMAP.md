@@ -211,11 +211,13 @@ feature completeness against a huge standard corpus.
       `set_in` + set-domain decls (SOS1), `bool2int`/`int2float`,
       `all_different` (exact domain/permutation encoding),
       `array_int_element` + `gecode_int_element` (SOS1 element lookup).
-- [x] Reified forms: exact `int_eq/le/lt/ge/gt_reif` and bool counterparts,
+- [x] Reified forms: exact `int_eq/le/lt/ge/gt/ne_reif`, reified linear
+      `int_lin_eq/le/lt/ge/gt/ne_reif`, and bool counterparts,
       including constant reifiers.  Equality uses an explicit positive/negative
       side selector, so `r = false` really means `a != b` rather than an
       impossible conjunction; the full small-domain truth table is regression
-      tested. `int_lin_ne`/`bool_lin_ne` use the same exact selector.
+      tested. `int_lin_ne`/`bool_lin_ne`, `int_ne`/`bool_ne` use the same exact
+      selector.
 - [x] `int_lin_ge`/`int_lin_gt`/`bool_lin_ge`; `fzn_count_eq`/`fzn_among_eq`
       (exact via per-variable `[x_i==v]` binary + a side-selector binary for the
       `x_i!=v` OR; fixed an AND-vs-OR encoding bug).
@@ -226,6 +228,10 @@ feature completeness against a huge standard corpus.
       predicates are parsed but reported as `UNKNOWN` at solve time: an LP
       cannot represent their open feasible sets without inventing an arbitrary
       epsilon, and we refuse to silently relax an open constraint to closed.
+- [x] **Array extrema**: `array_int_maximum/minimum` use an exact selector
+      encoding and tighten their result bounds. When the extremum is the sole
+      correctly-directed objective, the epigraph/hypograph is exact at optimum
+      without extra selector binaries.
 - [x] **Extensional table**: `gecode_table_int`, `fzn_table_int`, and
       `table_int` use one binary per permitted row, exactly one row selected
       (`sum b_j = 1`), and big-M equality `x_i = T[j][i]` implications whose
@@ -242,7 +248,17 @@ feature completeness against a huge standard corpus.
       and `circuit(x)` use a binary successor matrix plus MTZ order rows. This
       rules out self arcs and disconnected subtours exactly (including Gecode's
       zero-based offset form); the exact O(n²) model is capped at 64 nodes.
-- [ ] More handlers: nonlinear/reified float relations, `cumulative`.
+- [x] `cumulative`/`fzn_cumulative`/`gecode_cumulative`: exact handler for
+      fixed durations/usages/limit and bounded integer start times (binary
+      active indicators `[s_i<=t] AND [s_i+d_i>t]` per time point + resource
+      rows); variable durations/usages/limits return UNKNOWN, never a wrong
+      answer. Verified vs brute force (`tools/cumulative_verify.py`, 0
+      wrong).  **Note:** the double LP solver is numerically fragile on the
+      big-M relaxations of larger schedules (see `AUDIT.md` finding A), so
+      many combinatorial instances return `=====UNKNOWN=====`; the exact
+      `fxsolve` solves them.  Follow-up: use the exact solver for MIP
+      relaxations.
+- [ ] More handlers: nonlinear/reified float relations.
 - [x] **MIP bridge**: when the model has integer vars, `fz_solve` dispatches to
       the MIP branch-and-bound so answers are integral (objectives match brute
       force, e.g. knapsack=10, prod3=57).
@@ -280,6 +296,82 @@ linear/quadratic and well-structured MIP models.
 
 ### Phase 3 first-cut deliverable: `fznsolve <x.fzn>` solves the linear subset,
 with tests in `examples/fzn/` and `test.sh` (incl. the MiniZinc differential).
+
+### Fixed: QP returned infeasible / non-optimal points as solved
+`qp.h` promises symmetric **PSD** Q, but every existing test built a strictly
+positive-definite one, so the singular case was unexercised.  A KKT-certificate
+sweep (`tools/qp_diff.py`) over singular PSD Q, `Q = 0`, `m = 0` and duplicated
+rows found ~5% of instances answered wrongly.  Causes and fixes:
+
+- **The ratio test could take a negative step.**  For a constraint that was
+  already numerically violated, `-resid/ap` is negative and it was accepted as
+  the blocking step, moving the iterate backwards along `p` -- uphill, and
+  further outside the feasible region.  Negative ratios are now clamped to a
+  zero-length blocking step (standard degenerate-step handling).
+- **A singular KKT matrix was not detected.**  `lu_factor()` does not always
+  fail on a singular system; it can return a tiny pivot and a wildly wrong
+  solve, which was taken at face value.  The solve is now verified against the
+  original matrix and, if the residual is not small, the Q block is
+  regularized and the system refactorized.
+- **Success was certified from stationarity alone.**  A point could be
+  stationary and still violate a constraint (worst on duplicated/parallel rows,
+  where only one of the pair is rank-independent enough to enter the working
+  set).  Primal feasibility and complementary slackness are now required too,
+  and `find_feasible()` verifies its Phase-I answer against the original rows
+  instead of inferring feasibility from the slack sum.
+- **The stationarity tolerance scaled with the objective value.**  On an
+  unbounded QP the iterate ran to 1e26, the objective to 1e36, and the
+  `1e-6*(1+|obj|)` tolerance with it, so a meaningless point passed as optimal.
+  The tolerance now scales with the magnitude of the terms being cancelled, and
+  a divergence guard stops the loop when the iterate runs away.
+- **Unbounded QPs ground to the iteration limit.**  Added a recession-direction
+  certificate (`Q d = 0`, `A d <= 0`, `g.d < 0`): honest `UNBOUNDED` instead of
+  4,000 wasted iterations.  Its tolerances are deliberately one-sided -- a row
+  with even a rounding-level positive slope disqualifies the ray -- so a failed
+  certificate degrades to the old iteration limit rather than risking a wrong
+  answer.
+- `solve_kkt()` now takes one scratch allocation per call instead of three
+  (Phase 4 wants zero per-frame allocation; this at least moves the right way).
+  A 2-variable indefinite case dropped from 12,917 allocations to 8,617, and a
+  well-posed one from 26 to 23.
+
+`tools/qp_diff.py` verifies with the KKT conditions themselves -- necessary and
+sufficient for a convex QP, so no second optimizer has to converge -- plus an
+exact LP recession test for boundedness and a HiGHS feasibility test for the
+"no feasible start" status.  Old binary: 10-12 wrong per 200.  Now: 0 over
+1,000 instances.
+
+### Fixed: MIP reported suboptimal points as OPTIMAL
+Two independent defects made branch-and-bound return a feasible-but-suboptimal
+point labelled `OPTIMAL` on roughly 10% of randomly generated instances.
+
+1. **Uninitialised `MIP` struct in the driver.**  `tools/mipsolve.c` filled in
+   the fields it cared about and left the rest -- including
+   `stop_at_feasible` -- as whatever was on the stack.  A garbage nonzero value
+   made the search stop at the first integer-feasible point, and because
+   nothing had set `limit_reached`, that point came back as status 0.
+   `mip.h` now documents that the struct must be zeroed, the drivers do it, and
+   `MIPResult` grew a `proven_optimal` flag that is 1 only when the tree was
+   actually exhausted.  `mipsolve` prints `FEASIBLE` (not `OPTIMAL`) when the
+   flag is clear, and the FlatZinc bridge refuses to print an objective for an
+   optimisation model unless it is set.
+2. **The rounding heuristic could emit a fractional "integer" value.**  It
+   rounded the relaxation value and then clamped it into the node box with the
+   raw bounds, so an integer variable with a fractional upper bound
+   (`u = 1.875`) produced `x = 1.875`, which passed the row check and became
+   the incumbent.  Clamping now snaps to the lattice (`ceil(l)`/`floor(u)`) and
+   the heuristic fails outright if no lattice point remains; integer bounds are
+   additionally rounded inward once at the root, and accepted incumbents are
+   snapped with the objective recomputed from the returned point.
+
+New test `tools/mip_diff.py` (wired into `test.sh`) generates small fully
+bounded all-integer models -- half feasible by construction, a third with
+fractional bounds -- and checks the *status*, the objective, and the returned
+point (integral, in bounds, satisfies every row, matches the reported
+objective) against exhaustive enumeration.  Old binary: 33-45 wrong per 400.
+Now: 0 over 2,000+ instances.  It also replaces a dead
+`if [ -f /tmp/mip_verify.py ]` guard in `test.sh` under which the MIP
+verification had never actually run.
 
 ### Fixed: LP Phase I degeneracy
 The revised-simplex Phase I previously mis-declared INFEASIBLE on degenerate
