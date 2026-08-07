@@ -129,8 +129,34 @@ fixed number of times per substep.  **All of this runs in fixed point.**
       is satisfied for the foundation; the host app supplies buffers.)
 - [ ] *(moved to other projects)* Contact-block builder, broad/narrow-phase
       collision, fixed-point integration, VG path geometry.
-- [ ] *(future)* Fixed-point LP/QP kernels (integer revised-simplex) for UI
-      layout / VG, when a host project needs an integer general solver.
+- [x] **Fixed-point LP kernel** (`src/fx.c`, `fxsolve`): exact-rational
+      two-phase full-tableau simplex.  Every number is an exact fraction
+      (`__int128` intermediates), so the optimum is exact and bit-identical
+      across platforms — the same determinism the fixed-point PGS kernel gives
+      the physics hot loop, now for the LP backbone.  Validated against the
+      double `lpsolve` (`tools/fx_verify.py`) on thousands of random feasible
+      and arbitrary LPs (0 objective/status mismatches; the few divergences are
+      double-solver sentinel/numerical artifacts where `fxsolve` is correct).
+      Target: small, data-friendly problems (UI/layout, integer MiniZinc LPs).
+      Exact arithmetic is heavier than double SIMD on large dense instances, so
+      `lpsolve` remains the large-problem backbone.
+- [x] **fx performance** (profiled, `make fx_bench`): a gprof trace showed ~98%
+      of runtime in the pivot's gcd-reduced elimination (Euclid `%` gcd beat a
+      binary/Stein gcd ~3.5× here — the compiler's single hardware division
+      wins over a shift/subtract loop).  Optimizations: (1) **Dantzig's entering
+      rule** (most-negative reduced cost) with a Bland fallback when the exact
+      objective stops improving (anti-cycling) cut pivot count ~1.3–6× vs
+      Bland's rule, which is the double solver's own trick; (2) **fast-path
+      arithmetic**: all solver arrays are `0/1`-initialized (`fx_zalloc`) so the
+      hot `__int128` rational ops drop the per-call `den==0` cleanup branch and
+      are `static inline`; (3) **zero-skip** in the pivot elimination over the
+      normalized pivot row.  Result: ~1.0–1.7× faster across examples and
+      random dense/sparse instances (e.g. 216→127 µs on an n=8 dense LP) with
+      identical exact results (`fx_verify` WRONG=0, ASan/UBSan clean).  The
+      residual cost is the unavoidable 2-gcd-per-cell exact elimination — a
+      sparse/exact *revised* simplex would be the next step for large problems.
+- [ ] *(future)* Fixed-point QP kernel for UI layout / VG, when a host project
+      needs an integer general QP solver.
 
 ### Phase 1 complete (foundation). Next: Phase 3 FlatZinc, Phase 2 VG/UI kernels.
 
@@ -194,17 +220,24 @@ feature completeness against a huge standard corpus.
       (exact via per-variable `[x_i==v]` binary + a side-selector binary for the
       `x_i!=v` OR; fixed an AND-vs-OR encoding bug).
 - [x] **Continuous linear float subset**: decimal-domain inference, scalar and
-      array float output, `float_lin_eq/le/ge`, `float_eq/le/ge`,
-      `float_plus/minus/neg`, constant-operand multiplication and
-      constant-denominator division. Strict float comparisons intentionally
-      remain `UNKNOWN` (an LP cannot represent their open feasible sets without
-      inventing an arbitrary epsilon).
+      array float output, `float_lin_eq/le/ge/lt/gt`, `float_eq/le/ge/lt/gt`,
+      `bool_ge/gt`, `float_plus/minus/neg`, constant-operand multiplication and
+      constant-denominator division. Strict continuous `float_lt`/`float_gt`
+      predicates are parsed but reported as `UNKNOWN` at solve time: an LP
+      cannot represent their open feasible sets without inventing an arbitrary
+      epsilon, and we refuse to silently relax an open constraint to closed.
 - [x] **Extensional table**: `gecode_table_int`, `fzn_table_int`, and
-      `table_int` use one binary per permitted row, exactly one row selected,
-      and equality rows for every tuple component. The compact exact encoding is
-      bounded to 1,024 rows / 65,536 cells on untrusted input; larger tables
-      return `UNKNOWN` rather than exhausting resources. Real Gecode-generated
-      `.fzn` plus literal-propagation regressions are covered.
+      `table_int` use one binary per permitted row, exactly one row selected
+      (`sum b_j = 1`), and big-M equality `x_i = T[j][i]` implications whose
+      tight per-column big-M is taken over the actual table column values
+      (`max(maxCol-lo, hi-minCol)`) rather than the domain span, so rows whose
+      values fall outside a variable's domain are safely excluded. An empty
+      table is reported UNSATISFIABLE. The compact exact encoding is bounded
+      to 1,024 rows / 65,536 cells on untrusted input; larger tables return
+      `UNKNOWN` rather than exhausting resources. Real Gecode-generated `.fzn`,
+      literal-propagation regressions, and a Python brute-force enumerator
+      (`tools/table_verify.py`, 1500+ random instances, 0 wrong answers) cover
+      both satisfied, optimal, and unsatisfiable instances.
 - [x] **Hamiltonian circuit**: `gecode_circuit(offset,x)`, `fzn_circuit(x)`,
       and `circuit(x)` use a binary successor matrix plus MTZ order rows. This
       rules out self arcs and disconnected subtours exactly (including Gecode's

@@ -47,7 +47,7 @@ LP_LIB_OBJ = $(LP_LIB_SRC:.c=.o)
 QP_LIB_SRC = src/err.c src/qp.c src/lu.c src/kernels.c src/pgs.c src/pgs_fixed.c
 QP_LIB_OBJ = $(QP_LIB_SRC:.c=.o)
 
-all: lpsolve qpsolve mipsolve pgsbench pgfbench fznsolve
+all: lpsolve qpsolve mipsolve pgsbench pgfbench fznsolve fxsolve
 
 lpsolve: $(OBJ)
 	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -o $@ $(OBJ) $(LDFLAGS) $(LDLIBS)
@@ -101,6 +101,23 @@ src/mip.o: src/mip.c src/mip.h src/solver.h src/err.h
 tools/mipsolve.o: tools/mipsolve.c src/mip.h src/parser.h src/err.h
 	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -I src -c -o $@ $<
 
+# Fixed-point (exact rational) LP solver (src/fx.c)
+fxsolve: src/fx.o tools/fxsolve.o
+	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -o $@ $^ $(LDFLAGS) $(LDLIBS)
+
+src/fx.o: src/fx.c src/fx.h
+	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -I src -c -o $@ $<
+
+tools/fxsolve.o: tools/fxsolve.c src/fx.h
+	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -I src -c -o $@ $<
+
+# Benchmark: double revised-simplex vs fixed-point exact simplex
+fx_bench: tools/fx_bench.o src/err.o src/kernels.o src/lu.o src/splu.o src/solver.o src/parser.o src/fx.o
+	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -o $@ $^ $(LDFLAGS) $(LDLIBS)
+
+tools/fx_bench.o: tools/fx_bench.c src/solver.h src/parser.h src/fx.h
+	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -I src -c -o $@ $<
+
 # Library targets ------------------------------------------------------
 # Static archives of the solver cores (no main()).  Headers to use from a
 # consuming project: src/solver.h (LP), src/qp.h (QP), src/mip.h (MIP),
@@ -130,6 +147,6 @@ asan: clean
 	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -I src -c -o $@ $<
 
 clean:
-	rm -f lpsolve qpsolve mipsolve pgsbench pgfbench pgs_vs_lp fznsolve src/*.o tools/*.o libpsolve.a libpsolve-lp.a libpsolve-qp.a
+	rm -f lpsolve qpsolve mipsolve pgsbench pgfbench pgs_vs_lp fznsolve fxsolve fx_bench src/*.o tools/*.o libpsolve.a libpsolve-lp.a libpsolve-qp.a
 
 .PHONY: all asan clean lib liblp libqp

@@ -229,6 +229,60 @@ static int parse_array(FZModel*m,const char*s,Lin**out,int*outn)
 }
 static void free_lins(Lin*arr,int n){for(int i=0;i<n;i++)lin_free(&arr[i]);free(arr);}
 
+/* Parse the integer values of a FlatZinc 2D table argument into a flat
+ * row-major array of `long`.  Accepts (a) a bare identifier naming a declared
+ * par int array, (b) an `array2d(lo1,hi1,lo2,hi2,[v..])` call, or (c) a flat
+ * `[v..]` integer literal.  Returns 0 on success (values in *out, count in
+ * *outn), -1 on malformed input. */
+static int table_values(FZModel*m,const char*s,long**out,int*outn)
+{
+    /* (a) bare identifier naming a par array */
+    {
+        char name[256];int k=0;const char*p=s;
+        while(*p==' ')p++;
+        if(isalpha((unsigned char)*p)||*p=='_'){
+            while(k<255&&is_ident_ch((unsigned char)*p))name[k++]=*p++;
+            name[k]=0;
+            while(*p==' ')p++;
+            if(*p=='\0'||*p==';'){
+                FZDecl*d=find_decl(m,name);
+                if(d&&d->is_array&&d->par){
+                    *outn=d->n;
+                    *out=(long*)malloc((size_t)(d->n?d->n:1)*sizeof(long));
+                    for(int i=0;i<d->n;i++) (*out)[i]=(long)llround(d->par[i]);
+                    return 0;
+                }
+            }
+        }
+    }
+    /* (b)/(c): the last '[' starts the value list (for `array2d(...)` the only
+       '[' is the values list; for a flat literal it is too). */
+    const char*br=strchr(s,'[');
+    if(!br){*out=NULL;*outn=0;return -1;}
+    const char*last=br;
+    for(const char*q=br+1;*q;q++) if(*q=='[')last=q;
+    const char*e=strchr(last,']');
+    if(!e){*out=NULL;*outn=0;return -1;}
+    size_t len=(size_t)(e-last-1);
+    char*buf=(char*)malloc(len+1);
+    size_t n=0;
+    for(const char*q=last+1;q<e&&n<len;q++){ if(!isspace((unsigned char)*q)) buf[n++]=*q; else buf[n++]=','; }
+    buf[n]=0;
+    /* parse comma-separated integers (possibly negative) */
+    long*vals=NULL;int cnt=0,cap=0;
+    char*tok=strtok(buf,",");
+    while(tok){
+        char*endp;long v=strtol(tok,&endp,10);
+        if(cnt>=cap){cap=cap?cap*2:16;vals=(long*)realloc(vals,(size_t)cap*sizeof(long));}
+        vals[cnt++]=v;
+        tok=strtok(NULL,",");
+    }
+    free(buf);
+    if(cnt==0){free(vals);*out=NULL;*outn=0;return 0;}  /* empty table: 0 values */
+    *out=vals;*outn=cnt;
+    return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* Parser                                                              */
 /* ------------------------------------------------------------------ */
@@ -716,6 +770,12 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
         }
         lin_into(&lin,&d,-1.0);
         char rel='='; double rhs=0.0;
+        /* Continuous strict linear float relations are open half-spaces
+           and must not be silently relaxed to non-strict LP rows. */
+        if(strcmp(p,"float_lin_lt")==0||strcmp(p,"float_lin_gt")==0){
+            lin_free(&lin);lin_free(&d);free_lins(arr,narr);free_lins(parr,nparr);
+            return 1;
+        }
         if(strcmp(p,"int_lin_le")==0||strcmp(p,"bool_lin_le")==0||strcmp(p,"float_lin_le")==0) rel='<';
         else if(strcmp(p,"int_lin_lt")==0||strcmp(p,"bool_lin_lt")==0){rel='<';rhs=-1.0;}
         else if(strcmp(p,"int_lin_ge")==0||strcmp(p,"bool_lin_ge")==0||strcmp(p,"float_lin_ge")==0) rel='>';
@@ -726,18 +786,36 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
     }
     if(strcmp(p,"int_eq")==0||strcmp(p,"bool_eq")==0||strcmp(p,"float_eq")==0||
        strcmp(p,"int_le")==0||strcmp(p,"bool_le")==0||strcmp(p,"float_le")==0||
-       strcmp(p,"int_ge")==0||strcmp(p,"bool_ge")==0||strcmp(p,"float_ge")==0||
-       strcmp(p,"int_lt")==0||strcmp(p,"bool_lt")==0||strcmp(p,"int_gt")==0||strcmp(p,"bool_gt")==0){
+       strcmp(p,"int_lt")==0||strcmp(p,"float_lt")==0||strcmp(p,"bool_lt")==0||
+       strcmp(p,"int_ge")==0||strcmp(p,"float_ge")==0||strcmp(p,"bool_ge")==0||
+       strcmp(p,"int_gt")==0||strcmp(p,"float_gt")==0||strcmp(p,"bool_gt")==0){
         if(c->nargs<2)return -1;
         if(parse_lin(m,c->args[0],&l1)!=0)return -1;
         if(parse_lin(m,c->args[1],&l2)!=0){lin_free(&l1);return -1;}
         Lin dd;memset(&dd,0,sizeof(dd));
         lin_into(&dd,&l1,1.0);lin_into(&dd,&l2,-1.0);
         char rel='='; double rhs=0.0;
-        if(strcmp(p,"int_le")==0||strcmp(p,"bool_le")==0||strcmp(p,"float_le")==0)rel='<';
-        else if(strcmp(p,"int_ge")==0||strcmp(p,"bool_ge")==0||strcmp(p,"float_ge")==0)rel='>';
-        else if(strcmp(p,"int_lt")==0||strcmp(p,"bool_lt")==0){rel='<';rhs=-1.0;}
-        else if(strcmp(p,"int_gt")==0||strcmp(p,"bool_gt")==0){rel='>';rhs=1.0;}
+        int is_float = (strncmp(p,"float_",6)==0);
+        /* Strict continuous float relations (float_lt / float_gt) are
+           open half-spaces that an LP cannot represent without inventing
+           an arbitrary epsilon — refuse silently relaxing them to <= / >=
+           and mark the model UNHANDLED so the bridge reports UNKNOWN
+           rather than a fake optimum. */
+        if(is_float && (strcmp(p,"float_lt")==0||strcmp(p,"float_gt")==0)){
+            lin_free(&l1);lin_free(&l2);lin_free(&dd);
+            return 1;
+        }
+        /* Integer/bool strict relations use the adjacent lattice value
+           (e.g. x < y  ⇒  x ≤ y − 1), which is exact. */
+        if(strcmp(p,"int_le")==0||strcmp(p,"bool_le")==0||strcmp(p,"float_le")==0||
+           strcmp(p,"int_lt")==0||strcmp(p,"bool_lt")==0){
+            rel='<';
+            if(strcmp(p,"int_lt")==0||strcmp(p,"bool_lt")==0) rhs=-1.0;
+        } else if(strcmp(p,"int_ge")==0||strcmp(p,"bool_ge")==0||strcmp(p,"float_ge")==0||
+                  strcmp(p,"int_gt")==0||strcmp(p,"bool_gt")==0){
+            rel='>';
+            if(strcmp(p,"int_gt")==0||strcmp(p,"bool_gt")==0) rhs=1.0;
+        }
         b_put(b,rel,rhs,&dd);
         lin_free(&l1);lin_free(&l2);lin_free(&dd);
         return 0;
@@ -1327,6 +1405,67 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
         for(int i=0;i<narr;i++) lin_term(&s,bs[i],1.0);
         s.constant=-ntarget; b_put(b,'=',0.0,&s);
         lin_free(&s);free(bs);free_lins(arr,narr);lin_free(&vl);lin_free(&nl);
+        return 0;
+    }
+    /* table(x[], T): the tuple (x[0..n-1]) must equal one of the rows of the
+       int matrix T (row-major).  Exact MIP encoding with one binary selector
+       per row:  sum_j b_j = 1  and  b_j = 1  =>  x_i = T[j][i]  for all i,
+       where the implication uses a big-M bound large enough to dominate |x_i - t|
+       over the actual table column values (so rows with out-of-domain entries are
+       safely excluded); x must have finite declared bounds.  This is an
+       indicator/alternative constraint, so it is linear in the binaries
+       (SOS1-style row selection). */
+    if(strcmp(p,"table")==0||strcmp(p,"fzn_table")==0){
+        if(c->nargs<2)return -1;
+        Lin*arr;int narr;
+        if(parse_array(m,c->args[0],&arr,&narr)!=0)return -1;
+        long*vals;int nvals;
+        if(table_values(m,c->args[1],&vals,&nvals)!=0){free_lins(arr,narr);return -1;}
+        int arity=narr;
+        if(arity<1||nvals%arity!=0){free(vals);free_lins(arr,narr);return 1;}
+        int rows=nvals/arity;
+        if(rows==0){
+            /* an empty table is trivially unsatisfiable */
+            Lin nf;memset(&nf,0,sizeof(nf));b_put(b,'>',1.0,&nf);lin_free(&nf);
+            free(vals);free_lins(arr,narr);return 0;
+        }
+        /* per-arity big-M M[i] must dominate |x_i - t| for every table value t
+           in column i and every feasible x_i in [lo_i,hi_i].  The tight domain
+           span hi_i-lo_i is only enough when all table values lie inside the
+           domain; for out-of-domain values we need the full
+           max(maxCol_i - lo_i, hi_i - minCol_i). */
+        double*M=(double*)malloc((size_t)(arity?arity:1)*sizeof(double));
+        for(int i=0;i<arity;i++){
+            if(arr[i].n!=1){free(M);free(vals);free_lins(arr,narr);return 1;}
+            int v=arr[i].idx[0];
+            if(v<0||v>=b->nvars||!b->haslo[v]||!b->hashi[v]||b->lo[v]>b->hi[v]){
+                free(M);free(vals);free_lins(arr,narr);return 1;   /* unbounded -> UNKNOWN */
+            }
+            double lo=b->lo[v], hi=b->hi[v];
+            double colmin=1e18, colmax=-1e18;
+            for(int j=0;j<rows;j++){ double t=(double)vals[j*arity+i]; if(t<colmin)colmin=t; if(t>colmax)colmax=t; }
+            double m = fmax(colmax-lo, hi-colmin);
+            M[i]= (m<1.0)?1.0:m;
+        }
+        /* one binary selector per row */
+        int*bs=(int*)malloc((size_t)rows*sizeof(int));
+        for(int j=0;j<rows;j++) bs[j]=b_newvar(b,0.0,1.0);
+        /* exactly one row is selected: sum_j b_j = 1 */
+        Lin s;memset(&s,0,sizeof(s));
+        for(int j=0;j<rows;j++) lin_term(&s,bs[j],1.0);
+        s.constant=-1.0; b_put(b,'=',0.0,&s); lin_free(&s);
+        /* b_j = 1  =>  x_i = T[j][i], via big-M: |x_i - T[j][i]| <= M_i*(1-b_j) */
+        for(int i=0;i<arity;i++){
+            int v=arr[i].idx[0]; double m=M[i];
+            for(int j=0;j<rows;j++){
+                long t=vals[j*arity+i];
+                Lin r1;memset(&r1,0,sizeof(r1));lin_term(&r1,v,1.0);lin_term(&r1,bs[j],m);
+                b_put(b,'<',(double)t+m,&r1);lin_free(&r1);
+                Lin r2;memset(&r2,0,sizeof(r2));lin_term(&r2,v,1.0);lin_term(&r2,bs[j],-m);
+                b_put(b,'>',(double)t-m,&r2);lin_free(&r2);
+            }
+        }
+        free(M);free(bs);free(vals);free_lins(arr,narr);
         return 0;
     }
     /* everything else: unhandled (return UNKNOWN at top level) */

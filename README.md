@@ -42,10 +42,11 @@ with an explicit baseline `ARCH`.
 ## Usage
 
 ```sh
-./lpsolve <problem.lp> [--print]      # LP (revised simplex)
+./lpsolve <problem.lp> [--print]      # LP (revised simplex, double)
 ./qpsolve <qp.qp>                      # convex QP (active-set)
 ./mipsolve <problem.lp> <nint> <j...> [--print]   # MIP (branch-and-bound)
 ./fznsolve <problem.fzn>               # FlatZinc reader + solver (Phase 3)
+./fxsolve <problem.lp> [--print]      # LP (exact rational / fixed-point simplex)
 ```
 
 `--print` also dumps the optimal variable values.
@@ -66,6 +67,54 @@ The MIP solver (`mipsolve <lp> <nint> <j0 j1 ...>`) solves mixed-integer
 programs by **branch-and-bound** over the revised-simplex LP relaxation: the
 listed variables are required to be integer.  It reports the optimal objective,
 the number of B&B nodes, and the incumbent solution.
+
+## Fixed-point (exact-rational) LP solver
+
+`fxsolve` is the **fixed-point analogue** of the double `lpsolve`: it reads the
+same `.lp` format but represents every number as an exact rational
+(numerator/denominator pair, reduced, with `__int128` intermediates) and solves
+by an exact two-phase full-tableau simplex.  Because the arithmetic is integer,
+the result is **exact and bit-identical** across platforms/compilers — the same
+determinism guarantee the fixed-point PGS physics kernel already provides, now
+applied to the LP backbone:
+
+```sh
+./fxsolve examples/diet.lp
+# objective (exact): 33/25      <- the true rational optimum, not a float approx
+# objective (dec):   1.320000000000
+
+./lpsolve examples/exact.lp | grep objective    # double:  0.333333333333333
+./fxsolve examples/exact.lp | grep exact        # fixed:   objective (exact): 1/3
+```
+
+Compared with `lpsolve` (`make fx_bench`):
+
+- **Precision / determinism**: strictly better.  Every reported objective and
+  variable value is an exact rational; there is no rounding, no
+  `LP_INF`-sentinel clamping, and no `NUMERICAL_FAILURE`.  On unbounded LPs the
+  double solver can clamp a variable at its internal 1e30 bound and report a
+  bogus huge "OPTIMAL"; `fxsolve` reports `UNBOUNDED` correctly.
+- **Performance**: comparable-to-faster for tiny problems (single-digit
+  microseconds at n≲10; `make fx_bench` shows `fxsolve` about 0.6× the double
+  solver's time on the examples).  The pivot uses **Dantzig's entering rule**
+  with an anti-cycling Bland fallback, `static inline` fast-path rational
+  arithmetic (arrays `0/1`-initialized so no per-cell cleanup branch), and
+  zero-skip in the elimination — a gprof-driven optimization worth ~1.0–1.7×
+  on random dense/sparse instances with identical exact results.  It still
+  degrades on larger dense problems, because exact rational arithmetic with
+  coefficient growth (two gcd reductions per tableau cell) costs more than
+  double SIMD.  Use `fxsolve` where exactness/determinism matters on small,
+  data-friendly problems (UI/layout, integer MiniZinc LPs); keep `lpsolve` for
+  large sparse/continuous instances.
+
+The exact LP core is `src/fx.c` / `src/fx.h`; the CLI is `tools/fxsolve.c` and
+the double-vs-fixed benchmark is `tools/fx_bench.c`.  Differential test:
+`tools/fx_verify.py` (random feasible + arbitrary LPs vs `lpsolve`, checking
+status and objective agreement plus fixed-point determinism).
+
+> Note: exact rational arithmetic assumes the LP data stay small enough that
+> `__int128` intermediates do not overflow.  Very ill-conditioned large
+> instances should use the double `lpsolve`.
 
 ## Real-time physics kernel (projected Gauss-Seidel)
 
@@ -262,18 +311,23 @@ are integral):
   aliases retain compiler-propagated literal elements such as `x = [1,3]`.
 - **Constraints**: exact integer/bool `*_lin_eq/le/lt/ge/gt` and
   `*_eq/le/lt/ge/gt` relations; `int_eq/le/lt/ge/gt_reif` and their bool
-  counterparts; `int_lin_ne`, `count`/`among`; boolean logic; `int_abs/max/min`,
-  `int_times` (constant operand), `set_in` + set domains, `all_different`,
-  `array_int_element`, exact Gecode/standard integer `table` (up to 1,024 rows)
-  and Hamiltonian `circuit` constraints (up to 64 nodes), `bool2int`/`int2float`;
-  and the continuous linear float
-  subset `float_lin_eq/le/ge`, `float_eq/le/ge`, `float_plus/minus/neg`,
-  constant-operand `float_times`, and constant-denominator `float_div`; see
-  `examples/fzn/float_lin.fzn` for a runnable continuous model,
-  `examples/fzn/table.fzn` for an exact extensional table, and
-  `examples/fzn/circuit.fzn` for a Hamiltonian successor circuit.
+  counterparts; `int_lin_ne`, `int_lin_ge/gt`, `count`/`among`; boolean logic
+  (`bool_and/or/xor/not/clause`, `array_bool_and/or`); `int_plus/minus/neg`,
+  `int_abs/max/min`, `int_times` (constant operand), `set_in` + set domains,
+  `all_different`, `array_int_element`, `bool2int`/`int2float`; exact
+  Gecode/standard integer `table` (one binary per allowed row, tight per-column
+  big-M, up to 1,024 rows, empty table ⇒ UNSAT) and Hamiltonian `circuit`
+  constraints (binary successor matrix + MTZ order rows, up to 64 nodes); plus
+  the continuous linear float subset `float_lin_eq/le/ge/lt/gt`,
+  `float_eq/le/ge/lt/gt`, `float_plus/minus/neg`, constant-operand
+  `float_times`, constant-denominator `float_div`, and `bool_ge/gt` relational
+  variants.  See `examples/fzn/float_lin.fzn` for a runnable continuous model,
+  `examples/fzn/table.fzn` / `examples/fzn/table_{sat,opt,unsat}.fzn` for exact
+  extensional tables, and `examples/fzn/circuit.fzn` for a Hamiltonian
+  successor circuit.
 - **Solve**: satisfy / minimize / maximize; type-faithful FlatZinc output
-  (including full-precision float values and declared array indices), objective always, and `-s` stats
+  (full-precision float values, declared array indices via `array1d(lo..hi,[..])`,
+  status markers), objective always, and `-s` stats
   (`nodes`, `objectiveBound`); `-n` node limit and `-t`/SIGINT time limits are
   enforced via a cooperative abort polled in the LP simplex and B&B loops.
   Usage: `fznsolve [-n N] [-t ms] [-s] [-v] <x.fzn>`.
@@ -303,9 +357,12 @@ src/mip.c       mixed-integer programming via branch-and-bound
 src/pgs.c       projected Gauss-Seidel boxed-QP (float reference kernel)
 src/pgs_fixed.c fixed-point (integer) PGS boxed-QP (production physics kernel)
 src/fzn.c       FlatZinc reader + LP solver bridge (Phase 3)
+src/fx.c        fixed-point (exact rational) LP solver + fraction-aware reader
 src/qp.c        convex QP solver (active-set method + Phase-I feasibility)
 src/parser.c    LP file reader
 src/main.c      LP CLI
+tools/fxsolve.c fixed-point LP CLI
+tools/fx_bench.c double-vs-fixed LP benchmark
 tools/qpsolve.c QP CLI
 tools/mipsolve.c MIP CLI
 tools/          generators, differential tester, unit tests, benchmarks, fuzzer

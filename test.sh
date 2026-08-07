@@ -88,9 +88,20 @@ echo "(expect float array [1, 1.5])"
 echo "(expect table tuple [2, 3])"
 ./fznsolve examples/fzn/circuit.fzn | grep 's = array1d'
 echo "(expect a Hamiltonian successor cycle)"
+./fznsolve examples/fzn/table_sat.fzn | grep -E "x1 =|x2 =" | tr '\n' ' '
+echo "(expect a table row, e.g. x1=1 x2=2)"
+./fznsolve examples/fzn/table_opt.fzn | grep -E "x1 =|x2 =|x3 =|obj =" | tr '\n' ' '
+echo "(expect row (6,5,3) with obj=14)"
+if ./fznsolve examples/fzn/table_unsat.fzn | grep -q "=====UNSATISFIABLE====="; then
+  echo "table_unsat: UNSATISFIABLE (expect UNSATISFIABLE)  OK"
+else
+  echo "table_unsat: FAIL (expected UNSATISFIABLE)"
+fi
 
 echo "[8.25/8] FlatZinc strict/reified-int + float + table/circuit semantics..."
 python3 tools/fzn_semantics_test.py
+echo -n "table_verify (randomized, vs brute force): "
+python3 tools/table_verify.py 250 20240607 | sed 's/.*: //'
 
 if command -v minizinc >/dev/null 2>&1; then
   echo "[8.5/8] MiniZinc differential (compile .mzn -> fzn -> psolve vs Gecode)..."
@@ -98,5 +109,19 @@ if command -v minizinc >/dev/null 2>&1; then
 else
   echo "[8.5/8] MiniZinc differential SKIPPED (minizinc not installed)"
 fi
+
+echo "[9/9] Fixed-point exact-rational LP solver (fxsolve) vs double lpsolve..."
+make fxsolve >/dev/null 2>&1
+./fxsolve examples/prodplan.lp | grep -E "objective \(dec\):" | tr '\n' ' '; echo "(expect 26)"
+./fxsolve examples/diet.lp | grep -E "objective \(dec\):" | tr '\n' ' '; echo "(expect 1.32 exact)"
+./fxsolve examples/transport.lp | grep -E "objective \(dec\):" | tr '\n' ' '; echo "(expect 94.5 exact)"
+echo -n "  exact demo (double vs fixed): "
+echo -n "double="; ./lpsolve examples/exact.lp | grep -oE "objective:.*"
+echo -n "  fixed="; ./fxsolve examples/exact.lp | grep -oE "objective \(exact\):.*"
+echo -n "fx_verify (random feasible+arbitrary LPs vs double, incl. status): "
+python3 tools/fx_verify.py 300 99 | sed 's/.*: //'
+echo -n "fx_bench (examples): "
+make fx_bench >/dev/null 2>&1
+./fx_bench examples/prodplan.lp examples/diet.lp examples/transport.lp | tail -1
 
 echo "Done."
