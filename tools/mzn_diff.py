@@ -73,6 +73,28 @@ MODELS = [
         constraint val = arr[idx];
         solve maximize val;
     """, "max"),
+    ("reif_eq", """
+        var 0..10: x :: output_var;
+        var 0..10: y :: output_var;
+        var bool: b :: output_var;
+        constraint b <-> (x = y);
+        constraint x <= 6;
+        solve maximize x;
+    """, "max"),
+    ("not_eq", """
+        var 0..10: x :: output_var;
+        var 0..10: y :: output_var;
+        var bool: b :: output_var;
+        constraint b <-> (x = y);
+        constraint not b;
+        solve maximize x;
+    """, "max"),
+    ("lin_ne", """
+        var 0..10: x :: output_var;
+        var 0..10: y :: output_var;
+        constraint x + y != 7;
+        solve maximize x;
+    """, "max"),
 ]
 
 def run(cmd, timeout=120):
@@ -120,6 +142,9 @@ def main():
             elif name == 'max2': bobj = 10
             elif name == 'setdom': bobj = 5
             elif name == 'element': bobj = 40
+            elif name == 'reif_eq': bobj = 6
+            elif name == 'not_eq': bobj = 10
+            elif name == 'lin_ne': bobj = 10
             if mstat == 'UNKNOWN' or mstat == '?':
                 print(f"[{name}] MINE={mstat} -> FAIL (handled model must solve)"); fail += 1
             elif mstat == 'UNSAT':

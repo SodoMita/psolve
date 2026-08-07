@@ -873,6 +873,129 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
         free(bs); lin_free(&il);lin_free(&vl);free_lins(arr,narr);
         return 0;
     }
+    /* reified relational constraints: r <-> (a rel b), r in {0,1}.
+       Use big-M: for a <= b: r=1 -> a-b<=0 ; r=0 -> a-b >= M? Use
+       a-b <= M*(1-r)  and  a-b >= -M*r + eps*(1-r)?  Standard encoding with
+       a binary r and big-M, valid for bounded a,b.  We use:
+         (a<=b): a-b <= M*(1-r);  a-b >= eps - (M+eps)*r
+       where eps = -1e-6 is "not (a<=b)" is false => a>b means a-b>=1 (int). */
+    if(strcmp(p,"int_eq_reif")==0||strcmp(p,"int_le_reif")==0||
+       strcmp(p,"int_lt_reif")==0||strcmp(p,"int_ge_reif")==0||
+       strcmp(p,"int_gt_reif")==0||strcmp(p,"bool_eq_reif")==0||
+       strcmp(p,"bool_le_reif")==0){
+        if(c->nargs<3)return -1;
+        Lin l1,l2; Lin rb;
+        if(parse_lin(m,c->args[0],&l1)!=0)return -1;
+        if(parse_lin(m,c->args[1],&l2)!=0){lin_free(&l1);return -1;}
+        if(parse_lin(m,c->args[2],&rb)!=0){lin_free(&l1);lin_free(&l2);return -1;}
+        /* If the reification value is a constant, apply the relation directly. */
+        if(rb.n==0){
+            int want = (rb.constant >= 0.5);   /* true/false */
+            /* build d = a - b and apply the relation (or its negation) */
+            Lin d;memset(&d,0,sizeof(d));lin_into(&d,&l1,1.0);lin_into(&d,&l2,-1.0);
+            int neg = !want;
+            if(strcmp(p,"int_le_reif")==0||strcmp(p,"bool_le_reif")==0){
+                /* want: d<=0 ; neg: d>=1 */
+                b_put(b, neg?'>':'<', neg?1.0:0.0, &d);
+            } else if(strcmp(p,"int_lt_reif")==0){
+                b_put(b, neg?'<':'>', neg?0.0:1.0, &d);
+            } else if(strcmp(p,"int_ge_reif")==0){
+                b_put(b, neg?'<':'>', neg?1.0:0.0, &d);
+            } else if(strcmp(p,"int_gt_reif")==0){
+                b_put(b, neg?'>':'<', neg?0.0:1.0, &d);
+            } else { /* eq */
+                if(want){ b_put(b,'=',0.0,&d); }
+                else { /* d != 0: use a binary */
+                    double M=1.0;
+                    for(int i=0;i<d.n;i++){int v=d.idx[i];double dv=fabs(d.coef[i])*fmax(fabs(b->lo[v]),fabs(b->hi[v]));M=fmax(M,dv);}
+                    M=fmax(M,fabs(d.constant))+1.0;
+                    int u=b_newvar(b,0.0,1.0);
+                    /* d != 0  <=>  (d >= 1 AND u=0) OR (d <= -1 AND u=1)
+                       r1: d + M*u >= 1
+                       r2: -d - M*u + M >= 1  => -d - M*u + (M-1) >= 0 */
+                    Lin r1;memset(&r1,0,sizeof(r1));lin_into(&r1,&d,1.0);lin_term(&r1,u,M);r1.constant=-1.0;b_put(b,'>',0.0,&r1);
+                    Lin r2;memset(&r2,0,sizeof(r2));lin_into(&r2,&d,-1.0);lin_term(&r2,u,-M);r2.constant=M-1.0;b_put(b,'>',0.0,&r2);
+                    lin_free(&r1);lin_free(&r2);
+                }
+            }
+            lin_free(&d);lin_free(&l1);lin_free(&l2);lin_free(&rb);
+            return 0;
+        }
+        if(rb.n!=1){lin_free(&l1);lin_free(&l2);lin_free(&rb);return 1;}
+        int r=rb.idx[0];
+        /* build d = a - b (linear expression) */
+        Lin d;memset(&d,0,sizeof(d));lin_into(&d,&l1,1.0);lin_into(&d,&l2,-1.0);
+        /* M bound on |d| from var bounds */
+        double M=1.0;
+        for(int i=0;i<d.n;i++){ int v=d.idx[i]; double dv=fabs(d.coef[i])*fmax(fabs(b->lo[v]),fabs(b->hi[v])); M=fmax(M,dv); }
+        M=fmax(M,fabs(d.constant))+1.0;
+        int which;
+        if(strcmp(p,"int_eq_reif")==0||strcmp(p,"bool_eq_reif")==0) which=0;      /* a==b */
+        else if(strcmp(p,"int_le_reif")==0||strcmp(p,"bool_le_reif")==0) which=1;/* a<=b */
+        else if(strcmp(p,"int_lt_reif")==0) which=2;                              /* a<b */
+        else if(strcmp(p,"int_ge_reif")==0) which=3;                              /* a>=b */
+        else which=4;                                                             /* a>b */
+        /* Encodings (a,b int):
+           eq:  r=1 => d=0 ; r=0 => |d|>=1
+                d <= M*(1-r) ; d >= -M*(1-r)
+                d >= 1 - (M+1)*r ; -d >= 1 - (M+1)*r   (|d|>=1 when r=0)
+           le:  r=1 => d<=0 ; r=0 => d>=1
+                d <= M*(1-r) ; d >= 1 - (M+1)*r
+           lt:  r=1 => d<=-1 ; r=0 => d>=0
+                d <= -1 + (M+1)*(1-r) ; d >= -M*r
+           ge:  r=1 => d>=0 ; r=0 => d<=-1
+                d >= -M*(1-r) ; d <= -1 + (M+1)*r
+           gt:  r=1 => d>=1 ; r=0 => d<=0
+                d >= 1 - (M+1)*(1-r) ; d <= M*r
+        */
+        if(which==0){ /* eq */
+            Lin r1;memset(&r1,0,sizeof(r1));lin_into(&r1,&d,1.0);lin_term(&r1,r,M);r1.constant=-M;b_put(b,'<',0.0,&r1);
+            Lin r2;memset(&r2,0,sizeof(r2));lin_into(&r2,&d,-1.0);lin_term(&r2,r,M);r2.constant=-M;b_put(b,'<',0.0,&r2);
+            Lin r3;memset(&r3,0,sizeof(r3));lin_into(&r3,&d,1.0);lin_term(&r3,r,M+1.0);r3.constant=-(M+1.0);b_put(b,'>',0.0,&r3);
+            Lin r4;memset(&r4,0,sizeof(r4));lin_into(&r4,&d,-1.0);lin_term(&r4,r,M+1.0);r4.constant=-(M+1.0);b_put(b,'>',0.0,&r4);
+            lin_free(&r1);lin_free(&r2);lin_free(&r3);lin_free(&r4);
+        } else if(which==1){ /* le: d<=M(1-r); d>=1-(M+1)r */
+            Lin r1;memset(&r1,0,sizeof(r1));lin_into(&r1,&d,1.0);lin_term(&r1,r,M);r1.constant=-M;b_put(b,'<',0.0,&r1);
+            Lin r2;memset(&r2,0,sizeof(r2));lin_into(&r2,&d,1.0);lin_term(&r2,r,M+1.0);r2.constant=1.0-(M+1.0);b_put(b,'>',0.0,&r2);
+            lin_free(&r1);lin_free(&r2);
+        } else if(which==2){ /* lt: d<=-1+(M+1)(1-r); d>=-M*r */
+            Lin r1;memset(&r1,0,sizeof(r1));lin_into(&r1,&d,1.0);lin_term(&r1,r,M+1.0);r1.constant=-1.0-(M+1.0);b_put(b,'<',0.0,&r1);
+            Lin r2;memset(&r2,0,sizeof(r2));lin_into(&r2,&d,1.0);lin_term(&r2,r,-M);b_put(b,'>',0.0,&r2);
+            lin_free(&r1);lin_free(&r2);
+        } else if(which==3){ /* ge: d>=-M(1-r); d<=-1+(M+1)r */
+            Lin r1;memset(&r1,0,sizeof(r1));lin_into(&r1,&d,-1.0);lin_term(&r1,r,M);r1.constant=-M;b_put(b,'<',0.0,&r1);
+            Lin r2;memset(&r2,0,sizeof(r2));lin_into(&r2,&d,1.0);lin_term(&r2,r,M+1.0);r2.constant=-1.0;b_put(b,'<',0.0,&r2);
+            lin_free(&r1);lin_free(&r2);
+        } else { /* gt: d>=1-(M+1)(1-r); d<=M*r */
+            Lin r1;memset(&r1,0,sizeof(r1));lin_into(&r1,&d,-1.0);lin_term(&r1,r,M+1.0);r1.constant=-1.0-(M+1.0);b_put(b,'>',0.0,&r1);
+            Lin r2;memset(&r2,0,sizeof(r2));lin_into(&r2,&d,1.0);lin_term(&r2,r,-M);b_put(b,'<',0.0,&r2);
+            lin_free(&r1);lin_free(&r2);
+        }
+        lin_free(&d);lin_free(&l1);lin_free(&l2);lin_free(&rb);
+        return 0;
+    }
+    /* int_lin_ne: sum c_i x_i != d.  SOS1 over c'x - d >= 1 or <= -1 with a
+       binary.  d = sum c_i x_i.  Encode d - d0 >= 1 - M*u, d0 - d >= 1 - M*(1-u)
+       with binary u in {0,1}. */
+    if(strcmp(p,"int_lin_ne")==0||strcmp(p,"bool_lin_ne")==0){
+        if(c->nargs<3)return -1;
+        Lin*arr;int narr; Lin*parr;int nparr; Lin dd;
+        if(parse_array(m,c->args[0],&arr,&narr)!=0)return -1;
+        if(parse_array(m,c->args[1],&parr,&nparr)!=0){free_lins(arr,narr);return -1;}
+        if(parse_lin(m,c->args[2],&dd)!=0){free_lins(arr,narr);free_lins(parr,nparr);return -1;}
+        Lin lin;memset(&lin,0,sizeof(lin));
+        for(int i=0;i<narr&&i<nparr;i++) lin_into(&lin,&parr[i],arr[i].constant);
+        lin.constant -= dd.constant;
+        /* need M on |lin| */
+        double M=1.0;
+        for(int i=0;i<lin.n;i++){int v=lin.idx[i];double dv=fabs(lin.coef[i])*fmax(fabs(b->lo[v]),fabs(b->hi[v]));M=fmax(M,dv);}
+        M=fmax(M,fabs(lin.constant))+1.0;
+        int u=b_newvar(b,0.0,1.0);
+        Lin r1;memset(&r1,0,sizeof(r1));lin_into(&r1,&lin,1.0);lin_term(&r1,u,M);r1.constant=-1.0;b_put(b,'>',0.0,&r1);
+        Lin r2;memset(&r2,0,sizeof(r2));lin_into(&r2,&lin,-1.0);lin_term(&r2,u,-M);r2.constant=M-1.0;b_put(b,'>',0.0,&r2);
+        lin_free(&r1);lin_free(&r2);lin_free(&lin);lin_free(&dd);free_lins(arr,narr);free_lins(parr,nparr);
+        return 0;
+    }
     /* everything else: unhandled (return UNKNOWN at top level) */
     return 1;
 }

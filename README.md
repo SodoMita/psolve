@@ -245,7 +245,8 @@ when integer variables are present, so answers are integral):
 - **Constraints**: `int_lin_eq/le`, `int_eq/le/lt/ge/gt`, `bool_eq/le/lt`,
   `bool_and/or/xor/not/clause`, `array_bool_and/or`, `int_plus/minus/neg`,
   `int_abs/max/min`, `int_times` (constant operand), `set_in` + set domains,
-  `all_different`, `array_int_element`, `bool2int`/`int2float`.
+  `all_different`, `array_int_element`, `bool2int`/`int2float`, reified
+  `int_eq/le/lt/ge/gt_reif`, `int_lin_ne`.
 - **Solve**: satisfy / minimize / maximize; FlatZinc output (`x = v;`,
   `array1d(...)`, status markers), objective always, and `-s` stats
   (`nodes`, `objectiveBound`); `-n` node limit, `-t` time limit, SIGINT.

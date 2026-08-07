@@ -133,8 +133,12 @@ feature completeness against a huge standard corpus.
       `set_in` + set-domain decls (SOS1), `bool2int`/`int2float`,
       `all_different` (exact domain/permutation encoding),
       `array_int_element` + `gecode_int_element` (SOS1 element lookup).
-- [ ] More handlers: `float_*` relational variants, reified forms,
-      `int_lin_ne`, `count`/`among`, `cumulative`, `circuit`, `table`.
+- [x] Reified forms: `int_eq_reif`, `int_le_reif`, `int_lt_reif`,
+      `int_ge_reif`, `int_gt_reif`, `bool_eq_reif`, `bool_le_reif` (big-M with a
+      binary, incl. constant reification values); `int_lin_ne`/`bool_lin_ne`
+      (SOS1).  Fixed big-M sign bugs in the != / ne encodings.
+- [ ] More handlers: `float_*` relational variants, `count`/`among`,
+      `cumulative`, `circuit`, `table`.
 - [x] **MIP bridge**: when the model has integer vars, `fz_solve` dispatches to
       the MIP branch-and-bound so answers are integral (objectives match brute
       force, e.g. knapsack=10, prod3=57).
