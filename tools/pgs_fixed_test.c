@@ -86,9 +86,68 @@ static void t3_random_match_float(void)
     printf("T3 random match-float: tested=%d bad=%d\n",tested,bad);
 }
 
+/* T4: hostile / degenerate input must not crash and must stay in the box.
+ *
+ * A zero (or negative) diagonal is what an inactive or degenerate contact row
+ * looks like, and a physics host can hand one to the kernel at any frame.  It
+ * used to divide by zero: SIGFPE, taking the whole process down.  Huge
+ * residuals used to be truncated from the 128-bit accumulator to int64, so a
+ * large positive residual could wrap to a negative one and move x the wrong
+ * way; they are saturated now. */
+static void t4_degenerate(void)
+{
+    int bad = 0;
+
+    /* zero diagonal on one row */
+    {
+        int64_t A[4] = { 65536, 0,
+                         0,     0 };
+        int64_t b[2] = { -65536, -65536 };
+        int64_t lo[2] = { 0, 0 }, hi[2] = { 1 << 20, 1 << 20 };
+        int64_t x[2] = { 0, 0 };
+        PGSFixedOptions o = { 2, 10, 1, 1, 1 };
+        PGSResult r;
+        pgsf_solve(&o, A, b, lo, hi, x, &r);
+        for (int i = 0; i < 2; i++) if (x[i] < lo[i] || x[i] > hi[i]) bad++;
+    }
+    /* negative diagonal (caller passed a non-PSD matrix) */
+    {
+        int64_t A[4] = { -65536, 0,
+                          0,     65536 };
+        int64_t b[2] = { 65536, -65536 };
+        int64_t lo[2] = { -1000, -1000 }, hi[2] = { 1000, 1000 };
+        int64_t x[2] = { 0, 0 };
+        PGSFixedOptions o = { 2, 10, 1, 1, 1 };
+        PGSResult r;
+        pgsf_solve(&o, A, b, lo, hi, x, &r);
+        for (int i = 0; i < 2; i++) if (x[i] < lo[i] || x[i] > hi[i]) bad++;
+    }
+    /* saturating accumulation: values that overflow a 64-bit residual */
+    {
+        int64_t big = (int64_t)1 << 62;
+        int64_t A[4] = { 4, 3,
+                         3, 4 };
+        int64_t b[2] = { -big, big };
+        int64_t lo[2] = { -big, -big }, hi[2] = { big, big };
+        int64_t x[2] = { big, -big };
+        PGSFixedOptions o = { 2, 20, 1, 1, 1 };
+        PGSResult r;
+        pgsf_solve(&o, A, b, lo, hi, x, &r);
+        for (int i = 0; i < 2; i++) if (x[i] < lo[i] || x[i] > hi[i]) bad++;
+        /* determinism must hold here too */
+        int64_t y[2] = { big, -big };
+        PGSResult r2;
+        pgsf_solve(&o, A, b, lo, hi, y, &r2);
+        for (int i = 0; i < 2; i++) if (x[i] != y[i]) bad++;
+    }
+    printf("T4 degenerate/hostile input (zero+negative diagonal, saturation): "
+           "%s (bad=%d)\n", bad ? "FAIL" : "no crash, in-box, deterministic", bad);
+}
+
 int main(void){
     t1_analytic();
     t2_clamped();
     t3_random_match_float();
+    t4_degenerate();
     return 0;
 }
