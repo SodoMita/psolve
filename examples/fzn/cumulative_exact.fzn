@@ -1,0 +1,15 @@
+% Regression: this feasible scheduling instance used to return
+% =====UNKNOWN===== (double LP solver's big-M relaxation diverged) and then, after
+% the exact-solver cross-check landed, would have been mis-labelled UNSAT by a
+% false INFEASIBLE from the double simplex.  The MIP relaxation is now verified
+% with the exact rational solver, so this must solve to SAT.  A feasible point
+% is s1=3, s2=4, s3=1 (capacity 2):
+%   t=1: s3 (1)            -> 1 <= 2
+%   t=3: s1 (2)            -> 2 <= 2
+%   t=4,5: s2 (1)          -> 1 <= 2
+predicate cumulative(array[int] of var int: s, array[int] of var int: d, array[int] of var int: r, var int: b);
+var 3..3: s1 :: output_var;
+var 2..4: s2 :: output_var;
+var 1..1: s3 :: output_var;
+constraint cumulative([s1, s2, s3], [1, 2, 1], [2, 1, 1], 2);
+solve satisfy;
