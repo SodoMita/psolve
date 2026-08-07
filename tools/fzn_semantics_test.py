@@ -106,6 +106,7 @@ def test_array_extrema() -> None:
 def test_integer_reification_truth_table() -> None:
     predicates = {
         "int_eq_reif": lambda a, b: a == b,
+        "int_ne_reif": lambda a, b: a != b,
         "int_le_reif": lambda a, b: a <= b,
         "int_lt_reif": lambda a, b: a < b,
         "int_ge_reif": lambda a, b: a >= b,
@@ -161,6 +162,28 @@ def test_integer_reification_truth_table() -> None:
         """
     )
     require("r = false;" in out, f"bool equality reification failed:\n{out}")
+
+    out = run_model(
+        """
+        var 0..5: x;
+        var 0..5: y;
+        constraint int_ne(x, 3);
+        constraint int_ne(y, 3);
+        solve maximize x + y;
+        """
+    )
+    require("----------" in out, f"int_ne scalar failed:\n{out}")
+
+    out = run_model(
+        """
+        var 0..5: x;
+        var bool: r :: output_var;
+        constraint int_lin_le_reif([1], [x], 2, r);
+        constraint int_eq(x, 4);
+        solve satisfy;
+        """
+    )
+    require("r = false;" in out, f"int_lin_le_reif failed:\n{out}")
 
 
 def test_float_linear_subset() -> None:

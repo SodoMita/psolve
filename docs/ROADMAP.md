@@ -211,11 +211,13 @@ feature completeness against a huge standard corpus.
       `set_in` + set-domain decls (SOS1), `bool2int`/`int2float`,
       `all_different` (exact domain/permutation encoding),
       `array_int_element` + `gecode_int_element` (SOS1 element lookup).
-- [x] Reified forms: exact `int_eq/le/lt/ge/gt_reif` and bool counterparts,
+- [x] Reified forms: exact `int_eq/le/lt/ge/gt/ne_reif`, reified linear
+      `int_lin_eq/le/lt/ge/gt/ne_reif`, and bool counterparts,
       including constant reifiers.  Equality uses an explicit positive/negative
       side selector, so `r = false` really means `a != b` rather than an
       impossible conjunction; the full small-domain truth table is regression
-      tested. `int_lin_ne`/`bool_lin_ne` use the same exact selector.
+      tested. `int_lin_ne`/`bool_lin_ne`, `int_ne`/`bool_ne` use the same exact
+      selector.
 - [x] `int_lin_ge`/`int_lin_gt`/`bool_lin_ge`; `fzn_count_eq`/`fzn_among_eq`
       (exact via per-variable `[x_i==v]` binary + a side-selector binary for the
       `x_i!=v` OR; fixed an AND-vs-OR encoding bug).

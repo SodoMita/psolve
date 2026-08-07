@@ -707,6 +707,15 @@ static int add_int_reif(Builder*b,const Lin*d,int r,int which)
         Lin up;memset(&up,0,sizeof(up));lin_into(&up,d,1.0);lin_term(&up,r,-U);b_put(b,'<',0.0,&up);lin_free(&up);
         return 0;
     }
+    if(which==5){                 /* r <-> d != 0 */
+        int pos=b_newvar(b,0.0,1.0), neg=b_newvar(b,0.0,1.0);
+        Lin sel;memset(&sel,0,sizeof(sel));lin_term(&sel,r,-1.0);lin_term(&sel,pos,1.0);lin_term(&sel,neg,1.0);b_put(b,'=',0.0,&sel);lin_free(&sel);
+        Lin up;memset(&up,0,sizeof(up));lin_into(&up,d,1.0);lin_term(&up,r,-U);b_put(b,'<',0.0,&up);lin_free(&up);
+        Lin low0;memset(&low0,0,sizeof(low0));lin_into(&low0,d,1.0);lin_term(&low0,r,-L);b_put(b,'>',0.0,&low0);lin_free(&low0);
+        Lin low;memset(&low,0,sizeof(low));lin_into(&low,d,1.0);lin_term(&low,pos,-(1.0-L));b_put(b,'>',L,&low);lin_free(&low);
+        Lin high;memset(&high,0,sizeof(high));lin_into(&high,d,1.0);lin_term(&high,neg,U+1.0);b_put(b,'<',U,&high);lin_free(&high);
+        return 0;
+    }
     return -1;
 }
 
@@ -718,6 +727,7 @@ static int add_int_relation_constant(Builder*b,const Lin*d,int which,int want)
         else if(which==2)b_put(b,'<',-1.0,d);
         else if(which==3)b_put(b,'>',0.0,d);
         else if(which==4)b_put(b,'>',1.0,d);
+        else if(which==5)return add_int_ne(b,d);
         else return -1;
         return 0;
     }
@@ -726,6 +736,7 @@ static int add_int_relation_constant(Builder*b,const Lin*d,int which,int want)
     else if(which==2)b_put(b,'>',0.0,d);
     else if(which==3)b_put(b,'<',-1.0,d);
     else if(which==4)b_put(b,'<',0.0,d);
+    else if(which==5)b_put(b,'=',0.0,d);
     else return -1;
     return 0;
 }
@@ -785,6 +796,7 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
         return 0;
     }
     if(strcmp(p,"int_eq")==0||strcmp(p,"bool_eq")==0||strcmp(p,"float_eq")==0||
+       strcmp(p,"int_ne")==0||strcmp(p,"bool_ne")==0||
        strcmp(p,"int_le")==0||strcmp(p,"bool_le")==0||strcmp(p,"float_le")==0||
        strcmp(p,"int_lt")==0||strcmp(p,"float_lt")==0||strcmp(p,"bool_lt")==0||
        strcmp(p,"int_ge")==0||strcmp(p,"float_ge")==0||strcmp(p,"bool_ge")==0||
@@ -794,6 +806,11 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
         if(parse_lin(m,c->args[1],&l2)!=0){lin_free(&l1);return -1;}
         Lin dd;memset(&dd,0,sizeof(dd));
         lin_into(&dd,&l1,1.0);lin_into(&dd,&l2,-1.0);
+        if(strcmp(p,"int_ne")==0||strcmp(p,"bool_ne")==0){
+            int rr=add_int_ne(b,&dd);
+            lin_free(&l1);lin_free(&l2);lin_free(&dd);
+            return rr;
+        }
         char rel='='; double rhs=0.0;
         int is_float = (strncmp(p,"float_",6)==0);
         /* Strict continuous float relations (float_lt / float_gt) are
@@ -1385,9 +1402,11 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
        open and cannot be represented faithfully by this LP/MIP bridge. */
     if(strcmp(p,"int_eq_reif")==0||strcmp(p,"int_le_reif")==0||
        strcmp(p,"int_lt_reif")==0||strcmp(p,"int_ge_reif")==0||
-       strcmp(p,"int_gt_reif")==0||strcmp(p,"bool_eq_reif")==0||
+       strcmp(p,"int_gt_reif")==0||strcmp(p,"int_ne_reif")==0||
+       strcmp(p,"bool_eq_reif")==0||
        strcmp(p,"bool_le_reif")==0||strcmp(p,"bool_lt_reif")==0||
-       strcmp(p,"bool_ge_reif")==0||strcmp(p,"bool_gt_reif")==0){
+       strcmp(p,"bool_ge_reif")==0||strcmp(p,"bool_gt_reif")==0||
+       strcmp(p,"bool_ne_reif")==0){
         if(c->nargs<3)return -1;
         Lin l1,l2,rb;
         if(parse_lin(m,c->args[0],&l1)!=0)return -1;
@@ -1399,7 +1418,8 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
         else if(strcmp(p,"int_le_reif")==0||strcmp(p,"bool_le_reif")==0)which=1;
         else if(strcmp(p,"int_lt_reif")==0||strcmp(p,"bool_lt_reif")==0)which=2;
         else if(strcmp(p,"int_ge_reif")==0||strcmp(p,"bool_ge_reif")==0)which=3;
-        else which=4;
+        else if(strcmp(p,"int_gt_reif")==0||strcmp(p,"bool_gt_reif")==0)which=4;
+        else which=5;
         int rr;
         if(rb.n==0){
             /* The reifier may be a compile-time true/false literal. */
@@ -1430,6 +1450,44 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
         lin_into(&lin,&dd,-1.0);
         int rr=add_int_ne(b,&lin);
         lin_free(&lin);lin_free(&dd);free_lins(arr,narr);free_lins(parr,nparr);
+        return rr;
+    }
+    if(strcmp(p,"int_lin_eq_reif")==0||strcmp(p,"int_lin_le_reif")==0||
+       strcmp(p,"int_lin_lt_reif")==0||strcmp(p,"int_lin_ge_reif")==0||
+       strcmp(p,"int_lin_gt_reif")==0||strcmp(p,"int_lin_ne_reif")==0||
+       strcmp(p,"bool_lin_eq_reif")==0||strcmp(p,"bool_lin_le_reif")==0||
+       strcmp(p,"bool_lin_lt_reif")==0||strcmp(p,"bool_lin_ge_reif")==0||
+       strcmp(p,"bool_lin_gt_reif")==0||strcmp(p,"bool_lin_ne_reif")==0){
+        if(c->nargs<4)return -1;
+        Lin*arr;int narr; Lin*parr;int nparr; Lin dd; Lin rb;
+        if(parse_array(m,c->args[0],&arr,&narr)!=0)return -1;
+        if(parse_array(m,c->args[1],&parr,&nparr)!=0){free_lins(arr,narr);return -1;}
+        if(parse_lin(m,c->args[2],&dd)!=0){free_lins(arr,narr);free_lins(parr,nparr);return -1;}
+        if(parse_lin(m,c->args[3],&rb)!=0){lin_free(&dd);free_lins(arr,narr);free_lins(parr,nparr);return -1;}
+        if(narr!=nparr){lin_free(&rb);lin_free(&dd);free_lins(arr,narr);free_lins(parr,nparr);return -1;}
+        Lin lin;memset(&lin,0,sizeof(lin));
+        for(int i=0;i<narr;i++){
+            if(arr[i].n!=0){lin_free(&lin);lin_free(&rb);lin_free(&dd);free_lins(arr,narr);free_lins(parr,nparr);return 1;}
+            lin_into(&lin,&parr[i],arr[i].constant);
+        }
+        lin_into(&lin,&dd,-1.0);
+        int which;
+        if(strcmp(p,"int_lin_eq_reif")==0||strcmp(p,"bool_lin_eq_reif")==0)which=0;
+        else if(strcmp(p,"int_lin_le_reif")==0||strcmp(p,"bool_lin_le_reif")==0)which=1;
+        else if(strcmp(p,"int_lin_lt_reif")==0||strcmp(p,"bool_lin_lt_reif")==0)which=2;
+        else if(strcmp(p,"int_lin_ge_reif")==0||strcmp(p,"bool_lin_ge_reif")==0)which=3;
+        else if(strcmp(p,"int_lin_gt_reif")==0||strcmp(p,"bool_lin_gt_reif")==0)which=4;
+        else which=5;
+        int rr;
+        if(rb.n==0){
+            if(fabs(rb.constant)>1e-12&&fabs(rb.constant-1.0)>1e-12)rr=1;
+            else rr=add_int_relation_constant(b,&lin,which,rb.constant>=0.5);
+        } else {
+            int r;
+            if(lin_unit_var(&rb,&r)!=0)rr=1;
+            else rr=add_int_reif(b,&lin,r,which);
+        }
+        lin_free(&lin);lin_free(&rb);lin_free(&dd);free_lins(arr,narr);free_lins(parr,nparr);
         return rr;
     }
     /* fzn_count_eq(x[], v, n): exactly n of the variables x equal value v.

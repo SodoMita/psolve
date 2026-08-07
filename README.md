@@ -44,15 +44,15 @@ with an explicit baseline `ARCH`.
 ```sh
 ./lpsolve [-t ms|--time-limit ms] <problem.lp> [--print]  # LP (revised simplex, double)
 ./qpsolve <qp.qp>                      # convex QP (active-set)
-./mipsolve <problem.lp> <nint> <j...> [--print]   # MIP (branch-and-bound)
+./mipsolve [-t ms|--time-limit ms] <problem.lp> <nint> <j...> [--print]   # MIP (branch-and-bound)
 ./fznsolve <problem.fzn>               # FlatZinc reader + solver (Phase 3)
 ./fxsolve <problem.lp> [--print]      # LP (exact rational / fixed-point simplex)
 ```
 
 `--print` also dumps the optimal variable values. `-t` / `--time-limit` sets a
 cooperative wall-clock limit in milliseconds; `Ctrl-C` also stops the double LP
-solve cleanly. Both return `STOPPED` rather than presenting a partial solution
-as optimal.
+or MIP solve cleanly. Both return `STOPPED` rather than presenting a partial
+solution as optimal.
 
 The LP solver handles: **maximize or minimize**, `<`, `>`, and `=` constraints,
 variables with lower, upper, boxed, or fully free bounds (use `-inf inf`), and
@@ -312,9 +312,10 @@ are integral):
   ranges, annotations, and domains in both `var 1..10:` shorthand and
   `::`-annotation forms. Decimal shorthand domains infer `var float`; var-array
   aliases retain compiler-propagated literal elements such as `x = [1,3]`.
-- **Constraints**: exact integer/bool `*_lin_eq/le/lt/ge/gt` and
-  `*_eq/le/lt/ge/gt` relations; `int_eq/le/lt/ge/gt_reif` and their bool
-  counterparts; `int_lin_ne`, `int_lin_ge/gt`, `count`/`among`; boolean logic
+- **Constraints**: exact integer/bool `*_lin_eq/le/lt/ge/gt/ne` and
+  `*_eq/le/lt/ge/gt/ne` relations; `int_eq/le/lt/ge/gt/ne_reif`, reified linear
+  `int_lin_*_reif`/`bool_lin_*_reif`, and their bool counterparts;
+  `count`/`among`; boolean logic
   (`bool_and/or/xor/not/clause`, `array_bool_and/or`); `int_plus/minus/neg`,
   `int_abs/max/min`, `int_times` (constant operand), `set_in` + set domains,
   `all_different`, `array_int_element`, `array_int_maximum/minimum`, `bool2int`/`int2float`; exact
