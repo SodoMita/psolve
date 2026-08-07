@@ -134,6 +134,21 @@ fixed number of times per substep.  **All of this runs in fixed point.**
       Target: small, data-friendly problems (UI/layout, integer MiniZinc LPs).
       Exact arithmetic is heavier than double SIMD on large dense instances, so
       `lpsolve` remains the large-problem backbone.
+- [x] **fx performance** (profiled, `make fx_bench`): a gprof trace showed ~98%
+      of runtime in the pivot's gcd-reduced elimination (Euclid `%` gcd beat a
+      binary/Stein gcd ~3.5× here — the compiler's single hardware division
+      wins over a shift/subtract loop).  Optimizations: (1) **Dantzig's entering
+      rule** (most-negative reduced cost) with a Bland fallback when the exact
+      objective stops improving (anti-cycling) cut pivot count ~1.3–6× vs
+      Bland's rule, which is the double solver's own trick; (2) **fast-path
+      arithmetic**: all solver arrays are `0/1`-initialized (`fx_zalloc`) so the
+      hot `__int128` rational ops drop the per-call `den==0` cleanup branch and
+      are `static inline`; (3) **zero-skip** in the pivot elimination over the
+      normalized pivot row.  Result: ~1.0–1.7× faster across examples and
+      random dense/sparse instances (e.g. 216→127 µs on an n=8 dense LP) with
+      identical exact results (`fx_verify` WRONG=0, ASan/UBSan clean).  The
+      residual cost is the unavoidable 2-gcd-per-cell exact elimination — a
+      sparse/exact *revised* simplex would be the next step for large problems.
 - [ ] *(future)* Fixed-point QP kernel for UI layout / VG, when a host project
       needs an integer general QP solver.
 

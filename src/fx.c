@@ -10,30 +10,49 @@
 
 Fx fx_from_ll(long long v){ Fx r; r.num=v; r.den=1; return r; }
 
-static long long ll_abs_(long long x){ return x<0 ? -x : x; }
+/* Euclidean GCD on unsigned magnitudes.  (A binary/Stein GCD is measurably
+ * *slower* here because the compiler's single hardware `%` beats its
+ * shift/subtract loop; the exact solver spends ~all its time in gcd, so this
+ * matters.) */
 static long long ll_gcd(long long a, long long b){
-    a=ll_abs_(a); b=ll_abs_(b);
-    while(b){ long long t=a%b; a=b; b=t; }
-    return a<0 ? -a : a;
+    unsigned long long u = a<0 ? (unsigned long long)(-(a+1))+1ULL : (unsigned long long)a;
+    unsigned long long v = b<0 ? (unsigned long long)(-(b+1))+1ULL : (unsigned long long)b;
+    while(v){ unsigned long long t=u%v; u=v; v=t; }
+    return (long long)u;
 }
-static void fx_norm(Fx*r){
-    if(r->num==0){ r->den=1; return; }
-    long long g=ll_gcd(r->num, r->den);
-    r->num/=g; r->den/=g;
-    if(r->den<0){ r->num=-r->num; r->den=-r->den; }
+/* Build a reduced fraction from (n,d).  Every Fx in the solver is created by
+ * fx_mk / fx_from_ll / fx_zalloc, so den>0 and no den==0 ever reaches the
+ * arithmetic below (no per-call cleanup branch needed in the hot loop). */
+static Fx fx_mk(long long n, long long d){
+    Fx r;
+    if(n==0){ r.num=0; r.den=1; return r; }
+    if(d<0){ n=-n; d=-d; }
+    long long g=ll_gcd(n,d);
+    r.num=n/g; r.den=d/g;
+    return r;
 }
-static Fx fx_mk(long long n, long long d){ Fx r; r.num=n; r.den=d; fx_norm(&r); return r; }
-/* Clean a stored value: calloc'd arrays leave zero entries as {0,0}; treat any
- * den==0 value as exactly zero (0/1) so arithmetic is always well-defined. */
+/* Clean a stored value (reader/var-transform path only; the hot loop never
+ * sees a den==0 entry because all solver arrays are fx_zalloc'd to 0/1). */
 static Fx fx_cln(Fx a){ if(a.den==0){ a.num=0; a.den=1; } return a; }
-static Fx fx_neg(Fx a){ a=fx_cln(a); a.num=-a.num; return a; }
-static Fx fx_add(Fx a, Fx b){ a=fx_cln(a); b=fx_cln(b); return fx_mk((long long)((__int128)a.num*b.den + (__int128)b.num*a.den), (long long)((__int128)a.den*b.den)); }
-static Fx fx_sub(Fx a, Fx b){ a=fx_cln(a); b=fx_cln(b); return fx_mk((long long)((__int128)a.num*b.den - (__int128)b.num*a.den), (long long)((__int128)a.den*b.den)); }
-static Fx fx_mul(Fx a, Fx b){ a=fx_cln(a); b=fx_cln(b); return fx_mk((long long)((__int128)a.num*b.num), (long long)((__int128)a.den*b.den)); }
-static Fx fx_div(Fx a, Fx b){ a=fx_cln(a); b=fx_cln(b); return fx_mk((long long)((__int128)a.num*b.den), (long long)((__int128)a.den*b.num)); }
-static int fx_cmp(Fx a, Fx b){ a=fx_cln(a); b=fx_cln(b); __int128 l=(__int128)a.num*b.den, r=(__int128)b.num*a.den; return l<r?-1:(l>r?1:0); }
-static int fx_zero(Fx a){ a=fx_cln(a); return a.num==0; }
-static int fx_neg0(Fx a){ a=fx_cln(a); return a.num<=0; }
+/* Allocate an Fx array initialized to exactly 0/1 (instead of calloc's 0/0),
+ * so the fast arithmetic never needs the den==0 cleanup branch.  Overflow of
+ * n*sizeof(Fx) is checked (this also silences -Walloc-size-larger-than, which
+ * cannot bound the table dimensions M,K itself). */
+static Fx *fx_zalloc(size_t n){
+    if(n==0) n=1;
+    size_t bytes;
+    if(__builtin_mul_overflow(n, sizeof(Fx), &bytes)) return NULL;
+    Fx *a=(Fx*)malloc(bytes);
+    if(a){ for(size_t i=0;i<n;i++){ a[i].num=0; a[i].den=1; } }
+    return a;
+}
+static inline Fx fx_neg(Fx a){ a.num=-a.num; return a; }
+static inline Fx fx_add(Fx a, Fx b){ return fx_mk((long long)((__int128)a.num*b.den + (__int128)b.num*a.den), (long long)((__int128)a.den*b.den)); }
+static inline Fx fx_sub(Fx a, Fx b){ return fx_mk((long long)((__int128)a.num*b.den - (__int128)b.num*a.den), (long long)((__int128)a.den*b.den)); }
+static inline Fx fx_mul(Fx a, Fx b){ return fx_mk((long long)((__int128)a.num*b.num), (long long)((__int128)a.den*b.den)); }
+static inline Fx fx_div(Fx a, Fx b){ return fx_mk((long long)((__int128)a.num*b.den), (long long)((__int128)a.den*b.num)); }
+static inline int fx_cmp(Fx a, Fx b){ __int128 l=(__int128)a.num*b.den, r=(__int128)b.num*a.den; return l<r?-1:(l>r?1:0); }
+static inline int fx_zero(Fx a){ return a.num==0; }
 
 double fx_todouble(Fx r){ return (double)r.num/(double)r.den; }
 
@@ -72,7 +91,7 @@ static int fx_from_str(const char*s, Fx*out){
         for(int i=0;i<-exp;i++){ if(den>((long long)1)<<60)return -1; den*=10; }
     }
     num*=sign;
-    Fx r; r.num=(long long)num; r.den=den; fx_norm(&r); *out=r;
+    *out=fx_mk((long long)num,den);
     return 0;
 }
 
@@ -194,13 +213,24 @@ static void tabset(Tab*t,int r,int c,Fx v){ t->T[(size_t)r*(t->K+1)+c]=v; }
 /* pivot on column j, leaving row r (0..M-1).  Updates rows 0..M (M=obj). */
 static void pivot(Tab*t,int r,int j){
     Fx p=tab(t,r,j);
-    int K=t->K, M=t->M;
-    for(int c=0;c<=K;c++) tabset(t,r,c,fx_div(tab(t,r,c),p));
+    int K=t->K, M=t->M, S=K+1;
+    Fx *T=t->T;
+    Fx *Tr=&T[(size_t)r*S];
+    /* normalize pivot row */
+    for(int c=0;c<=K;c++) Tr[c]=fx_div(Tr[c],p);
+    /* eliminate rows i != r (including the objective row M).  The inner loop
+     * is the hot spot of the exact solver: skip the (common) zero entries of
+     * the normalized pivot row so we do no gcd-reduced work on no-ops. */
     for(int i=0;i<=M;i++){
         if(i==r)continue;
-        Fx f=tab(t,i,j);
-        if(fx_zero(f))continue;
-        for(int c=0;c<=K;c++) tabset(t,i,c,fx_sub(tab(t,i,c),fx_mul(f,tab(t,r,c))));
+        Fx *Ti=&T[(size_t)i*S];
+        Fx f=Ti[j];
+        if(f.num==0)continue;
+        for(int c=0;c<=K;c++){
+            Fx b=Tr[c];
+            if(b.num==0)continue;
+            Ti[c]=fx_sub(Ti[c],fx_mul(f,b));
+        }
     }
     t->basis[r]=j;
 }
@@ -217,13 +247,31 @@ static void pivot(Tab*t,int r,int j){
 static int simplex(Tab*t,long itercap,long*iters){
     int M=t->M, K=t->K;
     long niter=0;
+    /* Entering rule: Dantzig (most-negative reduced cost) converges in far
+     * fewer pivots than Bland's rule, but can cycle on degenerate problems.
+     * In exact arithmetic the objective z=T[M][K] is non-decreasing, so a long
+     * run of pivots that never improve z signals cycling -> fall back to Bland
+     * (smallest-index entering), which is guaranteed to terminate. */
+    int use_bland=0;
+    long stale=0;
     for(;;){
         int ej=-1;
-        for(int j=0;j<K;j++){
-            if(!t->activeVar[j])continue;
-            int basic=0; for(int r=0;r<M;r++) if(t->basis[r]==j){basic=1;break;}
-            if(basic)continue;
-            if(fx_cmp(tab(t,M,j),fx_from_ll(0))<0){ ej=j; break; }
+        if(!use_bland){
+            for(int j=0;j<K;j++){
+                if(!t->activeVar[j])continue;
+                int basic=0; for(int r=0;r<M;r++) if(t->basis[r]==j){basic=1;break;}
+                if(basic)continue;
+                if(fx_cmp(tab(t,M,j),fx_from_ll(0))<0){
+                    if(ej<0||fx_cmp(tab(t,M,j),tab(t,M,ej))<0) ej=j;
+                }
+            }
+        } else {
+            for(int j=0;j<K;j++){
+                if(!t->activeVar[j])continue;
+                int basic=0; for(int r=0;r<M;r++) if(t->basis[r]==j){basic=1;break;}
+                if(basic)continue;
+                if(fx_cmp(tab(t,M,j),fx_from_ll(0))<0){ ej=j; break; }
+            }
         }
         *iters=niter;
         if(ej<0) return 0;   /* optimal */
@@ -238,7 +286,10 @@ static int simplex(Tab*t,long itercap,long*iters){
             }
         }
         if(lr<0) return 2;   /* unbounded */
+        Fx zbefore=tab(t,M,K);
         pivot(t,lr,ej);
+        if(fx_cmp(tab(t,M,K),zbefore)==0) stale++; else stale=0;
+        if(stale > (long)(t->V + M + 2)) use_bland=1;
         niter++;
         if(niter>=itercap){ *iters=niter; return 3; }
     }
@@ -254,7 +305,7 @@ int fx_solve(const FxLP*lp, FxResult*res){
     int n=lp->n, m=lp->m;
 
     /* ---- transform variables: x_j = base_j + sign_j * y_j, y_j>=0 ---- */
-    Fx *base=(Fx*)calloc((size_t)(n?n:1),sizeof(Fx));
+    Fx *base=fx_zalloc((size_t)(n?n:1));
     int *sign=(int*)calloc((size_t)(n?n:1),sizeof(int));
     int *yidx=(int*)malloc((size_t)(n?n:1)*sizeof(int));  /* -1 = fixed */
     for(int j=0;j<n;j++){ yidx[j]=-1; }
@@ -275,8 +326,8 @@ int fx_solve(const FxLP*lp, FxResult*res){
 
     /* build M rows: y-coefficients (M x V), rhs, relation.  Rows with rhs<0
        are negated (flipping the relation) so every rhs >= 0. */
-    Fx *A=(Fx*)calloc((size_t)(M?(size_t)M*V:1),sizeof(Fx));
-    Fx *b=(Fx*)calloc((size_t)(M?M:1),sizeof(Fx));
+    Fx *A=fx_zalloc((size_t)(M?(size_t)M*V:1));
+    Fx *b=fx_zalloc((size_t)(M?M:1));
     char *rel=(char*)malloc((size_t)(M?M:1));
     int row=0;
     for(int i=0;i<m;i++){
@@ -305,15 +356,18 @@ int fx_solve(const FxLP*lp, FxResult*res){
     /* count slack/surplus vars (one per non-'=' row) */
     int S=0;
     for(int r=0;r<M;r++) if(rel[r]!='=') S++;
-    /* slack column index per row (or -1) */
-    int *slackcol=(int*)malloc((size_t)(M?M:1)*sizeof(int));
+    /* slack column index per row (or -1); use calloc (recognized by the
+       compiler, so no -Walloc-size-larger-than, and overflow-safe) */
+    int *slackcol=(int*)calloc((size_t)(M?M:1),sizeof(int));
+    if(!slackcol){ res->status=2; free(base);free(sign);free(yidx);free(A);free(b);free(rel);
+        return 2; }
     { int cur=V; for(int r=0;r<M;r++){ if(rel[r]!='='){ slackcol[r]=cur++; } else slackcol[r]=-1; } }
 
     /* objective constant and internal linear coefficients */
     int sense_mult = lp->maximize ? 1 : -1;
     Fx C0=fx_from_ll(0);
     for(int j=0;j<n;j++) C0=fx_add(C0,fx_mul(lp->c[j],base[j]));
-    Fx *coef=(Fx*)calloc((size_t)(V?V:1),sizeof(Fx));
+    Fx *coef=fx_zalloc((size_t)(V?V:1));
     for(int j=0;j<n;j++) if(yidx[j]>=0)
         coef[yidx[j]]=fx_mul(lp->c[j],fx_from_ll((long long)(sense_mult*sign[j])));
 
@@ -321,7 +375,7 @@ int fx_solve(const FxLP*lp, FxResult*res){
     int K=V+S+M;
     Tab t; memset(&t,0,sizeof(t));
     t.M=M; t.K=K; t.V=V;
-    t.T=(Fx*)calloc((size_t)(M+1)*(K+1),sizeof(Fx));
+    t.T=fx_zalloc((size_t)((size_t)(M+1)*(size_t)(K+1)));
     t.basis=(int*)malloc((size_t)(M?M:1)*sizeof(int));
     t.activeVar=(int*)malloc((size_t)(K?K:1)*sizeof(int));
     t.activeRow=(int*)malloc((size_t)(M?M:1)*sizeof(int));

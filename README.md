@@ -95,10 +95,16 @@ Compared with `lpsolve` (`make fx_bench`):
   `LP_INF`-sentinel clamping, and no `NUMERICAL_FAILURE`.  On unbounded LPs the
   double solver can clamp a variable at its internal 1e30 bound and report a
   bogus huge "OPTIMAL"; `fxsolve` reports `UNBOUNDED` correctly.
-- **Performance**: comparable for tiny problems (single-digit microseconds at
-  n≲10, on par with the double solver), but degrades on larger dense problems —
-  exact rational arithmetic with coefficient growth costs more than double
-  SIMD.  Use `fxsolve` where exactness/determinism matters on small,
+- **Performance**: comparable-to-faster for tiny problems (single-digit
+  microseconds at n≲10; `make fx_bench` shows `fxsolve` about 0.6× the double
+  solver's time on the examples).  The pivot uses **Dantzig's entering rule**
+  with an anti-cycling Bland fallback, `static inline` fast-path rational
+  arithmetic (arrays `0/1`-initialized so no per-cell cleanup branch), and
+  zero-skip in the elimination — a gprof-driven optimization worth ~1.0–1.7×
+  on random dense/sparse instances with identical exact results.  It still
+  degrades on larger dense problems, because exact rational arithmetic with
+  coefficient growth (two gcd reductions per tableau cell) costs more than
+  double SIMD.  Use `fxsolve` where exactness/determinism matters on small,
   data-friendly problems (UI/layout, integer MiniZinc LPs); keep `lpsolve` for
   large sparse/continuous instances.
 
