@@ -276,6 +276,27 @@ int fz_read(const char*path,FZModel*m)
                 /* optional 'var' before the type (array ... of var int) */
                 if(ti<nt&&is_kw(toks[ti].text,"var")){ is_var=1; d->is_var=1; ti++; }
                 if(ti<nt&&toks[ti].kind==TK_IDENT){if(is_kw(toks[ti].text,"int"))d->kind=FZ_K_INT;else if(is_kw(toks[ti].text,"float"))d->kind=FZ_K_FLOAT;else if(is_kw(toks[ti].text,"bool"))d->kind=FZ_K_BOOL;ti++;}
+                /* FlatZinc set domain: var {1,3,5}: x  — store as bounds only
+                   (min..max); exact membership is enforced by a set_in in the
+                   model body if present, else this is a relaxation. */
+                if(ti<nt&&toks[ti].kind==TK_SYM&&strcmp(toks[ti].text,"{")==0){
+                    long vmin=1000000000L,vmax=-1000000000L; int nv=0;
+                    long vals[256];
+                    ti++;  /* skip '{' */
+                    while(ti<nt&&!(toks[ti].kind==TK_SYM&&strcmp(toks[ti].text,"}")==0)){
+                        if(toks[ti].kind==TK_INT){ long v=toks[ti].ival; if(nv<256)vals[nv]=v; if(!nv||v<vmin)vmin=v; if(v>vmax)vmax=v; nv++; }
+                        ti++;
+                    }
+                    if(ti<nt)ti++;  /* skip '}' */
+                    if(nv>0){
+                        d->has_lo=1;d->has_hi=1;
+                        d->lo=(double*)malloc(sizeof(double));d->hi=(double*)malloc(sizeof(double));
+                        d->lo[0]=(double)vmin; d->hi[0]=(double)vmax;
+                        /* store exact set for SOS1 enforcement in fz_solve */
+                        d->nset=nv; d->setvals=(long*)malloc((size_t)nv*sizeof(long));
+                        for(int q=0;q<nv;q++)d->setvals[q]=vals[q];
+                    }
+                }
                 /* FlatZinc shorthand: var 1..10: x  (domain before ':') */
                 if(ti<nt&&(toks[ti].kind==TK_INT||toks[ti].kind==TK_FLOAT)){
                     char lo[64],hi[64];snprintf(lo,sizeof(lo),"%ld",(long)toks[ti].ival);ti++;
@@ -325,9 +346,7 @@ int fz_read(const char*path,FZModel*m)
                             for(int q=0;q<nel;q++){ if(arr[q].n==1) alias[q]=arr[q].idx[0]; else {alias_ok=0; break;} }
                             if(alias_ok){
                                 d->base_idx=alias[0];
-                                /* do not allocate new vars; but ensure they're
-                                   contiguous -> base_idx is the first alias and
-                                   m->nvars unchanged.  Validate contiguity. */
+                                d->is_alias=1;
                                 for(int q=1;q<nel;q++) if(alias[q]!=alias[0]+q) alias_ok=0;
                             }
                             free(alias);
@@ -392,7 +411,20 @@ int fz_read(const char*path,FZModel*m)
 /* LP bridge                                                           */
 /* ------------------------------------------------------------------ */
 typedef struct { int n;int*idx;double*coef;double rhs;char rel; } Row;
-typedef struct { int nvars;double*lo,*hi;int*haslo,*hashi;Row*rows;int nrows,cap; } Builder;
+typedef struct { int nvars;int varcap;double*lo,*hi;int*haslo,*hashi;Row*rows;int nrows,cap; } Builder;
+static int b_newvar(Builder*b, double lo, double hi){
+    if(b->nvars>=b->varcap){
+        int nc=b->varcap?b->varcap*2:16;
+        b->lo=(double*)realloc(b->lo,(size_t)nc*sizeof(double));
+        b->hi=(double*)realloc(b->hi,(size_t)nc*sizeof(double));
+        b->haslo=(int*)realloc(b->haslo,(size_t)nc*sizeof(int));
+        b->hashi=(int*)realloc(b->hashi,(size_t)nc*sizeof(int));
+        b->varcap=nc;
+    }
+    int v=b->nvars++;
+    b->lo[v]=lo;b->hi[v]=hi;b->haslo[v]=1;b->hashi[v]=1;
+    return v;
+}
 static void b_add(Builder*b){if(b->nrows>=b->cap){b->cap=b->cap?b->cap*2:16;b->rows=(Row*)realloc(b->rows,(size_t)b->cap*sizeof(Row));}memset(&b->rows[b->nrows],0,sizeof(Row));}
 static void b_put(Builder*b,char rel,double rhs,const Lin*l){
     b_add(b);Row*r=&b->rows[b->nrows++];r->rel=rel;r->rhs=rhs-l->constant;
@@ -408,8 +440,7 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
        strcmp(p,"bool_lin_eq")==0||strcmp(p,"bool_lin_le")==0){
         if(c->nargs<3)return -1;
         Lin*arr;int narr;
-        if(parse_array(m,c->args[0],&arr,&narr)!=0){if(getenv("FZDBG"))fprintf(stderr,"  parse_array coeff FAIL\n");return -1;}
-        if(getenv("FZDBG"))fprintf(stderr,"  coeff array narr=%d\n",narr);
+        if(parse_array(m,c->args[0],&arr,&narr)!=0)return -1;
         Lin*parr;int nparr;
         if(parse_array(m,c->args[1],&parr,&nparr)!=0){free_lins(arr,narr);return -1;}
         Lin d; if(parse_lin(m,c->args[2],&d)!=0){free_lins(arr,narr);free_lins(parr,nparr);return -1;}
@@ -576,6 +607,169 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
         lin_free(&l1);lin_free(&l2);lin_free(&dd);
         return 0;
     }
+    /* int_times(a,b,c): c = a*b.  Linearizable when one operand is a constant
+       (par); if both are variables it is bilinear -> unhandled (UNKNOWN). */
+    if(strcmp(p,"int_times")==0||strcmp(p,"float_times")==0){
+        if(c->nargs<3)return -1;
+        if(parse_lin(m,c->args[0],&l1)!=0)return -1;
+        if(parse_lin(m,c->args[1],&l2)!=0){lin_free(&l1);return -1;}
+        if(parse_lin(m,c->args[2],&l3)!=0){lin_free(&l1);lin_free(&l2);return -1;}
+        int a_is_const=(l1.n==0), b_is_const=(l2.n==0);
+        if(a_is_const && b_is_const){
+            /* c = const*const  ->  c = k  (constant) */
+            if(l3.n!=0){lin_free(&l1);lin_free(&l2);lin_free(&l3);return -1;}
+            b_put(b,'=', l1.constant*l2.constant, &(Lin){0});  /* 0 = c - k */
+            /* redo cleanly: enforce c = k via a row */
+            Lin ck;memset(&ck,0,sizeof(ck));lin_term(&ck,l3.idx[0],1.0);ck.constant=-l1.constant*l2.constant;b_put(b,'=',0.0,&ck);lin_free(&ck);
+            lin_free(&l1);lin_free(&l2);lin_free(&l3);return 0;
+        } else if(a_is_const && !b_is_const && l3.n==1){
+            /* c = const * b => c - const*b = 0 */
+            double k=l1.constant;
+            Lin dd;memset(&dd,0,sizeof(dd));lin_into(&dd,&l3,1.0);
+            for(int i=0;i<l2.n;i++)lin_term(&dd,l2.idx[i],-k*l2.coef[i]);
+            dd.constant -= k*l2.constant;
+            b_put(b,'=',0.0,&dd);lin_free(&dd);
+            lin_free(&l1);lin_free(&l2);lin_free(&l3);return 0;
+        } else if(b_is_const && !a_is_const && l3.n==1){
+            double k=l2.constant;
+            Lin dd;memset(&dd,0,sizeof(dd));lin_into(&dd,&l3,1.0);
+            for(int i=0;i<l1.n;i++)lin_term(&dd,l1.idx[i],-k*l1.coef[i]);
+            dd.constant -= k*l1.constant;
+            b_put(b,'=',0.0,&dd);lin_free(&dd);
+            lin_free(&l1);lin_free(&l2);lin_free(&l3);return 0;
+        }
+        lin_free(&l1);lin_free(&l2);lin_free(&l3);
+        return 1;   /* bilinear -> unhandled */
+    }
+    /* int_abs(x,y): y = |x|.  y >= x, y >= -x; y <= M*u + ... (big-M) or with
+       a bounded x we can do y = x (x>=0) or y=-x (x<=0) but general needs M.
+       For bounded x in [lo,hi] with lo>=0: y=x; hi<=0: y=-x; else use big-M. */
+    if(strcmp(p,"int_abs")==0){
+        if(c->nargs<2)return -1;
+        if(parse_lin(m,c->args[0],&l1)!=0)return -1;
+        if(parse_lin(m,c->args[1],&l2)!=0){lin_free(&l1);return -1;}
+        if(l1.n!=1||l2.n!=1){lin_free(&l1);lin_free(&l2);return 1;}
+        int x=l1.idx[0], y=l2.idx[0];
+        double xlo=b->lo[x], xhi=b->hi[x];
+        if(xlo>=0){ /* y = x */
+            Lin dd;memset(&dd,0,sizeof(dd));lin_term(&dd,y,1.0);lin_term(&dd,x,-1.0);b_put(b,'=',0.0,&dd);lin_free(&dd);
+            lin_free(&l1);lin_free(&l2);return 0;
+        } else if(xhi<=0){ /* y = -x */
+            Lin dd;memset(&dd,0,sizeof(dd));lin_term(&dd,y,1.0);lin_term(&dd,x,1.0);b_put(b,'=',0.0,&dd);lin_free(&dd);
+            lin_free(&l1);lin_free(&l2);return 0;
+        }
+        /* bounded both sides with xlo<0<xhi: big-M with a binary sign flag s.
+           y >= x, y >= -x,
+           y <= x + 2*(-xlo)*s          (when x>=0, s=0 => y<=x)
+           y <= -x + 2*xhi*(1-s)         (when x<=0, s=1 => y<=-x)
+           Using big-M form: y - x - 2*(-xlo)*s <= 0  and  y + x - 2*xhi + 2*xhi*s <= 0 */
+        int s=b_newvar(b,0.0,1.0);   /* binary flag */
+        Lin d1;memset(&d1,0,sizeof(d1));lin_term(&d1,y,1.0);lin_term(&d1,x,-1.0);b_put(b,'>',0.0,&d1);lin_free(&d1);
+        Lin d2;memset(&d2,0,sizeof(d2));lin_term(&d2,y,1.0);lin_term(&d2,x,1.0);b_put(b,'>',0.0,&d2);lin_free(&d2);
+        Lin d3;memset(&d3,0,sizeof(d3));lin_term(&d3,y,1.0);lin_term(&d3,x,-1.0);lin_term(&d3,s,-2.0*(-xlo));b_put(b,'<',0.0,&d3);lin_free(&d3);
+        Lin d4;memset(&d4,0,sizeof(d4));lin_term(&d4,y,1.0);lin_term(&d4,x,1.0);lin_term(&d4,s,2.0*xhi);d4.constant=-2.0*xhi;b_put(b,'<',0.0,&d4);lin_free(&d4);
+        lin_free(&l1);lin_free(&l2);
+        return 0;
+    }
+    /* int_max(a,b,m) / int_min(a,b,m): m = max/min of a,b.  Requires a binary
+       selection: use a big-M encoding with a binary flag s.  For max:
+         m >= a, m >= b,
+         m <= a + M*s,  m <= b + M*(1-s)   (choose a if s=0, b if s=1)
+       For min:
+         m <= a, m <= b,
+         m >= a - M*s,  m >= b - M*(1-s) */
+    if(strcmp(p,"int_max")==0||strcmp(p,"int_min")==0){
+        int ismax=(strcmp(p,"int_max")==0);
+        if(c->nargs<3)return -1;
+        if(parse_lin(m,c->args[0],&l1)!=0)return -1;
+        if(parse_lin(m,c->args[1],&l2)!=0){lin_free(&l1);return -1;}
+        if(parse_lin(m,c->args[2],&l3)!=0){lin_free(&l1);lin_free(&l2);return -1;}
+        if(l1.n!=1||l2.n!=1||l3.n!=1){lin_free(&l1);lin_free(&l2);lin_free(&l3);return 1;}
+        int a=l1.idx[0], bb=l2.idx[0], mm=l3.idx[0];
+        double M = fmax(fabs(b->lo[a]),fabs(b->hi[a]));
+        M = fmax(M, fmax(fabs(b->lo[bb]),fabs(b->hi[bb])));
+        M = fmax(M,1.0)*2.0;
+        int s=b_newvar(b,0.0,1.0);
+        if(ismax){
+            Lin d1;memset(&d1,0,sizeof(d1));lin_term(&d1,mm,1.0);lin_term(&d1,a,-1.0);b_put(b,'>',0.0,&d1);lin_free(&d1);
+            Lin d2;memset(&d2,0,sizeof(d2));lin_term(&d2,mm,1.0);lin_term(&d2,bb,-1.0);b_put(b,'>',0.0,&d2);lin_free(&d2);
+            Lin d3;memset(&d3,0,sizeof(d3));lin_term(&d3,mm,1.0);lin_term(&d3,a,-1.0);lin_term(&d3,s,-M);b_put(b,'<',0.0,&d3);lin_free(&d3);
+            Lin d4;memset(&d4,0,sizeof(d4));lin_term(&d4,mm,1.0);lin_term(&d4,bb,-1.0);lin_term(&d4,s,M);d4.constant-=M;b_put(b,'<',0.0,&d4);lin_free(&d4);
+        } else {
+            Lin d1;memset(&d1,0,sizeof(d1));lin_term(&d1,mm,1.0);lin_term(&d1,a,-1.0);b_put(b,'<',0.0,&d1);lin_free(&d1);
+            Lin d2;memset(&d2,0,sizeof(d2));lin_term(&d2,mm,1.0);lin_term(&d2,bb,-1.0);b_put(b,'<',0.0,&d2);lin_free(&d2);
+            Lin d3;memset(&d3,0,sizeof(d3));lin_term(&d3,mm,1.0);lin_term(&d3,a,-1.0);lin_term(&d3,s,M);b_put(b,'>',0.0,&d3);lin_free(&d3);
+            Lin d4;memset(&d4,0,sizeof(d4));lin_term(&d4,mm,1.0);lin_term(&d4,bb,-1.0);lin_term(&d4,s,-M);d4.constant+=M;b_put(b,'>',0.0,&d4);lin_free(&d4);
+        }
+        lin_free(&l1);lin_free(&l2);lin_free(&l3);
+        return 0;
+    }
+    /* bool2int(b, i): i = b (0/1 to int).  i - b = 0. */
+    if(strcmp(p,"bool2int")==0){
+        if(c->nargs<2)return -1;
+        if(parse_lin(m,c->args[0],&l1)!=0)return -1;
+        if(parse_lin(m,c->args[1],&l2)!=0){lin_free(&l1);return -1;}
+        Lin dd;memset(&dd,0,sizeof(dd));lin_into(&dd,&l2,1.0);lin_into(&dd,&l1,-1.0);b_put(b,'=',0.0,&dd);
+        lin_free(&l1);lin_free(&l2);lin_free(&dd);return 0;
+    }
+    /* int2float(a,f): f = a (integer value as float) */
+    if(strcmp(p,"int2float")==0){
+        if(c->nargs<2)return -1;
+        if(parse_lin(m,c->args[0],&l1)!=0)return -1;
+        if(parse_lin(m,c->args[1],&l2)!=0){lin_free(&l1);return -1;}
+        Lin dd;memset(&dd,0,sizeof(dd));lin_into(&dd,&l2,1.0);lin_into(&dd,&l1,-1.0);b_put(b,'=',0.0,&dd);
+        lin_free(&l1);lin_free(&l2);lin_free(&dd);return 0;
+    }
+    /* set_in(x, {set of ints}): x must be one of the values.  Only handle
+       when x is a variable and the set has values -> add as box bounds if
+       contiguous or as a union; for a discrete set use x in {v1,v2,..} via
+       x - vk (rel) via a disjunction which we cannot model linearly without
+       binaries.  For a single value or contiguous range we handle it; else
+       UNKNOWN. */
+    if(strcmp(p,"set_in")==0){
+        if(c->nargs<2)return -1;
+        Lin xl; if(parse_lin(m,c->args[0],&xl)!=0)return -1;
+        if(xl.n!=1){lin_free(&xl);return 1;}
+        int x=xl.idx[0];
+        const char*set=c->args[1];
+        char setbuf[512]; strncpy(setbuf,set,511); setbuf[511]=0;
+        char*br=strchr(setbuf,'{');
+        if(br){ br++; char*br2=strchr(br,'}'); if(br2)*br2=0; }
+        else br=setbuf;
+        long vals[256]; int nvals=0; long vmin=1000000000L,vmax=-1000000000L;
+        char*dd=strchr(br,'.');
+        if(dd){
+            *dd=0; long lo=atol(br), hi=atol(dd+2);
+            if(lo<=hi && hi-lo+1<=256){ for(long v=lo;v<=hi;v++){vals[nvals++]=(int)v; if(v<vmin)vmin=v; if(v>vmax)vmax=v;} }
+            else { lin_free(&xl); return 1; }
+        } else {
+            char*tok=strtok(br,", \t");
+            while(tok && nvals<256){ long v=atol(tok); vals[nvals++]=(int)v; if(nvals==1||v<vmin)vmin=v; if(v>vmax)vmax=v; tok=strtok(NULL,", \t"); }
+        }
+        if(nvals==0){lin_free(&xl);return 1;}
+        if(nvals==1){ b->lo[x]=vals[0];b->haslo[x]=1;b->hi[x]=vals[0];b->hashi[x]=1; lin_free(&xl); return 0; }
+        /* multi-value: SOS1 via binaries b_i, x = sum b_i*v_i, sum b_i = 1 */
+        int *bs=(int*)malloc((size_t)nvals*sizeof(int));
+        for(int i=0;i<nvals;i++) bs[i]=b_newvar(b,0.0,1.0);
+        Lin eq;memset(&eq,0,sizeof(eq));
+        lin_term(&eq,x,1.0);
+        for(int i=0;i<nvals;i++) lin_term(&eq,bs[i],-(double)vals[i]);
+        b_put(b,'=',0.0,&eq);
+        Lin sum;memset(&sum,0,sizeof(sum));
+        for(int i=0;i<nvals;i++) lin_term(&sum,bs[i],1.0);
+        sum.constant=-1.0;
+        b_put(b,'=',0.0,&sum);
+        lin_free(&eq);lin_free(&sum);
+        free(bs);lin_free(&xl);
+        return 0;
+    }
+    /* all_different(x[]): pairwise x_i != x_j.  For bounded integer vars this
+       is a global constraint; linearize as x_i - x_j (rel) 0 is not exact for
+       != (disjunction).  Use pairwise bounds when domains are tiny (enumerate)
+       is impractical; return UNKNOWN for general. */
+    if(strcmp(p,"all_different_int")==0||strcmp(p,"all_different")==0){
+        return 1;   /* needs a dedicated global handler (TODO) */
+    }
     /* everything else: unhandled (return UNKNOWN at top level) */
     return 1;
 }
@@ -585,57 +779,85 @@ void fz_solve(const FZModel*m,FZSolution*sol)
     memset(sol,0,sizeof(*sol));
     int nv=m->nvars; sol->nvars=nv; sol->x=(double*)calloc((size_t)(nv?nv:1),sizeof(double));
     if(nv==0){sol->status=3;return;}
-    Builder b;memset(&b,0,sizeof(b));b.nvars=nv;
-    b.lo=(double*)malloc((size_t)nv*sizeof(double));b.hi=(double*)malloc((size_t)nv*sizeof(double));
-    b.haslo=(int*)calloc((size_t)nv,sizeof(int));b.hashi=(int*)calloc((size_t)nv,sizeof(int));
+    Builder b;memset(&b,0,sizeof(b));b.nvars=nv;b.varcap=nv?nv:16;
+    b.lo=(double*)malloc((size_t)b.varcap*sizeof(double));b.hi=(double*)malloc((size_t)b.varcap*sizeof(double));
+    b.haslo=(int*)calloc((size_t)b.varcap,sizeof(int));b.hashi=(int*)calloc((size_t)b.varcap,sizeof(int));
     /* FlatZinc `var int/float` are unbounded by default; our LP solver needs
        finite bounds, so clamp undecorated variables to a big-M interval. */
     const double BIG = 1e9;
     for(int i=0;i<nv;i++){b.lo[i]=-BIG;b.hi[i]=BIG;}
-    for(int d=0;d<m->ndecl;d++){FZDecl*decl=&m->decls[d];if(!decl->is_var||decl->base_idx<0)continue;
+    for(int d=0;d<m->ndecl;d++){FZDecl*decl=&m->decls[d];
+        if(!decl->is_var||decl->base_idx<0)continue;
+        if(decl->is_alias)continue;   /* alias elements get bounds from their own decls */
         for(int e=0;e<decl->n;e++){int vi=decl->base_idx+e;
             /* bool variables are implicitly 0..1 in FlatZinc */
             if(decl->kind==FZ_K_BOOL){ b.lo[vi]=0; b.hi[vi]=1; b.haslo[vi]=1; b.hashi[vi]=1; continue; }
             if(decl->has_lo){b.lo[vi]=decl->lo[0];b.haslo[vi]=1;}
             if(decl->has_hi){b.hi[vi]=decl->hi[0];b.hashi[vi]=1;}}}
     int unhandled=0;
+    /* enforce exact set-domain declarations (var {1,3,5}: x) via SOS1 */
+    for(int d=0;d<m->ndecl;d++){FZDecl*decl=&m->decls[d];
+        if(!decl->is_var||decl->base_idx<0||decl->nset<=0||decl->n!=1)continue;
+        int x=decl->base_idx;
+        if(decl->nset==1){ b.lo[x]=decl->setvals[0];b.haslo[x]=1;b.hi[x]=decl->setvals[0];b.hashi[x]=1; continue; }
+        /* contiguous range already tightened; if gapped, add SOS1 */
+        int contiguous=1;
+        for(int q=1;q<decl->nset;q++) if(decl->setvals[q]!=decl->setvals[0]+q) {contiguous=0;break;}
+        if(contiguous) continue;
+        int *bs=(int*)malloc((size_t)decl->nset*sizeof(int));
+        for(int i=0;i<decl->nset;i++) bs[i]=b_newvar(&b,0.0,1.0);
+        Lin eq;memset(&eq,0,sizeof(eq));lin_term(&eq,x,1.0);
+        for(int i=0;i<decl->nset;i++) lin_term(&eq,bs[i],-(double)decl->setvals[i]);
+        b_put(&b,'=',0.0,&eq);
+        Lin sum;memset(&sum,0,sizeof(sum));
+        for(int i=0;i<decl->nset;i++) lin_term(&sum,bs[i],1.0);
+        sum.constant=-1.0; b_put(&b,'=',0.0,&sum);
+        lin_free(&eq);lin_free(&sum);free(bs);
+    }
     for(FZConstr*c=m->constr;c;c=c->next){int r=handle_constraint((FZModel*)m,&b,c);if(r!=0)unhandled=1;}
+
     if(unhandled){for(int r=0;r<b.nrows;r++){free(b.rows[r].idx);free(b.rows[r].coef);}free(b.rows);free(b.lo);free(b.hi);free(b.haslo);free(b.hashi);sol->status=2;return;}
 
+    int ntot=b.nvars;
     LP lp;memset(&lp,0,sizeof(lp));
-    lp.n=nv;lp.m=b.nrows;lp.maximize=1;
-    lp.c=(double*)calloc((size_t)nv,sizeof(double));
-    if(m->solve_kind==2){for(int i=0;i<m->objective.n;i++){int vi=m->objective.idx[i];if(vi>=0&&vi<nv)lp.c[vi]+=m->objective.coef[i];}}
-    else if(m->solve_kind==1){lp.maximize=0;for(int i=0;i<m->objective.n;i++){int vi=m->objective.idx[i];if(vi>=0&&vi<nv)lp.c[vi]+=m->objective.coef[i];}}
-    lp.l=(double*)malloc((size_t)nv*sizeof(double));lp.u=(double*)malloc((size_t)nv*sizeof(double));
-    for(int i=0;i<nv;i++){lp.l[i]=b.lo[i];lp.u[i]=b.hi[i];}
+    lp.n=ntot;lp.m=b.nrows;lp.maximize=1;
+    lp.c=(double*)calloc((size_t)ntot,sizeof(double));
+    if(m->solve_kind==2){for(int i=0;i<m->objective.n;i++){int vi=m->objective.idx[i];if(vi>=0&&vi<ntot)lp.c[vi]+=m->objective.coef[i];}}
+    else if(m->solve_kind==1){lp.maximize=0;for(int i=0;i<m->objective.n;i++){int vi=m->objective.idx[i];if(vi>=0&&vi<ntot)lp.c[vi]+=m->objective.coef[i];}}
+    lp.l=(double*)malloc((size_t)ntot*sizeof(double));lp.u=(double*)malloc((size_t)ntot*sizeof(double));
+    for(int i=0;i<ntot;i++){lp.l[i]=b.lo[i];lp.u[i]=b.hi[i];}
     long nnz=0;for(int r=0;r<b.nrows;r++)nnz+=b.rows[r].n;
     lp.b=(double*)malloc((size_t)(b.nrows?b.nrows:1)*sizeof(double));lp.rel=(char*)malloc((size_t)(b.nrows?b.nrows:1));
     for(int r=0;r<b.nrows;r++){lp.b[r]=b.rows[r].rhs;lp.rel[r]=b.rows[r].rel;}
-    lp.Acolptr=(int*)calloc((size_t)(nv+1),sizeof(int));
+    lp.Acolptr=(int*)calloc((size_t)(ntot+1),sizeof(int));
     lp.Arow=(int*)malloc((size_t)(nnz?nnz:1)*sizeof(int));lp.Aval=(double*)malloc((size_t)(nnz?nnz:1)*sizeof(double));
-    for(int r=0;r<b.nrows;r++)for(int k=0;k<b.rows[r].n;k++){int j=b.rows[r].idx[k];if(j>=0&&j<nv)lp.Acolptr[j+1]++;}
-    for(int j=0;j<nv;j++)lp.Acolptr[j+1]+=lp.Acolptr[j];
-    int*ff=(int*)malloc((size_t)nv*sizeof(int));for(int j=0;j<nv;j++)ff[j]=lp.Acolptr[j];
-    for(int r=0;r<b.nrows;r++)for(int k=0;k<b.rows[r].n;k++){int j=b.rows[r].idx[k];if(j>=0&&j<nv){lp.Arow[ff[j]]=r;lp.Aval[ff[j]]=b.rows[r].coef[k];ff[j]++;}}
+    for(int r=0;r<b.nrows;r++)for(int k=0;k<b.rows[r].n;k++){int j=b.rows[r].idx[k];if(j>=0&&j<ntot)lp.Acolptr[j+1]++;}
+    for(int j=0;j<ntot;j++)lp.Acolptr[j+1]+=lp.Acolptr[j];
+    int*ff=(int*)malloc((size_t)ntot*sizeof(int));for(int j=0;j<ntot;j++)ff[j]=lp.Acolptr[j];
+    for(int r=0;r<b.nrows;r++)for(int k=0;k<b.rows[r].n;k++){int j=b.rows[r].idx[k];if(j>=0&&j<ntot){lp.Arow[ff[j]]=r;lp.Aval[ff[j]]=b.rows[r].coef[k];ff[j]++;}}
     free(ff);
 
     /* decide integer vs continuous: FlatZinc int/bool vars are integer
        (bool is 0/1); float vars are continuous.  If any integer variable is
        present, solve with the MIP branch-and-bound solver so the answer is
        integral; otherwise the LP relaxation is exact. */
-    unsigned char *isint=(unsigned char*)calloc((size_t)(nv?nv:1),1);
+    unsigned char *isint=(unsigned char*)calloc((size_t)(ntot?ntot:1),1);
     int any_int=0;
     for(int d=0;d<m->ndecl;d++){FZDecl*decl=&m->decls[d];if(!decl->is_var||decl->base_idx<0)continue;
         int integer = (decl->kind!=FZ_K_FLOAT);   /* int and bool are integer */
-        for(int e=0;e<decl->n;e++){int vi=decl->base_idx+e;if(vi>=0&&vi<nv&&integer){isint[vi]=1;any_int=1;}}}
+        for(int e=0;e<decl->n;e++){int vi=decl->base_idx+e;if(vi>=0&&vi<ntot&&integer){isint[vi]=1;any_int=1;}}}
+    /* introduced (auxiliary) variables for big-M encodings (e.g. the binary
+       flag in int_abs) are integer; set them so the MIP keeps them integral. */
+    for(int vi=nv;vi<ntot;vi++){isint[vi]=1;any_int=1;}
+    sol->nvars=ntot;
+    sol->x=(double*)realloc(sol->x,(size_t)(ntot?ntot:1)*sizeof(double));
     if(any_int){
         MIP mip;memset(&mip,0,sizeof(mip));
-        mip.n=nv;mip.m=b.nrows;mip.c=lp.c;mip.Acolptr=lp.Acolptr;mip.Arow=lp.Arow;mip.Aval=lp.Aval;
+        mip.n=ntot;mip.m=b.nrows;mip.c=lp.c;mip.Acolptr=lp.Acolptr;mip.Arow=lp.Arow;mip.Aval=lp.Aval;
         mip.rel=lp.rel;mip.b=lp.b;mip.l=lp.l;mip.u=lp.u;mip.maximize=lp.maximize;
         mip.isint=isint;mip.mip_gap=1e-4;mip.node_limit=200000;mip.lp_iter_limit=2000000;
         MIPResult mr;mip_solve(&mip,&mr);
-        if(mr.status==0){memcpy(sol->x,mr.x,(size_t)nv*sizeof(double));sol->obj=mr.obj;sol->iters=mr.lp_iters;sol->status=0;}
+        if(mr.status==0){memcpy(sol->x,mr.x,(size_t)ntot*sizeof(double));sol->obj=mr.obj;sol->iters=mr.lp_iters;sol->status=0;}
         else if(mr.status==1)sol->status=1;
         else sol->status=2;
         mip_result_free(&mr);
@@ -664,7 +886,7 @@ void fz_print_solution(const FZModel*m,const FZSolution*sol)
 }
 void fz_solution_free(FZSolution*sol){free(sol->x);memset(sol,0,sizeof(*sol));}
 void fz_model_free(FZModel*m){
-    for(int i=0;i<m->ndecl;i++){FZDecl*d=&m->decls[i];free(d->name);free(d->par);free(d->par_int);free(d->lo);free(d->hi);}
+    for(int i=0;i<m->ndecl;i++){FZDecl*d=&m->decls[i];free(d->name);free(d->par);free(d->par_int);free(d->lo);free(d->hi);free(d->setvals);}
     free(m->decls);
     FZConstr*c=m->constr;while(c){FZConstr*nx=c->next;for(int i=0;i<c->nargs;i++)free(c->args[i]);free(c->args);free(c->pred);free(c);c=nx;}
     free(m->objective.idx);free(m->objective.coef);free(m->file);

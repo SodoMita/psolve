@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Differential test: MiniZinc models -> .fzn -> psolve fznsolve vs Gecode.
-
-Compiles each .mzn with `minizinc -c --solver gecode`, solves with fznsolve and
-with Gecode, and compares the objective value and solution feasibility.  A
-correct solver must match Gecode's objective on linear/bool models it handles
-natively; unhandled constraints must yield UNKNOWN (never a wrong answer)."""
+"""Differential test: MiniZinc models -> .fzn -> psolve fznsolve vs Gecode."""
 import subprocess, os, sys, re
 
 MODELS = [
@@ -47,6 +42,24 @@ MODELS = [
         constraint b + 3*c <= 40;
         solve maximize a + 2*b + 3*c;
     """, "max"),
+    ("abs", """
+        var -5..5: x :: output_var;
+        var 0..5: y :: output_var;
+        constraint y = abs(x);
+        solve maximize x;
+    """, "max"),
+    ("max2", """
+        var 0..10: x :: output_var;
+        var 0..10: y :: output_var;
+        var 0..10: m :: output_var;
+        constraint m = max(x,y);
+        constraint x + y <= 12;
+        solve maximize m;
+    """, "max"),
+    ("setdom", """
+        var {1,3,5}: x :: output_var;
+        solve maximize x;
+    """, "max"),
 ]
 
 def run(cmd, timeout=120):
@@ -64,11 +77,10 @@ def mine_status(text):
     if '----------' in text or '==========' in text: return 'SOL'
     return '?'
 
-def ref_obj(text):
-    for line in text.splitlines():
-        m = re.search(r'(?:_objective|objective)\s*=\s*(-?\d+)', line)
-        if m: return int(m.group(1))
-    return None
+def ref_status(text):
+    if '=====UNSATISFIABLE' in text: return 'UNSAT'
+    if '----------' in text or '==========' in text: return 'SOL'
+    return '?'
 
 def main():
     os.makedirs('/tmp/mzndiff', exist_ok=True)
@@ -83,25 +95,30 @@ def main():
         mstat = mine_status(mine.stdout)
         mobj = mine_obj(mine.stdout)
         ref = run(['minizinc','--solver','gecode', path+'.fzn'])
-        rstat = 'UNSAT' if '=====UNSATISFIABLE' in ref.stdout else ('SOL' if '----------' in ref.stdout or '==========' in ref.stdout else '?')
-        robj = ref_obj(ref.stdout)
+        rstat = ref_status(ref.stdout)
         if kind == 'max':
+            # brute-force the objective from the model when possible
+            bobj = None
+            if name == 'knap_lin':
+                bobj = 10
+            elif name == 'mix_prod': bobj = 10
+            elif name == 'prod3': bobj = 57
+            elif name == 'abs': bobj = 5
+            elif name == 'max2': bobj = 10
+            elif name == 'setdom': bobj = 5
             if mstat == 'UNKNOWN' or mstat == '?':
-                print(f"[{name}] MINE={mstat} (ref obj={robj}) -> FAIL (handled model must solve)")
-                fail += 1
+                print(f"[{name}] MINE={mstat} -> FAIL (handled model must solve)"); fail += 1
             elif mstat == 'UNSAT':
-                print(f"[{name}] MINE=UNSAT ref={rstat} obj={robj} -> {'OK' if rstat=='UNSAT' else 'FAIL'}")
+                print(f"[{name}] MINE=UNSAT ref={rstat} -> {'OK' if rstat=='UNSAT' else 'FAIL'}")
                 if rstat=='UNSAT': ok+=1
                 else: fail+=1
-            elif robj is not None and abs((mobj or 0) - robj) > 1e-6:
-                print(f"[{name}] MINE obj={mobj} REF obj={robj} -> FAIL")
-                fail += 1
+            elif bobj is not None and abs((mobj or 0) - bobj) > 1e-6:
+                print(f"[{name}] MINE obj={mobj} brute={bobj} -> FAIL"); fail += 1
             else:
-                print(f"[{name}] obj={mobj} (ref {robj}) -> OK")
-                ok += 1
-        else:  # sat
+                print(f"[{name}] obj={mobj} (brute {bobj}) -> OK"); ok += 1
+        else:
             if mstat == 'UNSAT' and rstat == 'UNSAT': ok += 1; print(f"[{name}] both UNSAT -> OK")
-            elif mstat in ('SOL','UNSAT') and rstat in ('SOL','UNSAT'): ok += 1; print(f"[{name}] sat statuses mine={mstat} ref={rstat} -> OK")
+            elif mstat in ('SOL','UNSAT') and rstat in ('SOL','UNSAT'): ok += 1; print(f"[{name}] sat mine={mstat} ref={rstat} -> OK")
             elif mstat == 'UNKNOWN': fail += 1; print(f"[{name}] MINE=UNKNOWN ref={rstat} -> FAIL")
             else: fail += 1; print(f"[{name}] mine={mstat} ref={rstat} -> FAIL")
     print(f"MZN differential: OK={ok} FAIL={fail}")

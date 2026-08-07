@@ -1,0 +1,4 @@
+
+        var {1,3,5}: x :: output_var;
+        solve maximize x;
+    

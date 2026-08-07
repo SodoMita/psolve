@@ -43,6 +43,8 @@ typedef struct {
     /* domain bounds for vars (from :: l..u annotation); -inf/+inf if unset */
     double *lo, *hi;
     int   has_lo, has_hi;   /* any element has a bound */
+    long  *setvals; int nset;  /* exact set domain (if gapped), for SOS1 */
+    int is_alias;      /* var-array that aliases already-declared vars */
 } FZDecl;
 
 typedef struct {

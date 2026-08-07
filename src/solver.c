@@ -273,7 +273,7 @@ Solver *solver_create(const LP *lp)
 
     /* initial refactorization */
     refactorize(s);
-    free(mlt);
+        free(mlt);
     return s;
 }
 
@@ -772,7 +772,6 @@ int solver_solve(Solver *s)
             s->cobj[av] = -1.0;      /* all artificials, basic or not */
         }
         r = solve_phase(s);
-                if(getenv("PD"))fprintf(stderr,"P1END2 r=%d\n", r);
         if (r == 2) { s->status_out = 2; return 2; }
         if (r != 0) { s->status_out = 1; return 1; }
 
