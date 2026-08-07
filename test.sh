@@ -38,4 +38,11 @@ gcc -O2 -march=native -I src tools/incr_test.c src/solver.c src/splu.c src/lu.c 
 gcc -O2 -march=native -I src tools/incr_rand.c src/solver.c src/splu.c src/lu.c src/kernels.c src/parser.c -o /tmp/incr_rand -lm
 /tmp/incr_rand | tail -1
 
+echo "[7/7] Fuzz malformed inputs under ASan/UBSan..."
+if command -v gcc >/dev/null; then
+  python3 tools/fuzz_inputs.py --iters 80 --seed 7
+else
+  echo "  (skipped: gcc not available)"
+fi
+
 echo "Done."

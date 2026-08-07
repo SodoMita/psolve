@@ -14,12 +14,17 @@ harness, and an incremental-solving test.
 ## Building
 
 ```sh
-make            # produces ./lpsolve (requires GCC, x86-64 with AVX-512)
+make            # produces ./lpsolve and ./qpsolve
 make clean
 ```
 
-The Makefile uses `-march=native -mavx512f -mfma`. On a CPU without AVX-512 the
-code falls back to AVX2/SSE2/scalar automatically (see `src/kernels.c`).
+The default `ARCH=-march=native` builds for the CPU it is compiled on: on an
+AVX-512 machine the vectorized kernels are used; on older CPUs the compiler
+emits the scalar/AVX2 fallbacks (see `src/kernels.c`).  To target a specific
+baseline, pass e.g. `make ARCH="-march=x86-64 -mavx2"`.  Because the code uses
+compile-time feature detection, **a binary is only guaranteed to run on the
+architecture (or newer) that it was built for** — build on the target host, or
+with an explicit baseline `ARCH`.
 
 ## Usage
 
@@ -37,6 +42,31 @@ correctly reports `OPTIMAL`, `INFEASIBLE`, or `UNBOUNDED`.
 The QP solver handles: **minimize** ½xᵀQx + cᵀx subject to Ax ≤ b with Q
 symmetric positive semi-definite (convex), reporting the optimum, Lagrange
 multipliers, and status (solved / infeasible).
+
+## Security & untrusted input
+
+`lpsolve` and `qpsolve` parse files supplied on the command line, which may be
+attacker-controlled.  The parsers are hardened accordingly:
+
+- **Dimensions, counts, and matrix indices are validated** before any
+  allocation or indexing (`n`, `m`, `nnz` non-negative and bounded; every
+  `row`/`col` triplet in range).  Malformed input is rejected cleanly instead
+  of corrupting memory.
+- **Relation tokens are read into a bounded buffer** (no unbounded `%s`) and
+  their characters validated.
+- **Allocations are checked**, and error paths free partial state so a caller
+  can safely `lp_free()`.
+- **Dense QP dimensions are capped** (`MAX_QPDIM=8192`) so a hostile `n` cannot
+  trigger a multi-gigabyte allocation.
+- The **build is hardened**: stack canaries, `_FORTIFY_SOURCE=2`, format
+  security warnings, PIE + full RELRO, non-executable stack.
+
+Run a memory-safety sweep with:
+
+```sh
+make asan                                   # AddressSanitizer + UBSan binaries
+python3 tools/fuzz_inputs.py --iters 200 --seed 1   # fuzz malformed .lp/.qp
+```
 
 ## Incremental solving
 
@@ -63,7 +93,8 @@ maximize|minimize
 <n> <m>
 <c_1 ... c_n>            # objective coefficients
 <b_1 ... b_m>            # right-hand sides
-<rel[0..m-1]>            # one token, chars '<' '>' '='  (e.g. <<=<<)
+<rel[0..m-1]>            # one token of concatenated relations, each '<' '>' '=' '<='
+                        #   or '>='  (e.g. <<=<< means <, <, =, <, <;  <=<=< is <=, <=, <)
 <lo_1> <hi_1>            # per variable: bounds, 'inf' for unbounded
 ...
 <nnz>

@@ -20,7 +20,7 @@ int main(int argc, char **argv)
     if (lp_read(path, &lp) != 0) return 1;
 
     Solver *s = solver_create(&lp);
-    if (!s) return 1;
+    if (!s) { lp_free(&lp); return 1; }
 
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -31,6 +31,7 @@ int main(int argc, char **argv)
     if (r == 0 && !solver_feasible(s)) {
         solver_destroy(s);
         s = solver_create(&lp);
+        if (!s) { lp_free(&lp); return 1; }
         s->sparse_disabled = 1;  /* force dense from the start */
         s->use_sparse = 0;
         r = solver_solve(s);
@@ -46,8 +47,9 @@ int main(int argc, char **argv)
     } else if (r == 2) {
         printf("status: UNBOUNDED\n");
     } else {
-        double *xo = (double*)malloc(lp.n * sizeof(double));
+        double *xo = (double*)malloc((size_t)(lp.n > 0 ? lp.n : 1) * sizeof(double));
         double obj;
+        if (!xo) { solver_destroy(s); lp_free(&lp); return 1; }
         solver_optimum(s, xo, &obj);
         printf("status: OPTIMAL\n");
         printf("objective: %.15g\n", obj);

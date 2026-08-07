@@ -831,6 +831,9 @@ int solver_warm_solve(Solver *s)
 int solver_add_row(Solver *s, const double *a, double rhs, char rel)
 {
     int n = s->n_orig, m = s->M;
+    /* F-06: guard against dimension overflow / abuse before allocating */
+    if (n <= 0 || m < 0 || m >= 1000000) return -1;
+    if (rel != '<' && rel != '>' && rel != '=') return -1;
     /* Reconstruct the current LP (original constraints) from the solver state,
        add the new row, and do a clean full re-solve.  This is guaranteed to
        match a from-scratch solve regardless of the solver's prior state. */

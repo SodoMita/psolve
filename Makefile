@@ -1,8 +1,24 @@
 CC      ?= gcc
 OPT     ?= -O3
+# Architecture.  Default to native auto-detection: with -march=native the
+# compiler emits AVX-512 only on machines that support it and the scalar
+# fallback otherwise, so the binary runs on the machine it was built for.
+# To build for a specific baseline set, e.g.:
+#   make ARCH="-march=x86-64 -mavx2"
 ARCH    ?= -march=native
-CFLAGS   = -std=gnu11 -Wall -Wextra -O3 $(ARCH) -mavx512f -mfma -funroll-loops \
-           -fno-math-errno -ffast-math
+
+# Performance flags.  NOTE: -mavx512f/-mfma are NOT forced here; they are only
+# active if the chosen ARCH enables them.  Forcing them unconditionally would
+# make the binary SIGILL on CPUs without AVX-512.
+PERF    = -funroll-loops -fno-math-errno -ffast-math
+
+# Defensive hardening (F-08): stack protector, FORTIFY_SOURCE, format checks,
+# and PIE + RELRO so ROP/GOT-overwrite attacks are harder.
+HARDEN  = -fstack-protector-strong -D_FORTIFY_SOURCE=2 \
+          -Wformat=2 -Werror=format-security -fPIE
+LDFLAGS = -pie -Wl,-z,relro,-z,now -Wl,--as-needed -Wl,-z,noexecstack
+
+CFLAGS   = -std=gnu11 -Wall -Wextra $(OPT) $(ARCH) $(PERF) $(HARDEN)
 LDLIBS   = -lm
 
 SRC = src/kernels.c src/lu.c src/splu.c src/solver.c src/parser.c src/main.c
@@ -13,21 +29,21 @@ QPOBJ = $(QPSRC:.c=.o)
 all: lpsolve qpsolve
 
 lpsolve: $(OBJ)
-	$(CC) $(CFLAGS) -o $@ $(OBJ) $(LDLIBS)
+	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -o $@ $(OBJ) $(LDFLAGS) $(LDLIBS)
 
 qpsolve: src/qp.o src/lu.o src/kernels.o tools/qpsolve.o
-	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -o $@ $^ $(LDFLAGS) $(LDLIBS)
 
-src/qp.o: src/qp.c src/qp.h src/lu.h
-	$(CC) $(CFLAGS) -I src -c -o $@ $<
+# AddressSanitizer + UndefinedBehaviorSanitizer debug build (not for
+# production): catches memory-safety and UB bugs on malformed input.
+asan: clean
+	$(MAKE) OPT="-O1 -g" PERF="-fno-omit-frame-pointer" \
+		CFLAGS_EXTRA="-fsanitize=address,undefined" all
 
-tools/qpsolve.o: tools/qpsolve.c src/qp.h
-	$(CC) $(CFLAGS) -I src -c -o $@ $<
-
-%.o: %.c src/solver.h src/kernels.h src/lu.h src/splu.h src/parser.h src/qp.h
-	$(CC) $(CFLAGS) -I src -c -o $@ $<
+%.o: %.c
+	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -I src -c -o $@ $<
 
 clean:
 	rm -f lpsolve qpsolve src/*.o tools/*.o
 
-.PHONY: all clean
+.PHONY: all asan clean
