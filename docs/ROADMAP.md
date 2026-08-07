@@ -128,13 +128,21 @@ feature completeness against a huge standard corpus.
 - [x] **bool vars** bounded to [0,1]; array output uses `array1d(lo..hi,[..])`.
 - [x] More handlers: `bool_and/or/xor/not/clause(+reif)`, `array_bool_and/or`,
       `int_neg` (fixed an `array_bool_and` constraint-sign bug).
-- [ ] More handlers: `all_different`, `element`, `set_in`, `int_abs/max/min`,
-      `float_*`, `int2float`, reified forms, etc.
+- [x] More handlers: `int_abs`/`int_max`/`int_min` (big-M with binary flags),
+      `int_times`/`float_times` (constant-operand linearization),
+      `set_in` + set-domain decls (SOS1), `bool2int`/`int2float`,
+      `all_different` (exact domain/permutation encoding),
+      `array_int_element` + `gecode_int_element` (SOS1 element lookup).
+- [ ] More handlers: `float_*` relational variants, reified forms,
+      `int_lin_ne`, `count`/`among`, `cumulative`, `circuit`, `table`.
 - [x] **MIP bridge**: when the model has integer vars, `fz_solve` dispatches to
       the MIP branch-and-bound so answers are integral (objectives match brute
       force, e.g. knapsack=10, prod3=57).
 - [ ] MIP CLI bridge (integer var list, node/time limits, best-bound stats).
-- [ ] CLI flags (`-a`, `-n`, `-t`, `-s`, `-v`, SIGINT), time-limit signal.
+- [x] CLI flags: `-n` (node limit), `-t` (time limit via alarm), `-s` (stats),
+      `-v` (verbose), SIGINT handler; `fznsolve` prints objective always and
+      `objectiveBound`/`nodes` in stats.
+- [ ] CLI: `-a` (all solutions), `-f` (free search).
 - [x] **MiniZinc differential** (`tools/mzn_diff.py`): compiles real `.mzn`
       models with the MiniZinc compiler and compares fznsolve vs Gecode
       (objectives + feasibility).  Models in `examples/mzn/`.

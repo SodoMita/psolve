@@ -95,6 +95,9 @@ typedef struct {
     double *x;           /* value per solver variable index */
     double obj;
     long  iters;
+    long  nodes;
+    double best_bound;
+    long  node_limit;
 } FZSolution;
 
 /* Build + solve the LP from the model.  Unhandled constraints -> UNKNOWN. */

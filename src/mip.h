@@ -43,6 +43,7 @@ typedef struct {
     int *isint_sol;        /* reported integrality status per var (0/1) */
     long nodes;            /* nodes explored */
     long lp_iters;         /* total simplex iterations across all nodes */
+    double best_bound;     /* best LP-relaxation bound over open nodes */
 } MIPResult;
 
 void mip_solve(const MIP *mip, MIPResult *res);

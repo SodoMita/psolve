@@ -149,7 +149,8 @@ static int parse_lin(FZModel*m,const char*s,Lin*out)
 static int parse_array(FZModel*m,const char*s,Lin**out,int*outn)
 {
     /* An array argument may be a bare identifier naming a previously-declared
-       par array (e.g. X_INTRODUCED_1_ = [1,1]).  Resolve it to its elements. */
+       array: a par array (e.g. X_INTRODUCED_1_ = [1,1]) or a var array that
+       aliases introduced vars (e.g. x = [X0,X1,..]).  Resolve to elements. */
     {
         char name[256]; int k=0; const char*p=s;
         while(*p==' ')p++;
@@ -159,14 +160,25 @@ static int parse_array(FZModel*m,const char*s,Lin**out,int*outn)
             while(*p==' ')p++;
             if(*p=='\0'||*p==';'){   /* it's just an identifier */
                 FZDecl*d=find_decl(m,name);
-                if(d&&d->is_array&&d->par){
-                    *outn=d->n;
-                    *out=(Lin*)malloc((size_t)(d->n?d->n:1)*sizeof(Lin));
-                    for(int i=0;i<d->n;i++){
-                        memset(&(*out)[i],0,sizeof(Lin));
-                        (*out)[i].constant=d->par[i];
+                if(d&&d->is_array){
+                    if(d->par){   /* par array of constants */
+                        *outn=d->n;
+                        *out=(Lin*)malloc((size_t)(d->n?d->n:1)*sizeof(Lin));
+                        for(int i=0;i<d->n;i++){
+                            memset(&(*out)[i],0,sizeof(Lin));
+                            (*out)[i].constant=d->par[i];
+                        }
+                        return 0;
                     }
-                    return 0;
+                    if(d->is_var && d->base_idx>=0){  /* var array alias */
+                        *outn=d->n;
+                        *out=(Lin*)malloc((size_t)(d->n?d->n:1)*sizeof(Lin));
+                        for(int i=0;i<d->n;i++){
+                            memset(&(*out)[i],0,sizeof(Lin));
+                            lin_term(&(*out)[i], d->base_idx+i, 1.0);
+                        }
+                        return 0;
+                    }
                 }
             }
         }
@@ -763,12 +775,103 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
         free(bs);lin_free(&xl);
         return 0;
     }
-    /* all_different(x[]): pairwise x_i != x_j.  For bounded integer vars this
-       is a global constraint; linearize as x_i - x_j (rel) 0 is not exact for
-       != (disjunction).  Use pairwise bounds when domains are tiny (enumerate)
-       is impractical; return UNKNOWN for general. */
-    if(strcmp(p,"all_different_int")==0||strcmp(p,"all_different")==0){
-        return 1;   /* needs a dedicated global handler (TODO) */
+    /* all_different(x[]): each variable takes a distinct value.
+       Exact encoding for bounded integer domains via the assignment
+       (permutation) formulation: binary y_{i,v} = [x_i == v],
+         sum_v y_{i,v} = 1            (each var takes one value)
+         sum_i y_{i,v} <= 1           (each value used at most once)
+         x_i = sum_v v * y_{i,v}
+       Works when the common domain is small (<= 128 values). */
+    if(strcmp(p,"all_different_int")==0||strcmp(p,"fzn_all_different_int")==0||strcmp(p,"all_different")==0){
+        if(c->nargs<1)return -1;
+        Lin*arr;int narr;
+        if(parse_array(m,c->args[0],&arr,&narr)!=0)return -1;
+        /* domain: min/max over all vars' bounds */
+        double dlo=1e18, dhi=-1e18; int anyvar=0;
+        for(int i=0;i<narr;i++){
+            if(arr[i].n!=1){free_lins(arr,narr);return 1;}
+            int v=arr[i].idx[0];
+            if(v<0||v>=b->nvars){free_lins(arr,narr);return 1;}
+            if(b->lo[v]<dlo)dlo=b->lo[v];
+            if(b->hi[v]>dhi)dhi=b->hi[v];
+            anyvar=1;
+        }
+        if(!anyvar){free_lins(arr,narr);return 1;}
+        long ndom=(long)(dhi-dlo)+1;
+        if(ndom<=0||ndom>128){free_lins(arr,narr);return 1;}   /* too big */
+        /* y_{i,v}: index = i*ndom + (v-dlo) */
+        int *y=(int*)malloc((size_t)narr*ndom*sizeof(int));
+        for(int i=0;i<narr;i++)for(int vv=0;vv<ndom;vv++){
+            y[i*ndom+vv]=b_newvar(b,0.0,1.0);
+        }
+        /* each var takes one value: sum_v y = 1 ;  x_i = sum v*y */
+        for(int i=0;i<narr;i++){
+            Lin s;memset(&s,0,sizeof(s));
+            for(int vv=0;vv<ndom;vv++) lin_term(&s,y[i*ndom+vv],1.0);
+            s.constant=-1.0; b_put(b,'=',0.0,&s); lin_free(&s);
+            Lin e;memset(&e,0,sizeof(e)); lin_term(&e,arr[i].idx[0],1.0);
+            for(int vv=0;vv<ndom;vv++) lin_term(&e,y[i*ndom+vv],-(double)(dlo+vv));
+            b_put(b,'=',0.0,&e); lin_free(&e);
+        }
+        /* each value used at most once: sum_i y <= 1 */
+        for(int vv=0;vv<ndom;vv++){
+            Lin s;memset(&s,0,sizeof(s));
+            for(int i=0;i<narr;i++) lin_term(&s,y[i*ndom+vv],1.0);
+            s.constant=-1.0; b_put(b,'<',0.0,&s); lin_free(&s);
+        }
+        free(y); free_lins(arr,narr);
+        return 0;
+    }
+    /* array element: val = arr[index] (1-based), or the Gecode-specific
+       gecode_int_element(index, offset, [arr], val) where index+offset is the
+       array subscript.  Exact SOS1 encoding: binary b_i = [index==i],
+         sum b_i = 1, index = sum i*b_i + offset, val = sum arr[i]*b_i. */
+    if(strcmp(p,"array_int_element")==0||strcmp(p,"fzn_array_int_element")==0||
+       strcmp(p,"gecode_int_element")==0||strcmp(p,"array_var_int_element")==0){
+        int gec = (strcmp(p,"gecode_int_element")==0);
+        if(gec){
+            if(c->nargs<4)return -1;
+            /* index, offset, [arr], val */
+            Lin il; if(parse_lin(m,c->args[0],&il)!=0)return -1;
+            Lin ol; if(parse_lin(m,c->args[1],&ol)!=0){lin_free(&il);return -1;}
+            Lin*arr;int narr;
+            if(parse_array(m,c->args[2],&arr,&narr)!=0){lin_free(&il);lin_free(&ol);return -1;}
+            Lin vl; if(parse_lin(m,c->args[3],&vl)!=0){lin_free(&il);lin_free(&ol);free_lins(arr,narr);return -1;}
+            if(il.n!=1||vl.n!=1){lin_free(&il);lin_free(&ol);lin_free(&vl);free_lins(arr,narr);return 1;}
+            int idx=il.idx[0], val=vl.idx[0];
+            double offset = ol.constant;
+            /* build SOS1 */
+            int *bs=(int*)malloc((size_t)narr*sizeof(int));
+            for(int i=0;i<narr;i++) bs[i]=b_newvar(b,0.0,1.0);
+            Lin s;memset(&s,0,sizeof(s)); for(int i=0;i<narr;i++) lin_term(&s,bs[i],1.0); s.constant=-1.0; b_put(b,'=',0.0,&s); lin_free(&s);
+            Lin ie;memset(&ie,0,sizeof(ie)); lin_term(&ie,idx,1.0);
+            for(int i=0;i<narr;i++) lin_term(&ie,bs[i],-(double)(i+offset));
+            b_put(b,'=',0.0,&ie); lin_free(&ie);
+            Lin ve;memset(&ve,0,sizeof(ve)); lin_term(&ve,val,1.0);
+            for(int i=0;i<narr;i++) lin_term(&ve,bs[i],-arr[i].constant);
+            b_put(b,'=',0.0,&ve); lin_free(&ve);
+            free(bs); lin_free(&il);lin_free(&ol);lin_free(&vl);free_lins(arr,narr);
+            return 0;
+        }
+        /* array_int_element(index, [arr], val)  -- 3-arg MiniZinc form */
+        if(c->nargs<3)return -1;
+        Lin il; if(parse_lin(m,c->args[0],&il)!=0)return -1;
+        Lin*arr;int narr;
+        if(parse_array(m,c->args[1],&arr,&narr)!=0){lin_free(&il);return -1;}
+        Lin vl; if(parse_lin(m,c->args[2],&vl)!=0){lin_free(&il);free_lins(arr,narr);return -1;}
+        if(il.n!=1||vl.n!=1){lin_free(&il);lin_free(&vl);free_lins(arr,narr);return 1;}
+        int idx=il.idx[0], val=vl.idx[0];
+        int *bs=(int*)malloc((size_t)narr*sizeof(int));
+        for(int i=0;i<narr;i++) bs[i]=b_newvar(b,0.0,1.0);
+        Lin s;memset(&s,0,sizeof(s)); for(int i=0;i<narr;i++) lin_term(&s,bs[i],1.0); s.constant=-1.0; b_put(b,'=',0.0,&s); lin_free(&s);
+        Lin ie;memset(&ie,0,sizeof(ie)); lin_term(&ie,idx,1.0);
+        for(int i=0;i<narr;i++) lin_term(&ie,bs[i],-(double)(i+1));
+        b_put(b,'=',0.0,&ie); lin_free(&ie);
+        Lin ve;memset(&ve,0,sizeof(ve)); lin_term(&ve,val,1.0);
+        for(int i=0;i<narr;i++) lin_term(&ve,bs[i],-arr[i].constant);
+        b_put(b,'=',0.0,&ve); lin_free(&ve);
+        free(bs); lin_free(&il);lin_free(&vl);free_lins(arr,narr);
+        return 0;
     }
     /* everything else: unhandled (return UNKNOWN at top level) */
     return 1;
@@ -814,7 +917,7 @@ void fz_solve(const FZModel*m,FZSolution*sol)
         sum.constant=-1.0; b_put(&b,'=',0.0,&sum);
         lin_free(&eq);lin_free(&sum);free(bs);
     }
-    for(FZConstr*c=m->constr;c;c=c->next){int r=handle_constraint((FZModel*)m,&b,c);if(r!=0)unhandled=1;}
+    for(FZConstr*c=m->constr;c;c=c->next){int r=handle_constraint((FZModel*)m,&b,c);if(getenv("HD"))fprintf(stderr,"constr %s -> %d\n",c->pred,r);if(r!=0)unhandled=1;}
 
     if(unhandled){for(int r=0;r<b.nrows;r++){free(b.rows[r].idx);free(b.rows[r].coef);}free(b.rows);free(b.lo);free(b.hi);free(b.haslo);free(b.hashi);sol->status=2;return;}
 
@@ -857,6 +960,7 @@ void fz_solve(const FZModel*m,FZSolution*sol)
         mip.rel=lp.rel;mip.b=lp.b;mip.l=lp.l;mip.u=lp.u;mip.maximize=lp.maximize;
         mip.isint=isint;mip.mip_gap=1e-4;mip.node_limit=200000;mip.lp_iter_limit=2000000;
         MIPResult mr;mip_solve(&mip,&mr);
+        sol->nodes=mr.nodes; sol->best_bound=mr.best_bound;
         if(mr.status==0){memcpy(sol->x,mr.x,(size_t)ntot*sizeof(double));sol->obj=mr.obj;sol->iters=mr.lp_iters;sol->status=0;}
         else if(mr.status==1)sol->status=1;
         else sol->status=2;

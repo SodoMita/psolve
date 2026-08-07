@@ -60,6 +60,19 @@ MODELS = [
         var {1,3,5}: x :: output_var;
         solve maximize x;
     """, "max"),
+    ("alldiff", """
+        include "alldifferent.mzn";
+        array[1..3] of var 1..3: x :: output_array([1..3]);
+        constraint all_different(x);
+        solve satisfy;
+    """, "sat"),
+    ("element", """
+        array[1..4] of int: arr = [10,20,30,40];
+        var 1..4: idx :: output_var;
+        var int: val :: output_var;
+        constraint val = arr[idx];
+        solve maximize val;
+    """, "max"),
 ]
 
 def run(cmd, timeout=120):
@@ -106,6 +119,7 @@ def main():
             elif name == 'abs': bobj = 5
             elif name == 'max2': bobj = 10
             elif name == 'setdom': bobj = 5
+            elif name == 'element': bobj = 40
             if mstat == 'UNKNOWN' or mstat == '?':
                 print(f"[{name}] MINE={mstat} -> FAIL (handled model must solve)"); fail += 1
             elif mstat == 'UNSAT':

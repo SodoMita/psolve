@@ -97,6 +97,8 @@ void mip_solve(const MIP *mip, MIPResult *res)
 
     double incumbent = mip->maximize ? -1e30 : 1e30;
     int have_incumbent = 0;
+    double best_bound = mip->maximize ? -1e30 : 1e30;
+    res->best_bound = mip->maximize ? 1e30 : -1e30;
     Node *stack = NULL;
     double *lo0 = (double*)psolve_malloc((size_t)n * sizeof(double));
     double *hi0 = (double*)psolve_malloc((size_t)n * sizeof(double));
@@ -127,6 +129,9 @@ void mip_solve(const MIP *mip, MIPResult *res)
         }
 
         /* prune by bound */
+        /* track best bound over solved (not pruned) nodes */
+        if (mip->maximize) { if (obj > best_bound) best_bound = obj; }
+        else { if (obj < best_bound) best_bound = obj; }
         if (have_incumbent) {
             if (mip->maximize && obj <= incumbent + gap * (1.0 + fabs(incumbent))) { free(node->lo); free(node->hi); free(node); continue; }
             if (!mip->maximize && obj >= incumbent - gap * (1.0 + fabs(incumbent))) { free(node->lo); free(node->hi); free(node); continue; }
@@ -184,6 +189,7 @@ void mip_solve(const MIP *mip, MIPResult *res)
     }
 
     res->nodes = nodes;
+    res->best_bound = best_bound;
     if (have_incumbent) {
         status = 0;
         res->obj = incumbent;
