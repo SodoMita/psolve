@@ -26,7 +26,7 @@ def build_asan(bindir):
     base = ['gcc','-O1','-g','-march=native','-fsanitize=address,undefined',
             '-fno-omit-frame-pointer','-I','src']
     cmd = base + ['src/err.c','src/kernels.c','src/lu.c','src/splu.c',
-                  'src/solver.c','src/parser.c','src/qp.c','src/mip.c',
+                  'src/solver.c','src/parser.c','src/qp.c','src/mip.c','src/fx.c',
                   'src/pgs.c','src/pgs_fixed.c','src/fzn.c','tools/fznsolve.c',
                   '-o',os.path.join(bindir,'fznsolve_asan'),'-lm']
     subprocess.run(cmd, check=True)
