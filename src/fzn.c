@@ -8,6 +8,7 @@
 #include <math.h>
 #include <ctype.h>
 #include <limits.h>
+#include <stdint.h>
 
 /* ------------------------------------------------------------------ */
 /* Lexer                                                               */
@@ -1013,9 +1014,10 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
             dd.constant -= k*l1.constant;
             b_put(b,'=',0.0,&dd);lin_free(&dd);
             lin_free(&l1);lin_free(&l2);lin_free(&l3);return 0;
-        } else if(l1.n==1 && l2.n==1 && l3.n==1){
-            int va=l1.idx[0], vb=l2.idx[0], vc=l3.idx[0];
-            if(b->haslo[va] && b->lo[va]>=0.0 && b->hashi[va] && b->hi[va]<=1.0 &&
+        } else {
+            int va,vb,vc;
+            if(lin_unit_var(&l1,&va)==0&&lin_unit_var(&l2,&vb)==0&&lin_unit_var(&l3,&vc)==0&&
+               b->haslo[va] && b->lo[va]>=0.0 && b->hashi[va] && b->hi[va]<=1.0 &&
                b->haslo[vb] && b->lo[vb]>=0.0 && b->hashi[vb] && b->hi[vb]<=1.0){
                 /* boolean conjunction: c = a AND b */
                 Lin d1;memset(&d1,0,sizeof(d1));lin_term(&d1,vc,1.0);lin_term(&d1,va,-1.0);b_put(b,'<',0.0,&d1);lin_free(&d1);
@@ -1028,43 +1030,61 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
         lin_free(&l1);lin_free(&l2);lin_free(&l3);
         return 1;   /* bilinear -> unhandled */
     }
-    /* int_div / int_mod(a, b, c): linear when divisor b is a non-zero constant. */
+    /* int_div / int_mod(a, k, c), for a non-zero constant divisor k.
+       MiniZinc division truncates toward zero and the remainder has the sign
+       of the dividend.  The identity a = k*q + r plus |r| < |k| is NOT enough
+       for negative a: without the sign condition, both adjacent quotients can
+       be feasible.  Encode the sign exactly with nonneg <-> (a >= 0). */
     if(strcmp(p,"int_div")==0||strcmp(p,"int_mod")==0){
         if(c->nargs<3)return -1;
         if(parse_lin(m,c->args[0],&l1)!=0)return -1;
         if(parse_lin(m,c->args[1],&l2)!=0){lin_free(&l1);return -1;}
         if(parse_lin(m,c->args[2],&l3)!=0){lin_free(&l1);lin_free(&l2);return -1;}
-        if(l2.n==0 && fabs(l2.constant)>=1.0){
-            double K = round(l2.constant);
-            int is_div = (strcmp(p,"int_div")==0);
-            if(l1.n==0){
-                long a = (long)llround(l1.constant), bval = (long)llround(K);
-                long res = is_div ? (a / bval) : (a % bval);
-                Lin eq;memset(&eq,0,sizeof(eq)); lin_into(&eq,&l3,1.0); eq.constant=-(double)res;
-                b_put(b,'=',0.0,&eq); lin_free(&eq);
-                lin_free(&l1);lin_free(&l2);lin_free(&l3); return 0;
-            }
-            if(is_div){
-                int rem = b_newvar(b,-fabs(K)+1.0,fabs(K)-1.0);
-                Lin eq;memset(&eq,0,sizeof(eq)); lin_into(&eq,&l1,1.0); lin_into(&eq,&l3,-K); lin_term(&eq,rem,-1.0);
-                b_put(b,'=',0.0,&eq); lin_free(&eq);
-                if(l1.n==1 && b->haslo[l1.idx[0]] && b->lo[l1.idx[0]]>=0){
-                    b->lo[rem]=0.0; b->haslo[rem]=1; b->hi[rem]=fabs(K)-1.0; b->hashi[rem]=1;
-                }
-                lin_free(&l1);lin_free(&l2);lin_free(&l3); return 0;
+        int handled=0;
+        if(l2.n==0 && isfinite(l2.constant) && l2.constant==rint(l2.constant) &&
+           l2.constant!=0.0 && fabs(l2.constant)<=0x1p53){
+            double K=l2.constant, R=fabs(K)-1.0;
+            int is_div=(strcmp(p,"int_div")==0);
+            if(l1.n==0 && isfinite(l1.constant) &&
+               l1.constant==rint(l1.constant) && fabs(l1.constant)<=0x1p53){
+                /* These values are exact integers in double, and their ratio
+                   is far inside int64, so C's truncation-toward-zero semantics
+                   exactly match MiniZinc's div/mod semantics. */
+                long long av=(long long)l1.constant, kv=(long long)K;
+                long long result=is_div ? av/kv : av%kv;
+                Lin eq;memset(&eq,0,sizeof(eq));lin_into(&eq,&l3,1.0);eq.constant-=(double)result;
+                b_put(b,'=',0.0,&eq);lin_free(&eq);handled=1;
             } else {
-                int q = b_newvar(b,-FZ_BIG_BOUND,FZ_BIG_BOUND);
-                Lin eq;memset(&eq,0,sizeof(eq)); lin_into(&eq,&l1,1.0); lin_term(&eq,q,-K); lin_into(&eq,&l3,-1.0);
-                b_put(b,'=',0.0,&eq); lin_free(&eq);
-                if(l1.n==1 && b->haslo[l1.idx[0]] && b->lo[l1.idx[0]]>=0){
-                    Lin rlo;memset(&rlo,0,sizeof(rlo)); lin_into(&rlo,&l3,1.0); b_put(b,'>',0.0,&rlo); lin_free(&rlo);
-                    Lin rhi;memset(&rhi,0,sizeof(rhi)); lin_into(&rhi,&l3,1.0); b_put(b,'<',fabs(K)-1.0,&rhi); lin_free(&rhi);
+                double alo,ahi;
+                if(lin_bounds(b,&l1,&alo,&ahi)==0){
+                    int q=-1,rem=-1;
+                    if(is_div) rem=b_newvar(b,-R,R);
+                    else {
+                        double q1=alo/K,q2=ahi/K;
+                        double qlo=floor(fmin(q1,q2))-1.0;
+                        double qhi=ceil(fmax(q1,q2))+1.0;
+                        q=b_newvar(b,qlo,qhi);
+                    }
+                    Lin eq;memset(&eq,0,sizeof(eq));lin_into(&eq,&l1,1.0);
+                    if(is_div){lin_into(&eq,&l3,-K);lin_term(&eq,rem,-1.0);}
+                    else {lin_term(&eq,q,-K);lin_into(&eq,&l3,-1.0);}
+                    b_put(b,'=',0.0,&eq);lin_free(&eq);
+
+                    int nonneg=b_newvar(b,0.0,1.0);
+                    add_int_reif(b,&l1,nonneg,3); /* nonneg <-> a >= 0 */
+                    /* nonneg=1 -> 0 <= r <= R; nonneg=0 -> -R <= r <= 0. */
+                    Lin rlo;memset(&rlo,0,sizeof(rlo));
+                    if(is_div)lin_term(&rlo,rem,1.0);else lin_into(&rlo,&l3,1.0);
+                    lin_term(&rlo,nonneg,-R);b_put(b,'>',-R,&rlo);lin_free(&rlo);
+                    Lin rhi;memset(&rhi,0,sizeof(rhi));
+                    if(is_div)lin_term(&rhi,rem,1.0);else lin_into(&rhi,&l3,1.0);
+                    lin_term(&rhi,nonneg,-R);b_put(b,'<',0.0,&rhi);lin_free(&rhi);
+                    handled=1;
                 }
-                lin_free(&l1);lin_free(&l2);lin_free(&l3); return 0;
             }
         }
         lin_free(&l1);lin_free(&l2);lin_free(&l3);
-        return 1;
+        return handled?0:1;
     }
     /* int_pow(x, y, z): z = x^y when linear (constant exponent/base or bounded lattice). */
     if(strcmp(p,"int_pow")==0){
@@ -1072,8 +1092,9 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
         if(parse_lin(m,c->args[0],&l1)!=0)return -1;
         if(parse_lin(m,c->args[1],&l2)!=0){lin_free(&l1);return -1;}
         if(parse_lin(m,c->args[2],&l3)!=0){lin_free(&l1);lin_free(&l2);return -1;}
-        if(l2.n==0){
-            long exp = (long)llround(l2.constant);
+        if(l2.n==0&&isfinite(l2.constant)&&l2.constant==rint(l2.constant)&&
+           l2.constant>=0.0&&l2.constant<=1000.0){
+            long exp = (long)l2.constant;
             if(exp == 0){
                 Lin eq;memset(&eq,0,sizeof(eq)); lin_into(&eq,&l3,1.0); eq.constant=-1.0;
                 b_put(b,'=',0.0,&eq); lin_free(&eq);
@@ -1083,16 +1104,25 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
                 b_put(b,'=',0.0,&eq); lin_free(&eq);
                 lin_free(&l1);lin_free(&l2);lin_free(&l3); return 0;
             } else if(l1.n==0){
-                double base = l1.constant;
-                double val = pow(base, (double)exp);
+                double base=l1.constant,val=pow(base,(double)exp);
+                /* Beyond 2^53 a rounded double is not an exact integer
+                   coefficient, so claiming exact int_pow support would solve a
+                   nearby model.  Return UNKNOWN instead. */
+                if(!isfinite(base)||base!=rint(base)||!isfinite(val)||
+                   fabs(val)>0x1p53||val!=rint(val)){
+                    lin_free(&l1);lin_free(&l2);lin_free(&l3);return 1;
+                }
                 Lin eq;memset(&eq,0,sizeof(eq)); lin_into(&eq,&l3,1.0); eq.constant=-val;
                 b_put(b,'=',0.0,&eq); lin_free(&eq);
                 lin_free(&l1);lin_free(&l2);lin_free(&l3); return 0;
             } else if(l1.n==1 && b->haslo[l1.idx[0]] && b->hashi[l1.idx[0]]){
                 int xv = l1.idx[0];
                 if(fabs(b->lo[xv] - b->hi[xv]) <= 1e-9){
-                    double base = b->lo[xv];
-                    double val = pow(base, (double)exp);
+                    double base=b->lo[xv],val=pow(base,(double)exp);
+                    if(!isfinite(base)||base!=rint(base)||!isfinite(val)||
+                       fabs(val)>0x1p53||val!=rint(val)){
+                        lin_free(&l1);lin_free(&l2);lin_free(&l3);return 1;
+                    }
                     Lin eq;memset(&eq,0,sizeof(eq)); lin_into(&eq,&l3,1.0); eq.constant=-val;
                     b_put(b,'=',0.0,&eq); lin_free(&eq);
                     lin_free(&l1);lin_free(&l2);lin_free(&l3); return 0;
@@ -1108,8 +1138,11 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
                     }
                     Lin sum;memset(&sum,0,sizeof(sum)); lin_into(&sum,&l3,1.0);
                     for(int k=0;k<nvals;k++){
-                        double pval = pow((double)(vlo + k), (double)exp);
-                        lin_term(&sum, zs[k], -pval);
+                        double pval=pow((double)(vlo+k),(double)exp);
+                        if(!isfinite(pval)||fabs(pval)>0x1p53||pval!=rint(pval)){
+                            lin_free(&sum);free(zs);lin_free(&l1);lin_free(&l2);lin_free(&l3);return 1;
+                        }
+                        lin_term(&sum,zs[k],-pval);
                     }
                     b_put(b,'=',0.0,&sum); lin_free(&sum);
                     Lin ones;memset(&ones,0,sizeof(ones));
@@ -1360,6 +1393,7 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
         double offset = 1.0;
         if(gec){
             Lin ol; if(parse_lin(m,c->args[off_arg],&ol)!=0){lin_free(&il);return -1;}
+            if(ol.n!=0||ol.constant!=rint(ol.constant)){lin_free(&ol);lin_free(&il);return 1;}
             offset = ol.constant; lin_free(&ol);
         }
         Lin*arr; int narr;
@@ -1378,8 +1412,8 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
             lin_free(&il);lin_free(&vl);free_lins(arr,narr);
             return 0;
         }
-        if(il.n!=1){lin_free(&il);lin_free(&vl);free_lins(arr,narr);return 1;}
-        int idx=il.idx[0];
+        int idx;
+        if(lin_unit_var(&il,&idx)!=0){lin_free(&il);lin_free(&vl);free_lins(arr,narr);return 1;}
 
         int *bs=(int*)psolve_malloc((size_t)narr*sizeof(int));
         for(int i=0;i<narr;i++) bs[i]=b_newvar(b,0.0,1.0);
@@ -1396,35 +1430,22 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
             for(int i=0;i<narr;i++) lin_term(&ve,bs[i],-arr[i].constant);
             b_put(b,'=',0.0,&ve); lin_free(&ve);
         } else {
-            double M_val = 1000.0;
-            int val_idx = vl.n == 1 ? vl.idx[0] : -1;
-            if(val_idx >= 0 && b->haslo[val_idx] && b->hashi[val_idx])
-                M_val = b->hi[val_idx] - b->lo[val_idx];
             for(int i=0;i<narr;i++){
-                double M = M_val;
-                if(arr[i].n == 1){
-                    int av = arr[i].idx[0];
-                    if(b->haslo[av] && b->hashi[av]) {
-                        double span = b->hi[av] - b->lo[av];
-                        if(span > M) M = span;
-                        if(val_idx >= 0 && b->haslo[val_idx]) {
-                            double span2 = fmax(fabs(b->hi[val_idx] - b->lo[av]), fabs(b->hi[av] - b->lo[val_idx]));
-                            if(span2 > M) M = span2;
-                        }
-                    }
-                } else {
-                    double cval = arr[i].constant;
-                    if(val_idx >= 0 && b->haslo[val_idx] && b->hashi[val_idx]) {
-                        double span = fmax(fabs(b->hi[val_idx] - cval), fabs(cval - b->lo[val_idx]));
-                        if(span > M) M = span;
-                    }
+                /* For selector b_i=0 the implication rows must be redundant
+                   over the complete bound box.  A fixed magic M=1000 was not:
+                   an unselected array value at 1e6 could make a valid element
+                   constraint UNSAT.  Bound the actual expression val-arr[i]. */
+                Lin diff;memset(&diff,0,sizeof(diff));lin_into(&diff,&vl,1.0);lin_into(&diff,&arr[i],-1.0);
+                double dlo,dhi;
+                if(lin_bounds(b,&diff,&dlo,&dhi)!=0||!isfinite(dlo)||!isfinite(dhi)){
+                    lin_free(&diff);free(bs);lin_free(&il);lin_free(&vl);free_lins(arr,narr);return 1;
                 }
-                M = fmax(M, 1.0) + 1.0;
-                if(strstr(p,"bool")!=NULL) M = 1.0;
-                Lin d1;memset(&d1,0,sizeof(d1)); lin_into(&d1,&vl,1.0); lin_into(&d1,&arr[i],-1.0);
-                lin_term(&d1,bs[i],M); b_put(b,'<',M,&d1); lin_free(&d1);
-                Lin d2;memset(&d2,0,sizeof(d2)); lin_into(&d2,&vl,1.0); lin_into(&d2,&arr[i],-1.0);
-                lin_term(&d2,bs[i],-M); b_put(b,'>',-M,&d2); lin_free(&d2);
+                double M=fmax(fabs(dlo),fabs(dhi));
+                Lin d1;memset(&d1,0,sizeof(d1));lin_into(&d1,&diff,1.0);
+                lin_term(&d1,bs[i],M);b_put(b,'<',M,&d1);lin_free(&d1);
+                Lin d2;memset(&d2,0,sizeof(d2));lin_into(&d2,&diff,1.0);
+                lin_term(&d2,bs[i],-M);b_put(b,'>',-M,&d2);lin_free(&d2);
+                lin_free(&diff);
             }
         }
         free(bs); lin_free(&il);lin_free(&vl);free_lins(arr,narr);
@@ -1700,12 +1721,13 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
         if(parse_array(m,c->args[0],&arr,&narr)!=0)return -1;
         Lin vl; if(parse_lin(m,c->args[1],&vl)!=0){free_lins(arr,narr);return -1;}
         Lin nl; if(parse_lin(m,c->args[2],&nl)!=0){free_lins(arr,narr);lin_free(&vl);return -1;}
-        double v = vl.constant;
         int *bs=(int*)psolve_malloc((size_t)(narr?narr:1)*sizeof(int));
         for(int i=0;i<narr;i++){
             int bi=b_newvar(b,0.0,1.0);
             bs[i]=bi;
-            Lin di;memset(&di,0,sizeof(di)); lin_into(&di,&arr[i],1.0); di.constant=-v;
+            /* The counted value may itself be a var int.  Reify x_i-v==0;
+               using only vl.constant silently counted zero when v was a var. */
+            Lin di;memset(&di,0,sizeof(di));lin_into(&di,&arr[i],1.0);lin_into(&di,&vl,-1.0);
             add_int_reif(b,&di,bi,0);
             lin_free(&di);
         }
@@ -1980,11 +2002,88 @@ static void fz_print_one_solution(const FZModel*m,const double*x,int nvars)
 typedef struct {
     const FZModel *m;
     FZSolution *sol;
+    int dedupe_outputs;
+    size_t key_len, seen_count, seen_cap, slot_cap;
+    uint64_t *scratch, *keys, *hashes;
+    size_t *slots;                 /* open-addressed table: seen index + 1 */
 } FZSolveCtx;
+
+static uint64_t fz_hash_key(const uint64_t *key,size_t n)
+{
+    uint64_t h=UINT64_C(1469598103934665603);
+    for(size_t i=0;i<n;i++){
+        uint64_t w=key[i];
+        for(int b=0;b<8;b++){h^=(unsigned char)(w&255u);h*=UINT64_C(1099511628211);w>>=8;}
+    }
+    return h?h:1;
+}
+
+static void fz_seen_rehash(FZSolveCtx *ctx,size_t cap)
+{
+    size_t *slots=(size_t*)psolve_calloc(cap,sizeof(size_t));
+    for(size_t i=0;i<ctx->seen_count;i++){
+        size_t p=(size_t)ctx->hashes[i]&(cap-1);
+        while(slots[p])p=(p+1)&(cap-1);
+        slots[p]=i+1;
+    }
+    free(ctx->slots);ctx->slots=slots;ctx->slot_cap=cap;
+}
+
+/* Return 1 for a new visible FlatZinc output tuple and 0 for a duplicate.
+   Auxiliary selector binaries are implementation details, not distinct user
+   solutions; enumerating them used to print repeated output assignments. */
+static int fz_seen_output(FZSolveCtx *ctx,const double *x)
+{
+    size_t q=0;
+    for(int d=0;d<ctx->m->ndecl;d++){
+        FZDecl *decl=&ctx->m->decls[d];if(!decl->is_output)continue;
+        for(int e=0;e<decl->n;e++){
+            double v=0.0;(void)fz_decl_val_at(decl,x,ctx->sol->nvars,e,&v);
+            uint64_t w;
+            if(decl->kind==FZ_K_FLOAT){if(v==0.0)v=0.0;memcpy(&w,&v,sizeof(w));}
+            else {int64_t iv=(int64_t)llround(v);memcpy(&w,&iv,sizeof(w));}
+            ctx->scratch[q++]=w;
+        }
+    }
+    uint64_t h=fz_hash_key(ctx->scratch,ctx->key_len);
+    if(ctx->slot_cap==0)fz_seen_rehash(ctx,16);
+    if(ctx->seen_count+1>=ctx->slot_cap*7/10){
+        if(ctx->slot_cap>SIZE_MAX/2/sizeof(size_t))psolve_fail(PSOLVE_ERR_OOM);
+        fz_seen_rehash(ctx,ctx->slot_cap*2);
+    }
+    size_t p=(size_t)h&(ctx->slot_cap-1);
+    while(ctx->slots[p]){
+        size_t i=ctx->slots[p]-1;
+        if(ctx->hashes[i]==h &&
+           (ctx->key_len==0||memcmp(&ctx->keys[i*ctx->key_len],ctx->scratch,ctx->key_len*sizeof(uint64_t))==0))
+            return 0;
+        p=(p+1)&(ctx->slot_cap-1);
+    }
+    if(ctx->seen_count==ctx->seen_cap){
+        if(ctx->seen_cap>SIZE_MAX/2)psolve_fail(PSOLVE_ERR_OOM);
+        size_t nc=ctx->seen_cap?ctx->seen_cap*2:16;
+        if(nc>SIZE_MAX/sizeof(uint64_t) ||
+           (ctx->key_len&&nc>SIZE_MAX/ctx->key_len/sizeof(uint64_t)))psolve_fail(PSOLVE_ERR_OOM);
+        ctx->hashes=(uint64_t*)psolve_realloc((void**)&ctx->hashes,nc*sizeof(uint64_t));
+        if(ctx->key_len)ctx->keys=(uint64_t*)psolve_realloc((void**)&ctx->keys,nc*ctx->key_len*sizeof(uint64_t));
+        ctx->seen_cap=nc;
+    }
+    size_t i=ctx->seen_count++;
+    ctx->hashes[i]=h;
+    if(ctx->key_len)memcpy(&ctx->keys[i*ctx->key_len],ctx->scratch,ctx->key_len*sizeof(uint64_t));
+    ctx->slots[p]=i+1;
+    return 1;
+}
+
+static void fz_solve_ctx_free(FZSolveCtx *ctx)
+{
+    free(ctx->scratch);free(ctx->keys);free(ctx->hashes);free(ctx->slots);
+}
 
 static void fz_solution_cb(const double *x, double obj, void *user_data)
 {
     FZSolveCtx *ctx = (FZSolveCtx*)user_data;
+    if(ctx->dedupe_outputs&&!fz_seen_output(ctx,x))return;
     ctx->sol->num_solutions++;
     if (ctx->sol->all_solutions) {
         fz_print_one_solution(ctx->m, x, ctx->sol->nvars);
@@ -2040,6 +2139,14 @@ void fz_solve(const FZModel*m,FZSolution*sol)
         lin_free(&eq);lin_free(&sum);free(bs);
     }
     for(FZConstr*c=m->constr;c;c=c->next){int r=handle_constraint((FZModel*)m,&b,c);if(r!=0)unhandled=1;}
+    if(sol->all_solutions&&m->solve_kind==0){
+        /* A finite list cannot be a complete enumeration of a continuous
+           output domain.  Do not print one LP vertex followed by the FlatZinc
+           completion marker as if infinitely many float solutions were done. */
+        for(int d=0;d<m->ndecl;d++)
+            if(m->decls[d].is_output&&m->decls[d].is_var&&m->decls[d].kind==FZ_K_FLOAT)
+                unhandled=1;
+    }
 
     if(unhandled){for(int r=0;r<b.nrows;r++){free(b.rows[r].idx);free(b.rows[r].coef);}free(b.rows);free(b.lo);free(b.hi);free(b.haslo);free(b.hashi);sol->status=2;return;}
 
@@ -2076,7 +2183,16 @@ void fz_solve(const FZModel*m,FZSolution*sol)
     for(int vi=nv;vi<ntot;vi++){isint[vi]=1;any_int=1;}
     sol->nvars=ntot;
     sol->x=(double*)psolve_realloc((void**)&sol->x,(size_t)(ntot?ntot:1)*sizeof(double));
-    FZSolveCtx ctx = { m, sol };
+    FZSolveCtx ctx;memset(&ctx,0,sizeof(ctx));ctx.m=m;ctx.sol=sol;
+    ctx.dedupe_outputs=(sol->all_solutions&&m->solve_kind==0);
+    if(ctx.dedupe_outputs){
+        for(int d=0;d<m->ndecl;d++)if(m->decls[d].is_output){
+            if((size_t)m->decls[d].n>SIZE_MAX-ctx.key_len)psolve_fail(PSOLVE_ERR_OOM);
+            ctx.key_len+=(size_t)m->decls[d].n;
+        }
+        if(ctx.key_len>SIZE_MAX/sizeof(uint64_t))psolve_fail(PSOLVE_ERR_OOM);
+        ctx.scratch=(uint64_t*)psolve_calloc(ctx.key_len?ctx.key_len:1,sizeof(uint64_t));
+    }
     if(any_int){
         MIP mip;memset(&mip,0,sizeof(mip));
         mip.n=ntot;mip.m=b.nrows;mip.c=lp.c;mip.Acolptr=lp.Acolptr;mip.Arow=lp.Arow;mip.Aval=lp.Aval;
@@ -2125,6 +2241,7 @@ void fz_solve(const FZModel*m,FZSolution*sol)
            that fznsolve never prints a fabricated optimum. */
         sol->status=2;
     }
+    fz_solve_ctx_free(&ctx);
     free(isint);
     free(lp.c);free(lp.l);free(lp.u);free(lp.b);free(lp.rel);free(lp.Acolptr);free(lp.Arow);free(lp.Aval);
     for(int r=0;r<b.nrows;r++){free(b.rows[r].idx);free(b.rows[r].coef);}free(b.rows);free(b.lo);free(b.hi);free(b.haslo);free(b.hashi);
