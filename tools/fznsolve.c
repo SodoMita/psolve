@@ -11,12 +11,15 @@ static volatile sig_atomic_t g_stop = 0;
 static void on_sigint(int s){ (void)s; g_stop = 1; }
 static int stop_requested(void){ return (int)g_stop; }
 
-typedef struct { const char*path; long node_limit; int show_stats; int verbose; long time_ms; } Options;
+typedef struct { const char*path; long node_limit; int show_stats; int verbose; long time_ms; int all_solutions; } Options;
 static Options parse_args(int argc, char**argv){
-    Options o = { NULL, 200000, 0, 0, 0 };
+    Options o = { NULL, 200000, 0, 0, 0, 0 };
     for (int a = 1; a < argc; a++) {
         if (strcmp(argv[a], "-s") == 0) o.show_stats = 1;
         else if (strcmp(argv[a], "-v") == 0) o.verbose = 1;
+        else if (strcmp(argv[a], "-a") == 0 || strcmp(argv[a], "--all-solutions") == 0) o.all_solutions = 1;
+        else if (strcmp(argv[a], "-f") == 0 || strcmp(argv[a], "--free-search") == 0) ;
+        else if (strcmp(argv[a], "-p") == 0 && a+1 < argc) a++;
         else if (strcmp(argv[a], "-n") == 0 && a+1 < argc) o.node_limit = atol(argv[++a]);
         else if (strcmp(argv[a], "-t") == 0 && a+1 < argc) o.time_ms = atol(argv[++a]);
         else if (argv[a][0] != '-') o.path = argv[a];
@@ -28,7 +31,8 @@ int main(int argc,char**argv)
 {
     Options opt = parse_args(argc, argv);
     if (!opt.path) { fprintf(stderr,"usage: %s [options] <problem.fzn>\n",argv[0]);
-        fprintf(stderr,"  -n N   node limit   -s stats   -v verbose\n"); return 1; }
+        fprintf(stderr,"  -a/--all-solutions  enumerate all solutions / improving incumbents\n");
+        fprintf(stderr,"  -n N   node limit   -t MS   time limit (s)   -s stats   -v verbose\n"); return 1; }
 
     /* Resolve the path into a volatile-qualified copy before setjmp so the
        compiler cannot hold the pointer in a callee-saved register that
@@ -55,6 +59,7 @@ int main(int argc,char**argv)
     psolve_stop_fn = stop_requested;       /* cooperative abort polled by solver */
     if (opt.time_ms > 0) alarm((unsigned)((opt.time_ms+999)/1000));
     sol.node_limit = opt.node_limit;       /* wire -n into the MIP node limit */
+    sol.all_solutions = opt.all_solutions; /* -a / --all-solutions */
 
     {
         struct timespec t0,t1; clock_gettime(CLOCK_MONOTONIC,&t0);
@@ -66,7 +71,7 @@ int main(int argc,char**argv)
     psolve_end();
 
     fz_print_solution(&m, &sol);
-    if (m.solve_kind != 0 && sol.status == 0)
+    if (m.solve_kind != 0 && sol.status == 0 && !opt.all_solutions)
         printf("%%%%mzn-stat: objective=%.15g\n", sol.obj);
     if (opt.show_stats) {
         printf("%%%%mzn-stat: intVariables=%d\n", sol.nvars);

@@ -1,4 +1,10 @@
-# psolve — audit & hardening notes (branch `arena/audit-hardening`)
+# psolve — audit & hardening notes
+
+> **2026-08-08 follow-up:** the remaining remote branches were re-audited from
+> `arena/unmerged-audit-and-correctness`. Safe changes were ported, several
+> wrong-answer cases were repaired, and the unsound branch-and-clip commit was
+> rejected. See [`docs/BRANCH_AUDIT.md`](docs/BRANCH_AUDIT.md) for branch-by-
+> branch disposition, counterexamples, and regression coverage.
 
 This is a working audit document. It records what was reviewed, what was
 changed on this branch, and the prioritized list of the most important things to
@@ -106,11 +112,90 @@ answer, but a completeness gap. (Roadmap notes this; no change here.)
 - Removed a dead duplicate `-t` branch in `tools/fznsolve.c` arg parsing.
 - `-Wshadow` warnings in `src/fzn.c` are benign re-declarations; left as-is.
 
+### DONE — exact-solver fallback for MIP relaxations (was finding A)
+Implemented. `src/mip.c` now cross-checks a relaxation with the fixed-point
+exact-rational simplex (`src/fx.c`) whenever the double revised-simplex returns
+`SOLVE_NUMERICAL` **or** a false `INFEASIBLE` — both of which it does on the
+ill-conditioned big-M bases of combinatorial MIPs. `fx_from_double` /
+`FX_INF_SENT` are exported; `mip_build_fxlp()` converts the double MIP + per-node
+bounds into an exact FxLP. Only exactly integral `double` values are accepted;
+duplicate CSC cells are summed with checked rational arithmetic. When the exact
+solve succeeds its verdict wins; otherwise the honest double verdict is kept.
+
+Impact: `cumulative_verify.py 200 777` went from **OK=124 UNKNOWN=76** on
+`main` to **OK=200 UNKNOWN=0 MISMATCH=0**. The false-INFEASIBLE→UNSAT bug is
+fixed, with a deterministic regression in `examples/fzn/cumulative_exact.fzn`.
+
+### DONE — CLI `-a` (all solutions) and FlatZinc constraint expansion
+Implemented standard `-a` / `--all-solutions` for `fznsolve`, `fz_solve`, and `mip_solve`:
+- In satisfaction problems (`solve satisfy`), `-a` traverses the branch-and-bound
+  tree and prints distinct **visible output tuples**, de-duplicating alternative
+  auxiliary-selector assignments. Continuous output spaces return `UNKNOWN`
+  rather than falsely printing a finite completion marker.
+- In optimization problems (`solve minimize` / `solve maximize`), `-a` reports all intermediate
+  strictly-improving incumbents, each followed by `----------`, and terminates with `==========`
+  once optimality is proved.
+- In default single-solution mode, optimization problems correctly print the proved optimum
+  followed by `----------` and `==========` per the FlatZinc standard.
+
+Expanded native FlatZinc constraint handlers:
+- `array_var_int_element`, `array_bool_element`, `array_var_bool_element`,
+  `array_float_element`, `array_var_float_element` (exact SOS1 and bounded indicator encodings).
+- `array_float_maximum`, `array_float_minimum` (exact selector formulation for float arrays).
+- `set_in_reif`, `int_in`, `int_in_reif` (exact reified integer set and range membership).
+- `int_div`, `int_mod` (exact linear quotient-remainder formulation for constant divisors).
+- `int_pow` (linear exponentiation for integer constants and bounded lattice domains).
+- `bool_times` / `int_times` (linear boolean conjunction).
+- `count_leq`, `count_geq`, `count_lt`, `count_gt`, `count_ne`, `count_neq`, `among`, `fzn_among`
+  (exact reified count and among constraints).
+- `table_bool`, `fzn_table_bool`, `gecode_table_bool` (extensional boolean table constraints).
+
+The port was hardened for negative division/modulo, variable count values,
+proven element big-M bounds, exact-range exponentiation, and output-level
+all-solutions de-duplication. See `docs/BRANCH_AUDIT.md`. All new handlers and
+options have dedicated regressions in `tools/fzn_semantics_test.py`.
+
+### DONE — public C API invalid-input audit
+
+Public LP, MIP, QP, exact LP, PGS, FlatZinc, LU, and sparse-LU entry points now
+check null/structurally invalid inputs before dereferencing. Invalid models have
+dedicated statuses rather than being mislabeled infeasible. `tools/api_test.c`
+is wired into `test.sh`; details and differences from remote commit `2253a93`
+are recorded in `docs/BRANCH_AUDIT.md`.
+
+### DONE — batch PGS entry points
+
+`pgs_batch_solve` and `pgsf_batch_solve` provide checked sequential traversal of
+independent contact systems with aggregate statistics. The global arena half of
+remote commit `6ebf11d` was rejected for ownership/alignment/thread-safety bugs;
+see `docs/BRANCH_AUDIT.md`.
+
+### DONE — FlatZinc set-literal + status honesty (branch `arena/fzn-set-status-ports`)
+
+Follow-up merge of the still-unmerged parts of `arena/continue-hardening`,
+after verifying each of its claims empirically against the MiniZinc
+specification (see `docs/BRANCH_AUDIT.md` for the full review):
+
+- **Set-literal parsing no longer truncates silently** (`fz_parse_int_set`):
+  `set_in(y,{1,...,280})` with `y=265` had printed `UNSATISFIABLE`; a
+  singleton set had overwritten the declared domain (`var 0..5` + `{8}` had
+  printed `x = 8`); `among` double-counted duplicate set members.  All three
+  fixed and covered by the new brute-force differential
+  `tools/divmod_verify.py` (0 wrong answers; wired into `test.sh`).
+- **UNSAT is only certified inside the synthetic box**: an infeasible
+  verdict on a model containing an undeclared (`var int:`/`var float:`)
+  variable is downgraded to UNKNOWN.
+- **GLPK differential re-run and green** (sweep 119/119, four-way difftest
+  0 mismatches) — glpsol was obtained for this environment.
+- That branch's `int_div`/`int_mod` floor-semantics rewrite was **rejected**:
+  MiniZinc defines `mod` with the dividend's sign (truncation, C semantics),
+  which `main` already implements.  The verifier it ships now encodes the
+  spec-correct reference semantics explicitly (with citations), so a future
+  contributor cannot make the same mistake either direction.
+
 ## Not done (recommended next steps, in priority order)
-1. **Exact-solver fallback for MIP relaxations** (fixes A) — makes cumulative
-   and all big-M models reliable and unlocks `-a` all-solutions enumeration.
-2. **CLI `-a` (all solutions)** for `fznsolve` (FlatZinc standard; gated on #1
-   being reliable).
-3. Re-run the GLPK and MiniZinc differential suites (need `glpsol`/`minizinc`).
-4. Public C API audit for Phase 4 hardening (documented, bounds-checked, no
-   `exit` in library paths).
+1. Re-run the MiniZinc differential suite (`tools/mzn_diff.py`) when
+   `minizinc` is installed (not packaged for this host's distro).
+   The GLPK side is done.
+2. Redesign the global `setjmp` allocation-error protocol so a recovering,
+   multi-threaded library host can own cleanup without process-global state.

@@ -49,7 +49,12 @@ typedef struct {
                                 about the objective must check it. */
     long   node_limit;     /* max branch-and-bound nodes */
     long   lp_iter_limit;  /* simplex iteration limit per relaxation */
+    int    all_solutions;  /* 1 = find all solutions / report all incumbents */
+    void   (*on_solution)(const double *x, double obj, void *user_data);
+    void   *solution_user_data;
 } MIP;
+
+#define MIP_INVALID 7
 
 typedef struct {
     int status;            /* 0 optimal, 1 infeasible, 2 unbounded, 3 node limit,
@@ -57,7 +62,7 @@ typedef struct {
                               5 feasible but not proven optimal (limit reached with
                                 an incumbent; NOT a proof of optimality),
                               6 numerical failure (an LP relaxation could not be
-                                factorized/certified) */
+                                factorized/certified), 7 invalid model */
     double obj;            /* optimal objective value */
     double *x;             /* optimal integer solution (n) */
     int *isint_sol;        /* reported integrality status per var (0/1) */

@@ -274,7 +274,11 @@ feature completeness against a huge standard corpus.
 - [x] CLI flags: `-n` (node limit), `-t` (time limit via alarm), `-s` (stats),
       `-v` (verbose), SIGINT/SIGALRM handlers; `fznsolve` prints objective
       always and `objectiveBound`/`nodes` in stats.
-- [ ] CLI: `-a` (all solutions), `-f` (free search).
+- [x] CLI: `-a` / `--all-solutions` for distinct visible finite-domain solutions
+      and improving optimization incumbents; continuous satisfaction outputs
+      return `UNKNOWN` because their solution set cannot be enumerated.
+- [ ] CLI/search: implement a meaningful `-f` (free search) policy; the flag is
+      currently accepted for MiniZinc driver compatibility but is a no-op.
 - [x] **MiniZinc differential** (`tools/mzn_diff.py`): compiles real `.mzn`
       models with the MiniZinc compiler and compares fznsolve vs Gecode
       (objectives + feasibility).  Models in `examples/mzn/`.
@@ -285,14 +289,41 @@ feature completeness against a huge standard corpus.
       error paths) found and fixed.
 - [ ] More MiniZinc-suite coverage; HiGHS round-trip.
 
-### Known Phase 3 limitation
+### Known Phase 3 limitation (improved)
 Pure LP-based B&B has weak relaxations on *combinatorial* feasibility models
 that combine gapped `set` domains, `all_different`, and nonlinear (`!=`)
-constraints (big-M encodings).  Such models solve correctly when they complete
-(never a wrong answer — `UNKNOWN` is returned), but B&B may not reach a
-solution quickly.  Real-time CSPs are better served by a propagation-based
-engine in the consuming project; psolve's LP/QP/MIP backbone targets
-linear/quadratic and well-structured MIP models.
+constraints (big-M encodings).  The double revised-simplex is also numerically
+fragile on the resulting big-M bases (it could return `NUMERICAL_FAILURE` or a
+false `INFEASIBLE` on a feasible relaxation).  Since the exact-rational MIP
+cross-check (see below) that limitation is largely resolved for integral data:
+every relaxation the double solver cannot certify is re-solved exactly, so
+`cumulative_verify` now reports `UNKNOWN=0`.  Remaining gap: hard combinatorial
+models can still need many B&B nodes (a weak relaxation, not a wrong answer),
+and real-time CSPs are still better served by a propagation-based engine in the
+consuming project.
+
+### Honesty rules for the FlatZinc bridge (no fabricated verdicts)
+- `var int/float` without declared bounds is clamped to a synthetic ±1e9 box.
+  An `UNSATISFIABLE` verdict is only certified *inside* that box: when a
+  synthetically-bounded variable is present, infeasibility is downgraded to
+  `=====UNKNOWN=====` (bounded models keep exact UNSAT).  Optimization
+  results whose objective touches a synthetic bound were already UNKNOWN.
+- Set literals are never truncated: `set_in`/`among` parse dynamically with
+  deduplication and an honest enumeration cap (UNKNOWN past it), clamp
+  ranges of any width, and intersect singletons/ranges with the declared
+  domain (empty intersection = UNSAT).
+- `int_div`/`int_mod` implement the MiniZinc spec: the remainder takes the
+  *dividend's* sign (truncation toward zero, `x = (x div y)*y + (x mod y)`),
+  encoded exactly incl. negative dividends and divisors.
+
+### Exact-solver MIP fallback
+`src/mip.c` cross-checks a relaxation with the fixed-point exact-rational
+simplex (`src/fx.c`) whenever the double revised-simplex returns
+`SOLVE_NUMERICAL` or `INFEASIBLE`.  `fx_from_double` / `FX_INF_SENT` are
+exported; `mip_build_fxlp()` builds the exact FxLP from the double MIP and
+per-node bounds.  For integral data the exact verdict wins (immune to double
+rounding); otherwise the honest double verdict is kept.  Deterministic
+regression: `examples/fzn/cumulative_exact.fzn`.
 
 ### Phase 3 first-cut deliverable: `fznsolve <x.fzn>` solves the linear subset,
 with tests in `examples/fzn/` and `test.sh` (incl. the MiniZinc differential).
@@ -408,9 +439,10 @@ only**, removing all ambiguity.  Examples and generators updated; parser fuzzed
 ---
 
 ## Phase 5 — Scale & integration
-- [ ] Batch solve API: solve N independent tiny problems with one call
-      (SIMD-friendly, amortized setup) — matches "many contacts per frame".
-- [ ] SIMD over independent contact clusters (AVX-512 gather/scatter).
+- [x] Batch PGS APIs (`pgs_batch_solve` / `pgsf_batch_solve`) solve N
+      independent contact systems with one call and aggregate stats.
+- [ ] SIMD over independent batch/contact clusters (current traversal is
+      sequential; target AVX-512 gather/scatter).
 - [ ] Python binding (ctypes) + a tiny demo harness (visualize a 2D physics
       scene solved by psolve each frame).
 - [ ] Microbenchmark suite with a CI budget guard (no silent regressions).

@@ -45,14 +45,16 @@ with an explicit baseline `ARCH`.
 ./lpsolve [-t ms|--time-limit ms] <problem.lp> [--print]  # LP (revised simplex, double)
 ./qpsolve <qp.qp>                      # convex QP (active-set)
 ./mipsolve [-t ms|--time-limit ms] <problem.lp> <nint> <j...> [--print]   # MIP (branch-and-bound)
-./fznsolve <problem.fzn>               # FlatZinc reader + solver (Phase 3)
+./fznsolve [-a|--all-solutions] <problem.fzn>  # FlatZinc reader + solver (Phase 3)
 ./fxsolve <problem.lp> [--print]      # LP (exact rational / fixed-point simplex)
 ```
 
 `--print` also dumps the optimal variable values. `-t` / `--time-limit` sets a
 cooperative wall-clock limit in milliseconds; `Ctrl-C` also stops the double LP
 or MIP solve cleanly. Both return `STOPPED` rather than presenting a partial
-solution as optimal.
+solution as optimal. For FlatZinc, `-a` enumerates distinct visible finite-domain
+solutions (or improving optimization incumbents). Continuous satisfaction
+outputs cannot be exhaustively enumerated and return `UNKNOWN` under `-a`.
 
 The LP solver handles: **maximize or minimize**, `<`, `>`, and `=` constraints,
 variables with lower, upper, boxed, or fully free bounds (use `-inf inf`), and
@@ -380,8 +382,11 @@ are integral):
   are deliberately not relaxed to non-strict LP rows: their feasible sets are
   open.  An optimization result that reaches the bridge's synthetic bound for
   an otherwise unbounded objective-bearing variable is likewise `UNKNOWN`, not
-  a fake optimum.
-  See `docs/ROADMAP.md` for the remaining handler list.
+  a fake optimum — and an infeasibility verdict is certified only inside the
+  synthetic box given to undeclared `var int/float` domains, so such models
+  report `UNKNOWN` rather than a possibly-false `UNSATISFIABLE`.
+  `int_div`/`int_mod` use MiniZinc semantics (remainder takes the dividend's
+  sign).  See `docs/ROADMAP.md` for the remaining handler list.
 
 ## Layout
 

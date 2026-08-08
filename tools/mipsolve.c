@@ -106,6 +106,8 @@ int main(int argc, char **argv)
         if (res.obj == res.obj) printf("best objective: %.15g\n", res.obj);
     } else if (res.status == 6) {
         printf("status: NUMERICAL_FAILURE\n");
+    } else if (res.status == MIP_INVALID) {
+        printf("status: INVALID_MODEL\n");
     } else {   /* status 5: feasible incumbent, optimality not proven */
         printf("status: FEASIBLE_LIMIT\n");
         if (res.obj == res.obj) {

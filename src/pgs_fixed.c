@@ -38,6 +38,7 @@ static inline int64_t div_round_sat(__int128 n, int64_t d)
 
 void pgsf_matvec(const int64_t *A, int n, const int64_t *x, int64_t *y)
 {
+    if(!A||!x||!y||n<=0||n>46340)return;
     for (int i = 0; i < n; i++) {
         __int128 s = 0;
         for (int j = 0; j < n; j++) s += (__int128)A[i*n + j] * x[j];
@@ -50,10 +51,14 @@ void pgsf_solve(const PGSFixedOptions *opt,
                 const int64_t *lo, const int64_t *hi,
                 int64_t *x, PGSResult *res)
 {
+    if(!res)return;
+    res->iters=0;res->flops=0;res->obj=0.0;res->status=PGS_INVALID;
+    if(!opt||!A||!b||!lo||!hi||!x||opt->n<=0||opt->n>46340)return;
     int n = opt->n;
+    for(int i=0;i<n;i++)if(lo[i]>hi[i])return;
     int64_t w_num = opt->w_num, w_den = opt->w_den;
     if (w_den <= 0) { w_num = 1; w_den = 1; }
-    if (w_num <= 0 || w_num >= 2 * w_den) { w_num = w_den; } /* default GS */
+    if (w_num <= 0 || (__int128)w_num >= 2 * (__int128)w_den) { w_num = w_den; } /* default GS */
     int max_iter = opt->max_iter > 0 ? opt->max_iter : 1;
     int64_t tol = opt->tol;
 
@@ -112,4 +117,20 @@ void pgsf_solve(const PGSFixedOptions *opt,
         obj += 0.5 * ((double)ax) * (double)x[i] + (double)b[i] * (double)x[i];
     }
     res->obj = obj;
+}
+
+long pgsf_batch_solve(int count,const PGSFixedOptions *opts,
+                      const int64_t *const *A_arr,const int64_t *const *b_arr,
+                      const int64_t *const *lo_arr,const int64_t *const *hi_arr,
+                      int64_t **x_arr,PGSResult *res_arr)
+{
+    if(count<0)return -1;
+    if(count==0)return 0;
+    if(!opts||!A_arr||!b_arr||!lo_arr||!hi_arr||!x_arr||!res_arr)return -1;
+    long total=0;
+    for(int k=0;k<count;k++){
+        pgsf_solve(&opts[k],A_arr[k],b_arr[k],lo_arr[k],hi_arr[k],x_arr[k],&res_arr[k]);
+        if(res_arr[k].flops>LONG_MAX-total)total=LONG_MAX;else total+=res_arr[k].flops;
+    }
+    return total;
 }

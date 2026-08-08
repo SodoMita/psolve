@@ -1,6 +1,7 @@
 #include "pgs.h"
 #include <math.h>
 #include <stddef.h>
+#include <limits.h>
 
 /* ------------------------------------------------------------------ */
 /* Projected Gauss-Seidel with optional SOR.                           */
@@ -20,7 +21,17 @@ void pgs_solve(const PGSOptions *opt,
                const double *lo, const double *hi,
                double *x, PGSResult *res)
 {
+    if (!res) return;
+    res->iters=0;res->flops=0;res->obj=0.0;res->status=PGS_INVALID;
+    if (!opt || !A || !b || !lo || !hi || !x || opt->n <= 0 || opt->n > 46340)
+        return;
     int n = opt->n;
+    for(int i=0;i<n;i++){
+        if(!isfinite(b[i])||!isfinite(lo[i])||!isfinite(hi[i])||
+           !isfinite(x[i])||lo[i]>hi[i]) return;
+    }
+    for(size_t k=0;k<(size_t)n*n;k++)if(!isfinite(A[k]))return;
+    res->status=1;
     double omega = opt->omega;
     if (omega <= 0.0 || omega > 2.0) omega = 1.0;
     int max_iter = opt->max_iter;
@@ -84,9 +95,26 @@ void pgs_solve(const PGSOptions *opt,
 
 void pgs_matvec(const double *A, int n, const double *x, double *y)
 {
+    if(!A||!x||!y||n<=0||n>46340)return;
     for (int i = 0; i < n; i++) {
         double s = 0.0;
         for (int j = 0; j < n; j++) s += A[i*n + j] * x[j];
         y[i] = s;
     }
+}
+
+long pgs_batch_solve(int count,const PGSOptions *opts,
+                     const double *const *A_arr,const double *const *b_arr,
+                     const double *const *lo_arr,const double *const *hi_arr,
+                     double **x_arr,PGSResult *res_arr)
+{
+    if(count<0)return -1;
+    if(count==0)return 0;
+    if(!opts||!A_arr||!b_arr||!lo_arr||!hi_arr||!x_arr||!res_arr)return -1;
+    long total=0;
+    for(int k=0;k<count;k++){
+        pgs_solve(&opts[k],A_arr[k],b_arr[k],lo_arr[k],hi_arr[k],x_arr[k],&res_arr[k]);
+        if(res_arr[k].flops>LONG_MAX-total)total=LONG_MAX;else total+=res_arr[k].flops;
+    }
+    return total;
 }

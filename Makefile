@@ -40,7 +40,7 @@ QPOBJ = $(QPSRC:.c=.o)
 #   make lib   ->  libpsolve.a  (all solvers: LP, QP, MIP, PGS)
 #   make liblp ->  libpsolve-lp.a   (LP only)
 #   make libqp ->  libpsolve-qp.a   (QP only)
-LIB_SRC = src/err.c src/kernels.c src/lu.c src/splu.c src/solver.c src/parser.c src/qp.c src/mip.c src/pgs.c src/pgs_fixed.c src/fzn.c
+LIB_SRC = src/err.c src/kernels.c src/lu.c src/splu.c src/solver.c src/parser.c src/qp.c src/mip.c src/fx.c src/pgs.c src/pgs_fixed.c src/fzn.c
 LIB_OBJ = $(LIB_SRC:.c=.o)
 LP_LIB_SRC = src/err.c src/kernels.c src/lu.c src/splu.c src/solver.c src/parser.c
 LP_LIB_OBJ = $(LP_LIB_SRC:.c=.o)
@@ -55,7 +55,7 @@ lpsolve: $(OBJ)
 qpsolve: src/err.o src/qp.o src/lu.o src/kernels.o tools/qpsolve.o
 	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -o $@ $^ $(LDFLAGS) $(LDLIBS)
 
-mipsolve: src/err.o src/mip.o src/lu.o src/splu.o src/solver.o src/kernels.o src/parser.o tools/mipsolve.o
+mipsolve: src/err.o src/mip.o src/lu.o src/splu.o src/solver.o src/kernels.o src/parser.o src/fx.o tools/mipsolve.o
 	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -o $@ $^ $(LDFLAGS) $(LDLIBS)
 
 # Real-time 2D-physics kernel: projected Gauss-Seidel boxed-QP
@@ -76,7 +76,7 @@ tools/pgs_vs_lp.o: tools/pgs_vs_lp.c src/pgs.h src/pgs_fixed.h src/qp.h src/solv
 	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -I src -c -o $@ $<
 
 # FlatZinc reader + solver bridge (Phase 3)
-fznsolve: src/fzn.o src/mip.o src/err.o src/solver.o src/splu.o src/lu.o src/kernels.o src/parser.o tools/fznsolve.o
+fznsolve: src/fzn.o src/mip.o src/err.o src/solver.o src/splu.o src/lu.o src/kernels.o src/parser.o src/fx.o tools/fznsolve.o
 	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -o $@ $^ $(LDFLAGS) $(LDLIBS)
 
 src/fzn.o: src/fzn.c src/fzn.h src/solver.h src/err.h
@@ -95,7 +95,7 @@ src/pgs_fixed.o: src/pgs_fixed.c src/pgs_fixed.h src/pgs.h
 tools/pgfbench.o: tools/pgfbench.c src/pgs_fixed.h
 	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -I src -c -o $@ $<
 
-src/mip.o: src/mip.c src/mip.h src/solver.h src/err.h
+src/mip.o: src/mip.c src/mip.h src/solver.h src/err.h src/fx.h
 	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -I src -c -o $@ $<
 
 tools/mipsolve.o: tools/mipsolve.c src/mip.h src/parser.h src/err.h

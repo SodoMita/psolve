@@ -39,8 +39,22 @@ static int parse_bound(const char *s, double *out)
     return 0;
 }
 
-int lp_read(const char *path, LP *lp)
+int lp_read(const char *path, LP *out)
 {
+    if(!path||!out)return -1;
+    /* Parse into local zeroed storage so an early error never frees garbage
+       from an uninitialized caller output and never partially mutates it. */
+    LP storage;memset(&storage,0,sizeof(storage));LP *lp=&storage;
+    /* Keep every cleanup-owned pointer in function scope and initialize it
+       before any path can jump to `err`.  The previous layout declared these
+       halfway through the function, so early parse errors jumped past their
+       initializers and then passed indeterminate pointers to free(). */
+    int *tr = NULL, *tc = NULL;
+    double *tv = NULL;
+    int *colcount = NULL;
+    int *out_r = NULL;
+    double *out_v = NULL;
+
     FILE *f = fopen(path, "r");
     if (!f) { fprintf(stderr, "cannot open %s\n", path); return -1; }
     char sense[32];
@@ -80,8 +94,18 @@ int lp_read(const char *path, LP *lp)
     lp->rel = (char*)psolve_malloc((size_t)(m ? m : 1) * sizeof(char));
     if (!lp->c || !lp->b || !lp->l || !lp->u || !lp->rel) goto err;
 
-    for (int j = 0; j < n; j++) if (fscanf(f, "%lf", &lp->c[j]) != 1) goto err;
-    for (int i = 0; i < m; i++) if (fscanf(f, "%lf", &lp->b[i]) != 1) goto err;
+    for (int j = 0; j < n; j++) {
+        if (fscanf(f, "%lf", &lp->c[j]) != 1 || !isfinite(lp->c[j])) {
+            fprintf(stderr, "invalid objective coefficient at column %d\n", j);
+            goto err;
+        }
+    }
+    for (int i = 0; i < m; i++) {
+        if (fscanf(f, "%lf", &lp->b[i]) != 1 || !isfinite(lp->b[i])) {
+            fprintf(stderr, "invalid rhs at row %d\n", i);
+            goto err;
+        }
+    }
 
     /* F-01: relation token.  Each relation is a single char ('<','>','=');
        the token is the m chars concatenated (e.g. "<<=<<").  The solver
@@ -137,8 +161,6 @@ int lp_read(const char *path, LP *lp)
     }
 
     /* read triplets into temporary arrays (only when nnz > 0) */
-    int *tr = NULL, *tc = NULL;
-    double *tv = NULL;
     if (nnz > 0) {
         tr = (int*)psolve_malloc((size_t)nnz * sizeof(int));
         tc = (int*)psolve_malloc((size_t)nnz * sizeof(int));
@@ -148,6 +170,10 @@ int lp_read(const char *path, LP *lp)
     for (long k = 0; k < nnz; k++) {
         int r, c; double v;
         if (fscanf(f, "%d %d %lf", &r, &c, &v) != 3) goto err2;
+        if (!isfinite(v)) {
+            fprintf(stderr, "invalid matrix coefficient at triplet %ld\n", k);
+            goto err2;
+        }
         /* F-03: reject out-of-range row/column indices */
         if (r < 0 || r >= m || c < 0 || c >= n) {
             fprintf(stderr, "triplet %ld out of range: r=%d c=%d (n=%d m=%d)\n", k, r, c, n, m);
@@ -157,9 +183,6 @@ int lp_read(const char *path, LP *lp)
     }
     /* Counting sort by column: O(nnz + n), linear in input size (the previous
        insertion sort was O(nnz^2) on adversarial triplet orderings). */
-    int *colcount = NULL;
-    int *out_r = NULL;
-    double *out_v = NULL;
     colcount = (int*)psolve_calloc((size_t)(n + 1), sizeof(int));
     out_r = (int*)psolve_malloc((size_t)(nnz ? nnz : 1) * sizeof(int));
     out_v = (double*)psolve_malloc((size_t)(nnz ? nnz : 1) * sizeof(double));
@@ -177,12 +200,13 @@ int lp_read(const char *path, LP *lp)
     lp->Acolptr = (int*)psolve_malloc((size_t)(n + 1) * sizeof(int));
     lp->Arow = (int*)psolve_malloc((size_t)(nnz ? nnz : 1) * sizeof(int));
     lp->Aval = (double*)psolve_malloc((size_t)(nnz ? nnz : 1) * sizeof(double));
-    if (!lp->Acolptr || !lp->Arow || !lp->Aval) { free(colcount); free(out_r); free(out_v); goto err2; }
+    if (!lp->Acolptr || !lp->Arow || !lp->Aval) goto err2;
     lp->Acolptr[0] = 0;
     for (int j = 0; j < n; j++) lp->Acolptr[j + 1] = colcount[j];
     for (long k = 0; k < nnz; k++) { lp->Arow[k] = out_r[k]; lp->Aval[k] = out_v[k]; }
     free(colcount); free(out_r); free(out_v);
     fclose(f);
+    *out=storage;
     return 0;
 
 err2:
@@ -190,10 +214,10 @@ err2:
 err:
     fclose(f);
     fprintf(stderr, "LP parse error\n");
-    /* free any partially-allocated temporary arrays and problem members */
+    /* Every temporary is initialized at function entry and owned until this
+       single cleanup point, so early errors cannot free garbage or double-free
+       an allocation already released by an intermediate error path. */
     free(tr); free(tc); free(tv);
-    /* colcount/out_r/out_v are freed at their allocation site; if we reach
-       err from a path before they exist they are NULL, so free is safe. */
     free(colcount); free(out_r); free(out_v);
     lp_free(lp);
     return -1;

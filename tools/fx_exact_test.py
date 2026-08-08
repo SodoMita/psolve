@@ -112,6 +112,27 @@ def main():
     rnd = random.Random(seed)
 
     wrong = 0
+
+    # CSC triplets are allowed to repeat a (row, column) pair and therefore
+    # must be summed.  The old dense exact reader overwrote the first entry,
+    # solving x <= 2 instead of x + x <= 2 and confidently returning 2.
+    duplicate_lp = """maximize
+1 1
+1
+2
+<
+0 10
+2
+0 0 1
+0 0 1
+"""
+    with open(TMP, "w") as f:
+        f.write(duplicate_lp)
+    dup = run([FX, TMP, "--print"])
+    if dup.get("status") != "OPTIMAL" or dup.get("objective (exact)") != "1/1":
+        wrong += 1
+        print("  WRONG duplicate-triplet regression:", dup)
+
     stats = {"OPTIMAL": 0, "INFEASIBLE": 0, "UNBOUNDED": 0, "OVERFLOW": 0,
              "ITERATION_LIMIT": 0, "OTHER": 0}
     widths = {64: 0, 128: 0}
