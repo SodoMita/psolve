@@ -83,6 +83,31 @@ static void test_physics_apis(void)
     pgsf_matvec(NULL,0,NULL,NULL);
 }
 
+static void test_batch_apis(void)
+{
+    assert(pgs_batch_solve(-1,NULL,NULL,NULL,NULL,NULL,NULL,NULL)==-1);
+    assert(pgs_batch_solve(0,NULL,NULL,NULL,NULL,NULL,NULL,NULL)==0);
+    assert(pgs_batch_solve(1,NULL,NULL,NULL,NULL,NULL,NULL,NULL)==-1);
+
+    PGSOptions fo[2]={{1,10,1.0,1e-12},{1,10,1.0,1e-12}};
+    double A0[1]={2},A1[1]={1},b0[1]={-6},b1[1]={-2};
+    double lo0[1]={0},lo1[1]={0},hi0[1]={10},hi1[1]={1},x0[1]={0},x1[1]={0};
+    const double *As[2]={A0,A1},*bs[2]={b0,b1},*los[2]={lo0,lo1},*his[2]={hi0,hi1};
+    double *xs[2]={x0,x1};PGSResult rr[2];
+    assert(pgs_batch_solve(2,fo,As,bs,los,his,xs,rr)>0);
+    assert(rr[0].status==0&&rr[1].status==0&&x0[0]==3.0&&x1[0]==1.0);
+
+    assert(pgsf_batch_solve(-1,NULL,NULL,NULL,NULL,NULL,NULL,NULL)==-1);
+    assert(pgsf_batch_solve(0,NULL,NULL,NULL,NULL,NULL,NULL,NULL)==0);
+    PGSFixedOptions io[2]={{1,10,1,1,1},{1,10,1,1,1}};
+    int64_t iA0[1]={2},iA1[1]={1},ib0[1]={-6},ib1[1]={-2};
+    int64_t ilo0[1]={0},ilo1[1]={0},ihi0[1]={10},ihi1[1]={1},ix0[1]={0},ix1[1]={0};
+    const int64_t *iAs[2]={iA0,iA1},*ibs[2]={ib0,ib1},*ilos[2]={ilo0,ilo1},*ihis[2]={ihi0,ihi1};
+    int64_t *ixs[2]={ix0,ix1};
+    assert(pgsf_batch_solve(2,io,iAs,ibs,ilos,ihis,ixs,rr)>0);
+    assert(rr[0].status==0&&rr[1].status==0&&ix0[0]==3&&ix1[0]==1);
+}
+
 static void test_parser_fzn_apis(void)
 {
     LP lp;
@@ -106,6 +131,7 @@ int main(void)
     test_linear_apis();
     test_qp_fx_apis();
     test_physics_apis();
+    test_batch_apis();
     test_parser_fzn_apis();
     puts("ALL PUBLIC C API INVALID-INPUT GUARDS PASSED");
     return 0;

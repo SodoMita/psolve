@@ -1,6 +1,7 @@
 #include "pgs.h"
 #include <math.h>
 #include <stddef.h>
+#include <limits.h>
 
 /* ------------------------------------------------------------------ */
 /* Projected Gauss-Seidel with optional SOR.                           */
@@ -100,4 +101,20 @@ void pgs_matvec(const double *A, int n, const double *x, double *y)
         for (int j = 0; j < n; j++) s += A[i*n + j] * x[j];
         y[i] = s;
     }
+}
+
+long pgs_batch_solve(int count,const PGSOptions *opts,
+                     const double *const *A_arr,const double *const *b_arr,
+                     const double *const *lo_arr,const double *const *hi_arr,
+                     double **x_arr,PGSResult *res_arr)
+{
+    if(count<0)return -1;
+    if(count==0)return 0;
+    if(!opts||!A_arr||!b_arr||!lo_arr||!hi_arr||!x_arr||!res_arr)return -1;
+    long total=0;
+    for(int k=0;k<count;k++){
+        pgs_solve(&opts[k],A_arr[k],b_arr[k],lo_arr[k],hi_arr[k],x_arr[k],&res_arr[k]);
+        if(res_arr[k].flops>LONG_MAX-total)total=LONG_MAX;else total+=res_arr[k].flops;
+    }
+    return total;
 }

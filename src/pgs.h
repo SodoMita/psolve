@@ -51,6 +51,14 @@ void pgs_solve(const PGSOptions *opt,
 /* Convenience: A*x evaluation (for tests / energy checks).  y = A x. */
 void pgs_matvec(const double *A, int n, const double *x, double *y);
 
+/* Solve independent systems sequentially in one call. Returns aggregate flop
+ * count, saturated at LONG_MAX, or -1 for an invalid top-level array/count.
+ * Per-system invalid inputs are reported in res_arr[k].status. */
+long pgs_batch_solve(int count, const PGSOptions *opts,
+                     const double *const *A_arr, const double *const *b_arr,
+                     const double *const *lo_arr, const double *const *hi_arr,
+                     double **x_arr, PGSResult *res_arr);
+
 #define PGS_INF 1e30
 
 #endif

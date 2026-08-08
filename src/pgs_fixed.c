@@ -118,3 +118,19 @@ void pgsf_solve(const PGSFixedOptions *opt,
     }
     res->obj = obj;
 }
+
+long pgsf_batch_solve(int count,const PGSFixedOptions *opts,
+                      const int64_t *const *A_arr,const int64_t *const *b_arr,
+                      const int64_t *const *lo_arr,const int64_t *const *hi_arr,
+                      int64_t **x_arr,PGSResult *res_arr)
+{
+    if(count<0)return -1;
+    if(count==0)return 0;
+    if(!opts||!A_arr||!b_arr||!lo_arr||!hi_arr||!x_arr||!res_arr)return -1;
+    long total=0;
+    for(int k=0;k<count;k++){
+        pgsf_solve(&opts[k],A_arr[k],b_arr[k],lo_arr[k],hi_arr[k],x_arr[k],&res_arr[k]);
+        if(res_arr[k].flops>LONG_MAX-total)total=LONG_MAX;else total+=res_arr[k].flops;
+    }
+    return total;
+}
