@@ -382,8 +382,11 @@ are integral):
   are deliberately not relaxed to non-strict LP rows: their feasible sets are
   open.  An optimization result that reaches the bridge's synthetic bound for
   an otherwise unbounded objective-bearing variable is likewise `UNKNOWN`, not
-  a fake optimum.
-  See `docs/ROADMAP.md` for the remaining handler list.
+  a fake optimum — and an infeasibility verdict is certified only inside the
+  synthetic box given to undeclared `var int/float` domains, so such models
+  report `UNKNOWN` rather than a possibly-false `UNSATISFIABLE`.
+  `int_div`/`int_mod` use MiniZinc semantics (remainder takes the dividend's
+  sign).  See `docs/ROADMAP.md` for the remaining handler list.
 
 ## Layout
 

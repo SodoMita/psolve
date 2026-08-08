@@ -170,7 +170,32 @@ independent contact systems with aggregate statistics. The global arena half of
 remote commit `6ebf11d` was rejected for ownership/alignment/thread-safety bugs;
 see `docs/BRANCH_AUDIT.md`.
 
+### DONE — FlatZinc set-literal + status honesty (branch `arena/fzn-set-status-ports`)
+
+Follow-up merge of the still-unmerged parts of `arena/continue-hardening`,
+after verifying each of its claims empirically against the MiniZinc
+specification (see `docs/BRANCH_AUDIT.md` for the full review):
+
+- **Set-literal parsing no longer truncates silently** (`fz_parse_int_set`):
+  `set_in(y,{1,...,280})` with `y=265` had printed `UNSATISFIABLE`; a
+  singleton set had overwritten the declared domain (`var 0..5` + `{8}` had
+  printed `x = 8`); `among` double-counted duplicate set members.  All three
+  fixed and covered by the new brute-force differential
+  `tools/divmod_verify.py` (0 wrong answers; wired into `test.sh`).
+- **UNSAT is only certified inside the synthetic box**: an infeasible
+  verdict on a model containing an undeclared (`var int:`/`var float:`)
+  variable is downgraded to UNKNOWN.
+- **GLPK differential re-run and green** (sweep 119/119, four-way difftest
+  0 mismatches) — glpsol was obtained for this environment.
+- That branch's `int_div`/`int_mod` floor-semantics rewrite was **rejected**:
+  MiniZinc defines `mod` with the dividend's sign (truncation, C semantics),
+  which `main` already implements.  The verifier it ships now encodes the
+  spec-correct reference semantics explicitly (with citations), so a future
+  contributor cannot make the same mistake either direction.
+
 ## Not done (recommended next steps, in priority order)
-1. Re-run the GLPK and MiniZinc differential suites (when `glpsol`/`minizinc` are installed in the host environment).
+1. Re-run the MiniZinc differential suite (`tools/mzn_diff.py`) when
+   `minizinc` is installed (not packaged for this host's distro).
+   The GLPK side is done.
 2. Redesign the global `setjmp` allocation-error protocol so a recovering,
    multi-threaded library host can own cleanup without process-global state.

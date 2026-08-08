@@ -12,6 +12,37 @@ This pass compared every remote branch against `main` before selecting work for
 | `fzn-table-constraint` | fully merged; no exclusive commits | No action required. |
 | `arena/fzn-all-solutions` | exact fallback + FlatZinc commits already reviewed here, a merge, and a narrow parser-warning fix | Superseded by this branch's stricter parser and hardened ports. |
 | `arena/audit-hardening` | six exclusive commits and three `main` commits missing at final fetch | Reviewed commit by commit; safe/high-value parts were ported and hardened. The branch-and-clip and global arena allocator implementations were rejected as unsound; batch PGS APIs were ported separately. |
+| `arena/continue-hardening` | set semantics / status-honesty fixes + verifiers, plus a division-semantics regression | Reviewed empirically against MiniZinc semantics; sound fixes ported on `arena/fzn-set-status-ports` (now on `main`), one part rejected — see below. |
+
+### `arena/continue-hardening` review findings
+
+- **REJECTED: `int_div`/`int_mod` floor-division rewrite.**  The branch
+  changed the constant divisor handlers from C truncation to Python-style
+  floor semantics (remainder sign of the divisor) and its verifier encoded
+  the same assumption.  But MiniZinc spec 4.1.11.2 fixes the modulo sign to
+  the *dividend's* (`7 mod -3 = 1`, `-7 mod 3 = -1`) with the identity
+  `x = (x div y)*y + (x mod y)` — i.e. truncation toward zero, C semantics.
+  `main`'s handlers (with the exact sign-condition encoding) already
+  implement this correctly, verified by the ported verifier under corrected
+  reference semantics.  The rewrite was therefore not merged.
+- **Ported: set-literal honesty.**  `main` still parsed `set_in`/`among` set
+  literals through a fixed 512-byte buffer with a silent 256-value cap —
+  `set_in(y,{1,...,280})` with `y=265` printed `UNSATISFIABLE` while the
+  model is satisfiable — and a singleton set overwrote the variable's
+  declared domain (`var 0..5: x; set_in(x,{8})` printed `x = 8`).  Ported
+  the branch's dynamic deduplicating parser (`fz_parse_int_set`, honest
+  1024-value cap, ranges of any width as bound clamps, singleton/range
+  intersection with the declared domain, empty-range infeasibility,
+  `among` duplicate-member dedupe and encoding-size cap).
+- **Ported: synthetic-box UNSAT honesty.**  `UNSATISFIABLE` is only
+  certified inside the bridge's ±1e9 sentinel box; models with undeclared
+  (`var int:`/`var float:`) bounds now degrade an infeasible verdict to
+  UNKNOWN instead of fabricating UNSAT (e.g. `int_lin_eq z=2e10`).
+- **Ported: brute-force verifier + tests.** `tools/divmod_verify.py`
+  (reference semantics corrected to truncation as above; duplicates,
+  negative divisors/dividends, optimize objectives) and the `-a`
+  distinct/exact-count regression; `fznsolve` usage lists `-a`; GLPK
+  differential re-run green (sweep 119/119, difftest 0 mismatches).
 
 ## Ported work
 

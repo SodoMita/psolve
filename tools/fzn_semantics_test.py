@@ -9,6 +9,7 @@ cannot be represented by a closed LP.
 from __future__ import annotations
 
 import pathlib
+import re
 import subprocess
 import sys
 import tempfile
@@ -374,6 +375,35 @@ def test_all_solutions_and_extended_constraints() -> None:
         require("x = 1;" in res.stdout and "x = 2;" in res.stdout and "x = 3;" in res.stdout,
                 f"-a satisfaction missed solutions:\n{res.stdout}")
         require("==========" in res.stdout, f"-a satisfaction missing completion marker:\n{res.stdout}")
+    finally:
+        path.unlink(missing_ok=True)
+
+    # 1b. -a distinctness + exact solution count: x < y on a 3x3 lattice
+    #     has exactly 3 solutions ((1,2),(1,3),(2,3)); blocks must be distinct.
+    with tempfile.NamedTemporaryFile("w", suffix=".fzn", delete=False) as f:
+        f.write(
+            """
+            var 1..3: x :: output_var;
+            var 1..3: y :: output_var;
+            constraint int_lt(x, y);
+            solve satisfy;
+            """
+        )
+        path = pathlib.Path(f.name)
+    try:
+        res = subprocess.run([str(SOLVER), "-a", str(path)], text=True, capture_output=True, timeout=10)
+        seen = set()
+        blocks = [b for b in res.stdout.split("----------") if "x =" in b]
+        for b in blocks:
+            xm = re.search(r"x = (\d+);", b)
+            ym = re.search(r"y = (\d+);", b)
+            require(xm and ym, f"-a malformed block:\\n{b}")
+            pair = (int(xm.group(1)), int(ym.group(1)))
+            require(pair[0] < pair[1], f"-a violated x<y: {pair}")
+            require(pair not in seen, f"-a duplicate solution {pair}")
+            seen.add(pair)
+        require(len(seen) == 3, f"-a must find exactly 3 solutions, found {len(seen)}:\\n{res.stdout}")
+        require("==========" in res.stdout, f"-a missing completion marker:\\n{res.stdout}")
     finally:
         path.unlink(missing_ok=True)
 

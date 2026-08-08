@@ -302,6 +302,20 @@ models can still need many B&B nodes (a weak relaxation, not a wrong answer),
 and real-time CSPs are still better served by a propagation-based engine in the
 consuming project.
 
+### Honesty rules for the FlatZinc bridge (no fabricated verdicts)
+- `var int/float` without declared bounds is clamped to a synthetic ±1e9 box.
+  An `UNSATISFIABLE` verdict is only certified *inside* that box: when a
+  synthetically-bounded variable is present, infeasibility is downgraded to
+  `=====UNKNOWN=====` (bounded models keep exact UNSAT).  Optimization
+  results whose objective touches a synthetic bound were already UNKNOWN.
+- Set literals are never truncated: `set_in`/`among` parse dynamically with
+  deduplication and an honest enumeration cap (UNKNOWN past it), clamp
+  ranges of any width, and intersect singletons/ranges with the declared
+  domain (empty intersection = UNSAT).
+- `int_div`/`int_mod` implement the MiniZinc spec: the remainder takes the
+  *dividend's* sign (truncation toward zero, `x = (x div y)*y + (x mod y)`),
+  encoded exactly incl. negative dividends and divisors.
+
 ### Exact-solver MIP fallback
 `src/mip.c` cross-checks a relaxation with the fixed-point exact-rational
 simplex (`src/fx.c`) whenever the double revised-simplex returns

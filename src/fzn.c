@@ -769,6 +769,65 @@ static int objective_uses_synthetic_bound(const FZModel*m,const Builder*b,const 
     return 0;
 }
 
+/* Cap on enumerated set members materialized into selector binaries.  Sets
+   larger than this are UNHANDLED (the bridge reports UNKNOWN) rather than
+   silently truncated — answering on a truncated set would be a wrong answer. */
+#define FZ_MAX_SET_ENUM 1024
+
+/* Parse a FlatZinc int-set literal: either a range `a..b` (optionally brace-
+   enclosed) or an enumeration `{v1, v2, ...}` / `v1, v2, ...`.  Enumerated
+   values are deduplicated (duplicate members are legal input but must not
+   double-count in selector/sum encodings) and returned in ascending order.
+   Returns 0 on success: *is_range_out tells which form matched; enumerations
+   return a psolve_malloc'd *vals_out (caller frees) with *nvals_out values.
+   Returns 1 (unhandled) on unparseable tokens or when the enumeration exceeds
+   `cap` — callers then report UNKNOWN instead of truncating the set. */
+static int fz_parse_int_set(const char *set,int cap,int *is_range_out,long *rlo_out,long *rhi_out,
+                            long **vals_out,int *nvals_out)
+{
+    const char *s=set;
+    while(*s==' '||*s=='\t')s++;
+    if(*s=='{')s++;
+    while(*s==' '||*s=='\t')s++;
+    /* range form?  the only '.' in an int set comes from '..' */
+    const char *dd=strstr(s,"..");
+    if(dd){
+        char *e1; long lo=strtol(s,&e1,10);
+        if(e1!=dd)return 1;
+        char *e2; long hi=strtol(dd+2,&e2,10);
+        if(e2==dd+2)return 1;
+        while(*e2==' '||*e2=='\t')e2++;
+        if(*e2!='}'&&*e2!=0)return 1;
+        *is_range_out=1; *rlo_out=lo; *rhi_out=hi;
+        *vals_out=NULL; *nvals_out=0;
+        return 0;
+    }
+    /* enumeration */
+    *is_range_out=0; *vals_out=NULL; *nvals_out=0;
+    if(*s=='}'||*s==0)return 0;                 /* empty set: nvals=0 */
+    int alloc=16; long *vals=(long*)psolve_malloc((size_t)alloc*sizeof(long));
+    int n=0;
+    for(;;){
+        char *e; long v=strtol(s,&e,10);
+        if(e==s){free(vals);return 1;}          /* unparseable token */
+        /* dedupe insert, ascending */
+        int pos=0;
+        while(pos<n&&vals[pos]<v)pos++;
+        if(pos>=n||vals[pos]!=v){
+            if(n>=cap){free(vals);return 1;}    /* honest cap, no truncation */
+            if(n>=alloc){alloc*=2;vals=(long*)psolve_realloc((void**)&vals,(size_t)alloc*sizeof(long));}
+            memmove(vals+pos+1,vals+pos,(size_t)(n-pos)*sizeof(long));
+            vals[pos]=v;n++;
+        }
+        while(*e==' '||*e=='\t')e++;
+        if(*e==','){s=e+1;while(*s==' '||*s=='\t')s++;continue;}
+        if(*e=='}'||*e==0)break;
+        free(vals);return 1;
+    }
+    *vals_out=vals; *nvals_out=n;
+    return 0;
+}
+
 /* dispatch: 0 handled, 1 unhandled, -1 malformed */
 static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
 {
@@ -1255,33 +1314,36 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
         Lin xl; if(parse_lin(m,c->args[0],&xl)!=0) return -1;
         Lin rb;
         if(reified && parse_lin(m,c->args[2],&rb)!=0){lin_free(&xl);return -1;}
-        const char*set=c->args[1];
-        char setbuf[512]; strncpy(setbuf,set,511); setbuf[511]=0;
-        char*br=strchr(setbuf,'{');
-        if(br){ br++; char*br2=strchr(br,'}'); if(br2)*br2=0; }
-        else br=setbuf;
-        long vals[256]; int nvals=0; long vmin=1000000000L,vmax=-1000000000L;
-        int is_range = 0; long rlo=0, rhi=0;
-        char*dd=strchr(br,'.');
-        if(dd){
-            *dd=0; rlo=atol(br); rhi=atol(dd+2);
-            is_range = 1;
-            if(rlo<=rhi && rhi-rlo+1<=256){
-                for(long v=rlo;v<=rhi;v++){vals[nvals++]=(int)v; if(v<vmin)vmin=v; if(v>vmax)vmax=v;}
-            }
-        } else {
-            char*tok=strtok(br,", \t");
-            while(tok && nvals<256){ long v=atol(tok); vals[nvals++]=(int)v; if(nvals==1||v<vmin)vmin=v; if(v>vmax)vmax=v; tok=strtok(NULL,", \t"); }
+        int is_range=0; long rlo=0, rhi=0; long*vals=NULL; int nvals=0;
+        if(fz_parse_int_set(c->args[1],FZ_MAX_SET_ENUM,&is_range,&rlo,&rhi,&vals,&nvals)!=0){
+            lin_free(&xl); if(reified)lin_free(&rb); return 1;
         }
         if(!reified){
-            if(nvals==0){lin_free(&xl);return 1;}
-            if(xl.n!=1){lin_free(&xl);return 1;}
+            if(xl.n!=1){free(vals);lin_free(&xl);return 1;}
             int x=xl.idx[0];
-            if(nvals==1){ b->lo[x]=vals[0];b->haslo[x]=1;b->hi[x]=vals[0];b->hashi[x]=1; lin_free(&xl); return 0; }
-            if(is_range && rlo<=rhi){
-                if(b->lo[x]<rlo){ b->lo[x]=rlo; b->haslo[x]=1; }
-                if(b->hi[x]>rhi){ b->hi[x]=rhi; b->hashi[x]=1; }
-                lin_free(&xl); return 0;
+            if(is_range){
+                if(rlo>rhi){ /* empty range: unsatisfiable */
+                    Lin nf;memset(&nf,0,sizeof(nf)); b_put(b,'=',1.0,&nf); lin_free(&nf);
+                } else {
+                    if(!b->haslo[x]||b->lo[x]<rlo){ b->lo[x]=(double)rlo; b->haslo[x]=1; }
+                    if(!b->hashi[x]||b->hi[x]>rhi){ b->hi[x]=(double)rhi; b->hashi[x]=1; }
+                    if(b->lo[x]>b->hi[x]){ /* intersection with the domain is empty */
+                        Lin nf;memset(&nf,0,sizeof(nf)); b_put(b,'=',1.0,&nf); lin_free(&nf);
+                    }
+                }
+                free(vals); lin_free(&xl); return 0;
+            }
+            if(nvals==0){free(vals);lin_free(&xl);return 1;}
+            if(nvals==1){
+                double v=(double)vals[0];
+                /* intersect the singleton with the declared domain: a value
+                   outside it is unsatisfiable, not a new domain */
+                if((b->haslo[x]&&b->lo[x]>v)||(b->hashi[x]&&b->hi[x]<v)){
+                    Lin nf;memset(&nf,0,sizeof(nf)); b_put(b,'=',1.0,&nf); lin_free(&nf);
+                } else {
+                    b->lo[x]=v;b->haslo[x]=1;b->hi[x]=v;b->hashi[x]=1;
+                }
+                free(vals); lin_free(&xl); return 0;
             }
             int *bs=(int*)psolve_malloc((size_t)nvals*sizeof(int));
             for(int i=0;i<nvals;i++) bs[i]=b_newvar(b,0.0,1.0);
@@ -1291,12 +1353,16 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
             Lin sum;memset(&sum,0,sizeof(sum));
             for(int i=0;i<nvals;i++) lin_term(&sum,bs[i],1.0);
             sum.constant=-1.0; b_put(b,'=',0.0,&sum);
-            lin_free(&eq);lin_free(&sum); free(bs);lin_free(&xl);
+            lin_free(&eq);lin_free(&sum); free(bs);free(vals);lin_free(&xl);
             return 0;
         } else {
             int r;
-            if(lin_unit_var(&rb,&r)!=0){lin_free(&xl);lin_free(&rb);return 1;}
-            if(is_range && rlo<=rhi){
+            if(lin_unit_var(&rb,&r)!=0){free(vals);lin_free(&xl);lin_free(&rb);return 1;}
+            if(is_range){
+                if(rlo>rhi){ /* empty range: r = false */
+                    Lin z;memset(&z,0,sizeof(z)); lin_term(&z,r,1.0); b_put(b,'=',0.0,&z); lin_free(&z);
+                    free(vals); lin_free(&xl);lin_free(&rb); return 0;
+                }
                 Lin d1;memset(&d1,0,sizeof(d1)); lin_into(&d1,&xl,1.0); d1.constant=-(double)rlo;
                 int b1=b_newvar(b,0.0,1.0);
                 add_int_reif(b,&d1,b1,3); lin_free(&d1);
@@ -1308,8 +1374,8 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
                 Lin c2;memset(&c2,0,sizeof(c2)); lin_term(&c2,r,1.0); lin_term(&c2,b2,-1.0); b_put(b,'<',0.0,&c2); lin_free(&c2);
                 Lin c3;memset(&c3,0,sizeof(c3)); lin_term(&c3,r,1.0); lin_term(&c3,b1,-1.0); lin_term(&c3,b2,-1.0); c3.constant=1.0;
                 b_put(b,'>',0.0,&c3); lin_free(&c3);
-                lin_free(&xl);lin_free(&rb); return 0;
-            } else if(nvals>0 && nvals<=128){
+                free(vals); lin_free(&xl);lin_free(&rb); return 0;
+            } else if(nvals>0){
                 int *zs=(int*)psolve_malloc((size_t)nvals*sizeof(int));
                 for(int i=0;i<nvals;i++){
                     zs[i]=b_newvar(b,0.0,1.0);
@@ -1322,9 +1388,9 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
                 Lin at_most_one;memset(&at_most_one,0,sizeof(at_most_one));
                 for(int i=0;i<nvals;i++) lin_term(&at_most_one,zs[i],1.0);
                 b_put(b,'<',1.0,&at_most_one); lin_free(&at_most_one);
-                free(zs); lin_free(&xl);lin_free(&rb); return 0;
+                free(zs); free(vals); lin_free(&xl);lin_free(&rb); return 0;
             }
-            lin_free(&xl);lin_free(&rb); return 1;
+            free(vals); lin_free(&xl);lin_free(&rb); return 1;
         }
     }
     /* all_different(x[]): each variable takes a distinct value.
@@ -1758,24 +1824,28 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
         Lin nl; if(parse_lin(m,c->args[0],&nl)!=0)return -1;
         Lin*arr;int narr;
         if(parse_array(m,c->args[1],&arr,&narr)!=0){lin_free(&nl);return -1;}
-        const char*set=c->args[2];
-        char setbuf[512]; strncpy(setbuf,set,511); setbuf[511]=0;
-        char*br=strchr(setbuf,'{');
-        if(br){ br++; char*br2=strchr(br,'}'); if(br2)*br2=0; }
-        else br=setbuf;
-        long vals[256]; int nvals=0;
-        char*dd=strchr(br,'.');
-        if(dd){
-            *dd=0; long lo=atol(br), hi=atol(dd+2);
-            if(lo<=hi && hi-lo+1<=256){ for(long v=lo;v<=hi;v++) vals[nvals++]=(int)v; }
-        } else {
-            char*tok=strtok(br,", \t");
-            while(tok && nvals<256){ vals[nvals++]=(int)atol(tok); tok=strtok(NULL,", \t"); }
+        int is_range=0; long rlo=0, rhi=0; long*vals=NULL; int nvals=0;
+        if(fz_parse_int_set(c->args[2],FZ_MAX_SET_ENUM,&is_range,&rlo,&rhi,&vals,&nvals)!=0){
+            lin_free(&nl); free_lins(arr,narr); return 1;
         }
-        if(nvals==0){lin_free(&nl);free_lins(arr,narr);return 1;}
+        if(is_range){
+            /* materialize the range (bounded work); beyond the honest cap
+               report UNHANDLED rather than truncating the set */
+            if(rlo>rhi){ vals=NULL; nvals=0; }
+            else if(rhi-rlo+1>FZ_MAX_SET_ENUM){ lin_free(&nl); free_lins(arr,narr); return 1; }
+            else {
+                nvals=(int)(rhi-rlo+1);
+                vals=(long*)psolve_malloc((size_t)nvals*sizeof(long));
+                for(long v=rlo;v<=rhi;v++) vals[(int)(v-rlo)]=v;
+            }
+        }
+        /* per-(element,value) selector binaries: cap the total encoding */
+        if(nvals==0 || (narr>0 && nvals > 4096/narr)){
+            free(vals); lin_free(&nl); free_lins(arr,narr); return 1;
+        }
         int *bs=(int*)psolve_malloc((size_t)(narr?narr:1)*sizeof(int));
         for(int i=0;i<narr;i++){
-            if(arr[i].n!=1){free(bs);free_lins(arr,narr);lin_free(&nl);return 1;}
+            if(arr[i].n!=1){free(bs);free(vals);free_lins(arr,narr);lin_free(&nl);return 1;}
             int bi=b_newvar(b,0.0,1.0);
             bs[i]=bi;
             int *zs=(int*)psolve_malloc((size_t)nvals*sizeof(int));
@@ -1793,7 +1863,7 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
         for(int i=0;i<narr;i++) lin_term(&s,bs[i],1.0);
         lin_into(&s,&nl,-1.0);
         b_put(b,'=',0.0,&s); lin_free(&s);
-        free(bs); free_lins(arr,narr); lin_free(&nl);
+        free(bs); free(vals); free_lins(arr,narr); lin_free(&nl);
         return 0;
     }
     /* table(x[], T): the tuple (x[0..n-1]) must equal one of the rows of the
@@ -2243,6 +2313,16 @@ void fz_solve(const FZModel*m,FZSolution*sol)
            unproven) FlatZinc objective look optimal.  Preserve the invariant
            that fznsolve never prints a fabricated optimum. */
         sol->status=2;
+    }
+    if(sol->status==1){
+        /* UNSATISFIABLE is only certified *inside* the bridge's finite box:
+           a `var int/float` without declared bounds (haslo/hashi unset) was
+           clamped to ±FZ_BIG_BOUND, so the real model may have solutions
+           outside that box.  Downgrade to UNKNOWN rather than print a false
+           UNSAT — bounded models keep their exact verdict. */
+        for(int v=0;v<nv;v++){
+            if(!b.haslo[v]||!b.hashi[v]){ sol->status=2; break; }
+        }
     }
     fz_solve_ctx_free(&ctx);
     free(isint);
