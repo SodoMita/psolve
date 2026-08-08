@@ -285,14 +285,27 @@ feature completeness against a huge standard corpus.
       error paths) found and fixed.
 - [ ] More MiniZinc-suite coverage; HiGHS round-trip.
 
-### Known Phase 3 limitation
+### Known Phase 3 limitation (improved)
 Pure LP-based B&B has weak relaxations on *combinatorial* feasibility models
 that combine gapped `set` domains, `all_different`, and nonlinear (`!=`)
-constraints (big-M encodings).  Such models solve correctly when they complete
-(never a wrong answer — `UNKNOWN` is returned), but B&B may not reach a
-solution quickly.  Real-time CSPs are better served by a propagation-based
-engine in the consuming project; psolve's LP/QP/MIP backbone targets
-linear/quadratic and well-structured MIP models.
+constraints (big-M encodings).  The double revised-simplex is also numerically
+fragile on the resulting big-M bases (it could return `NUMERICAL_FAILURE` or a
+false `INFEASIBLE` on a feasible relaxation).  Since the exact-rational MIP
+cross-check (see below) that limitation is largely resolved for integral data:
+every relaxation the double solver cannot certify is re-solved exactly, so
+`cumulative_verify` now reports `UNKNOWN=0`.  Remaining gap: hard combinatorial
+models can still need many B&B nodes (a weak relaxation, not a wrong answer),
+and real-time CSPs are still better served by a propagation-based engine in the
+consuming project.
+
+### Exact-solver MIP fallback
+`src/mip.c` cross-checks a relaxation with the fixed-point exact-rational
+simplex (`src/fx.c`) whenever the double revised-simplex returns
+`SOLVE_NUMERICAL` or `INFEASIBLE`.  `fx_from_double` / `FX_INF_SENT` are
+exported; `mip_build_fxlp()` builds the exact FxLP from the double MIP and
+per-node bounds.  For integral data the exact verdict wins (immune to double
+rounding); otherwise the honest double verdict is kept.  Deterministic
+regression: `examples/fzn/cumulative_exact.fzn`.
 
 ### Phase 3 first-cut deliverable: `fznsolve <x.fzn>` solves the linear subset,
 with tests in `examples/fzn/` and `test.sh` (incl. the MiniZinc differential).

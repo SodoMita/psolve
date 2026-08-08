@@ -1,4 +1,5 @@
 #include "mip.h"
+#include "fx.h"
 #include "err.h"
 #include <stdlib.h>
 #include <string.h>
@@ -6,6 +7,51 @@
 #include <stdio.h>
 
 #define MIP_TOL 1e-6
+
+/* Build an exact-rational FxLP from the double MIP data plus per-node bounds.
+ * Used to retry a relaxation with the exact solver when the double revised
+ * simplex diverges (returns SOLVE_NUMERICAL) on a big-M relaxation.
+ *
+ * Only integral coefficients/bounds are representable exactly (see
+ * fx_from_double); a model with float data returns -1 so the caller keeps the
+ * double solver's honest failure rather than producing a wrong answer.  On
+ * success the caller owns *flp (free with fx_free). */
+static int mip_build_fxlp(const MIP *mip, const double *lo, const double *hi, FxLP *flp){
+    int n = mip->n, m = mip->m;
+    memset(flp, 0, sizeof(*flp));
+    flp->n = n; flp->m = m; flp->maximize = mip->maximize;
+    flp->c = (Fx*)calloc((size_t)n, sizeof(Fx));
+    flp->b = (Fx*)calloc((size_t)(m ? m : 1), sizeof(Fx));
+    flp->l = (Fx*)calloc((size_t)n, sizeof(Fx));
+    flp->u = (Fx*)calloc((size_t)n, sizeof(Fx));
+    flp->lfinite = (int*)calloc((size_t)n, sizeof(int));
+    flp->ufinite = (int*)calloc((size_t)n, sizeof(int));
+    flp->rel = (char*)malloc((size_t)(m ? m : 1));
+    flp->A = (Fx*)calloc((size_t)(m ? (size_t)m * n : 1), sizeof(Fx));
+    if(!flp->c || !flp->b || !flp->l || !flp->u ||
+       !flp->lfinite || !flp->ufinite || !flp->rel || !flp->A){ fx_free(flp); return -1; }
+    for(int j = 0; j < n; j++) if(fx_from_double(mip->c[j], &flp->c[j]) != 0) goto fail;
+    for(int i = 0; i < m; i++) if(fx_from_double(mip->b[i], &flp->b[i]) != 0) goto fail;
+    for(int i = 0; i < m; i++) flp->rel[i] = mip->rel[i];
+    for(int j = 0; j < n; j++){
+        if(lo[j] <= -1e29){ flp->lfinite[j] = 0; flp->l[j].num = -FX_INF_SENT; }
+        else { if(fx_from_double(lo[j], &flp->l[j]) != 0) goto fail; flp->lfinite[j] = 1; }
+        if(hi[j] >= 1e29){ flp->ufinite[j] = 0; flp->u[j].num = FX_INF_SENT; }
+        else { if(fx_from_double(hi[j], &flp->u[j]) != 0) goto fail; flp->ufinite[j] = 1; }
+        if(!flp->lfinite[j] && !flp->ufinite[j]) goto fail;   /* free var unsupported */
+    }
+    for(int j = 0; j < n; j++)
+        for(int k = mip->Acolptr[j]; k < mip->Acolptr[j+1]; k++){
+            int r = mip->Arow[k];
+            if(r < 0 || r >= m) continue;
+            if(fx_from_double(mip->Aval[k], &flp->A[(size_t)r * n + j]) != 0) goto fail;
+        }
+    return 0;
+fail:
+    fx_free(flp);
+    return -1;
+}
+
 
 /* LP-rounding feasibility heuristic: round the relaxation solution's integer
    variables to integer values inside the current node bounds and test the
@@ -121,6 +167,30 @@ static int solve_relaxation(const MIP *mip, const Node *node,
         solver_optimum(s, xo, obj);
         for (int j = 0; j < n; j++) x[j] = xo[j];
         free(xo);
+    } else if (r == SOLVE_NUMERICAL || r == 1) {
+        /* The double revised-simplex either diverged (SOLVE_NUMERICAL, its
+           solution certificate failed) or declared the relaxation INFEASIBLE.
+           On the ill-conditioned big-M bases of combinatorial MIPs
+           (table/circuit/cumulative) both are possible even when the
+           relaxation is feasible.  Cross-check the SAME relaxation exactly
+           with the fixed-point rational simplex, which is immune to double
+           rounding.  If the data are integral and the exact solve succeeds we
+           trust its verdict; otherwise we keep the double solver's honest
+           result. */
+        FxLP flp; memset(&flp, 0, sizeof(flp));
+        if (mip_build_fxlp(mip, lo, hi, &flp) == 0) {
+            FxResult fres; memset(&fres, 0, sizeof(fres));
+            int fr = fx_solve(&flp, &fres);
+            if (fr == FX_OPTIMAL) {
+                status = 0;
+                for (int j = 0; j < n; j++) x[j] = fx_todouble(fres.x[j]);
+                *obj = fx_todouble(fres.obj);
+            } else if (fr == FX_INFEASIBLE) status = 1;
+            else if (fr == FX_UNBOUNDED) status = 2;
+            else status = r;   /* iter limit / overflow: keep the double verdict */
+            fx_result_free(&fres);
+        }
+        fx_free(&flp);
     }
     for (int j = 0; j < n; j++) { lcur[j] = lo[j]; ucur[j] = hi[j]; }
     solver_destroy(s);
@@ -199,7 +269,7 @@ void mip_solve(const MIP *mip, MIPResult *res)
         /* track best bound over solved (not pruned) nodes */
         if (mip->maximize) { if (obj > best_bound) best_bound = obj; }
         else { if (obj < best_bound) best_bound = obj; }
-        if (have_incumbent) {
+        if (have_incumbent && !mip->stop_at_feasible) {
             if (mip->maximize && obj <= incumbent + gap * (1.0 + fabs(incumbent))) { free(node->lo); free(node->hi); free(node); continue; }
             if (!mip->maximize && obj >= incumbent - gap * (1.0 + fabs(incumbent))) { free(node->lo); free(node->hi); free(node); continue; }
         }
@@ -207,7 +277,7 @@ void mip_solve(const MIP *mip, MIPResult *res)
         /* LP-rounding feasibility heuristic: if the relaxation is already
            integral after rounding, grab it as an incumbent immediately
            (fast path, especially for solve satisfy). */
-        if (try_rounding_heuristic(mip, x, lcur, ucur, xc)) {
+        if (!mip->all_solutions && try_rounding_heuristic(mip, x, lcur, ucur, xc)) {
             double objr = 0.0;
             for (int j = 0; j < n; j++) objr += mip->c[j] * xc[j];
             if (!have_incumbent ||
@@ -219,7 +289,7 @@ void mip_solve(const MIP *mip, MIPResult *res)
                 for (int j = 0; j < n; j++) res->isint_sol[j] = mip->isint[j];
             }
         }
-        if (mip->stop_at_feasible && have_incumbent) {
+        if (mip->stop_at_feasible && have_incumbent && !mip->all_solutions) {
             free(node->lo); free(node->hi); free(node);
             stopped_early = 1;
             break;
@@ -238,6 +308,42 @@ void mip_solve(const MIP *mip, MIPResult *res)
         }
 
         if (allint) {
+            /* In all-solutions satisfaction mode, if any integer variable is
+               not yet fixed to a single value, branch on it to enumerate all
+               lattice points rather than stopping at the first point. */
+            if (mip->all_solutions && mip->stop_at_feasible) {
+                int unfixed = -1;
+                for (int j = 0; j < n; j++) {
+                    if (mip->isint[j] && (ucur[j] - lcur[j] > 0.5)) {
+                        unfixed = j; break;
+                    }
+                }
+                if (unfixed >= 0) {
+                    double v = floor(x[unfixed] + 0.5);
+                    if (v < lcur[unfixed]) v = lcur[unfixed];
+                    if (v >= ucur[unfixed]) v = ucur[unfixed] - 1.0;
+
+                    Node *c1 = (Node*)psolve_malloc(sizeof(Node));
+                    c1->lo = (double*)psolve_malloc((size_t)n * sizeof(double));
+                    c1->hi = (double*)psolve_malloc((size_t)n * sizeof(double));
+                    for (int j = 0; j < n; j++) { c1->lo[j] = lcur[j]; c1->hi[j] = ucur[j]; }
+                    c1->hi[unfixed] = v;
+                    c1->bound = obj; c1->feasible = 0; c1->next = NULL;
+                    push_node(&stack, c1, mip->maximize);
+
+                    Node *c2 = (Node*)psolve_malloc(sizeof(Node));
+                    c2->lo = (double*)psolve_malloc((size_t)n * sizeof(double));
+                    c2->hi = (double*)psolve_malloc((size_t)n * sizeof(double));
+                    for (int j = 0; j < n; j++) { c2->lo[j] = lcur[j]; c2->hi[j] = ucur[j]; }
+                    c2->lo[unfixed] = v + 1.0;
+                    c2->bound = obj; c2->feasible = 0; c2->next = NULL;
+                    push_node(&stack, c2, mip->maximize);
+
+                    free(node->lo); free(node->hi); free(node);
+                    continue;
+                }
+            }
+
             /* Integer-feasible.  Snap the integer components to the lattice:
                the LP returns them within MIP_TOL of an integer, and callers
                must never see 2.9999999997 for a variable declared integer. */
@@ -255,13 +361,17 @@ void mip_solve(const MIP *mip, MIPResult *res)
                 memcpy(bestx, x, (size_t)n * sizeof(double));
                 have_incumbent = 1;
                 for (int j = 0; j < n; j++) res->isint_sol[j] = mip->isint[j];
-                if (mip->stop_at_feasible) {
+                if (mip->all_solutions && mip->on_solution)
+                    mip->on_solution(x, obj, mip->solution_user_data);
+                if (mip->stop_at_feasible && !mip->all_solutions) {
                     /* solve satisfy: the first feasible integer point is an
                        answer; stop branching instead of proving optimality. */
                     free(node->lo); free(node->hi); free(node);
                     stopped_early = 1;
                     break;
                 }
+            } else if (mip->all_solutions && mip->stop_at_feasible && mip->on_solution) {
+                mip->on_solution(x, obj, mip->solution_user_data);
             }
             free(node->lo); free(node->hi); free(node);
             continue;
