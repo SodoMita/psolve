@@ -147,6 +147,79 @@ Expanded native FlatZinc constraint handlers:
 
 All new handlers and options are verified by dedicated regression tests in `tools/fzn_semantics_test.py`.
 
+## Continuation pass — FlatZinc handler & parser correctness (branch `arena/continue-hardening`)
+
+A focused review of the just-landed `-a`/exact-fallback code and the
+constraint handlers found **seven wrong-answer / undefined-behaviour bugs**,
+all fixed and covered by a new brute-force differential verifier
+(`tools/divmod_verify.py`, wired into `test.sh`):
+
+1. **`int_div`/`int_mod` used C truncation, not MiniZinc floor division.**
+   `int_div(-7,3,q)` printed `q = -2` (correct: `-3`); `int_mod(-7,3,r)`
+   printed `r = -1` (correct: `2`).  Both the constant-fold path and the
+   general encoding (remainder bounds admitted lattice-foreign points for
+   possibly-negative dividends) were wrong; negative divisors were wrong
+   even for non-negative dividends.  Now: exact sign-aware remainder bounds
+   (`K>0: rem∈[0,K-1]`, `K<0: rem∈[K+1,0]`) pin `q = floor(a/K)` uniquely;
+   constant folding uses floor semantics; non-integral/over-wide divisors
+   are rejected as UNHANDLED.
+2. **`int_pow` pinned results from inexact doubles.**  No `isfinite`/2^53
+   guard: `int_pow(3, 34, z)` reported **UNSATISFIABLE** (rounded double
+   vs the synthetic result box), `int_pow(3, 40, z)` likewise.  Now any
+   non-finite, >2^53, or non-integral value — and any negative exponent —
+   is honest UNHANDLED (UNKNOWN), with all lattice values validated before
+   committing rows.
+3. **`set_in`/`among` silently truncated sets.**  A 512-byte buffer and a
+   256-value cap dropped values without a word: `set_in(y,{1,...,280})`
+   with `y=265` printed **UNSATISFIABLE** (265 is in the set).  A shared
+   parser (`fz_parse_int_set`) now grows dynamically, deduplicates
+   (duplicate members double-counted `among`), and reports UNHANDLED past
+   an honest cap (1024) instead of truncating.  Non-reified range sets of
+   any width now clamp bounds (a >256-wide range wrongly returned UNKNOWN);
+   empty ranges are infeasible, not unhandled.
+4. **Singleton `set_in` overwrote the declared domain.**  `var 0..5: x;
+   set_in(x, {8, 8})` printed `x = 8` — a value *outside the variable's
+   own domain*.  The singleton and range paths now intersect with the
+   declared domain (empty intersection = UNSAT).
+5. **`count(x, y, c)` with a variable target `y`** (valid FlatZinc)
+   silently counted zeros → false UNSAT.  Now UNHANDLED (UNKNOWN).
+6. **False UNSATISFIABLE inside the synthetic box.**  `var int:` is
+   unbounded in FlatZinc but clamped to ±1e9 by the bridge; a model whose
+   only solutions live outside that box (e.g. `int_lin_eq([1],[z],2e10)`)
+   was declared **UNSATISFIABLE**.  The optimization side already refused
+   synthetic-bound optima; UNSAT is now likewise downgraded to UNKNOWN
+   whenever the model contains a synthetically-bounded original variable.
+   Bounded models keep exact UNSAT.  (In practice mzn2fzn always emits
+   bounded int domains, so this mostly guards hand-written FlatZinc.)
+7. **`lp_read` freed indeterminate pointers** (gcc `-Wmaybe-uninitialized`,
+   a real bug): the counting-sort buffers were declared mid-function while
+   every parse-error `goto err` funnels through `free()`s at the label —
+   an early error skipped the initializers and freed stack garbage.  All
+   six pointers are now declared NULL at function entry.
+
+### New/extended verification this pass
+- `tools/divmod_verify.py`: randomized differential vs a Python
+  brute-force enumerator using exact MiniZinc semantics (floor division,
+  divisor-signed remainder, deduplicated sets, derived-value domains)
+  across div/mod/pow/set_in/among, satisfy+optimize, edge-biased
+  instances, plus 10 fixed regressions for the bugs above.  **0 wrong
+  answers across 5 seeds (1,000+ instances)**; the only UNKNOWNs are
+  synthetic-boxed models, by design.
+- `tools/fzn_semantics_test.py`: `-a` now asserts *distinct* solutions and
+  the exact count (3 for x<y on a 3×3 lattice), negative-dividend/divisor
+  div/mod pins, and the set-outside-domain UNSAT regression.
+- GLPK differential finally run in this environment (`glpsol` 5.0):
+  canonical sweep **119/119**, four-way differential **0 mismatches**
+  (30 optimal + 33 infeasible + 57 unbounded agree).  MiniZinc remains
+  environment-gated.
+- Full `./test.sh` green incl. OOM injection (7,802 points, 0 failures)
+  and ASan/UBSan fuzzing with the parser fix in place.
+
 ## Not done (recommended next steps, in priority order)
-1. Re-run the GLPK and MiniZinc differential suites (when `glpsol`/`minizinc` are installed in the host environment).
-2. Public C API audit for Phase 4 hardening (documented, bounds-checked, no `exit` in library paths).
+1. MiniZinc differential suite (`tools/mzn_diff.py`) — ready to run wherever
+   `minizinc` is installed (not packaged for this host's distro).
+2. Public C API audit for Phase 4 hardening — partially done: the one
+   exit-style library path (`psolve_fail` with no handler installed) is now
+   an explicit embedding contract in `src/err.h`.  Remaining: a bounds-check
+   sweep of `LP`/`MIP` struct inputs (an embedding host must currently pass
+   valid CSC arrays).

@@ -16,6 +16,11 @@
  *   PSOLVE_OK        = 0
  *   PSOLVE_ERR_OOM   = 1   (allocation failed)
  *   PSOLVE_ERR_SOLVE = 2   (internal solver error)
+ *
+ * Embedding contract: a library host MUST install psolve_try().  With no
+ * handler installed, psolve_fail() cannot unwind anywhere, so it prints a
+ * diagnostic and calls exit(code) — that is the only exit(1)-style path in
+ * the library and it never fires while a handler is active.
  */
 
 #define PSOLVE_OK        0

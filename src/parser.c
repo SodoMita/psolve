@@ -43,6 +43,14 @@ int lp_read(const char *path, LP *lp)
 {
     FILE *f = fopen(path, "r");
     if (!f) { fprintf(stderr, "cannot open %s\n", path); return -1; }
+    /* Sort buffers are allocated mid-function, but every error path funnels
+       to err: which frees them — declare them up here initialized to NULL so
+       no path ever frees an indeterminate pointer. */
+    int *tr = NULL, *tc = NULL;
+    double *tv = NULL;
+    int *colcount = NULL;
+    int *out_r = NULL;
+    double *out_v = NULL;
     char sense[32];
     if (fscanf(f, "%31s", sense) != 1) goto err;
     /* Objective sense must be exactly max/maximize or min/minimize.  Reject
@@ -137,8 +145,6 @@ int lp_read(const char *path, LP *lp)
     }
 
     /* read triplets into temporary arrays (only when nnz > 0) */
-    int *tr = NULL, *tc = NULL;
-    double *tv = NULL;
     if (nnz > 0) {
         tr = (int*)psolve_malloc((size_t)nnz * sizeof(int));
         tc = (int*)psolve_malloc((size_t)nnz * sizeof(int));
@@ -157,9 +163,6 @@ int lp_read(const char *path, LP *lp)
     }
     /* Counting sort by column: O(nnz + n), linear in input size (the previous
        insertion sort was O(nnz^2) on adversarial triplet orderings). */
-    int *colcount = NULL;
-    int *out_r = NULL;
-    double *out_v = NULL;
     colcount = (int*)psolve_calloc((size_t)(n + 1), sizeof(int));
     out_r = (int*)psolve_malloc((size_t)(nnz ? nnz : 1) * sizeof(int));
     out_v = (double*)psolve_malloc((size_t)(nnz ? nnz : 1) * sizeof(double));

@@ -31,7 +31,8 @@ int main(int argc,char**argv)
 {
     Options opt = parse_args(argc, argv);
     if (!opt.path) { fprintf(stderr,"usage: %s [options] <problem.fzn>\n",argv[0]);
-        fprintf(stderr,"  -n N   node limit   -s stats   -v verbose\n"); return 1; }
+        fprintf(stderr,"  -a/--all-solutions  enumerate all solutions / improving incumbents\n");
+        fprintf(stderr,"  -n N   node limit   -t MS   time limit (s)   -s stats   -v verbose\n"); return 1; }
 
     /* Resolve the path into a volatile-qualified copy before setjmp so the
        compiler cannot hold the pointer in a callee-saved register that

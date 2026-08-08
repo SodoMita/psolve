@@ -371,16 +371,23 @@ are integral):
   status markers), objective always, and `-s` stats
   (`nodes`, `objectiveBound`); `-n` node limit and `-t`/SIGINT time limits are
   enforced via a cooperative abort polled in the LP simplex and B&B loops.
-  Usage: `fznsolve [-n N] [-t ms] [-s] [-v] <x.fzn>`.
+  `-a`/`--all-solutions` enumerates all distinct solutions of satisfaction
+  models (or every improving incumbent of optimization models), ending with
+  `==========` only when the search space is exhausted.
+  Usage: `fznsolve [-a] [-n N] [-t ms] [-s] [-v] <x.fzn>`.
 - **MiniZinc differential**: `tools/mzn_diff.py` compiles real `.mzn` models
   with the MiniZinc compiler and checks fznsolve against Gecode (objectives
   match, e.g. knapsack=10, prod3=57).  See `examples/mzn/`.
 - Nonlinear/unhandled constraints return `=====UNKNOWN=====` (never a wrong
   answer).  In particular, strict continuous `float_lt`/`float_gt` predicates
   are deliberately not relaxed to non-strict LP rows: their feasible sets are
-  open.  An optimization result that reaches the bridge's synthetic bound for
-  an otherwise unbounded objective-bearing variable is likewise `UNKNOWN`, not
-  a fake optimum.
+  open.  `int_div`/`int_mod` use exact MiniZinc floor semantics (the remainder
+  takes the divisor's sign).  An optimization result that reaches the bridge's
+  synthetic bound for an otherwise unbounded objective-bearing variable is
+  `UNKNOWN`, not a fake optimum; likewise, an infeasibility verdict is
+  certified only inside the synthetic box the bridge must give unbounded
+  `var int/float` declarations, so such models report `UNKNOWN` rather than a
+  possibly-false `UNSATISFIABLE`.
   See `docs/ROADMAP.md` for the remaining handler list.
 
 ## Layout

@@ -9,6 +9,7 @@ cannot be represented by a closed LP.
 from __future__ import annotations
 
 import pathlib
+import re
 import subprocess
 import sys
 import tempfile
@@ -435,7 +436,38 @@ def test_all_solutions_and_extended_constraints() -> None:
     )
     require("mx = 4.25;" in out, f"array_float_maximum failed:\n{out}")
 
-    # 5. int_div and int_mod
+    # 1b. -a distinctness + exact solution count: x < y on a 3x3 lattice
+    #     has exactly 3 solutions ((1,2),(1,3),(2,3)); each block must be a
+    #     distinct pair.
+    with tempfile.NamedTemporaryFile("w", suffix=".fzn", delete=False) as f:
+        f.write(
+            """
+            var 1..3: x :: output_var;
+            var 1..3: y :: output_var;
+            constraint int_lt(x, y);
+            solve satisfy;
+            """
+        )
+        path = pathlib.Path(f.name)
+    try:
+        res = subprocess.run([str(SOLVER), "-a", str(path)], text=True, capture_output=True, timeout=10)
+        seen = set()
+        blocks = [b for b in res.stdout.split("----------") if "x =" in b]
+        for b in blocks:
+            xm = re.search(r"x = (\d+);", b)
+            ym = re.search(r"y = (\d+);", b)
+            require(xm and ym, f"-a malformed block:\\n{b}")
+            pair = (int(xm.group(1)), int(ym.group(1)))
+            require(pair[0] < pair[1], f"-a violated x<y: {pair}")
+            require(pair not in seen, f"-a duplicate solution {pair}")
+            seen.add(pair)
+        require(len(seen) == 3, f"-a must find exactly 3 solutions, found {len(seen)}:\\n{res.stdout}")
+        require("==========" in res.stdout, f"-a missing completion marker:\\n{res.stdout}")
+    finally:
+        path.unlink(missing_ok=True)
+
+    # 5. int_div and int_mod — MiniZinc floor semantics incl. negative
+    #    dividends/divisors (C's truncating / and % are wrong here)
     out = run_model(
         """
         var 0..20: a :: output_var;
@@ -449,6 +481,35 @@ def test_all_solutions_and_extended_constraints() -> None:
     )
     require("q = 3;" in out and "r = 2;" in out,
             f"int_div / int_mod failed:\n{out}")
+
+    out = run_model(
+        """
+        var -10..10: x :: output_var;
+        var int: q :: output_var;
+        var int: r :: output_var;
+        var int: qn :: output_var;
+        var int: rn :: output_var;
+        constraint int_eq(x, -7);
+        constraint int_div(x, 3, q);
+        constraint int_mod(x, 3, r);
+        constraint int_div(7, -3, qn);
+        constraint int_mod(7, -3, rn);
+        solve satisfy;
+        """
+    )
+    require("q = -3;" in out and "r = 2;" in out and "qn = -3;" in out and "rn = -2;" in out,
+            f"int_div/int_mod floor semantics failed:\n{out}")
+
+    # 5b. set_in with duplicate members and members outside the domain
+    out = run_model(
+        """
+        var 0..5: x :: output_var;
+        constraint set_in(x, {8, 8});
+        solve minimize x;
+        """
+    )
+    require("UNSATISFIABLE" in out,
+            f"set_in outside the domain must be UNSAT, not x=8:\n{out}")
 
     # 6. int_pow
     out = run_model(

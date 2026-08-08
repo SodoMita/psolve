@@ -274,7 +274,16 @@ feature completeness against a huge standard corpus.
 - [x] CLI flags: `-n` (node limit), `-t` (time limit via alarm), `-s` (stats),
       `-v` (verbose), SIGINT/SIGALRM handlers; `fznsolve` prints objective
       always and `objectiveBound`/`nodes` in stats.
-- [ ] CLI: `-a` (all solutions), `-f` (free search).
+- [x] CLI `-a` (all solutions): satisfaction models enumerate all distinct
+      integer solutions (verified distinct + exact counts); optimization
+      models print strictly-improving incumbents; `==========` only on
+      completion, honest `=====UNKNOWN=====` when the node/time budget stops
+      the search.  `-f`/`-p` accepted as no-ops for driver compatibility.
+- [x] Extended handlers: `array_var_int/bool/float_element`,
+      `array_float_maximum/minimum`, `set_in_reif`/`int_in(_reif)`,
+      `int_div`/`int_mod` (exact MiniZinc **floor** semantics incl. negative
+      dividends/divisors), `int_pow` (exact-representable values only,
+      otherwise UNKNOWN), `bool_times`, `count_*`/`among`, `table_bool`.
 - [x] **MiniZinc differential** (`tools/mzn_diff.py`): compiles real `.mzn`
       models with the MiniZinc compiler and compares fznsolve vs Gecode
       (objectives + feasibility).  Models in `examples/mzn/`.
@@ -297,6 +306,19 @@ every relaxation the double solver cannot certify is re-solved exactly, so
 models can still need many B&B nodes (a weak relaxation, not a wrong answer),
 and real-time CSPs are still better served by a propagation-based engine in the
 consuming project.
+
+### Honesty rules for the FlatZinc bridge (no fabricated verdicts)
+- `var int/float` without declared bounds is clamped to a synthetic ±1e9 box.
+  An `UNSATISFIABLE` verdict is only certified *inside* that box: when a
+  synthetically-bounded variable is present, infeasibility is downgraded to
+  `=====UNKNOWN=====` (bounded models keep exact UNSAT).  Optimization
+  results whose objective touches a synthetic bound were already UNKNOWN.
+- Handlers that cannot encode a form exactly (variable `count` target,
+  `int_pow` beyond 2^53, sets past the honest enumeration cap, strict float
+  relations, ...) return UNHANDLED → `UNKNOWN`; they never relax or truncate
+  the model silently.  `int_div`/`int_mod` implement MiniZinc floor
+  semantics (remainder takes the divisor's sign), verified against a
+  brute-force enumerator over negative dividends and divisors.
 
 ### Exact-solver MIP fallback
 `src/mip.c` cross-checks a relaxation with the fixed-point exact-rational
