@@ -18,7 +18,12 @@
  * success the caller owns *flp (free with fx_free). */
 static int mip_build_fxlp(const MIP *mip, const double *lo, const double *hi, FxLP *flp){
     int n = mip->n, m = mip->m;
+    size_t cells;
     memset(flp, 0, sizeof(*flp));
+    if(n <= 0 || m < 0 || (m > 0 && (size_t)n > (size_t)-1 / (size_t)m))
+        return -1;
+    cells = m ? (size_t)m * (size_t)n : 1;
+    if(cells > (size_t)-1 / sizeof(Fx)) return -1;
     flp->n = n; flp->m = m; flp->maximize = mip->maximize;
     flp->c = (Fx*)calloc((size_t)n, sizeof(Fx));
     flp->b = (Fx*)calloc((size_t)(m ? m : 1), sizeof(Fx));
@@ -27,7 +32,7 @@ static int mip_build_fxlp(const MIP *mip, const double *lo, const double *hi, Fx
     flp->lfinite = (int*)calloc((size_t)n, sizeof(int));
     flp->ufinite = (int*)calloc((size_t)n, sizeof(int));
     flp->rel = (char*)malloc((size_t)(m ? m : 1));
-    flp->A = (Fx*)calloc((size_t)(m ? (size_t)m * n : 1), sizeof(Fx));
+    flp->A = (Fx*)calloc(cells, sizeof(Fx));
     if(!flp->c || !flp->b || !flp->l || !flp->u ||
        !flp->lfinite || !flp->ufinite || !flp->rel || !flp->A){ fx_free(flp); return -1; }
     for(int j = 0; j < n; j++) if(fx_from_double(mip->c[j], &flp->c[j]) != 0) goto fail;
@@ -40,12 +45,17 @@ static int mip_build_fxlp(const MIP *mip, const double *lo, const double *hi, Fx
         else { if(fx_from_double(hi[j], &flp->u[j]) != 0) goto fail; flp->ufinite[j] = 1; }
         if(!flp->lfinite[j] && !flp->ufinite[j]) goto fail;   /* free var unsupported */
     }
-    for(int j = 0; j < n; j++)
+    for(int j = 0; j < n; j++){
+        if(mip->Acolptr[j] < 0 || mip->Acolptr[j+1] < mip->Acolptr[j]) goto fail;
         for(int k = mip->Acolptr[j]; k < mip->Acolptr[j+1]; k++){
             int r = mip->Arow[k];
-            if(r < 0 || r >= m) continue;
-            if(fx_from_double(mip->Aval[k], &flp->A[(size_t)r * n + j]) != 0) goto fail;
+            Fx term;
+            if(r < 0 || r >= m) goto fail;
+            if(fx_from_double(mip->Aval[k], &term) != 0 ||
+               fx_add_checked(flp->A[(size_t)r * n + j], term,
+                              &flp->A[(size_t)r * n + j]) != 0) goto fail;
         }
+    }
     return 0;
 fail:
     fx_free(flp);
@@ -200,6 +210,23 @@ static int solve_relaxation(const MIP *mip, const Node *node,
 
 void mip_solve(const MIP *mip, MIPResult *res)
 {
+    if(!res)return;
+    memset(res,0,sizeof(*res));res->status=MIP_INVALID;
+    if(!mip||mip->n<=0||mip->m<0||mip->n>1000000||mip->m>1000000||
+       !mip->c||!mip->Acolptr||!mip->l||!mip->u||!mip->isint||
+       (mip->m>0&&(!mip->rel||!mip->b)))return;
+    if(mip->Acolptr[0]!=0)return;
+    for(int j=0;j<mip->n;j++){
+        if(!isfinite(mip->c[j])||!isfinite(mip->l[j])||!isfinite(mip->u[j])||
+           mip->Acolptr[j]<0||mip->Acolptr[j+1]<mip->Acolptr[j])return;
+    }
+    int nnz=mip->Acolptr[mip->n];
+    if(nnz>0&&(!mip->Arow||!mip->Aval))return;
+    for(int k=0;k<nnz;k++)
+        if(mip->Arow[k]<0||mip->Arow[k]>=mip->m||!isfinite(mip->Aval[k]))return;
+    for(int i=0;i<mip->m;i++)
+        if(!isfinite(mip->b[i])||
+           (mip->rel[i]!='<'&&mip->rel[i]!='>'&&mip->rel[i]!='='))return;
     int n = mip->n;
     double gap = mip->mip_gap > 0 ? mip->mip_gap : 1e-4;
     long node_limit = mip->node_limit > 0 ? mip->node_limit : 100000;
@@ -253,6 +280,7 @@ void mip_solve(const MIP *mip, MIPResult *res)
         if (r == 3) { free(node->lo); free(node->hi); free(node); status = 3; limit_reached = 1; break; } /* lp limit */
         if (r == SOLVE_STOPPED) { free(node->lo); free(node->hi); free(node); status = 4; limit_reached = 1; break; } /* stopped */
         if (r == SOLVE_NUMERICAL) { free(node->lo); free(node->hi); free(node); status = 6; limit_reached = 1; break; } /* numerical */
+        if (r == SOLVE_INVALID) { free(node->lo); free(node->hi); free(node); status = MIP_INVALID; limit_reached = 1; break; }
         /* infeasible relaxation */
         if (r == 1) { free(node->lo); free(node->hi); free(node); continue; }
         if (r == 2) {

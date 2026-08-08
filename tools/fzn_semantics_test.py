@@ -17,13 +17,13 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 SOLVER = ROOT / "fznsolve"
 
 
-def run_model(source: str) -> str:
+def run_model(source: str, *options: str) -> str:
     with tempfile.NamedTemporaryFile("w", suffix=".fzn", delete=False) as f:
         f.write(source)
         path = pathlib.Path(f.name)
     try:
         result = subprocess.run(
-            [str(SOLVER), str(path)], text=True, capture_output=True, timeout=10
+            [str(SOLVER), *options, str(path)], text=True, capture_output=True, timeout=10
         )
     finally:
         path.unlink(missing_ok=True)
@@ -377,6 +377,31 @@ def test_all_solutions_and_extended_constraints() -> None:
     finally:
         path.unlink(missing_ok=True)
 
+    # Auxiliary selector assignments are not distinct FlatZinc solutions.
+    out = run_model(
+        """
+        array [1..2] of int: tuples = [1, 1];
+        var 1..1: x :: output_var;
+        array [1..1] of var int: xs = [x];
+        constraint fzn_table_int(xs, tuples);
+        solve satisfy;
+        """,
+        "-a",
+    )
+    require(out.count("x = 1;") == 1,
+            f"-a printed duplicate visible solutions for auxiliary selectors:\n{out}")
+
+    # A continuous satisfaction space cannot be completely enumerated.
+    out = run_model(
+        """
+        var 0.0..1.0: x :: output_var;
+        solve satisfy;
+        """,
+        "-a",
+    )
+    require("=====UNKNOWN=====" in out and "==========" not in out,
+            f"-a falsely claimed completion of an infinite float domain:\n{out}")
+
     # 2. array_var_int_element with variables in the array
     out = run_model(
         """
@@ -393,6 +418,19 @@ def test_all_solutions_and_extended_constraints() -> None:
     )
     require("idx = 2;" in out and "val = 20;" in out,
             f"array_var_int_element with variables failed:\n{out}")
+
+    out = run_model(
+        """
+        var 1..1: idx :: output_var;
+        var 0..0: a;
+        var 1000000..1000000: b;
+        array [1..2] of var int: arr = [a, b];
+        constraint array_var_int_element(idx, arr, 0);
+        solve satisfy;
+        """
+    )
+    require("idx = 1;" in out,
+            f"element's unselected far value was restricted by an undersized big-M:\n{out}")
 
     # 3. array_bool_element
     out = run_model(
@@ -450,6 +488,32 @@ def test_all_solutions_and_extended_constraints() -> None:
     require("q = 3;" in out and "r = 2;" in out,
             f"int_div / int_mod failed:\n{out}")
 
+    out = run_model(
+        """
+        var -5..-5: a;
+        var -10..10: q :: output_var;
+        var -10..10: r :: output_var;
+        constraint int_div(a, 2, q);
+        constraint int_mod(a, 2, r);
+        solve satisfy;
+        """
+    )
+    require("q = -2;" in out and "r = -1;" in out,
+            f"negative int_div / int_mod violated truncation semantics:\n{out}")
+
+    out = run_model(
+        """
+        var 5..5: a;
+        var -10..10: q :: output_var;
+        var -10..10: r :: output_var;
+        constraint int_div(a, -2, q);
+        constraint int_mod(a, -2, r);
+        solve satisfy;
+        """
+    )
+    require("q = -2;" in out and "r = 1;" in out,
+            f"negative-divisor int_div / int_mod semantics failed:\n{out}")
+
     # 6. int_pow
     out = run_model(
         """
@@ -492,6 +556,20 @@ def test_all_solutions_and_extended_constraints() -> None:
         """
     )
     require("----------" in out, f"count constraint failed:\n{out}")
+
+    out = run_model(
+        """
+        array [1..2] of var 0..2: x :: output_array([1..2]);
+        var 2..2: value :: output_var;
+        var 2..2: count;
+        constraint int_eq(x[1], 2);
+        constraint int_eq(x[2], 2);
+        constraint fzn_count_eq(x, value, count);
+        solve satisfy;
+        """
+    )
+    require("value = 2;" in out and "array1d(1..2, [2, 2])" in out,
+            f"count ignored its variable value argument:\n{out}")
 
     # 9. table_bool
     out = run_model(

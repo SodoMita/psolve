@@ -1,4 +1,10 @@
-# psolve — audit & hardening notes (branch `arena/audit-hardening`)
+# psolve — audit & hardening notes
+
+> **2026-08-08 follow-up:** the remaining remote branches were re-audited from
+> `arena/unmerged-audit-and-correctness`. Safe changes were ported, several
+> wrong-answer cases were repaired, and the unsound branch-and-clip commit was
+> rejected. See [`docs/BRANCH_AUDIT.md`](docs/BRANCH_AUDIT.md) for branch-by-
+> branch disposition, counterexamples, and regression coverage.
 
 This is a working audit document. It records what was reviewed, what was
 changed on this branch, and the prioritized list of the most important things to
@@ -112,20 +118,20 @@ exact-rational simplex (`src/fx.c`) whenever the double revised-simplex returns
 `SOLVE_NUMERICAL` **or** a false `INFEASIBLE` — both of which it does on the
 ill-conditioned big-M bases of combinatorial MIPs. `fx_from_double` /
 `FX_INF_SENT` are exported; `mip_build_fxlp()` converts the double MIP + per-node
-bounds into an exact FxLP. When the data are integral and the exact solve
-succeeds its verdict wins; otherwise the honest double verdict is kept.
+bounds into an exact FxLP. Only exactly integral `double` values are accepted;
+duplicate CSC cells are summed with checked rational arithmetic. When the exact
+solve succeeds its verdict wins; otherwise the honest double verdict is kept.
 
-Impact: `cumulative_verify` went from **OK=145 UNKNOWN=105** to **OK=300
-UNKNOWN=0 MISMATCH=0** — every previously-unresolved big-M schedule now solves
-correctly, and the false-INFEASIBLE→UNSAT bug is fixed. Deterministic regression
-added (`examples/fzn/cumulative_exact.fzn`). All differentials, fuzzing, and the
-OOM-injection suite (7,836 points, 0 failures) stay green; ASan/UBSan/leak clean.
+Impact: `cumulative_verify.py 200 777` went from **OK=124 UNKNOWN=76** on
+`main` to **OK=200 UNKNOWN=0 MISMATCH=0**. The false-INFEASIBLE→UNSAT bug is
+fixed, with a deterministic regression in `examples/fzn/cumulative_exact.fzn`.
 
 ### DONE — CLI `-a` (all solutions) and FlatZinc constraint expansion
 Implemented standard `-a` / `--all-solutions` for `fznsolve`, `fz_solve`, and `mip_solve`:
 - In satisfaction problems (`solve satisfy`), `-a` traverses the branch-and-bound
-  tree to enumerate and print all distinct integer satisfying assignments, each followed
-  by `----------`, and terminates with `==========` when the complete space has been explored.
+  tree and prints distinct **visible output tuples**, de-duplicating alternative
+  auxiliary-selector assignments. Continuous output spaces return `UNKNOWN`
+  rather than falsely printing a finite completion marker.
 - In optimization problems (`solve minimize` / `solve maximize`), `-a` reports all intermediate
   strictly-improving incumbents, each followed by `----------`, and terminates with `==========`
   once optimality is proved.
@@ -143,10 +149,28 @@ Expanded native FlatZinc constraint handlers:
 - `count_leq`, `count_geq`, `count_lt`, `count_gt`, `count_ne`, `count_neq`, `among`, `fzn_among`
   (exact reified count and among constraints).
 - `table_bool`, `fzn_table_bool`, `gecode_table_bool` (extensional boolean table constraints).
-- `int_min_reif`, `int_max_reif`, `int_abs_reif` (reified scalar extrema and absolute value).
 
-All new handlers and options are verified by dedicated regression tests in `tools/fzn_semantics_test.py`.
+The port was hardened for negative division/modulo, variable count values,
+proven element big-M bounds, exact-range exponentiation, and output-level
+all-solutions de-duplication. See `docs/BRANCH_AUDIT.md`. All new handlers and
+options have dedicated regressions in `tools/fzn_semantics_test.py`.
+
+### DONE — public C API invalid-input audit
+
+Public LP, MIP, QP, exact LP, PGS, FlatZinc, LU, and sparse-LU entry points now
+check null/structurally invalid inputs before dereferencing. Invalid models have
+dedicated statuses rather than being mislabeled infeasible. `tools/api_test.c`
+is wired into `test.sh`; details and differences from remote commit `2253a93`
+are recorded in `docs/BRANCH_AUDIT.md`.
+
+### DONE — batch PGS entry points
+
+`pgs_batch_solve` and `pgsf_batch_solve` provide checked sequential traversal of
+independent contact systems with aggregate statistics. The global arena half of
+remote commit `6ebf11d` was rejected for ownership/alignment/thread-safety bugs;
+see `docs/BRANCH_AUDIT.md`.
 
 ## Not done (recommended next steps, in priority order)
 1. Re-run the GLPK and MiniZinc differential suites (when `glpsol`/`minizinc` are installed in the host environment).
-2. Public C API audit for Phase 4 hardening (documented, bounds-checked, no `exit` in library paths).
+2. Redesign the global `setjmp` allocation-error protocol so a recovering,
+   multi-threaded library host can own cleanup without process-global state.

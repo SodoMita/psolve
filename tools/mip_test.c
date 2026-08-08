@@ -5,6 +5,8 @@
 #include <string.h>
 #include <math.h>
 
+static int failures;
+
 /* Test 1: knapsack-style
    max 3x0 + 4x1 + 2x2 s.t. x0+2x1 <= 4, 3x0+2x2 <= 5, x_i integer, >=0
    Solve by enumeration to verify. */
@@ -23,6 +25,7 @@ static void t1(void){
     mip.rel=rel;mip.b=b;mip.l=l;mip.u=u;mip.maximize=1;mip.isint=isint;mip.mip_gap=0;mip.node_limit=100000;mip.lp_iter_limit=2000000;
     MIPResult r; mip_solve(&mip,&r);
     printf("T1: status=%d obj=%g x=[%g %g %g] (expect x=[0 2 2] obj=12)\n",r.status,r.obj,r.x[0],r.x[1],r.x[2]);
+    if(r.status!=0||fabs(r.obj-12.0)>1e-8)failures++;
     mip_result_free(&r);
 }
 
@@ -45,10 +48,34 @@ static void t2(void){
     mip.rel=rel;mip.b=b;mip.l=l;mip.u=u;mip.maximize=1;mip.isint=isint;mip.mip_gap=0;mip.node_limit=100000;mip.lp_iter_limit=2000000;
     MIPResult r; mip_solve(&mip,&r);
     printf("T2: status=%d obj=%g x=[%g %g] (expect obj=4)\n",r.status,r.obj,r.x[0],r.x[1]);
+    if(r.status!=0||fabs(r.obj-4.0)>1e-8)failures++;
+    mip_result_free(&r);
+}
+
+/* Test 3: a numerically small coefficient can have a unit-sized contribution
+   when its variable is large.  The rejected branch-and-clip implementation
+   dropped |a|<1e-12 and changed this row from y<=2 to y<=1. */
+static void t3(void){
+    int n=2,m=1;
+    double c[2]={0,1},b[1]={1};
+    char rel[1]={'<'};
+    double l[2]={-1e13,0},u[2]={-1e13,10};
+    int Acolptr[3]={0,1,2},Arow[2]={0,0};
+    double Aval[2]={1e-13,1};
+    unsigned char isint[2]={0,1};
+    MIP mip;memset(&mip,0,sizeof(mip));mip.n=n;mip.m=m;mip.c=c;
+    mip.Acolptr=Acolptr;mip.Arow=Arow;mip.Aval=Aval;mip.rel=rel;mip.b=b;
+    mip.l=l;mip.u=u;mip.maximize=1;mip.isint=isint;mip.node_limit=100000;
+    mip.lp_iter_limit=2000000;
+    MIPResult r;mip_solve(&mip,&r);
+    printf("T3 small-coefficient semantics: status=%d obj=%g y=%g (expect 2)\n",
+           r.status,r.obj,r.x[1]);
+    if(r.status!=0||fabs(r.obj-2.0)>1e-8||fabs(r.x[1]-2.0)>1e-8)failures++;
     mip_result_free(&r);
 }
 
 int main(void){
-    t1(); t2();
-    return 0;
+    t1();t2();t3();
+    if(failures)fprintf(stderr,"MIP unit failures: %d\n",failures);
+    return failures?1:0;
 }

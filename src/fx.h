@@ -38,6 +38,7 @@
 #define FX_ITER_LIMIT  3
 #define FX_OVERFLOW    4   /* exact arithmetic exceeded 128-bit rationals */
 #define FX_ALLOC_FAIL  5   /* out of memory */
+#define FX_INVALID     6   /* NULL or structurally invalid model */
 
 /* Sentinel stored in l[j].num / u[j].num when lfinite[j] / ufinite[j] is 0
  * (the bound is absent, i.e. -inf / +inf). */
@@ -84,11 +85,14 @@ void fx_free(FxLP *lp);
 
 /* Helpers shared with the CLI / benchmark. */
 Fx  fx_from_ll(long long v);
-/* Convert a finite double that is exactly an integer (within 1e-9) to an
- * exact rational.  Returns 0 on success, -1 if v is not a small integer (so it
- * cannot be represented exactly) or is non-finite.  The MIP bridge uses this
- * to build exact relaxations from integer coefficient data. */
+/* Convert a finite double whose value is exactly integral to an exact
+ * rational.  Returns 0 on success, -1 if conversion would round or overflow.
+ * The MIP bridge relies on this strictness: an exact certificate for a rounded
+ * model is not a certificate for the caller's original model. */
 int  fx_from_double(double v, Fx *out);
+/* Checked exact addition.  den==0 is accepted as the zero-filled form of 0;
+ * returns -1 if the reduced result does not fit the public int64 Fx type. */
+int  fx_add_checked(Fx a, Fx b, Fx *out);
 double fx_todouble(Fx r);
 /* Print the exact value as a decimal with `prec` digits (round-half-even not
  * needed; long division).  Returns the number of chars written. */
