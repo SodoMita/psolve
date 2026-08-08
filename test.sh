@@ -10,6 +10,8 @@ gcc -O2 -march=native -I src tools/pgs_test.c src/pgs.c -o /tmp/pgs_test -lm
 echo "[0.5/7] Fixed-point PGS (integer) unit test + determinism..."
 gcc -O2 -march=native -I src tools/pgs_fixed_test.c src/pgs_fixed.c src/pgs.c -o /tmp/pgs_fixed_test -lm
 /tmp/pgs_fixed_test
+gcc -O2 -march=native -I src tools/arena_batch_test.c src/solver.c src/qp.c src/mip.c src/fx.c src/pgs.c src/pgs_fixed.c src/fzn.c src/splu.c src/lu.c src/kernels.c src/err.c src/parser.c -o /tmp/arena_batch_test -lm
+/tmp/arena_batch_test
 
 echo "[1/7] Dense LU unit test..."
 gcc -O2 -march=native -I src tools/unit_test.c src/lu.c src/kernels.c -o /tmp/unit_test -lm

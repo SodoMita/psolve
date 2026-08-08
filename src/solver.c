@@ -165,7 +165,7 @@ static Solver *solver_create_internal(const LP *lp)
     if (m > 0 && (size_t)m > (size_t)-1 / (size_t)m / sizeof(double)) basis_ok = 0;
     if (pos > INT_MAX || !basis_ok) {
         solver_destroy(s);
-        free(mlt);
+        psolve_free(mlt);
         return NULL;
     }
 
@@ -202,13 +202,18 @@ static Solver *solver_create_internal(const LP *lp)
        We compute S_i and choose, per row, the slack if it yields a feasible
        (nonneg) value, otherwise a sign-correct artificial so the artificial
        value is nonneg and Phase I can drive it to zero. */
+    /* (Re)build the canonical starting basis from the stored problem data:
+     * every structural variable nonbasic at a finite bound, and per row either the
+     * slack (when that gives a non-negative slack value) or a sign-corrected
+     * artificial, so the starting point is *exactly* primal feasible for the
+     * Phase I problem. */
     s->negate_obj = maximize ? 0 : 1;
     /* Build the canonical starting basis and reset the phase state (a full
        reset: basis + phase + refactorize).  Also used by the dense-LU retry
        in solver_solve() after a sparse solve diverges. */
     solver_reset_to_initial(s);
     s->iteration_limit = 2000000;
-    free(mlt);
+    psolve_free(mlt);
     return s;
 }
 
@@ -287,7 +292,7 @@ static void build_initial_basis(Solver *s)
             s->status[chosen] = LP_BASIC;
         }
     }
-    free(S);
+    psolve_free(S);
 
     /* finalize: every non-basic variable must have basispos = -1 */
     for (int j = 0; j < N; j++)
@@ -301,8 +306,8 @@ static int lp_var_is_free(double lo, double hi)
 
 static void free_normalized_lp(LP *lp)
 {
-    free(lp->c); free(lp->l); free(lp->u);
-    free(lp->Acolptr); free(lp->Arow); free(lp->Aval);
+    psolve_free(lp->c); psolve_free(lp->l); psolve_free(lp->u);
+    psolve_free(lp->Acolptr); psolve_free(lp->Arow); psolve_free(lp->Aval);
     memset(lp, 0, sizeof(*lp));
 }
 
@@ -323,7 +328,7 @@ Solver *solver_create(const LP *lp)
     for (int j = 0; j < n; j++) if (lp_var_is_free(lp->l[j], lp->u[j])) nfree++;
     /* ncore+1 is stored in an int-sized CSC pointer array. */
     if (n >= INT_MAX || nfree > INT_MAX - n - 1) {
-        free(orig_pos); free(orig_neg); return NULL;
+        psolve_free(orig_pos); psolve_free(orig_neg); return NULL;
     }
     int ncore = n + nfree;
     int next = 0;
@@ -348,12 +353,12 @@ Solver *solver_create(const LP *lp)
             long cnt = (long)lp->Acolptr[j+1] - lp->Acolptr[j];
             long mult = orig_neg[j] >= 0 ? 2L : 1L;
             if (cnt < 0 || cnt > (LONG_MAX - nnz) / mult) {
-                free_normalized_lp(&norm); free(orig_pos); free(orig_neg); return NULL;
+                free_normalized_lp(&norm); psolve_free(orig_pos); psolve_free(orig_neg); return NULL;
             }
             nnz += cnt * mult;
         }
         if (nnz > INT_MAX) {
-            free_normalized_lp(&norm); free(orig_pos); free(orig_neg); return NULL;
+            free_normalized_lp(&norm); psolve_free(orig_pos); psolve_free(orig_neg); return NULL;
         }
         norm.Acolptr = (int*)xmalloc((size_t)(ncore + 1) * sizeof(int));
         norm.Arow = (int*)xmalloc((size_t)(nnz ? nnz : 1) * sizeof(int));
@@ -381,7 +386,7 @@ Solver *solver_create(const LP *lp)
         s = solver_create_internal(&norm);
         free_normalized_lp(&norm);
     }
-    if (!s) { free(orig_pos); free(orig_neg); return NULL; }
+    if (!s) { psolve_free(orig_pos); psolve_free(orig_neg); return NULL; }
 
     s->n_orig = n;
     s->n_core = ncore;
@@ -400,6 +405,7 @@ Solver *solver_create(const LP *lp)
 void solver_destroy(Solver *s)
 {
     if (!s) return;
+    if (psolve_active_arena) return;
     for (int i = 0; i < s->eta_cap; i++) free(s->eta[i]);
     free(s->eta); free(s->eta_piv);
     free(s->l); free(s->u); free(s->cobj); free(s->c0); free(s->basis); free(s->basispos);
@@ -626,7 +632,7 @@ static void solver_reset_to_initial(Solver *s)
                 s->status[chosen] = LP_BASIC;
             }
         }
-        free(S);
+        psolve_free(S);
     }
 
     for (int j = 0; j < n; j++) {
@@ -997,7 +1003,7 @@ static void recompute_basic(Solver *s)
     }
     ftran(s, rhs);
     for (int i = 0; i < M; i++) s->x[s->basis[i]] = rhs[i];
-    free(rhs);
+    psolve_free(rhs);
 }
 
 static int solve_phase(Solver *s)
@@ -1130,7 +1136,7 @@ static int solver_solve_impl(Solver *s)
             memcpy(tmp, s->duals, (size_t)s->M * sizeof(double));
             btrans(s, tmp);
             memcpy(s->duals, tmp, (size_t)s->M * sizeof(double));
-            free(tmp);
+            psolve_free(tmp);
         }
     }
     return 0;
@@ -1385,6 +1391,6 @@ int solver_feasible(const Solver *s)
     int ok = 1;
     for (int i = 0; i < M; i++)
         if (fabs(res[i] - s->beq[i]) > 1e-5 * (1.0 + fabs(s->beq[i]))) { ok = 0; break; }
-    free(res);
+    psolve_free(res);
     return ok;
 }

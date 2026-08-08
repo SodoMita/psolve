@@ -49,6 +49,13 @@ void pgs_solve(const PGSOptions *opt,
 /* Convenience: A*x evaluation (for tests / energy checks).  y = A x. */
 void pgs_matvec(const double *A, int n, const double *x, double *y);
 
+/* Batch solve: solve N independent boxed QP systems sequentially with
+   amortized setup and cache-hot execution for contact clusters. */
+long pgs_batch_solve(int count, const PGSOptions *opts,
+                     const double *const *A_arr, const double *const *b_arr,
+                     const double *const *lo_arr, const double *const *hi_arr,
+                     double **x_arr, PGSResult *res_arr);
+
 #define PGS_INF 1e30
 
 #endif

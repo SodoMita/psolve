@@ -55,4 +55,10 @@ void pgsf_solve(const PGSFixedOptions *opt,
 /* Integer A*x matvec for tests / energy checks.  y = A x (128-bit-safe). */
 void pgsf_matvec(const int64_t *A, int n, const int64_t *x, int64_t *y);
 
+/* Batch solve: solve N independent fixed-point boxed-QP problems. */
+long pgsf_batch_solve(int count, const PGSFixedOptions *opts,
+                      const int64_t *const *A_arr, const int64_t *const *b_arr,
+                      const int64_t *const *lo_arr, const int64_t *const *hi_arr,
+                      int64_t **x_arr, PGSResult *res_arr);
+
 #endif

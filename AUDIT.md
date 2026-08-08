@@ -177,5 +177,16 @@ Audited and hardened every public C API entry point across all solver modules:
 - `tools/api_test.c`: Dedicated test harness verifying NULL and degenerate input safety
   across all public APIs, wired directly into `test.sh`.
 
+### DONE — Zero-Malloc Arena Allocator & Batch Solve APIs (`src/err.h`, `src/pgs.h`, `src/pgs_fixed.h`)
+- **Preallocated Memory Arena (`PSolveArena`)**:
+  Allows real-time and interactive host applications (UI, games, 60fps physics frames)
+  to supply a preallocated scratch buffer via `psolve_arena_init(&arena, buf, cap)` and
+  `psolve_arena_use(&arena)`. Solves execute with $O(1)$ bump allocation, zero `malloc`
+  calls, and zero GC pauses. Out-of-memory within the arena is caught and safely unwound.
+- **Batch Solve APIs (`pgs_batch_solve` / `pgsf_batch_solve`)**:
+  Provides batch evaluation over $N$ independent physics contact clusters and UI constraints,
+  amortizing dispatch overhead and keeping solver state cache-hot.
+- Verified with dedicated tests in `tools/arena_batch_test.c` wired into `test.sh`.
+
 ## Not done (recommended next steps, in priority order)
 1. Re-run the GLPK and MiniZinc differential suites (when `glpsol`/`minizinc` are installed in the host environment).

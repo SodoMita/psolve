@@ -59,6 +59,26 @@ char *psolve_strdup(const char *s);
  * this one. */
 char *psolve_strndup(const char *s, size_t n);
 
+/* Preallocated memory Arena.
+ * Allows interactive and real-time callers (UI / physics loops) to supply a
+ * fixed memory buffer so solves run with zero libc malloc calls and no GC pauses. */
+typedef struct {
+    char *buf;
+    size_t cap;
+    size_t used;
+} PSolveArena;
+
+extern PSolveArena *psolve_active_arena;
+
+void psolve_arena_init(PSolveArena *a, void *buf, size_t cap);
+void *psolve_arena_alloc(PSolveArena *a, size_t n);
+void *psolve_arena_calloc(PSolveArena *a, size_t n, size_t sz);
+void psolve_arena_reset(PSolveArena *a);
+void psolve_arena_use(PSolveArena *a);
+
+/* Checked free: no-op when an arena is active, frees with libc free otherwise. */
+void psolve_free(void *p);
+
 /* Cooperative abort.  Solvers call psolve_stop() periodically (e.g. once per
  * branch-and-bound node) and, if it returns nonzero, wind down and report a
  * limit status instead of running to completion.  The driver installs a

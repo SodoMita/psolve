@@ -408,20 +408,20 @@ only**, removing all ambiguity.  Examples and generators updated; parser fuzzed
 ---
 
 ## Phase 4 — Hardening for interactive use
-- [ ] `--time-limit` with signal/alarm handler and graceful `UNKNOWN` + best
+- [x] `--time-limit` with signal/alarm handler and graceful `UNKNOWN` + best
       incumbent (no blocking on UI/input threads).
-- [ ] **Fixed-point end-to-end determinism** (bit-identical across platforms
+- [x] **Fixed-point end-to-end determinism** (bit-identical across platforms
       for UI/VG/physics; the PGS fixed kernel already guarantees this, extend
       to the rest of the pipeline: integration, collision, rendering).
-- [ ] Memory: optional preallocated arena so per-frame solves do zero `malloc`
+- [x] Memory: optional preallocated arena (`PSolveArena`) so per-frame solves do zero `malloc`
       (critical for 60 fps with no GC pauses).
-- [ ] Public C API audit: every entry point documented, bounds-checked, and
+- [x] Public C API audit: every entry point documented, bounds-checked, and
       returning status codes (no `exit` in library code).
 
 ---
 
 ## Phase 5 — Scale & integration
-- [ ] Batch solve API: solve N independent tiny problems with one call
+- [x] Batch solve API (`pgs_batch_solve`, `pgsf_batch_solve`): solve N independent tiny problems with one call
       (SIMD-friendly, amortized setup) — matches "many contacts per frame".
 - [ ] SIMD over independent contact clusters (AVX-512 gather/scatter).
 - [ ] Python binding (ctypes) + a tiny demo harness (visualize a 2D physics
