@@ -274,7 +274,11 @@ feature completeness against a huge standard corpus.
 - [x] CLI flags: `-n` (node limit), `-t` (time limit via alarm), `-s` (stats),
       `-v` (verbose), SIGINT/SIGALRM handlers; `fznsolve` prints objective
       always and `objectiveBound`/`nodes` in stats.
-- [ ] CLI: `-a` (all solutions), `-f` (free search).
+- [x] CLI: `-a` / `--all-solutions` for distinct visible finite-domain solutions
+      and improving optimization incumbents; continuous satisfaction outputs
+      return `UNKNOWN` because their solution set cannot be enumerated.
+- [ ] CLI/search: implement a meaningful `-f` (free search) policy; the flag is
+      currently accepted for MiniZinc driver compatibility but is a no-op.
 - [x] **MiniZinc differential** (`tools/mzn_diff.py`): compiles real `.mzn`
       models with the MiniZinc compiler and compares fznsolve vs Gecode
       (objectives + feasibility).  Models in `examples/mzn/`.
