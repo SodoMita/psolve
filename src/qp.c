@@ -402,9 +402,22 @@ static int find_feasible(const QP *qp, const double *x0, double *x)
 
 void qp_solve(const QP *qp, QPResult *res)
 {
+    if (!res) return;
     memset(res, 0, sizeof(*res));
-    res->status = -1;
+    res->status = QP_INVALID;
+    if (!qp || qp->n <= 0 || qp->m < 0 || qp->n > 8192 || qp->m > 1000000 ||
+        !qp->Q || !qp->c || (qp->m > 0 && (!qp->A || !qp->b))) return;
     int n = qp->n;
+    if ((size_t)n > (size_t)-1 / (size_t)n ||
+        (qp->m > 0 && (size_t)n > (size_t)-1 / (size_t)qp->m)) return;
+    for (int j = 0; j < n; j++)
+        if (!isfinite(qp->c[j]) || (qp->x0 && !isfinite(qp->x0[j]))) return;
+    for (size_t k = 0; k < (size_t)n * n; k++) if (!isfinite(qp->Q[k])) return;
+    for (int i = 0; i < qp->m; i++) {
+        if (!isfinite(qp->b[i])) return;
+        for (int j = 0; j < n; j++) if (!isfinite(qp->A[(size_t)i*n+j])) return;
+    }
+    res->status = -1;
     /* Check Q for symmetry and 1x1/2x2 principal-minor positive semi-definiteness.
        Reject indefinite or non-symmetric Q immediately instead of iterating. */
     for (int i = 0; i < n; i++) {

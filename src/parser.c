@@ -39,8 +39,12 @@ static int parse_bound(const char *s, double *out)
     return 0;
 }
 
-int lp_read(const char *path, LP *lp)
+int lp_read(const char *path, LP *out)
 {
+    if(!path||!out)return -1;
+    /* Parse into local zeroed storage so an early error never frees garbage
+       from an uninitialized caller output and never partially mutates it. */
+    LP storage;memset(&storage,0,sizeof(storage));LP *lp=&storage;
     /* Keep every cleanup-owned pointer in function scope and initialize it
        before any path can jump to `err`.  The previous layout declared these
        halfway through the function, so early parse errors jumped past their
@@ -202,6 +206,7 @@ int lp_read(const char *path, LP *lp)
     for (long k = 0; k < nnz; k++) { lp->Arow[k] = out_r[k]; lp->Aval[k] = out_v[k]; }
     free(colcount); free(out_r); free(out_v);
     fclose(f);
+    *out=storage;
     return 0;
 
 err2:

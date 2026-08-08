@@ -313,8 +313,21 @@ static void free_normalized_lp(LP *lp)
  * The mapping is retained for solution, sensitivity, and incremental APIs. */
 Solver *solver_create(const LP *lp)
 {
-    if (!lp || lp->n <= 0 || lp->m < 0 || !lp->c || !lp->l || !lp->u ||
-        !lp->Acolptr || (lp->m > 0 && (!lp->b || !lp->rel))) return NULL;
+    if (!lp || lp->n <= 0 || lp->m < 0 || lp->n > 1000000 || lp->m > 1000000 ||
+        !lp->c || !lp->l || !lp->u || !lp->Acolptr ||
+        (lp->m > 0 && (!lp->b || !lp->rel))) return NULL;
+    if(lp->Acolptr[0]!=0)return NULL;
+    for(int j=0;j<lp->n;j++){
+        if(!isfinite(lp->c[j])||!isfinite(lp->l[j])||!isfinite(lp->u[j])||
+           lp->Acolptr[j]<0||lp->Acolptr[j+1]<lp->Acolptr[j])return NULL;
+    }
+    int input_nnz=lp->Acolptr[lp->n];
+    if(input_nnz>0&&(!lp->Arow||!lp->Aval))return NULL;
+    for(int k=0;k<input_nnz;k++)
+        if(lp->Arow[k]<0||lp->Arow[k]>=lp->m||!isfinite(lp->Aval[k]))return NULL;
+    for(int i=0;i<lp->m;i++)
+        if(!isfinite(lp->b[i])||
+           (lp->rel[i]!='<'&&lp->rel[i]!='>'&&lp->rel[i]!='='))return NULL;
 
     int n = lp->n;
     int *orig_pos = (int*)xmalloc((size_t)n * sizeof(int));
@@ -1138,6 +1151,7 @@ static int solver_solve_impl(Solver *s)
 
 int solver_solve(Solver *s)
 {
+    if(!s)return SOLVE_INVALID;
     int r = solver_solve_impl(s);
     /* Robustness: on ill-conditioned moderately-sparse big-M bases the sparse
        LU can factorize "successfully" yet diverge, so solver_solve_impl returns
@@ -1156,6 +1170,7 @@ int solver_solve(Solver *s)
 
 void solver_duals(const Solver *s, double *dual)
 {
+    if(!s||!dual)return;
     /* duals are computed for the internal maximize form; negate if the user's
        problem was a minimization so the reported shadow prices have the sign
        consistent with the original objective. */
@@ -1165,6 +1180,7 @@ void solver_duals(const Solver *s, double *dual)
 
 void solver_reduced_costs(const Solver *s, double *rc)
 {
+    if(!s||!rc)return;
     double ytol = 0.0;
     for (int j = 0; j < s->n_orig; j++) {
         /* The direct/positive component has exactly the user's column A_j
@@ -1180,6 +1196,7 @@ void solver_reduced_costs(const Solver *s, double *rc)
 
 void solver_optimum(const Solver *s, double *x_orig, double *obj)
 {
+    if(!s||!x_orig||!obj)return;
     for (int j = 0; j < s->n_orig; j++) {
         int p = s->orig_pos[j], q = s->orig_neg[j];
         x_orig[j] = s->x[p] - (q >= 0 ? s->x[q] : 0.0);
@@ -1189,6 +1206,7 @@ void solver_optimum(const Solver *s, double *x_orig, double *obj)
 
 void solver_set_objective(Solver *s, const double *c, int maximize)
 {
+    if(!s||!c)return;
     s->negate_obj = maximize ? 0 : 1;
     for (int j = 0; j < s->n_orig; j++) {
         int p = s->orig_pos[j], q = s->orig_neg[j];
@@ -1203,6 +1221,7 @@ void solver_set_objective(Solver *s, const double *c, int maximize)
 
 void solver_set_bounds(Solver *s, const double *l, const double *u)
 {
+    if(!s||!l||!u)return;
     int topology_changed = s->rebuild_pending;
     for (int j = 0; j < s->n_orig; j++) {
         int was_free = s->orig_neg[j] >= 0;
@@ -1317,6 +1336,7 @@ static void solver_refresh(Solver *s)
  * infeasible, falls back to a clean re-solve. */
 int solver_warm_solve(Solver *s)
 {
+    if(!s)return SOLVE_INVALID;
     if (s->rebuild_pending) {
         solver_refresh(s);
         return s->status_out;
@@ -1339,9 +1359,11 @@ int solver_warm_solve(Solver *s)
 
 int solver_add_row(Solver *s, const double *a, double rhs, char rel)
 {
+    if(!s||!a||!isfinite(rhs))return -1;
     int m = s->M;
     /* F-06: guard against dimension overflow / abuse before allocating. */
-    if (!a || s->n_orig <= 0 || m < 0 || m >= 1000000) return -1;
+    if (s->n_orig <= 0 || m < 0 || m >= 1000000) return -1;
+    for(int j=0;j<s->n_orig;j++)if(!isfinite(a[j]))return -1;
     if (rel != '<' && rel != '>' && rel != '=') return -1;
 
     LP lp;
@@ -1361,6 +1383,7 @@ int solver_add_row(Solver *s, const double *a, double rhs, char rel)
 /* Primal-feasibility check of the current solution. */
 int solver_feasible(const Solver *s)
 {
+    if(!s)return 0;
     int N = s->N, M = s->M;
     const double tol = 1e-6 * (1.0 + fabs(s->objval));
     for (int j = 0; j < N; j++) {

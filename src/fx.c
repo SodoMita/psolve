@@ -45,6 +45,7 @@ const char *fx_status_name(int status){
     case FX_ITER_LIMIT: return "ITERATION_LIMIT";
     case FX_OVERFLOW:   return "OVERFLOW";
     case FX_ALLOC_FAIL: return "OUT_OF_MEMORY";
+    case FX_INVALID:    return "INVALID_MODEL";
     default:            return "UNKNOWN";
     }
 }
@@ -270,20 +271,45 @@ void fx_result_free(FxResult*res){
     free(res->x); res->x=NULL;
 }
 
+static int fx_lp_valid(const FxLP *lp)
+{
+    if(!lp||lp->n<=0||lp->m<0||!lp->c||!lp->l||!lp->u||
+       !lp->lfinite||!lp->ufinite) return 0;
+    if(lp->m>0&&(!lp->b||!lp->rel||!lp->A)) return 0;
+    if(lp->m>0&&(size_t)lp->n>(size_t)-1/(size_t)lp->m) return 0;
+    for(int j=0;j<lp->n;j++){
+        if(lp->c[j].den<=0) return 0;
+        if((lp->lfinite[j]&&lp->l[j].den<=0)||
+           (lp->ufinite[j]&&lp->u[j].den<=0)) return 0;
+    }
+    for(int i=0;i<lp->m;i++){
+        if(lp->b[i].den<=0||
+           (lp->rel[i]!='<'&&lp->rel[i]!='>'&&lp->rel[i]!='=')) return 0;
+    }
+    size_t cells=(size_t)lp->n*(size_t)lp->m;
+    for(size_t k=0;k<cells;k++)
+        if(lp->A[k].den<0||(lp->A[k].den==0&&lp->A[k].num!=0)) return 0;
+    return 1;
+}
+
 /* Solve exactly.  Fast path: int64 rationals.  If the exact arithmetic runs
  * out of range (which used to wrap silently and produce a wrong answer), the
  * whole solve is retried with 128-bit rationals, which covers the coefficient
  * growth of any practically sized model.  Only if *that* overflows do we
  * report FX_OVERFLOW — "no answer", never a wrong one. */
 int fx_solve_wide(const FxLP*lp, FxResult*res){
+    if(!res) return FX_INVALID;
     memset(res,0,sizeof(*res));
+    if(!fx_lp_valid(lp)){res->status=FX_INVALID;return FX_INVALID;}
     int st = fx128_solve(lp, res);
     res->width = 128;
     return st;
 }
 
 int fx_solve(const FxLP*lp, FxResult*res){
+    if(!res) return FX_INVALID;
     memset(res,0,sizeof(*res));
+    if(!fx_lp_valid(lp)){res->status=FX_INVALID;return FX_INVALID;}
     int st = fx64_solve(lp, res);
     res->width = 64;
     if(st == FX_OVERFLOW){

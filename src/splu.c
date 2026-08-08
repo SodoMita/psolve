@@ -95,7 +95,9 @@ static void work_free(Work *w)
 
 int splu_factor(SPLU *s, const int *Bp, const int *Bi, const double *Bx, int m)
 {
-    if (m == 0) return 0;
+    if(!s||m<0)return -1;
+    if(m==0)return 0;
+    if(!Bp||!Bi||!Bx)return -1;
     double tol = s->pivot_tol > 0 ? s->pivot_tol : 1e-14;
 
     /* column order by increasing column degree */
@@ -257,6 +259,7 @@ static void build_rinv(const int *piv, int m, int *rinv)
 
 void splu_solve(const SPLU *s, const double *b, double *x)
 {
+    if(!s||!b||!x||s->m<=0)return;
     int m = s->m;
     const double tol = 1e-14;
     int *rinv = (int*)psolve_malloc((size_t)m * sizeof(int));
@@ -291,6 +294,7 @@ void splu_solve(const SPLU *s, const double *b, double *x)
 
 void splu_solve_t(const SPLU *s, const double *b, double *x)
 {
+    if(!s||!b||!x||s->m<=0)return;
     int m = s->m;
     int *rinv = (int*)psolve_malloc((size_t)m * sizeof(int));
     build_rinv(s->piv, m, rinv);

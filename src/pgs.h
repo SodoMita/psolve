@@ -31,8 +31,10 @@ typedef struct {
     double tol;            /* convergence tolerance (0 = run all iters) */
 } PGSOptions;
 
+#define PGS_INVALID 2
+
 typedef struct {
-    int status;            /* 0 = converged, 1 = ran out of iterations */
+    int status;            /* 0 = converged, 1 = iteration limit, 2 = invalid input */
     double obj;            /* final objective value */
     int iters;             /* sweeps performed */
     long flops;            /* approx multiply-adds performed (stats) */

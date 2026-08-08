@@ -38,6 +38,7 @@
 #define FX_ITER_LIMIT  3
 #define FX_OVERFLOW    4   /* exact arithmetic exceeded 128-bit rationals */
 #define FX_ALLOC_FAIL  5   /* out of memory */
+#define FX_INVALID     6   /* NULL or structurally invalid model */
 
 /* Sentinel stored in l[j].num / u[j].num when lfinite[j] / ufinite[j] is 0
  * (the bound is absent, i.e. -inf / +inf). */

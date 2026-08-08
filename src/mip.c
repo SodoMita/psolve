@@ -210,6 +210,23 @@ static int solve_relaxation(const MIP *mip, const Node *node,
 
 void mip_solve(const MIP *mip, MIPResult *res)
 {
+    if(!res)return;
+    memset(res,0,sizeof(*res));res->status=MIP_INVALID;
+    if(!mip||mip->n<=0||mip->m<0||mip->n>1000000||mip->m>1000000||
+       !mip->c||!mip->Acolptr||!mip->l||!mip->u||!mip->isint||
+       (mip->m>0&&(!mip->rel||!mip->b)))return;
+    if(mip->Acolptr[0]!=0)return;
+    for(int j=0;j<mip->n;j++){
+        if(!isfinite(mip->c[j])||!isfinite(mip->l[j])||!isfinite(mip->u[j])||
+           mip->Acolptr[j]<0||mip->Acolptr[j+1]<mip->Acolptr[j])return;
+    }
+    int nnz=mip->Acolptr[mip->n];
+    if(nnz>0&&(!mip->Arow||!mip->Aval))return;
+    for(int k=0;k<nnz;k++)
+        if(mip->Arow[k]<0||mip->Arow[k]>=mip->m||!isfinite(mip->Aval[k]))return;
+    for(int i=0;i<mip->m;i++)
+        if(!isfinite(mip->b[i])||
+           (mip->rel[i]!='<'&&mip->rel[i]!='>'&&mip->rel[i]!='='))return;
     int n = mip->n;
     double gap = mip->mip_gap > 0 ? mip->mip_gap : 1e-4;
     long node_limit = mip->node_limit > 0 ? mip->node_limit : 100000;
@@ -263,6 +280,7 @@ void mip_solve(const MIP *mip, MIPResult *res)
         if (r == 3) { free(node->lo); free(node->hi); free(node); status = 3; limit_reached = 1; break; } /* lp limit */
         if (r == SOLVE_STOPPED) { free(node->lo); free(node->hi); free(node); status = 4; limit_reached = 1; break; } /* stopped */
         if (r == SOLVE_NUMERICAL) { free(node->lo); free(node->hi); free(node); status = 6; limit_reached = 1; break; } /* numerical */
+        if (r == SOLVE_INVALID) { free(node->lo); free(node->hi); free(node); status = MIP_INVALID; limit_reached = 1; break; }
         /* infeasible relaxation */
         if (r == 1) { free(node->lo); free(node->hi); free(node); continue; }
         if (r == 2) {
