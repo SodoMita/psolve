@@ -20,16 +20,19 @@ void pgs_solve(const PGSOptions *opt,
                const double *lo, const double *hi,
                double *x, PGSResult *res)
 {
+    if (!res) return;
+    res->iters = 0;
+    res->flops = 0;
+    res->status = 1;
+    res->obj = 0.0;
+    if (!opt || !A || !b || !lo || !hi || !x || opt->n <= 0) return;
+
     int n = opt->n;
     double omega = opt->omega;
     if (omega <= 0.0 || omega > 2.0) omega = 1.0;
     int max_iter = opt->max_iter;
     if (max_iter <= 0) max_iter = 1;
     double tol = opt->tol;
-
-    res->iters = 0;
-    res->flops = 0;
-    res->status = 1;   /* assume not converged */
 
     /* warm start: clamp any initial guess to the box */
     for (int i = 0; i < n; i++) {
@@ -84,6 +87,7 @@ void pgs_solve(const PGSOptions *opt,
 
 void pgs_matvec(const double *A, int n, const double *x, double *y)
 {
+    if (!A || !x || !y || n <= 0) return;
     for (int i = 0; i < n; i++) {
         double s = 0.0;
         for (int j = 0; j < n; j++) s += A[i*n + j] * x[j];

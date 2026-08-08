@@ -245,14 +245,24 @@ void fx_result_free(FxResult*res){
  * growth of any practically sized model.  Only if *that* overflows do we
  * report FX_OVERFLOW — "no answer", never a wrong one. */
 int fx_solve_wide(const FxLP*lp, FxResult*res){
+    if(!res) return FX_ALLOC_FAIL;
     memset(res,0,sizeof(*res));
+    if(!lp || lp->n <= 0 || lp->m < 0){ res->status = FX_INFEASIBLE; return FX_INFEASIBLE; }
+    if(!lp->c || !lp->l || !lp->u || !lp->lfinite || !lp->ufinite || (lp->m > 0 && (!lp->b || !lp->rel || !lp->A))){
+        res->status = FX_INFEASIBLE; return FX_INFEASIBLE;
+    }
     int st = fx128_solve(lp, res);
     res->width = 128;
     return st;
 }
 
 int fx_solve(const FxLP*lp, FxResult*res){
+    if(!res) return FX_ALLOC_FAIL;
     memset(res,0,sizeof(*res));
+    if(!lp || lp->n <= 0 || lp->m < 0){ res->status = FX_INFEASIBLE; return FX_INFEASIBLE; }
+    if(!lp->c || !lp->l || !lp->u || !lp->lfinite || !lp->ufinite || (lp->m > 0 && (!lp->b || !lp->rel || !lp->A))){
+        res->status = FX_INFEASIBLE; return FX_INFEASIBLE;
+    }
     int st = fx64_solve(lp, res);
     res->width = 64;
     if(st == FX_OVERFLOW){

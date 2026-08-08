@@ -38,6 +38,7 @@ static inline int64_t div_round_sat(__int128 n, int64_t d)
 
 void pgsf_matvec(const int64_t *A, int n, const int64_t *x, int64_t *y)
 {
+    if (!A || !x || !y || n <= 0) return;
     for (int i = 0; i < n; i++) {
         __int128 s = 0;
         for (int j = 0; j < n; j++) s += (__int128)A[i*n + j] * x[j];
@@ -50,6 +51,13 @@ void pgsf_solve(const PGSFixedOptions *opt,
                 const int64_t *lo, const int64_t *hi,
                 int64_t *x, PGSResult *res)
 {
+    if (!res) return;
+    res->iters = 0;
+    res->flops = 0;
+    res->status = 1;
+    res->obj = 0.0;
+    if (!opt || !A || !b || !lo || !hi || !x || opt->n <= 0) return;
+
     int n = opt->n;
     int64_t w_num = opt->w_num, w_den = opt->w_den;
     if (w_den <= 0) { w_num = 1; w_den = 1; }

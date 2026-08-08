@@ -161,6 +161,21 @@ Expanded native FlatZinc constraint handlers:
 
 All new handlers and options are verified by dedicated regression tests in `tools/fzn_semantics_test.py`.
 
+### DONE — Public C API Audit & Defensive Bounds Checking
+Audited and hardened every public C API entry point across all solver modules:
+- `src/solver.c`: `solver_create`, `solver_solve`, `solver_optimum`, `solver_feasible`,
+  `solver_set_objective`, `solver_set_bounds`, `solver_add_row`, `solver_warm_solve`,
+  `solver_duals`, `solver_reduced_costs` validate pointer arguments and input dimensions.
+- `src/qp.c`: `qp_solve` and `qp_result_free` check for NULL inputs, $n \le 0$, $m < 0$,
+  and missing matrix pointers.
+- `src/pgs.c` / `src/pgs_fixed.c`: `pgs_solve`, `pgsf_solve`, `pgs_matvec`, `pgsf_matvec`
+  safely handle NULL options/result structs, degenerate dimensions, and invalid parameters.
+- `src/fx.c`: `fx_solve`, `fx_solve_wide`, `fx_result_free`, `fx_free` validate pointers
+  and dimensions.
+- `src/fzn.c`: `fz_read`, `fz_solve`, `fz_print_solution`, `fz_solution_free`, `fz_model_free`
+  guard against NULL pointers and invalid inputs.
+- `tools/api_test.c`: Dedicated test harness verifying NULL and degenerate input safety
+  across all public APIs, wired directly into `test.sh`.
+
 ## Not done (recommended next steps, in priority order)
 1. Re-run the GLPK and MiniZinc differential suites (when `glpsol`/`minizinc` are installed in the host environment).
-2. Public C API audit for Phase 4 hardening (documented, bounds-checked, no `exit` in library paths).

@@ -355,6 +355,7 @@ static int annotation_range(const char*s,double*lo,double*hi)
 
 int fz_read(const char*path,FZModel*m)
 {
+    if(!path || !m) return -1;
     memset(m,0,sizeof(*m));
     FILE*f=fopen(path,"r");if(!f){fprintf(stderr,"cannot open %s\n",path);return -1;}
     fseek(f,0,SEEK_END);long sz=ftell(f);fseek(f,0,SEEK_SET);
@@ -1994,11 +1995,13 @@ static void fz_solution_cb(const double *x, double obj, void *user_data)
 
 void fz_solve(const FZModel*m,FZSolution*sol)
 {
+    if(!sol) return;
     long node_limit_in = sol->node_limit;   /* input knob, preserved across memset */
     int all_sol_in = sol->all_solutions;
     memset(sol,0,sizeof(*sol));
     sol->node_limit = node_limit_in;
     sol->all_solutions = all_sol_in;
+    if(!m) { sol->status = 3; return; }
     int nv=m->nvars; sol->nvars=nv; sol->x=(double*)psolve_calloc((size_t)(nv?nv:1),sizeof(double));
     /* A compiler can propagate every decision variable to a literal (for
        example a table call on x = [1,3]).  Keep one fixed dummy column so the
@@ -2132,6 +2135,7 @@ void fz_solve(const FZModel*m,FZSolution*sol)
 
 void fz_print_solution(const FZModel*m,const FZSolution*sol)
 {
+    if(!m || !sol) return;
     if(sol->all_solutions){
         if(sol->status==0){
             if(sol->num_solutions>0) printf("==========\n");
@@ -2149,8 +2153,9 @@ void fz_print_solution(const FZModel*m,const FZSolution*sol)
         else printf("=====UNKNOWN=====\n");
     }
 }
-void fz_solution_free(FZSolution*sol){free(sol->x);memset(sol,0,sizeof(*sol));}
+void fz_solution_free(FZSolution*sol){if(!sol) return; free(sol->x);memset(sol,0,sizeof(*sol));}
 void fz_model_free(FZModel*m){
+    if(!m) return;
     for(int i=0;i<m->ndecl;i++){FZDecl*d=&m->decls[i];free(d->name);free(d->alias_idx);free(d->alias_const);free(d->par);free(d->par_int);free(d->lo);free(d->hi);free(d->setvals);}
     free(m->decls);
     FZConstr*c=m->constr;while(c){FZConstr*nx=c->next;for(int i=0;i<c->nargs;i++)free(c->args[i]);free(c->args);free(c->pred);free(c);c=nx;}

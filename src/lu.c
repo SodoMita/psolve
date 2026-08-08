@@ -13,7 +13,7 @@
 /* ------------------------------------------------------------------ */
 int lu_factor(double *restrict a, int m, int *restrict piv)
 {
-
+    if (!a || !piv || m <= 0) return -1;
     for (int k = 0; k < m; k++) {
         /* find pivot: max |a[i][k]|, i >= k */
         int imax = k;
@@ -67,6 +67,7 @@ int lu_factor(double *restrict a, int m, int *restrict piv)
 void lu_solve(const double *restrict a, const int *restrict piv, int m,
               const double *restrict b, double *restrict x)
 {
+    if (!a || !piv || !b || !x || m <= 0) return;
     double *y = x;
     for (int i = 0; i < m; i++) y[i] = b[i];
     for (int k = 0; k < m; k++) {
@@ -100,6 +101,7 @@ void lu_solve(const double *restrict a, const int *restrict piv, int m,
 void lu_solve_t(const double *restrict a, const int *restrict piv, int m,
                 const double *restrict b, double *restrict x)
 {
+    if (!a || !piv || !b || !x || m <= 0) return;
     double *z = x;   /* working buffer */
 
     /* step 1: U^T z = b.  (U^T)_{i,j}=U(j,i). Forward substitution:

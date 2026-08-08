@@ -41,6 +41,8 @@ static int parse_bound(const char *s, double *out)
 
 int lp_read(const char *path, LP *lp)
 {
+    if (!path || !lp) return -1;
+    memset(lp, 0, sizeof(*lp));
     FILE *f = fopen(path, "r");
     if (!f) { fprintf(stderr, "cannot open %s\n", path); return -1; }
     char sense[32];
