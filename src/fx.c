@@ -4,6 +4,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <math.h>
+#include <limits.h>
 
 /* ------------------------------------------------------------------ */
 /* Exact rational arithmetic (fixed point: every value is a fraction)  */
@@ -21,10 +22,15 @@
 Fx fx_from_ll(long long v){ Fx r; r.num=v; r.den=1; return r; }
 
 int fx_from_double(double v, Fx *out){
-    if(!isfinite(v)) return -1;
+    if(!out || !isfinite(v)) return -1;
     double rv = rint(v);
-    if(fabs(v - rv) > 1e-9) return -1;      /* only exactly-integral values */
-    if(rv < -9.2e18 || rv > 9.2e18) return -1;
+    /* The exact fallback may only certify the model it was actually given.
+       Rounding a near-integer coefficient (the old code accepted errors up to
+       1e-9) silently changed that model and could turn the fallback's exact
+       status into a false status for the original MIP. */
+    if(v != rv) return -1;
+    /* 2^63 itself is representable as double but is one past LLONG_MAX. */
+    if(rv < -0x1p63 || rv >= 0x1p63) return -1;
     out->num = (long long)rv; out->den = 1;
     return 0;
 }
@@ -62,6 +68,29 @@ static Fx fx_mk(long long n, long long d){
     long long g=ll_gcd(n,d);
     r.num=n/g; r.den=d/g;
     return r;
+}
+
+/* Checked addition used while canonicalizing duplicate sparse triplets.  A
+   zero-filled Fx (den==0) is treated as exact zero, matching the solve core.
+   Return -1 rather than wrapping when the reduced sum no longer fits Fx. */
+int fx_add_checked(Fx a, Fx b, Fx *out){
+    if(!out || a.den < 0 || b.den < 0) return -1;
+    if(a.den == 0 || a.num == 0){ *out = (b.den == 0) ? fx_from_ll(0) : b; return 0; }
+    if(b.den == 0 || b.num == 0){ *out = a; return 0; }
+    long long g = ll_gcd(a.den, b.den);
+    __int128 ad = a.den / g, bd = b.den / g;
+    __int128 n = (__int128)a.num * bd + (__int128)b.num * ad;
+    __int128 d = ad * b.den;
+    if(n == 0){ *out = fx_from_ll(0); return 0; }
+    unsigned __int128 un = n < 0 ? (unsigned __int128)(-(n + 1)) + 1u
+                                  : (unsigned __int128)n;
+    unsigned __int128 ud = (unsigned __int128)d;
+    while(ud){ unsigned __int128 t = un % ud; un = ud; ud = t; }
+    n /= (__int128)un; d /= (__int128)un;
+    if(n < (__int128)LLONG_MIN || n > (__int128)LLONG_MAX ||
+       d <= 0 || d > (__int128)LLONG_MAX) return -1;
+    out->num = (long long)n; out->den = (long long)d;
+    return 0;
 }
 
 /* Parse a decimal / integer / exponent string into an exact Fx.
@@ -190,7 +219,9 @@ int fx_read(const char*path, FxLP*lp){
         int r,c; char v[80];
         if(fscanf(f,"%d %d %79s",&r,&c,v)!=3) goto err;
         if(r<0||r>=m||c<0||c>=n){ fprintf(stderr,"triplet out of range\n"); goto err; }
-        if(fx_from_str(v,&lp->A[(size_t)r*n+c])!=0) goto err;
+        Fx term;
+        Fx *cell = &lp->A[(size_t)r*n+c];
+        if(fx_from_str(v,&term)!=0 || fx_add_checked(*cell,term,cell)!=0) goto err;
     }
     fclose(f);
     return 0;
