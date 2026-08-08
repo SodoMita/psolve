@@ -121,6 +121,20 @@ correctly, and the false-INFEASIBLE→UNSAT bug is fixed. Deterministic regressi
 added (`examples/fzn/cumulative_exact.fzn`). All differentials, fuzzing, and the
 OOM-injection suite (7,836 points, 0 failures) stay green; ASan/UBSan/leak clean.
 
+### DONE — Branch and Clip / Bound Tightening in MIP (`src/mip.c`)
+Implemented branch-and-clip bound tightening inspired by HiGHS and modern branch-and-cut solvers:
+- **Constraint Propagation / Feasibility Bound Clipping**:
+  `clip_bounds_by_propagation` propagates linear row constraints ($\sum_j A_{i,j} x_j \text{ rel } b_i$)
+  to compute row activity bounds and tighten (clip) variable bounds $l_j, u_j$ at root initialization,
+  node creation, and child branches. Infeasible boxes ($l_j > u_j$) are immediately fathomed before solving an LP.
+- **Reduced-Cost Bound Clipping (Reduced-Cost Fixing)**:
+  `clip_bounds_by_reduced_cost` uses simplex reduced costs $d_j$ and the remaining gap to the incumbent
+  ($\Delta = |z_{inc} - z_{LP}|$) to clip the domain of nonbasic integer variables ($u_j \leftarrow \lfloor l_j + \Delta/d_j \rfloor$
+  or $l_j \leftarrow \lceil u_j - \Delta/(-d_j) \rceil$).
+- **Score-Based Branching Variable Selection**:
+  `select_branch_variable` prioritizes integer variables based on fractionality distance to half-integer,
+  objective coefficient magnitude, and row participation degree.
+
 ### DONE — CLI `-a` (all solutions) and FlatZinc constraint expansion
 Implemented standard `-a` / `--all-solutions` for `fznsolve`, `fz_solve`, and `mip_solve`:
 - In satisfaction problems (`solve satisfy`), `-a` traverses the branch-and-bound

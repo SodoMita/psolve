@@ -53,6 +53,192 @@ fail:
 }
 
 
+/* Feasibility-based bound tightening (clipping).
+   Propagates row constraints to tighten (clip) per-node variable bounds.
+   Returns 0 on success, -1 if the box becomes infeasible (l[j] > u[j]). */
+static int clip_bounds_by_propagation(const MIP *mip, double *lo, double *hi)
+{
+    int n = mip->n, m = mip->m;
+    if (m == 0 || n == 0) return 0;
+
+    for (int pass = 0; pass < 3; pass++) {
+        int tightened = 0;
+        for (int i = 0; i < m; i++) {
+            char rel = mip->rel[i];
+            double rhs = mip->b[i];
+
+            double min_act = 0.0, max_act = 0.0;
+            int min_unbounded = 0, max_unbounded = 0;
+
+            for (int j = 0; j < n; j++) {
+                for (int k = mip->Acolptr[j]; k < mip->Acolptr[j + 1]; k++) {
+                    if (mip->Arow[k] != i) continue;
+                    double a = mip->Aval[k];
+                    if (fabs(a) < 1e-12) continue;
+
+                    if (a > 0.0) {
+                        if (lo[j] <= -1e20) min_unbounded++;
+                        else min_act += a * lo[j];
+                        if (hi[j] >= 1e20) max_unbounded++;
+                        else max_act += a * hi[j];
+                    } else {
+                        if (hi[j] >= 1e20) min_unbounded++;
+                        else min_act += a * hi[j];
+                        if (lo[j] <= -1e20) max_unbounded++;
+                        else max_act += a * lo[j];
+                    }
+                }
+            }
+
+            if ((rel == '<' || rel == '=') && min_unbounded == 0 && min_act > rhs + MIP_TOL)
+                return -1;
+            if ((rel == '>' || rel == '=') && max_unbounded == 0 && max_act < rhs - MIP_TOL)
+                return -1;
+
+            for (int j = 0; j < n; j++) {
+                for (int k = mip->Acolptr[j]; k < mip->Acolptr[j + 1]; k++) {
+                    if (mip->Arow[k] != i) continue;
+                    double a = mip->Aval[k];
+                    if (fabs(a) < 1e-12) continue;
+
+                    if ((rel == '<' || rel == '=') && (min_unbounded == 0 || (min_unbounded == 1 && ((a > 0 && lo[j] <= -1e20) || (a < 0 && hi[j] >= 1e20))))) {
+                        double other_min = min_act;
+                        if (a > 0.0) {
+                            if (lo[j] > -1e20) other_min -= a * lo[j];
+                            double new_hi = (rhs - other_min) / a;
+                            if (mip->isint[j]) new_hi = floor(new_hi + MIP_TOL);
+                            if (new_hi < hi[j] - 1e-9) {
+                                hi[j] = new_hi;
+                                tightened = 1;
+                            }
+                        } else {
+                            if (hi[j] < 1e20) other_min -= a * hi[j];
+                            double new_lo = (rhs - other_min) / a;
+                            if (mip->isint[j]) new_lo = ceil(new_lo - MIP_TOL);
+                            if (new_lo > lo[j] + 1e-9) {
+                                lo[j] = new_lo;
+                                tightened = 1;
+                            }
+                        }
+                    }
+
+                    if ((rel == '>' || rel == '=') && (max_unbounded == 0 || (max_unbounded == 1 && ((a > 0 && hi[j] >= 1e20) || (a < 0 && lo[j] <= -1e20))))) {
+                        double other_max = max_act;
+                        if (a > 0.0) {
+                            if (hi[j] < 1e20) other_max -= a * hi[j];
+                            double new_lo = (rhs - other_max) / a;
+                            if (mip->isint[j]) new_lo = ceil(new_lo - MIP_TOL);
+                            if (new_lo > lo[j] + 1e-9) {
+                                lo[j] = new_lo;
+                                tightened = 1;
+                            }
+                        } else {
+                            if (lo[j] > -1e20) other_max -= a * lo[j];
+                            double new_hi = (rhs - other_max) / a;
+                            if (mip->isint[j]) new_hi = floor(new_hi + MIP_TOL);
+                            if (new_hi < hi[j] - 1e-9) {
+                                hi[j] = new_hi;
+                                tightened = 1;
+                            }
+                        }
+                    }
+
+                    if (lo[j] > hi[j] + MIP_TOL) return -1;
+                }
+            }
+        }
+        if (!tightened) break;
+    }
+    return 0;
+}
+
+/* Reduced cost bound clipping (reduced cost fixing).
+   If an incumbent is known, any integer variable whose reduced cost step
+   would exceed the optimality gap is clipped to its current bound.
+   Returns 0 on success, -1 if inconsistent. */
+static int clip_bounds_by_reduced_cost(const MIP *mip, const double *x, const double *rc,
+                                       double lp_obj, double incumbent,
+                                       double *lcur, double *ucur)
+{
+    if (mip->stop_at_feasible || !rc) return 0;
+    int n = mip->n;
+    double gap = mip->maximize ? (lp_obj - incumbent) : (incumbent - lp_obj);
+    if (gap <= 1e-9) return 0;
+
+    for (int j = 0; j < n; j++) {
+        if (!mip->isint[j]) continue;
+        double r = rc[j];
+        if (fabs(r) < 1e-6) continue;
+
+        if (!mip->maximize) {
+            if (r > 0.0 && x[j] <= lcur[j] + MIP_TOL) {
+                double max_step = gap / r;
+                double clip_u = floor(lcur[j] + max_step + MIP_TOL);
+                if (clip_u < ucur[j]) {
+                    ucur[j] = clip_u;
+                    if (lcur[j] > ucur[j] + MIP_TOL) return -1;
+                }
+            } else if (r < 0.0 && x[j] >= ucur[j] - MIP_TOL) {
+                double max_step = gap / (-r);
+                double clip_l = ceil(ucur[j] - max_step - MIP_TOL);
+                if (clip_l > lcur[j]) {
+                    lcur[j] = clip_l;
+                    if (lcur[j] > ucur[j] + MIP_TOL) return -1;
+                }
+            }
+        } else {
+            if (r < 0.0 && x[j] <= lcur[j] + MIP_TOL) {
+                double max_step = gap / (-r);
+                double clip_u = floor(lcur[j] + max_step + MIP_TOL);
+                if (clip_u < ucur[j]) {
+                    ucur[j] = clip_u;
+                    if (lcur[j] > ucur[j] + MIP_TOL) return -1;
+                }
+            } else if (r > 0.0 && x[j] >= ucur[j] - MIP_TOL) {
+                double max_step = gap / r;
+                double clip_l = ceil(ucur[j] - max_step - MIP_TOL);
+                if (clip_l > lcur[j]) {
+                    lcur[j] = clip_l;
+                    if (lcur[j] > ucur[j] + MIP_TOL) return -1;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+/* Score-based branching variable selection:
+   Selects the integer variable that is most fractional (closest to 0.5)
+   weighted by objective impact and constraint participation. */
+static int select_branch_variable(const MIP *mip, const double *x, const double *lcur, const double *ucur, double *out_val)
+{
+    int n = mip->n;
+    int best_var = -1;
+    double best_score = -1.0;
+
+    for (int j = 0; j < n; j++) {
+        if (!mip->isint[j]) continue;
+        if (x[j] < lcur[j] - MIP_TOL || x[j] > ucur[j] + MIP_TOL) {
+            *out_val = x[j];
+            return j;
+        }
+        double xj = x[j];
+        double frac = fabs(xj - floor(xj + 0.5));
+        if (frac > MIP_TOL) {
+            double f_dist = 0.5 - fabs(frac - 0.5); /* 0.5 when exactly halfway */
+            int deg = mip->Acolptr[j + 1] - mip->Acolptr[j];
+            double obj_weight = 1.0 + fabs(mip->c[j]);
+            double score = f_dist * obj_weight * (1.0 + 0.05 * (double)deg);
+            if (score > best_score) {
+                best_score = score;
+                best_var = j;
+                *out_val = xj;
+            }
+        }
+    }
+    return best_var;
+}
+
 /* LP-rounding feasibility heuristic: round the relaxation solution's integer
    variables to integer values inside the current node bounds and test the
    resulting point against every constraint.  This cheaply produces a feasible
@@ -132,7 +318,7 @@ static Node *pop_node(Node **list)
 
 /* build an LP from the MIP with per-node tightened bounds, and solve it */
 static int solve_relaxation(const MIP *mip, const Node *node,
-                            double *x, double *obj, double *lcur, double *ucur)
+                            double *x, double *obj, double *rc, double *lcur, double *ucur)
 {
     int n = mip->n;
     LP lp;
@@ -155,6 +341,11 @@ static int solve_relaxation(const MIP *mip, const Node *node,
         if (lj > uj) { free(lo); free(hi); return -1; }   /* infeasible node */
         lo[j] = lj; hi[j] = uj;
     }
+
+    if (clip_bounds_by_propagation(mip, lo, hi) != 0) {
+        free(lo); free(hi); return -1;
+    }
+
     lp.l = lo; lp.u = hi;
 
     Solver *s = solver_create(&lp);
@@ -166,6 +357,7 @@ static int solve_relaxation(const MIP *mip, const Node *node,
         double *xo = (double*)psolve_malloc((size_t)n * sizeof(double));
         solver_optimum(s, xo, obj);
         for (int j = 0; j < n; j++) x[j] = xo[j];
+        if (rc) solver_reduced_costs(s, rc);
         free(xo);
     } else if (r == SOLVE_NUMERICAL || r == 1) {
         /* The double revised-simplex either diverged (SOLVE_NUMERICAL, its
@@ -185,6 +377,7 @@ static int solve_relaxation(const MIP *mip, const Node *node,
                 status = 0;
                 for (int j = 0; j < n; j++) x[j] = fx_todouble(fres.x[j]);
                 *obj = fx_todouble(fres.obj);
+                if (rc) for (int j = 0; j < n; j++) rc[j] = 0.0;
             } else if (fr == FX_INFEASIBLE) status = 1;
             else if (fr == FX_UNBOUNDED) status = 2;
             else status = r;   /* iter limit / overflow: keep the double verdict */
@@ -208,6 +401,7 @@ void mip_solve(const MIP *mip, MIPResult *res)
     res->x = (double*)psolve_malloc((size_t)n * sizeof(double));
     res->isint_sol = (int*)psolve_calloc((size_t)n, sizeof(int));
     double *x = (double*)psolve_malloc((size_t)n * sizeof(double));
+    double *rc = (double*)psolve_malloc((size_t)n * sizeof(double));
     double *lcur = (double*)psolve_malloc((size_t)n * sizeof(double));
     double *ucur = (double*)psolve_malloc((size_t)n * sizeof(double));
     double *bestx = (double*)psolve_malloc((size_t)n * sizeof(double));
@@ -231,6 +425,8 @@ void mip_solve(const MIP *mip, MIPResult *res)
             if (hi0[j] <  LP_INF) hi0[j] = floor(hi0[j] + MIP_TOL);
         }
     }
+    clip_bounds_by_propagation(mip, lo0, hi0);
+
     Node *root = (Node*)psolve_malloc(sizeof(Node));
     root->lo = lo0; root->hi = hi0; root->bound = 0.0; root->feasible = 0;
     root->next = NULL;
@@ -248,7 +444,7 @@ void mip_solve(const MIP *mip, MIPResult *res)
         nodes++;
 
         double obj;
-        int r = solve_relaxation(mip, node, x, &obj, lcur, ucur);
+        int r = solve_relaxation(mip, node, x, &obj, rc, lcur, ucur);
         if (r == -1) { free(node->lo); free(node->hi); free(node); continue; } /* infeasible */
         if (r == 3) { free(node->lo); free(node->hi); free(node); status = 3; limit_reached = 1; break; } /* lp limit */
         if (r == SOLVE_STOPPED) { free(node->lo); free(node->hi); free(node); status = 4; limit_reached = 1; break; } /* stopped */
@@ -272,6 +468,10 @@ void mip_solve(const MIP *mip, MIPResult *res)
         if (have_incumbent && !mip->stop_at_feasible) {
             if (mip->maximize && obj <= incumbent + gap * (1.0 + fabs(incumbent))) { free(node->lo); free(node->hi); free(node); continue; }
             if (!mip->maximize && obj >= incumbent - gap * (1.0 + fabs(incumbent))) { free(node->lo); free(node->hi); free(node); continue; }
+            /* Reduced cost bound clipping against incumbent */
+            if (clip_bounds_by_reduced_cost(mip, x, rc, obj, incumbent, lcur, ucur) != 0) {
+                free(node->lo); free(node->hi); free(node); continue;
+            }
         }
 
         /* LP-rounding feasibility heuristic: if the relaxation is already
@@ -295,17 +495,10 @@ void mip_solve(const MIP *mip, MIPResult *res)
             break;
         }
 
-        /* check integrality; find a fractional integer variable */
-        int frac = -1; double fracval = 0.0;
-        int allint = 1;
-        for (int j = 0; j < n; j++) {
-            if (!mip->isint[j]) continue;
-            if (x[j] < lcur[j] - MIP_TOL || x[j] > ucur[j] + MIP_TOL) { allint = 0; frac = j; fracval = x[j]; break; }
-            double xj = x[j];
-            if (fabs(xj - floor(xj + 0.5)) > MIP_TOL) {
-                allint = 0; frac = j; fracval = xj; break;
-            }
-        }
+        /* check integrality and select branching variable */
+        double fracval = 0.0;
+        int frac = select_branch_variable(mip, x, lcur, ucur, &fracval);
+        int allint = (frac < 0);
 
         if (allint) {
             /* In all-solutions satisfaction mode, if any integer variable is
@@ -329,7 +522,9 @@ void mip_solve(const MIP *mip, MIPResult *res)
                     for (int j = 0; j < n; j++) { c1->lo[j] = lcur[j]; c1->hi[j] = ucur[j]; }
                     c1->hi[unfixed] = v;
                     c1->bound = obj; c1->feasible = 0; c1->next = NULL;
-                    push_node(&stack, c1, mip->maximize);
+                    if (clip_bounds_by_propagation(mip, c1->lo, c1->hi) == 0)
+                        push_node(&stack, c1, mip->maximize);
+                    else { free(c1->lo); free(c1->hi); free(c1); }
 
                     Node *c2 = (Node*)psolve_malloc(sizeof(Node));
                     c2->lo = (double*)psolve_malloc((size_t)n * sizeof(double));
@@ -337,7 +532,9 @@ void mip_solve(const MIP *mip, MIPResult *res)
                     for (int j = 0; j < n; j++) { c2->lo[j] = lcur[j]; c2->hi[j] = ucur[j]; }
                     c2->lo[unfixed] = v + 1.0;
                     c2->bound = obj; c2->feasible = 0; c2->next = NULL;
-                    push_node(&stack, c2, mip->maximize);
+                    if (clip_bounds_by_propagation(mip, c2->lo, c2->hi) == 0)
+                        push_node(&stack, c2, mip->maximize);
+                    else { free(c2->lo); free(c2->hi); free(c2); }
 
                     free(node->lo); free(node->hi); free(node);
                     continue;
@@ -377,7 +574,7 @@ void mip_solve(const MIP *mip, MIPResult *res)
             continue;
         }
 
-        /* branch on the fractional variable */
+        /* branch on the selected fractional variable */
         double fdown = floor(fracval);
         double fup   = ceil(fracval);
 
@@ -388,7 +585,9 @@ void mip_solve(const MIP *mip, MIPResult *res)
         for (int j = 0; j < n; j++) { c1->lo[j] = lcur[j]; c1->hi[j] = ucur[j]; }
         c1->hi[frac] = fdown;
         c1->bound = obj; c1->feasible = 0; c1->next = NULL;
-        push_node(&stack, c1, mip->maximize);
+        if (clip_bounds_by_propagation(mip, c1->lo, c1->hi) == 0)
+            push_node(&stack, c1, mip->maximize);
+        else { free(c1->lo); free(c1->hi); free(c1); }
 
         /* child 2: x[frac] >= fup */
         Node *c2 = (Node*)psolve_malloc(sizeof(Node));
@@ -397,7 +596,9 @@ void mip_solve(const MIP *mip, MIPResult *res)
         for (int j = 0; j < n; j++) { c2->lo[j] = lcur[j]; c2->hi[j] = ucur[j]; }
         c2->lo[frac] = fup;
         c2->bound = obj; c2->feasible = 0; c2->next = NULL;
-        push_node(&stack, c2, mip->maximize);
+        if (clip_bounds_by_propagation(mip, c2->lo, c2->hi) == 0)
+            push_node(&stack, c2, mip->maximize);
+        else { free(c2->lo); free(c2->hi); free(c2); }
 
         free(node->lo); free(node->hi); free(node);
     }
@@ -425,7 +626,7 @@ void mip_solve(const MIP *mip, MIPResult *res)
     Node *n2 = stack;
     while (n2) { Node *t = n2; n2 = n2->next; free(t->lo); free(t->hi); free(t); }
 
-    free(x); free(lcur); free(ucur); free(bestx); free(xc);
+    free(x); free(rc); free(lcur); free(ucur); free(bestx); free(xc);
 }
 
 void mip_result_free(MIPResult *res)
