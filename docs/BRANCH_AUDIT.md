@@ -11,7 +11,7 @@ This pass compared every remote branch against `main` before selecting work for
 | `arena/flatzinc-float-correctness` | fully merged; no exclusive commits | No action required. |
 | `fzn-table-constraint` | fully merged; no exclusive commits | No action required. |
 | `arena/fzn-all-solutions` | exact fallback + FlatZinc commits already reviewed here, a merge, and a narrow parser-warning fix | Superseded by this branch's stricter parser and hardened ports. |
-| `arena/audit-hardening` | five exclusive commits and three `main` commits missing at final fetch | Reviewed commit by commit; safe/high-value parts were ported and hardened. The branch-and-clip commit was rejected as unsound. |
+| `arena/audit-hardening` | six exclusive commits and three `main` commits missing at final fetch | Reviewed commit by commit; safe/high-value parts were ported and hardened. The branch-and-clip and global arena allocator implementations were rejected as unsound; batch PGS APIs were ported separately. |
 
 ## Ported work
 
@@ -88,6 +88,25 @@ null-safety pass. Its intent was ported, but not verbatim:
 
 `tools/api_test.c`, wired into `test.sh`, locks in invalid-input behavior and
 also checks the empty-factorization contract.
+
+### Batch physics API ported; arena allocator rejected
+
+Late commit `6ebf11d` combined two independent features. The sequential
+`pgs_batch_solve` / `pgsf_batch_solve` wrappers were small and safe, so they
+were ported with clearer contracts: zero jobs succeeds without arrays, invalid
+top-level arguments return `-1`, per-job validation uses `PGS_INVALID`, and the
+aggregate flop count saturates instead of overflowing `long`.
+
+The global arena allocator was **not** ported. Its `psolve_free()` skipped every
+free whenever any arena was active, including heap pointers not owned by that
+arena; arena `realloc` blindly read a private header before any input pointer;
+and aligning only the offset did not align a caller-supplied unaligned base.
+The active arena was process-global rather than thread-local or scoped, and the
+solver still contained plain `free()` paths that could receive arena pointers.
+Those are invalid-free, leak, alignment-UB, and concurrency hazards. A future
+arena needs per-allocation ownership, alignment relative to the absolute base,
+checkpoint/rollback scopes, nested/thread-local contexts, and a proof that no
+arena pointer reaches libc `free`.
 
 ## Rejected work: branch-and-clip / reduced-cost fixing
 

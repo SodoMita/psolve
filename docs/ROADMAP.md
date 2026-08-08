@@ -412,9 +412,10 @@ only**, removing all ambiguity.  Examples and generators updated; parser fuzzed
 ---
 
 ## Phase 5 — Scale & integration
-- [ ] Batch solve API: solve N independent tiny problems with one call
-      (SIMD-friendly, amortized setup) — matches "many contacts per frame".
-- [ ] SIMD over independent contact clusters (AVX-512 gather/scatter).
+- [x] Batch PGS APIs (`pgs_batch_solve` / `pgsf_batch_solve`) solve N
+      independent contact systems with one call and aggregate stats.
+- [ ] SIMD over independent batch/contact clusters (current traversal is
+      sequential; target AVX-512 gather/scatter).
 - [ ] Python binding (ctypes) + a tiny demo harness (visualize a 2D physics
       scene solved by psolve each frame).
 - [ ] Microbenchmark suite with a CI budget guard (no silent regressions).

@@ -163,6 +163,13 @@ dedicated statuses rather than being mislabeled infeasible. `tools/api_test.c`
 is wired into `test.sh`; details and differences from remote commit `2253a93`
 are recorded in `docs/BRANCH_AUDIT.md`.
 
+### DONE — batch PGS entry points
+
+`pgs_batch_solve` and `pgsf_batch_solve` provide checked sequential traversal of
+independent contact systems with aggregate statistics. The global arena half of
+remote commit `6ebf11d` was rejected for ownership/alignment/thread-safety bugs;
+see `docs/BRANCH_AUDIT.md`.
+
 ## Not done (recommended next steps, in priority order)
 1. Re-run the GLPK and MiniZinc differential suites (when `glpsol`/`minizinc` are installed in the host environment).
 2. Redesign the global `setjmp` allocation-error protocol so a recovering,
