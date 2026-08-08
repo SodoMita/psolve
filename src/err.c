@@ -28,9 +28,9 @@ void psolve_fail(int code)
     if (psolve_active) {
         longjmp(psolve_env, code);    /* unwinds to the psolve_try() frame */
     }
-    /* No handler installed: nothing safe to do but abort. */
+    /* No handler installed: exit cleanly instead of aborting. */
     fprintf(stderr, "psolve: internal failure (code %d)\n", code);
-    abort();
+    exit(code);
 }
 
 void psolve_end(void)

@@ -157,10 +157,13 @@ int lp_read(const char *path, LP *lp)
     }
     /* Counting sort by column: O(nnz + n), linear in input size (the previous
        insertion sort was O(nnz^2) on adversarial triplet orderings). */
-    int *colcount = (int*)psolve_calloc((size_t)(n + 1), sizeof(int));
-    int *out_r = (int*)psolve_malloc((size_t)(nnz ? nnz : 1) * sizeof(int));
-    double *out_v = (double*)psolve_malloc((size_t)(nnz ? nnz : 1) * sizeof(double));
-    if (!colcount || !out_r || !out_v) { free(colcount); free(out_r); free(out_v); goto err2; }
+    int *colcount = NULL;
+    int *out_r = NULL;
+    double *out_v = NULL;
+    colcount = (int*)psolve_calloc((size_t)(n + 1), sizeof(int));
+    out_r = (int*)psolve_malloc((size_t)(nnz ? nnz : 1) * sizeof(int));
+    out_v = (double*)psolve_malloc((size_t)(nnz ? nnz : 1) * sizeof(double));
+    if (!colcount || !out_r || !out_v) { free(colcount); free(out_r); free(out_v); colcount = NULL; out_r = NULL; out_v = NULL; goto err2; }
     for (long k = 0; k < nnz; k++) colcount[tc[k] + 1]++;
     for (int j = 0; j < n; j++) colcount[j + 1] += colcount[j];
     for (long k = 0; k < nnz; k++) {
@@ -183,12 +186,15 @@ int lp_read(const char *path, LP *lp)
     return 0;
 
 err2:
-    free(tr); free(tc); free(tv);
+    goto err;
 err:
     fclose(f);
     fprintf(stderr, "LP parse error\n");
-    /* free any partially-allocated problem members so callers can safely
-       lp_free() the (zeroed) LP struct */
+    /* free any partially-allocated temporary arrays and problem members */
+    free(tr); free(tc); free(tv);
+    /* colcount/out_r/out_v are freed at their allocation site; if we reach
+       err from a path before they exist they are NULL, so free is safe. */
+    free(colcount); free(out_r); free(out_v);
     lp_free(lp);
     return -1;
 }

@@ -86,7 +86,7 @@ static int solve_kkt(const QP *qp, const int *W, int k,
        regularize the Q block and try again. */
     int r = lu_factor(K, N, piv);
     int good = 0;
-    for (int attempt = 0; attempt < 2 && !good; attempt++) {
+    for (int attempt = 0; attempt < 4 && !good; attempt++) {
         if (r == 0) {
             lu_solve(K, piv, N, rhs, rhs);
             double resid = 0.0;
@@ -99,10 +99,13 @@ static int solve_kkt(const QP *qp, const int *W, int k,
             for (int i = 0; i < N; i++) xnorm = fmax(xnorm, fabs(rhs[i]));
             if (resid <= 1e-8 * (1.0 + rhsnorm + xnorm)) good = 1;
         }
-        if (!good && attempt == 0) {
-            /* regularize the Q block (handles singular PSD Q) and retry */
+        if (!good && attempt < 3) {
+            /* regularize the Q block with increasing strength.  A singular PSD Q
+               makes the KKT matrix singular; larger regularization lets the
+               active-set take a null-space-aware step rather than failing. */
             memcpy(K, K0, (size_t)N * N * sizeof(double));
-            for (int i = 0; i < n; i++) K[i*N + i] += 1e-8;
+            double reg = (attempt == 0) ? 1e-8 : ((attempt == 1) ? 1e-6 : 1e-4);
+            for (int i = 0; i < n; i++) K[i*N + i] += reg;
             memcpy(K0, K, (size_t)N * N * sizeof(double));
             memcpy(rhs, rhs0, (size_t)N * sizeof(double));
             r = lu_factor(K, N, piv);
