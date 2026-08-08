@@ -10,7 +10,8 @@ This pass compared every remote branch against `main` before selecting work for
 | `arena/exactness-and-status-audit` | fully merged; no exclusive commits | No action required. Its status/OOM hardening is already on `main`. |
 | `arena/flatzinc-float-correctness` | fully merged; no exclusive commits | No action required. |
 | `fzn-table-constraint` | fully merged; no exclusive commits | No action required. |
-| `arena/audit-hardening` | four exclusive commits, plus one newer `main` commit missing | Reviewed commit by commit; safe/high-value parts were ported and hardened. The final branch-and-clip commit was rejected as unsound. |
+| `arena/fzn-all-solutions` | exact fallback + FlatZinc commits already reviewed here, a merge, and a narrow parser-warning fix | Superseded by this branch's stricter parser and hardened ports. |
+| `arena/audit-hardening` | five exclusive commits and three `main` commits missing at final fetch | Reviewed commit by commit; safe/high-value parts were ported and hardened. The branch-and-clip commit was rejected as unsound. |
 
 ## Ported work
 
@@ -61,6 +62,32 @@ wrong-answer cases found during review:
 - `int_pow` could insert rounded or non-finite `pow()` results into an integer
   model. Results that cannot be represented exactly in the solver's double
   integer range now return `UNKNOWN`.
+
+### Public C API guards
+
+The final remote fetch added commit `2253a93`, which attempted a public API
+null-safety pass. Its intent was ported, but not verbatim:
+
+- The original returned `FX_INFEASIBLE` for a null or malformed exact LP. That
+  is a mathematical claim about a model that was never valid. Dedicated
+  `SOLVE_INVALID`, `FX_INVALID`, `QP_INVALID`, `MIP_INVALID`, and `PGS_INVALID`
+  statuses now distinguish bad API input from legitimate solver outcomes.
+- The original omitted `mip_solve` from its guards even though the audit text
+  claimed every public solver entry point was covered. MIP is now covered too.
+- The original changed a valid empty sparse-LU factorization (`m=0`) from
+  success to failure. Empty LU/SPLU factorization remains a successful identity
+  operation; null pointers are rejected only when positive dimensions require
+  storage.
+- `solver_create` and `mip_solve` now validate CSC monotonicity, row indices,
+  required arrays, dimensions, relations, and finite numeric data before any
+  dereference. QP, PGS, exact LP, incremental LP, FlatZinc, LU, and SPLU entry
+  points have corresponding structural/null guards.
+- `lp_read` now parses into local zeroed storage and publishes it only on
+  success, so an early parse failure cannot free or partially mutate an
+  uninitialized caller output.
+
+`tools/api_test.c`, wired into `test.sh`, locks in invalid-input behavior and
+also checks the empty-factorization contract.
 
 ## Rejected work: branch-and-clip / reduced-cost fixing
 

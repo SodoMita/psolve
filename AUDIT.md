@@ -155,6 +155,15 @@ proven element big-M bounds, exact-range exponentiation, and output-level
 all-solutions de-duplication. See `docs/BRANCH_AUDIT.md`. All new handlers and
 options have dedicated regressions in `tools/fzn_semantics_test.py`.
 
+### DONE — public C API invalid-input audit
+
+Public LP, MIP, QP, exact LP, PGS, FlatZinc, LU, and sparse-LU entry points now
+check null/structurally invalid inputs before dereferencing. Invalid models have
+dedicated statuses rather than being mislabeled infeasible. `tools/api_test.c`
+is wired into `test.sh`; details and differences from remote commit `2253a93`
+are recorded in `docs/BRANCH_AUDIT.md`.
+
 ## Not done (recommended next steps, in priority order)
 1. Re-run the GLPK and MiniZinc differential suites (when `glpsol`/`minizinc` are installed in the host environment).
-2. Public C API audit for Phase 4 hardening (documented, bounds-checked, no `exit` in library paths).
+2. Redesign the global `setjmp` allocation-error protocol so a recovering,
+   multi-threaded library host can own cleanup without process-global state.
