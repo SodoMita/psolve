@@ -81,10 +81,12 @@ def rejected(binary, path, content):
 
 def main():
     iters, seed, bindir = parse_args(sys.argv[1:])
+    use_existing = bindir is not None
     if bindir is None: bindir = '/tmp/psolve_fuzz'
     rng = random.Random(seed)
-    if not (os.path.exists(os.path.join(bindir,'lpsolve_asan')) and
-            os.path.exists(os.path.join(bindir,'qpsolve_asan'))):
+    if (not use_existing or
+        not (os.path.exists(os.path.join(bindir,'lpsolve_asan')) and
+             os.path.exists(os.path.join(bindir,'qpsolve_asan')))):
         print("building ASAN binaries...")
         build_asan(bindir)
     lpb = os.path.join(bindir,'lpsolve_asan')
