@@ -137,8 +137,8 @@ int lp_read(const char *path, LP *lp)
     }
 
     /* read triplets into temporary arrays (only when nnz > 0) */
-    int *tr = NULL, *tc = NULL;
-    double *tv = NULL;
+    int *tr = NULL, *tc = NULL, *colcount = NULL, *out_r = NULL;
+    double *tv = NULL, *out_v = NULL;
     if (nnz > 0) {
         tr = (int*)psolve_malloc((size_t)nnz * sizeof(int));
         tc = (int*)psolve_malloc((size_t)nnz * sizeof(int));
@@ -157,9 +157,6 @@ int lp_read(const char *path, LP *lp)
     }
     /* Counting sort by column: O(nnz + n), linear in input size (the previous
        insertion sort was O(nnz^2) on adversarial triplet orderings). */
-    int *colcount = NULL;
-    int *out_r = NULL;
-    double *out_v = NULL;
     colcount = (int*)psolve_calloc((size_t)(n + 1), sizeof(int));
     out_r = (int*)psolve_malloc((size_t)(nnz ? nnz : 1) * sizeof(int));
     out_v = (double*)psolve_malloc((size_t)(nnz ? nnz : 1) * sizeof(double));
