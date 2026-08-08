@@ -72,6 +72,13 @@ def run(binary, path, tag, it):
         return False
     return True
 
+def rejected(binary, path, content):
+    """Non-finite and structurally invalid models must fail in the parser."""
+    with open(path, 'w') as f:
+        f.write(content)
+    r = subprocess.run([binary, path], capture_output=True, timeout=15)
+    return r.returncode != 0
+
 def main():
     iters, seed, bindir = parse_args(sys.argv[1:])
     if bindir is None: bindir = '/tmp/psolve_fuzz'
@@ -83,6 +90,24 @@ def main():
     lpb = os.path.join(bindir,'lpsolve_asan')
     qpb = os.path.join(bindir,'qpsolve_asan')
     os.makedirs('/tmp/psolve_fuzz_in', exist_ok=True)
+
+    # Fixed regressions: early parser failures used to jump over pointer
+    # initializers before cleanup, and NaN coefficients could reach the solver
+    # and be reported as an "OPTIMAL" objective of NaN.
+    bad_lp = [
+        "garbage\n",
+        "maximize\n1 0\nnan\n\n0 inf\n0\n",
+        "maximize\n1 1\n0\nnan\n<\n0 1\n0\n",
+        "maximize\n1 1\n0\n0\n<\n0 1\n1\n0 0 nan\n",
+    ]
+    for i, content in enumerate(bad_lp):
+        if not rejected(lpb, '/tmp/psolve_fuzz_in/reject.lp', content):
+            print(f"[!] LP parser accepted fixed invalid case {i}")
+            return 1
+    if not rejected(qpb, '/tmp/psolve_fuzz_in/reject.qp', "1 0\nnan\n1\n"):
+        print("[!] QP parser accepted a non-finite coefficient")
+        return 1
+
     for it in range(iters):
         with open('/tmp/psolve_fuzz_in/t.lp','w') as f: f.write(rand_lp(rng))
         if not run(lpb,'/tmp/psolve_fuzz_in/t.lp','LP',it): return 1

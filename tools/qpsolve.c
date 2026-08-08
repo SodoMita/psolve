@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 /* Q is a dense n*n matrix, so the practical limit on n is far smaller than for
    the sparse LP solver.  8192 keeps n*n*8 = 512MB max for Q, which is a
@@ -34,12 +35,16 @@ int main(int argc, char **argv){
     double *A = (double*)malloc((size_t)(m ? m : 1) * (size_t)(n ? n : 1) * sizeof(double));
     double *b = (double*)malloc((size_t)(m ? m : 1) * sizeof(double));
     if (!c || !Q || !A || !b) { fclose(f); free(c); free(Q); free(A); free(b); return 1; }
-    for (int j = 0; j < n; j++) if (fscanf(f, "%lf", &c[j]) != 1) goto bad;
+    for (int j = 0; j < n; j++)
+        if (fscanf(f, "%lf", &c[j]) != 1 || !isfinite(c[j])) goto bad;
     for (int j = 0; j < n; j++) for (int i = 0; i < n; i++)
-        if (fscanf(f, "%lf", &Q[(size_t)j*n+i]) != 1) goto bad;
+        if (fscanf(f, "%lf", &Q[(size_t)j*n+i]) != 1 ||
+            !isfinite(Q[(size_t)j*n+i])) goto bad;
     for (int i = 0; i < m; i++) for (int j = 0; j < n; j++)
-        if (fscanf(f, "%lf", &A[(size_t)i*n+j]) != 1) goto bad;
-    for (int i = 0; i < m; i++) if (fscanf(f, "%lf", &b[i]) != 1) goto bad;
+        if (fscanf(f, "%lf", &A[(size_t)i*n+j]) != 1 ||
+            !isfinite(A[(size_t)i*n+j])) goto bad;
+    for (int i = 0; i < m; i++)
+        if (fscanf(f, "%lf", &b[i]) != 1 || !isfinite(b[i])) goto bad;
     fclose(f);
 
     QP qp; qp.n = n; qp.m = m; qp.Q = Q; qp.c = c; qp.A = A; qp.b = b; qp.x0 = NULL;
