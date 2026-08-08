@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <math.h>
 
 /* ------------------------------------------------------------------ */
 /* Exact rational arithmetic (fixed point: every value is a fraction)  */
@@ -18,6 +19,15 @@
 /* ------------------------------------------------------------------ */
 
 Fx fx_from_ll(long long v){ Fx r; r.num=v; r.den=1; return r; }
+
+int fx_from_double(double v, Fx *out){
+    if(!isfinite(v)) return -1;
+    double rv = rint(v);
+    if(fabs(v - rv) > 1e-9) return -1;      /* only exactly-integral values */
+    if(rv < -9.2e18 || rv > 9.2e18) return -1;
+    out->num = (long long)rv; out->den = 1;
+    return 0;
+}
 
 double fx_todouble(Fx r){ return (double)r.num/(double)r.den; }
 
@@ -127,8 +137,6 @@ int fx_fmt(char*buf,int buflen,Fx r,int prec){
 /* ------------------------------------------------------------------ */
 /* LP reader (exact rational; same format as lp_read)                 */
 /* ------------------------------------------------------------------ */
-
-#define FX_INF_SENT  0x7fffffffffffffffLL
 
 int fx_read(const char*path, FxLP*lp){
     memset(lp,0,sizeof(*lp));

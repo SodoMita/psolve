@@ -39,6 +39,10 @@
 #define FX_OVERFLOW    4   /* exact arithmetic exceeded 128-bit rationals */
 #define FX_ALLOC_FAIL  5   /* out of memory */
 
+/* Sentinel stored in l[j].num / u[j].num when lfinite[j] / ufinite[j] is 0
+ * (the bound is absent, i.e. -inf / +inf). */
+#define FX_INF_SENT 0x7fffffffffffffffLL
+
 typedef struct {
     long long num, den;   /* den>0, reduced (num/den is the exact value) */
 } Fx;
@@ -80,6 +84,11 @@ void fx_free(FxLP *lp);
 
 /* Helpers shared with the CLI / benchmark. */
 Fx  fx_from_ll(long long v);
+/* Convert a finite double that is exactly an integer (within 1e-9) to an
+ * exact rational.  Returns 0 on success, -1 if v is not a small integer (so it
+ * cannot be represented exactly) or is non-finite.  The MIP bridge uses this
+ * to build exact relaxations from integer coefficient data. */
+int  fx_from_double(double v, Fx *out);
 double fx_todouble(Fx r);
 /* Print the exact value as a decimal with `prec` digits (round-half-even not
  * needed; long division).  Returns the number of chars written. */

@@ -49,6 +49,9 @@ typedef struct {
                                 about the objective must check it. */
     long   node_limit;     /* max branch-and-bound nodes */
     long   lp_iter_limit;  /* simplex iteration limit per relaxation */
+    int    all_solutions;  /* 1 = find all solutions / report all incumbents */
+    void   (*on_solution)(const double *x, double obj, void *user_data);
+    void   *solution_user_data;
 } MIP;
 
 typedef struct {

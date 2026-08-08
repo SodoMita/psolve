@@ -52,7 +52,7 @@ echo "  QP vs scipy: OK=$ok FAIL=$fail"
 python3 tools/qp_diff.py 200 4242 | head -2
 
 echo "[5.5/7] MIP solver (branch-and-bound) vs brute force..."
-gcc -O2 -march=native -I src tools/mip_test.c src/mip.c src/err.c src/solver.c src/splu.c src/lu.c src/kernels.c src/parser.c -o /tmp/mip_test -lm
+gcc -O2 -march=native -I src tools/mip_test.c src/mip.c src/fx.c src/err.c src/solver.c src/splu.c src/lu.c src/kernels.c src/parser.c -o /tmp/mip_test -lm
 /tmp/mip_test
 # NOTE: this used to read `if [ -f /tmp/mip_verify.py ]`, a path that never
 # exists, so the MIP verification silently never ran.  mip_diff.py replaces it
@@ -62,7 +62,7 @@ python3 tools/mip_diff.py 400 12345 | head -2
 python3 tools/mip_verify.py 0 | tail -1
 
 echo "[5.75/7] Fully free LP/MIP variables + incremental API..."
-gcc -O2 -march=native -I src tools/free_var_test.c src/mip.c src/err.c src/solver.c src/splu.c src/lu.c src/kernels.c -o /tmp/free_var_test -lm
+gcc -O2 -march=native -I src tools/free_var_test.c src/mip.c src/fx.c src/err.c src/solver.c src/splu.c src/lu.c src/kernels.c -o /tmp/free_var_test -lm
 /tmp/free_var_test
 
 echo "[6/7] Incremental solving (warm starts vs fresh solves)..."
@@ -114,6 +114,12 @@ if ./fznsolve examples/fzn/cumulative_unsat.fzn | grep -q "=====UNSATISFIABLE===
   echo "cumulative_unsat: UNSATISFIABLE (expect UNSATISFIABLE)  OK"
 else
   echo "cumulative_unsat: FAIL (expected UNSATISFIABLE)"
+fi
+echo "  cumulative_exact (exact-solver fallback regression):"
+if ./fznsolve examples/fzn/cumulative_exact.fzn | grep -q "=====UNKNOWN=====\|=====UNSATISFIABLE====="; then
+  echo "cumulative_exact: FAIL (returned UNKNOWN/UNSAT; must find a feasible schedule)"
+else
+  echo "cumulative_exact: solved (expect a feasible schedule)  OK"
 fi
 echo -n "cumulative_verify (randomized, vs brute force): "
 python3 tools/cumulative_verify.py 200 777 | sed 's/.*: //'
