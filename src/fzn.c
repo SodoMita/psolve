@@ -619,25 +619,32 @@ int fz_read(const char*path,FZModel*m)
 /* LP bridge                                                           */
 /* ------------------------------------------------------------------ */
 typedef struct { int n;int*idx;double*coef;double rhs;char rel; } Row;
-typedef struct { int nvars;int varcap;double*lo,*hi;int*haslo,*hashi;Row*rows;int nrows,cap; } Builder;
+typedef struct { int nvars;int varcap;double*lo,*hi;int*haslo,*hashi;unsigned char*isint;Row*rows;int nrows,cap; } Builder;
 
 /* The LP core needs a finite starting box.  This is only a bridge sentinel,
    never a mathematical FlatZinc bound; optimization results that rely on it
    are reported as UNKNOWN rather than a fictitious optimum at +/-1e9. */
 #define FZ_BIG_BOUND 1e9
 #define FZ_BIG_HIT_TOL 1e-5
-static int b_newvar(Builder*b, double lo, double hi){
+static int b_newvar_kind(Builder*b, double lo, double hi, int is_int){
     if(b->nvars>=b->varcap){
         int nc=b->varcap?b->varcap*2:16;
         psolve_realloc((void**)&b->lo,(size_t)nc*sizeof(double));
         psolve_realloc((void**)&b->hi,(size_t)nc*sizeof(double));
         psolve_realloc((void**)&b->haslo,(size_t)nc*sizeof(int));
         psolve_realloc((void**)&b->hashi,(size_t)nc*sizeof(int));
+        psolve_realloc((void**)&b->isint,(size_t)nc*sizeof(unsigned char));
         b->varcap=nc;
     }
     int v=b->nvars++;
-    b->lo[v]=lo;b->hi[v]=hi;b->haslo[v]=1;b->hashi[v]=1;
+    b->lo[v]=lo;b->hi[v]=hi;b->haslo[v]=1;b->hashi[v]=1;b->isint[v]=(unsigned char)is_int;
     return v;
+}
+static int b_newvar(Builder*b, double lo, double hi){
+    return b_newvar_kind(b, lo, hi, 1);
+}
+static int b_newvar_float(Builder*b, double lo, double hi){
+    return b_newvar_kind(b, lo, hi, 0);
 }
 static void b_add(Builder*b){if(b->nrows>=b->cap){b->cap=b->cap?b->cap*2:16;b->rows=(Row*)psolve_realloc((void**)&b->rows,(size_t)b->cap*sizeof(Row));}memset(&b->rows[b->nrows],0,sizeof(Row));}
 static void b_put(Builder*b,char rel,double rhs,const Lin*l){
@@ -725,6 +732,42 @@ static int add_int_reif(Builder*b,const Lin*d,int r,int which)
         Lin sel;memset(&sel,0,sizeof(sel));lin_term(&sel,r,-1.0);lin_term(&sel,pos,1.0);lin_term(&sel,neg,1.0);b_put(b,'=',0.0,&sel);lin_free(&sel);
         Lin up;memset(&up,0,sizeof(up));lin_into(&up,d,1.0);lin_term(&up,r,-U);b_put(b,'<',0.0,&up);lin_free(&up);
         Lin low0;memset(&low0,0,sizeof(low0));lin_into(&low0,d,1.0);lin_term(&low0,r,-L);b_put(b,'>',0.0,&low0);lin_free(&low0);
+        Lin low;memset(&low,0,sizeof(low));lin_into(&low,d,1.0);lin_term(&low,pos,-(1.0-L));b_put(b,'>',L,&low);lin_free(&low);
+        Lin high;memset(&high,0,sizeof(high));lin_into(&high,d,1.0);lin_term(&high,neg,U+1.0);b_put(b,'<',U,&high);lin_free(&high);
+        return 0;
+    }
+    return -1;
+}
+
+/* Half-reification r => (d rel 0) for an integer-valued d. */
+static int add_int_imp(Builder*b,const Lin*d,int r,int which)
+{
+    double L,U;
+    if(r<0||r>=b->nvars||b->lo[r]<-1e-9||b->hi[r]>1.0+1e-9||lin_bounds(b,d,&L,&U)!=0)return -1;
+    if(which==0){ /* r => d == 0 */
+        Lin up;memset(&up,0,sizeof(up));lin_into(&up,d,1.0);lin_term(&up,r,U);b_put(b,'<',U,&up);lin_free(&up);
+        Lin low;memset(&low,0,sizeof(low));lin_into(&low,d,1.0);lin_term(&low,r,L);b_put(b,'>',L,&low);lin_free(&low);
+        return 0;
+    }
+    if(which==1){ /* r => d <= 0 */
+        Lin up;memset(&up,0,sizeof(up));lin_into(&up,d,1.0);lin_term(&up,r,U);b_put(b,'<',U,&up);lin_free(&up);
+        return 0;
+    }
+    if(which==2){ /* r => d <= -1 */
+        Lin up;memset(&up,0,sizeof(up));lin_into(&up,d,1.0);lin_term(&up,r,U+1.0);b_put(b,'<',U,&up);lin_free(&up);
+        return 0;
+    }
+    if(which==3){ /* r => d >= 0 */
+        Lin low;memset(&low,0,sizeof(low));lin_into(&low,d,1.0);lin_term(&low,r,L);b_put(b,'>',L,&low);lin_free(&low);
+        return 0;
+    }
+    if(which==4){ /* r => d >= 1 */
+        Lin low;memset(&low,0,sizeof(low));lin_into(&low,d,1.0);lin_term(&low,r,L-1.0);b_put(b,'>',L,&low);lin_free(&low);
+        return 0;
+    }
+    if(which==5){ /* r => d != 0 */
+        int pos=b_newvar(b,0.0,1.0), neg=b_newvar(b,0.0,1.0);
+        Lin sel;memset(&sel,0,sizeof(sel));lin_term(&sel,r,-1.0);lin_term(&sel,pos,1.0);lin_term(&sel,neg,1.0);b_put(b,'=',0.0,&sel);lin_free(&sel);
         Lin low;memset(&low,0,sizeof(low));lin_into(&low,d,1.0);lin_term(&low,pos,-(1.0-L));b_put(b,'>',L,&low);lin_free(&low);
         Lin high;memset(&high,0,sizeof(high));lin_into(&high,d,1.0);lin_term(&high,neg,U+1.0);b_put(b,'<',U,&high);lin_free(&high);
         return 0;
@@ -1147,7 +1190,7 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
         return handled?0:1;
     }
     /* int_pow(x, y, z): z = x^y when linear (constant exponent/base or bounded lattice). */
-    if(strcmp(p,"int_pow")==0){
+    if(strcmp(p,"int_pow")==0||strcmp(p,"int_pow_fixed")==0){
         if(c->nargs<3)return -1;
         if(parse_lin(m,c->args[0],&l1)!=0)return -1;
         if(parse_lin(m,c->args[1],&l2)!=0){lin_free(&l1);return -1;}
@@ -1230,7 +1273,7 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
     /* int_abs(x,y): y = |x|.  y >= x, y >= -x; y <= M*u + ... (big-M) or with
        a bounded x we can do y = x (x>=0) or y=-x (x<=0) but general needs M.
        For bounded x in [lo,hi] with lo>=0: y=x; hi<=0: y=-x; else use big-M. */
-    if(strcmp(p,"int_abs")==0){
+    if(strcmp(p,"int_abs")==0||strcmp(p,"float_abs")==0){
         if(c->nargs<2)return -1;
         if(parse_lin(m,c->args[0],&l1)!=0)return -1;
         if(parse_lin(m,c->args[1],&l2)!=0){lin_free(&l1);return -1;}
@@ -1264,8 +1307,10 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
        For min:
          m <= a, m <= b,
          m >= a - M*s,  m >= b - M*(1-s) */
-    if(strcmp(p,"int_max")==0||strcmp(p,"int_min")==0){
-        int ismax=(strcmp(p,"int_max")==0);
+    if(strcmp(p,"int_max")==0||strcmp(p,"int_min")==0||
+       strcmp(p,"float_max")==0||strcmp(p,"float_min")==0||
+       strcmp(p,"fzn_float_max")==0||strcmp(p,"fzn_float_min")==0){
+        int ismax=(strstr(p,"max")!=NULL);
         if(c->nargs<3)return -1;
         if(parse_lin(m,c->args[0],&l1)!=0)return -1;
         if(parse_lin(m,c->args[1],&l2)!=0){lin_free(&l1);return -1;}
@@ -1404,21 +1449,17 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
         if(c->nargs<1)return -1;
         Lin*arr;int narr;
         if(parse_array(m,c->args[0],&arr,&narr)!=0)return -1;
-        /* domain: min/max over all vars' bounds */
-        double dlo=1e18, dhi=-1e18; int anyvar=0;
+        if(narr<=1){free_lins(arr,narr);return 0;}
+        double dlo=1e18, dhi=-1e18;
         for(int i=0;i<narr;i++){
-            if(arr[i].n!=1){free_lins(arr,narr);return 1;}
-            int v=arr[i].idx[0];
-            if(v<0||v>=b->nvars){free_lins(arr,narr);return 1;}
-            if(b->lo[v]<dlo)dlo=b->lo[v];
-            if(b->hi[v]>dhi)dhi=b->hi[v];
-            anyvar=1;
+            double lo_i, hi_i;
+            if(lin_bounds(b, &arr[i], &lo_i, &hi_i)!=0){free_lins(arr,narr);return 1;}
+            if(lo_i<dlo)dlo=lo_i;
+            if(hi_i>dhi)dhi=hi_i;
         }
-        if(!anyvar){free_lins(arr,narr);return 1;}
         long ndom=(long)(dhi-dlo)+1;
         if(ndom<=0||ndom>128){free_lins(arr,narr);return 1;}   /* too big */
-        /* y_{i,v}: index = i*ndom + (v-dlo) */
-        int *y=(int*)psolve_malloc((size_t)narr*ndom*sizeof(int));
+        int *y=(int*)psolve_malloc((size_t)narr*(size_t)ndom*sizeof(int));
         for(int i=0;i<narr;i++)for(int vv=0;vv<ndom;vv++){
             y[i*ndom+vv]=b_newvar(b,0.0,1.0);
         }
@@ -1427,7 +1468,7 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
             Lin s;memset(&s,0,sizeof(s));
             for(int vv=0;vv<ndom;vv++) lin_term(&s,y[i*ndom+vv],1.0);
             s.constant=-1.0; b_put(b,'=',0.0,&s); lin_free(&s);
-            Lin e;memset(&e,0,sizeof(e)); lin_term(&e,arr[i].idx[0],1.0);
+            Lin e;memset(&e,0,sizeof(e)); lin_into(&e,&arr[i],1.0);
             for(int vv=0;vv<ndom;vv++) lin_term(&e,y[i*ndom+vv],-(double)(dlo+vv));
             b_put(b,'=',0.0,&e); lin_free(&e);
         }
@@ -1452,12 +1493,17 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
        strcmp(p,"gecode_bool_element")==0||
        strcmp(p,"array_float_element")==0||strcmp(p,"fzn_array_float_element")==0||
        strcmp(p,"array_var_float_element")==0||strcmp(p,"fzn_array_var_float_element")==0||
-       strcmp(p,"gecode_float_element")==0){
+       strcmp(p,"gecode_float_element")==0||
+       strcmp(p,"array_var_int_element_nonshifted")==0||strcmp(p,"array_var_bool_element_nonshifted")==0||
+       strcmp(p,"array_var_float_element_nonshifted")==0||
+       strcmp(p,"array_int_element_nonshifted")==0||strcmp(p,"array_bool_element_nonshifted")==0||
+       strcmp(p,"array_float_element_nonshifted")==0){
         int gec = (strncmp(p,"gecode_",7)==0);
+        int nonshifted = (strstr(p,"_nonshifted")!=NULL);
         int idx_arg = 0, off_arg = 1, arr_arg = gec ? 2 : 1, val_arg = gec ? 3 : 2;
         if(c->nargs < (gec ? 4 : 3)) return -1;
         Lin il; if(parse_lin(m,c->args[idx_arg],&il)!=0) return -1;
-        double offset = 1.0;
+        double offset = nonshifted ? 0.0 : 1.0;
         if(gec){
             Lin ol; if(parse_lin(m,c->args[off_arg],&ol)!=0){lin_free(&il);return -1;}
             if(ol.n!=0||ol.constant!=rint(ol.constant)){lin_free(&ol);lin_free(&il);return 1;}
@@ -1671,7 +1717,7 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
             b_put(b,'=',0.0,&eq);lin_free(&eq);
         }
         int *ord=(int*)psolve_malloc((size_t)(nx-1)*sizeof(int));
-        for(int i=1;i<nx;i++)ord[i-1]=b_newvar(b,1.0,(double)(nx-1));
+        for(int i=1;i<nx;i++)ord[i-1]=b_newvar_float(b,1.0,(double)(nx-1));
         for(int i=1;i<nx;i++)for(int j=1;j<nx;j++)if(i!=j){
             Lin mtz;memset(&mtz,0,sizeof(mtz));lin_term(&mtz,ord[i-1],1.0);lin_term(&mtz,ord[j-1],-1.0);
             lin_term(&mtz,z[i*nx+j],(double)(nx-1));b_put(b,'<',(double)(nx-2),&mtz);lin_free(&mtz);
@@ -1689,28 +1735,40 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
        strcmp(p,"bool_eq_reif")==0||
        strcmp(p,"bool_le_reif")==0||strcmp(p,"bool_lt_reif")==0||
        strcmp(p,"bool_ge_reif")==0||strcmp(p,"bool_gt_reif")==0||
-       strcmp(p,"bool_ne_reif")==0){
+       strcmp(p,"bool_ne_reif")==0||
+       strcmp(p,"int_eq_imp")==0||strcmp(p,"int_le_imp")==0||
+       strcmp(p,"int_lt_imp")==0||strcmp(p,"int_ge_imp")==0||
+       strcmp(p,"int_gt_imp")==0||strcmp(p,"int_ne_imp")==0||
+       strcmp(p,"bool_eq_imp")==0||
+       strcmp(p,"bool_le_imp")==0||strcmp(p,"bool_lt_imp")==0||
+       strcmp(p,"bool_ge_imp")==0||strcmp(p,"bool_gt_imp")==0||
+       strcmp(p,"bool_ne_imp")==0){
         if(c->nargs<3)return -1;
+        int is_imp = (strstr(p,"_imp")!=NULL);
         Lin l1,l2,rb;
         if(parse_lin(m,c->args[0],&l1)!=0)return -1;
         if(parse_lin(m,c->args[1],&l2)!=0){lin_free(&l1);return -1;}
         if(parse_lin(m,c->args[2],&rb)!=0){lin_free(&l1);lin_free(&l2);return -1;}
         Lin d;memset(&d,0,sizeof(d));lin_into(&d,&l1,1.0);lin_into(&d,&l2,-1.0);
         int which;
-        if(strcmp(p,"int_eq_reif")==0||strcmp(p,"bool_eq_reif")==0)which=0;
-        else if(strcmp(p,"int_le_reif")==0||strcmp(p,"bool_le_reif")==0)which=1;
-        else if(strcmp(p,"int_lt_reif")==0||strcmp(p,"bool_lt_reif")==0)which=2;
-        else if(strcmp(p,"int_ge_reif")==0||strcmp(p,"bool_ge_reif")==0)which=3;
-        else if(strcmp(p,"int_gt_reif")==0||strcmp(p,"bool_gt_reif")==0)which=4;
+        if(strstr(p,"_eq_")!=NULL) which=0;
+        else if(strstr(p,"_le_")!=NULL) which=1;
+        else if(strstr(p,"_lt_")!=NULL) which=2;
+        else if(strstr(p,"_ge_")!=NULL) which=3;
+        else if(strstr(p,"_gt_")!=NULL) which=4;
         else which=5;
         int rr;
         if(rb.n==0){
-            /* The reifier may be a compile-time true/false literal. */
             if(fabs(rb.constant)>1e-12&&fabs(rb.constant-1.0)>1e-12)rr=1;
+            else if(is_imp){
+                if(rb.constant>=0.5) rr=add_int_relation_constant(b,&d,which,1);
+                else rr=0; /* 0 => relation is vacuously true */
+            }
             else rr=add_int_relation_constant(b,&d,which,rb.constant>=0.5);
         } else {
             int r;
             if(lin_unit_var(&rb,&r)!=0)rr=1;
+            else if(is_imp) rr=add_int_imp(b,&d,r,which);
             else rr=add_int_reif(b,&d,r,which);
         }
         lin_free(&d);lin_free(&l1);lin_free(&l2);lin_free(&rb);
@@ -1740,8 +1798,15 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
        strcmp(p,"int_lin_gt_reif")==0||strcmp(p,"int_lin_ne_reif")==0||
        strcmp(p,"bool_lin_eq_reif")==0||strcmp(p,"bool_lin_le_reif")==0||
        strcmp(p,"bool_lin_lt_reif")==0||strcmp(p,"bool_lin_ge_reif")==0||
-       strcmp(p,"bool_lin_gt_reif")==0||strcmp(p,"bool_lin_ne_reif")==0){
+       strcmp(p,"bool_lin_gt_reif")==0||strcmp(p,"bool_lin_ne_reif")==0||
+       strcmp(p,"int_lin_eq_imp")==0||strcmp(p,"int_lin_le_imp")==0||
+       strcmp(p,"int_lin_lt_imp")==0||strcmp(p,"int_lin_ge_imp")==0||
+       strcmp(p,"int_lin_gt_imp")==0||strcmp(p,"int_lin_ne_imp")==0||
+       strcmp(p,"bool_lin_eq_imp")==0||strcmp(p,"bool_lin_le_imp")==0||
+       strcmp(p,"bool_lin_lt_imp")==0||strcmp(p,"bool_lin_ge_imp")==0||
+       strcmp(p,"bool_lin_gt_imp")==0||strcmp(p,"bool_lin_ne_imp")==0){
         if(c->nargs<4)return -1;
+        int is_imp = (strstr(p,"_imp")!=NULL);
         Lin*arr;int narr; Lin*parr;int nparr; Lin dd; Lin rb;
         if(parse_array(m,c->args[0],&arr,&narr)!=0)return -1;
         if(parse_array(m,c->args[1],&parr,&nparr)!=0){free_lins(arr,narr);return -1;}
@@ -1755,19 +1820,24 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
         }
         lin_into(&lin,&dd,-1.0);
         int which;
-        if(strcmp(p,"int_lin_eq_reif")==0||strcmp(p,"bool_lin_eq_reif")==0)which=0;
-        else if(strcmp(p,"int_lin_le_reif")==0||strcmp(p,"bool_lin_le_reif")==0)which=1;
-        else if(strcmp(p,"int_lin_lt_reif")==0||strcmp(p,"bool_lin_lt_reif")==0)which=2;
-        else if(strcmp(p,"int_lin_ge_reif")==0||strcmp(p,"bool_lin_ge_reif")==0)which=3;
-        else if(strcmp(p,"int_lin_gt_reif")==0||strcmp(p,"bool_lin_gt_reif")==0)which=4;
+        if(strstr(p,"_eq_")!=NULL) which=0;
+        else if(strstr(p,"_le_")!=NULL) which=1;
+        else if(strstr(p,"_lt_")!=NULL) which=2;
+        else if(strstr(p,"_ge_")!=NULL) which=3;
+        else if(strstr(p,"_gt_")!=NULL) which=4;
         else which=5;
         int rr;
         if(rb.n==0){
             if(fabs(rb.constant)>1e-12&&fabs(rb.constant-1.0)>1e-12)rr=1;
+            else if(is_imp){
+                if(rb.constant>=0.5) rr=add_int_relation_constant(b,&lin,which,1);
+                else rr=0;
+            }
             else rr=add_int_relation_constant(b,&lin,which,rb.constant>=0.5);
         } else {
             int r;
             if(lin_unit_var(&rb,&r)!=0)rr=1;
+            else if(is_imp) rr=add_int_imp(b,&lin,r,which);
             else rr=add_int_reif(b,&lin,r,which);
         }
         lin_free(&lin);lin_free(&rb);lin_free(&dd);free_lins(arr,narr);free_lins(parr,nparr);
@@ -1925,98 +1995,856 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
         free(M);free(bs);free(vals);free_lins(arr,narr);
         return 0;
     }
-    /* cumulative(s[], d[], r[], b): task i runs for d_i time units starting
-       at s_i and uses r_i units of a renewable resource; at every integer time
-       point the total resource in use must not exceed the limit b.  We handle
-       the exact, overwhelmingly common case where the durations d, usages r
-       and the limit b are fixed parameters and each start s_i is a bounded
-       integer variable.  For every task i and every integer time point t in
-       the scheduling horizon we introduce binaries a2=[s_i<=t], a1=[s_i+d_i>t]
-       and active=(a1 and a2), then constrain sum_i r_i*active(i,t) <= b at
-       every t.  The horizon is taken from the finite start-variable boxes, so
-       no artificial bound is invented.  Variable durations/usages/limits are
-       not safely linearizable here and return UNHANDLED (=> UNKNOWN at the
-       top level) rather than a possibly wrong answer. */
-    if(strcmp(p,"cumulative")==0||strcmp(p,"fzn_cumulative")==0||strcmp(p,"gecode_cumulative")==0){
+    /* cumulative(s[], d[], r[], b): Pritsker time-indexed 0-1 formulation.
+       Strong exact LP relaxation with start-time indicator binaries. */
+    if(strcmp(p,"cumulative")==0||strcmp(p,"fzn_cumulative")==0||
+       strcmp(p,"gecode_cumulative")==0||strcmp(p,"gecode_cumulatives")==0){
         if(c->nargs<4)return -1;
-        Lin *sarr;int ns;
+        Lin *sarr;int ns; Lin *darr;int nd; Lin *rarr;int nr; Lin bl;
         if(parse_array(m,c->args[0],&sarr,&ns)!=0)return -1;
-        Lin *darr;int nd;
         if(parse_array(m,c->args[1],&darr,&nd)!=0){free_lins(sarr,ns);return -1;}
-        Lin *rarr;int nr;
         if(parse_array(m,c->args[2],&rarr,&nr)!=0){free_lins(sarr,ns);free_lins(darr,nd);return -1;}
-        Lin bl;memset(&bl,0,sizeof(bl));
         if(parse_lin(m,c->args[3],&bl)!=0){free_lins(sarr,ns);free_lins(darr,nd);free_lins(rarr,nr);return -1;}
-        if(ns!=nd||ns!=nr){lin_free(&bl);free_lins(sarr,ns);free_lins(darr,nd);free_lins(rarr,nr);return 1;}
+        if(ns!=nd||ns!=nr){lin_free(&bl);free_lins(sarr,ns);free_lins(darr,nd);free_lins(rarr,nr);return -1;}
         int n=ns;
-        if(n==0){lin_free(&bl);free_lins(sarr,ns);free_lins(darr,nd);free_lins(rarr,nr);return 0;} /* no tasks: trivially satisfiable */
-        /* limit b must be a fixed non-negative integer */
+        if(n==0){lin_free(&bl);free_lins(sarr,ns);free_lins(darr,nd);free_lins(rarr,nr);return 0;}
         if(bl.n!=0||bl.constant<0.0||fabs(bl.constant-rint(bl.constant))>1e-9){
             lin_free(&bl);free_lins(sarr,ns);free_lins(darr,nd);free_lins(rarr,nr);return 1;
         }
         double B=bl.constant;
-        /* collect the tasks that actually consume the resource and the horizon
-           from their finite start-variable boxes */
-        double minStart=1e18,maxEnd=-1e18;int any=0;
+
+        double minStart=1e18,maxEnd=-1e18;
+        long *lo=(long*)psolve_malloc((size_t)n*sizeof(long));
+        long *hi=(long*)psolve_malloc((size_t)n*sizeof(long));
+        double *dval=(double*)psolve_malloc((size_t)n*sizeof(double));
+        double *rval=(double*)psolve_malloc((size_t)n*sizeof(double));
+        int any=0;
+
         for(int i=0;i<n;i++){
-            if(sarr[i].n!=1||fabs(sarr[i].coef[0]-1.0)>1e-12||fabs(sarr[i].constant)>1e-12){
-                lin_free(&bl);free_lins(sarr,ns);free_lins(darr,nd);free_lins(rarr,nr);return 1;
-            }
             if(darr[i].n!=0||rarr[i].n!=0){
+                free(lo);free(hi);free(dval);free(rval);
                 lin_free(&bl);free_lins(sarr,ns);free_lins(darr,nd);free_lins(rarr,nr);return 1;
             }
             double d=darr[i].constant,r=rarr[i].constant;
-            if(d<0.0||fabs(d-rint(d))>1e-9||r<0.0||fabs(r-rint(r))>1e-9){
+            dval[i]=d; rval[i]=r;
+            if(d<0.0||r<0.0||fabs(d-rint(d))>1e-9||fabs(r-rint(r))>1e-9){
+                free(lo);free(hi);free(dval);free(rval);
                 lin_free(&bl);free_lins(sarr,ns);free_lins(darr,nd);free_lins(rarr,nr);return 1;
             }
-            if(d==0.0||r==0.0)continue;          /* never consumes resource */
-            int sv=sarr[i].idx[0];
-            if(sv<0||sv>=b->nvars||!b->haslo[sv]||!b->hashi[sv]||b->lo[sv]>b->hi[sv]){
-                lin_free(&bl);free_lins(sarr,ns);free_lins(darr,nd);free_lins(rarr,nr);return 1; /* unbounded start -> UNKNOWN */
+            if(d==0.0||r==0.0) continue;
+            double xlo, xhi;
+            if(lin_bounds(b,&sarr[i],&xlo,&xhi)!=0){
+                free(lo);free(hi);free(dval);free(rval);
+                lin_free(&bl);free_lins(sarr,ns);free_lins(darr,nd);free_lins(rarr,nr);return 1;
             }
-            if(b->lo[sv]<minStart)minStart=b->lo[sv];
-            if(b->hi[sv]+d>maxEnd)maxEnd=b->hi[sv]+d;
+            lo[i]=(long)floor(xlo); hi[i]=(long)ceil(xhi);
+            if(xlo < minStart) minStart=xlo;
+            if(xhi + d > maxEnd) maxEnd=xhi + d;
             any=1;
         }
-        if(!any){lin_free(&bl);free_lins(sarr,ns);free_lins(darr,nd);free_lins(rarr,nr);return 0;} /* nothing consumes resource */
-        long Tmin=(long)floor(minStart),Tmax=(long)floor(maxEnd)-1;
-        if(Tmax<Tmin){lin_free(&bl);free_lins(sarr,ns);free_lins(darr,nd);free_lins(rarr,nr);return 0;}
-        long pts=Tmax-Tmin+1;
-        /* size cap: guard the O(n*horizon) binary encoding against resource
-           exhaustion on untrusted input; larger models return UNKNOWN. */
-        if(n>32||pts>256||((long)n*pts>1200)){
+
+        if(!any){
+            free(lo);free(hi);free(dval);free(rval);
+            lin_free(&bl);free_lins(sarr,ns);free_lins(darr,nd);free_lins(rarr,nr);return 0;
+        }
+
+        long Tmin=(long)floor(minStart), Tmax=(long)floor(maxEnd)-1;
+        if(Tmax < Tmin){
+            free(lo);free(hi);free(dval);free(rval);
+            lin_free(&bl);free_lins(sarr,ns);free_lins(darr,nd);free_lins(rarr,nr);return 0;
+        }
+
+        long total_vars=0;
+        for(int i=0;i<n;i++){
+            if(dval[i]>0.0&&rval[i]>0.0) total_vars += (hi[i]-lo[i]+1);
+        }
+        if(total_vars > 2048 || (Tmax-Tmin+1) > 512){
+            free(lo);free(hi);free(dval);free(rval);
             lin_free(&bl);free_lins(sarr,ns);free_lins(darr,nd);free_lins(rarr,nr);return 1;
         }
-        for(long t=Tmin;t<=Tmax;t++){
-            Lin R;memset(&R,0,sizeof(R));
-            for(int i=0;i<n;i++){
-                if(darr[i].n!=0||rarr[i].n!=0)continue;   /* already checked: all fixed */
-                double d=darr[i].constant,r=rarr[i].constant;
-                if(d==0.0||r==0.0)continue;
-                int sv=sarr[i].idx[0];
-                /* a2 = [s_i <= t]  =  [s_i - t <= 0] */
-                Lin da;memset(&da,0,sizeof(da));lin_term(&da,sv,1.0);da.constant=-(double)t;
-                int a2=b_newvar(b,0.0,1.0);
-                if(add_int_reif(b,&da,a2,1)!=0){lin_free(&da);lin_free(&R);lin_free(&bl);free_lins(sarr,ns);free_lins(darr,nd);free_lins(rarr,nr);return 1;}
-                lin_free(&da);
-                /* a1 = [s_i + d_i > t]  =  [s_i + d_i - t >= 1] */
-                Lin db;memset(&db,0,sizeof(db));lin_term(&db,sv,1.0);db.constant=d-(double)t;
-                int a1=b_newvar(b,0.0,1.0);
-                if(add_int_reif(b,&db,a1,4)!=0){lin_free(&db);lin_free(&R);lin_free(&bl);free_lins(sarr,ns);free_lins(darr,nd);free_lins(rarr,nr);return 1;}
-                lin_free(&db);
-                /* active = a1 AND a2  (active<=a1, active<=a2, active>=a1+a2-1) */
-                int av=b_newvar(b,0.0,1.0);
-                Lin c1;memset(&c1,0,sizeof(c1));lin_term(&c1,av,1.0);lin_term(&c1,a1,-1.0);b_put(b,'<',0.0,&c1);lin_free(&c1);
-                Lin c2;memset(&c2,0,sizeof(c2));lin_term(&c2,av,1.0);lin_term(&c2,a2,-1.0);b_put(b,'<',0.0,&c2);lin_free(&c2);
-                Lin c3;memset(&c3,0,sizeof(c3));lin_term(&c3,av,1.0);lin_term(&c3,a1,-1.0);lin_term(&c3,a2,-1.0);b_put(b,'>',-1.0,&c3);lin_free(&c3);
-                lin_term(&R,av,r);
+
+        int **z=(int**)psolve_malloc((size_t)n*sizeof(int*));
+        for(int i=0;i<n;i++){
+            if(dval[i]>0.0&&rval[i]>0.0){
+                long n_k = hi[i]-lo[i]+1;
+                z[i]=(int*)psolve_malloc((size_t)n_k*sizeof(int));
+                Lin s_sum; memset(&s_sum,0,sizeof(s_sum));
+                Lin s_val; memset(&s_val,0,sizeof(s_val)); lin_into(&s_val,&sarr[i],1.0);
+                for(long k=lo[i]; k<=hi[i]; k++){
+                    int zik = b_newvar(b, 0.0, 1.0);
+                    z[i][k - lo[i]] = zik;
+                    lin_term(&s_sum, zik, 1.0);
+                    lin_term(&s_val, zik, -(double)k);
+                }
+                b_put(b, '=', 1.0, &s_sum); lin_free(&s_sum);
+                b_put(b, '=', 0.0, &s_val); lin_free(&s_val);
+            } else {
+                z[i]=NULL;
             }
-            if(R.n>0)b_put(b,'<',B,&R);
+        }
+
+        for(long t=Tmin; t<=Tmax; t++){
+            Lin R; memset(&R, 0, sizeof(R));
+            for(int i=0;i<n;i++){
+                if(dval[i]==0.0||rval[i]==0.0) continue;
+                long k_start = t - (long)dval[i] + 1;
+                if(k_start < lo[i]) k_start = lo[i];
+                long k_end = t;
+                if(k_end > hi[i]) k_end = hi[i];
+                for(long k=k_start; k<=k_end; k++){
+                    lin_term(&R, z[i][k - lo[i]], rval[i]);
+                }
+            }
+            if(R.n > 0) b_put(b, '<', B, &R);
             lin_free(&R);
         }
-        lin_free(&bl);free_lins(sarr,ns);free_lins(darr,nd);free_lins(rarr,nr);
+
+        for(int i=0;i<n;i++) if(z[i]) free(z[i]);
+        free(z); free(lo); free(hi); free(dval); free(rval);
+        lin_free(&bl); free_lins(sarr,ns); free_lins(darr,nd); free_lins(rarr,nr);
         return 0;
     }
+    /* all_equal(x[]): every element of x equals x[0] */
+    if(strcmp(p,"all_equal")==0||strcmp(p,"all_equal_int")==0||strcmp(p,"fzn_all_equal_int")==0||
+       strcmp(p,"all_equal_bool")==0||strcmp(p,"fzn_all_equal_bool")==0){
+        if(c->nargs<1)return -1;
+        Lin*arr;int narr;
+        if(parse_array(m,c->args[0],&arr,&narr)!=0)return -1;
+        for(int i=0;i+1<narr;i++){
+            Lin d;memset(&d,0,sizeof(d));
+            lin_into(&d,&arr[i],1.0);lin_into(&d,&arr[i+1],-1.0);
+            b_put(b,'=',0.0,&d);
+            lin_free(&d);
+        }
+        free_lins(arr,narr);
+        return 0;
+    }
+    /* increasing / decreasing (non-strict and strict integer) */
+    if(strcmp(p,"increasing")==0||strcmp(p,"increasing_int")==0||strcmp(p,"fzn_increasing_int")==0||
+       strcmp(p,"increasing_bool")==0||strcmp(p,"fzn_increasing_bool")==0||
+       strcmp(p,"increasing_float")==0||strcmp(p,"fzn_increasing_float")==0||
+       strcmp(p,"decreasing")==0||strcmp(p,"decreasing_int")==0||strcmp(p,"fzn_decreasing_int")==0||
+       strcmp(p,"decreasing_bool")==0||strcmp(p,"fzn_decreasing_bool")==0||
+       strcmp(p,"decreasing_float")==0||strcmp(p,"fzn_decreasing_float")==0||
+       strcmp(p,"strictly_increasing")==0||strcmp(p,"strictly_increasing_int")==0||strcmp(p,"fzn_strictly_increasing_int")==0||
+       strcmp(p,"strictly_decreasing")==0||strcmp(p,"strictly_decreasing_int")==0||strcmp(p,"fzn_strictly_decreasing_int")==0){
+        if(c->nargs<1)return -1;
+        Lin*arr;int narr;
+        if(parse_array(m,c->args[0],&arr,&narr)!=0)return -1;
+        int is_dec = (strstr(p,"decreasing")!=NULL);
+        int is_strict = (strstr(p,"strictly")!=NULL);
+        int is_float = (strstr(p,"float")!=NULL);
+        if(is_strict && is_float){
+            free_lins(arr,narr); return 1; /* strict continuous relation -> unhandled */
+        }
+        char rel = is_dec ? '>' : '<';
+        double rhs = 0.0;
+        if(is_strict) rhs = is_dec ? 1.0 : -1.0;
+        for(int i=0;i+1<narr;i++){
+            Lin d;memset(&d,0,sizeof(d));
+            lin_into(&d,&arr[i],1.0);lin_into(&d,&arr[i+1],-1.0);
+            b_put(b,rel,rhs,&d);
+            lin_free(&d);
+        }
+        free_lins(arr,narr);
+        return 0;
+    }
+    /* Lexicographical comparison between arrays x and y:
+       lex_less(x, y), lex_lesseq(x, y), array_int_lt(x, y), array_int_lq(x, y), etc. */
+    if(strcmp(p,"lex_less")==0||strcmp(p,"lex_less_int")==0||strcmp(p,"fzn_lex_less_int")==0||
+       strcmp(p,"array_int_lt")==0||strcmp(p,"lex_less_bool")==0||strcmp(p,"fzn_lex_less_bool")==0||
+       strcmp(p,"array_bool_lt")==0||
+       strcmp(p,"lex_lesseq")==0||strcmp(p,"lex_lesseq_int")==0||strcmp(p,"fzn_lex_lesseq_int")==0||
+       strcmp(p,"array_int_lq")==0||strcmp(p,"lex_lesseq_bool")==0||strcmp(p,"fzn_lex_lesseq_bool")==0||
+       strcmp(p,"array_bool_lq")==0){
+        if(c->nargs<2)return -1;
+        Lin*xs;int nx; Lin*ys;int ny;
+        if(parse_array(m,c->args[0],&xs,&nx)!=0)return -1;
+        if(parse_array(m,c->args[1],&ys,&ny)!=0){free_lins(xs,nx);return -1;}
+        int is_strict = (strstr(p,"less")!=NULL && strstr(p,"lesseq")==NULL) || (strstr(p,"_lt")!=NULL);
+        int n = (nx < ny) ? nx : ny;
+        if(n == 0){
+            int sat = is_strict ? (nx < ny) : (nx <= ny);
+            if(!sat){ Lin nf;memset(&nf,0,sizeof(nf));b_put(b,'=',1.0,&nf);lin_free(&nf); }
+            free_lins(xs,nx);free_lins(ys,ny);
+            return 0;
+        }
+        if(n > 256){ free_lins(xs,nx);free_lins(ys,ny);return 1; } /* cap */
+
+        int *e = (int*)psolve_malloc((size_t)n * sizeof(int));
+        int *l = (int*)psolve_malloc((size_t)n * sizeof(int));
+        int *p_eq = (int*)psolve_malloc((size_t)n * sizeof(int));
+        int *b_diff = (int*)psolve_malloc((size_t)n * sizeof(int));
+
+        for(int i=0;i<n;i++){
+            e[i] = b_newvar(b, 0.0, 1.0);
+            l[i] = b_newvar(b, 0.0, 1.0);
+            Lin di; memset(&di, 0, sizeof(di)); lin_into(&di, &xs[i], 1.0); lin_into(&di, &ys[i], -1.0);
+            add_int_reif(b, &di, e[i], 0); /* e[i] <-> xs[i] == ys[i] */
+            add_int_reif(b, &di, l[i], 2); /* l[i] <-> xs[i] < ys[i] */
+            lin_free(&di);
+
+            if(i == 0){
+                p_eq[0] = e[0];
+                b_diff[0] = l[0];
+            } else {
+                p_eq[i] = b_newvar(b, 0.0, 1.0);
+                /* p_eq[i] = p_eq[i-1] AND e[i] */
+                Lin c1; memset(&c1, 0, sizeof(c1)); lin_term(&c1, p_eq[i], 1.0); lin_term(&c1, p_eq[i-1], -1.0); b_put(b, '<', 0.0, &c1); lin_free(&c1);
+                Lin c2; memset(&c2, 0, sizeof(c2)); lin_term(&c2, p_eq[i], 1.0); lin_term(&c2, e[i], -1.0); b_put(b, '<', 0.0, &c2); lin_free(&c2);
+                Lin c3; memset(&c3, 0, sizeof(c3)); lin_term(&c3, p_eq[i], 1.0); lin_term(&c3, p_eq[i-1], -1.0); lin_term(&c3, e[i], -1.0); c3.constant = 1.0; b_put(b, '>', 0.0, &c3); lin_free(&c3);
+
+                b_diff[i] = b_newvar(b, 0.0, 1.0);
+                /* b_diff[i] = p_eq[i-1] AND l[i] */
+                Lin d1; memset(&d1, 0, sizeof(d1)); lin_term(&d1, b_diff[i], 1.0); lin_term(&d1, p_eq[i-1], -1.0); b_put(b, '<', 0.0, &d1); lin_free(&d1);
+                Lin d2; memset(&d2, 0, sizeof(d2)); lin_term(&d2, b_diff[i], 1.0); lin_term(&d2, l[i], -1.0); b_put(b, '<', 0.0, &d2); lin_free(&d2);
+                Lin d3; memset(&d3, 0, sizeof(d3)); lin_term(&d3, b_diff[i], 1.0); lin_term(&d3, p_eq[i-1], -1.0); lin_term(&d3, l[i], -1.0); d3.constant = 1.0; b_put(b, '>', 0.0, &d3); lin_free(&d3);
+            }
+        }
+
+        int allow_eq = is_strict ? (nx < ny) : (nx <= ny);
+        Lin sum; memset(&sum, 0, sizeof(sum));
+        for(int i=0;i<n;i++) lin_term(&sum, b_diff[i], 1.0);
+        if(allow_eq) lin_term(&sum, p_eq[n-1], 1.0);
+        b_put(b, '=', 1.0, &sum);
+        lin_free(&sum);
+
+        free(e); free(l); free(p_eq); free(b_diff);
+        free_lins(xs,nx); free_lins(ys,ny);
+        return 0;
+    }
+    /* global_cardinality(x[], cover[], counts[]) and low_up / closed variants */
+    if(strcmp(p,"global_cardinality")==0||strcmp(p,"fzn_global_cardinality")==0||
+       strcmp(p,"gecode_global_cardinality")==0||
+       strcmp(p,"global_cardinality_closed")==0||strcmp(p,"fzn_global_cardinality_closed")==0||
+       strcmp(p,"global_cardinality_low_up")==0||strcmp(p,"fzn_global_cardinality_low_up")==0||
+       strcmp(p,"global_cardinality_low_up_closed")==0||strcmp(p,"fzn_global_cardinality_low_up_closed")==0){
+        int is_low_up = (strstr(p,"low_up")!=NULL);
+        int is_closed = (strstr(p,"closed")!=NULL);
+        if(c->nargs < (is_low_up ? 4 : 3)) return -1;
+        Lin*xs; int nx; Lin*cover; int nc;
+        if(parse_array(m,c->args[0],&xs,&nx)!=0) return -1;
+        if(parse_array(m,c->args[1],&cover,&nc)!=0){free_lins(xs,nx);return -1;}
+        Lin*counts = NULL; int ncnt = 0;
+        Lin*lbound = NULL; int nlb = 0;
+        Lin*ubound = NULL; int nub = 0;
+        if(is_low_up){
+            if(parse_array(m,c->args[2],&lbound,&nlb)!=0||parse_array(m,c->args[3],&ubound,&nub)!=0||
+               nlb != nc || nub != nc){
+                if(lbound) { free_lins(lbound,nlb); }
+                if(ubound) { free_lins(ubound,nub); }
+                free_lins(xs,nx); free_lins(cover,nc); return -1;
+            }
+        } else {
+            if(parse_array(m,c->args[2],&counts,&ncnt)!=0 || ncnt != nc){
+                if(counts) { free_lins(counts,ncnt); }
+                free_lins(xs,nx); free_lins(cover,nc); return -1;
+            }
+        }
+        if(nx > 0 && nc > 0 && nx * nc > 4096){
+            if(counts) { free_lins(counts,ncnt); }
+            if(lbound) { free_lins(lbound,nlb); }
+            if(ubound) { free_lins(ubound,nub); }
+            free_lins(xs,nx); free_lins(cover,nc);
+            return 1;
+        }
+
+        size_t sz_z = (nx > 0 && nc > 0) ? (size_t)nx * (size_t)nc : 1;
+        int *z = (int*)psolve_malloc(sz_z * sizeof(int));
+        for(int i=0;i<nx;i++){
+            for(int k=0;k<nc;k++){
+                z[i*nc + k] = b_newvar(b, 0.0, 1.0);
+                Lin di; memset(&di, 0, sizeof(di)); lin_into(&di, &xs[i], 1.0); lin_into(&di, &cover[k], -1.0);
+                add_int_reif(b, &di, z[i*nc + k], 0);
+                lin_free(&di);
+            }
+        }
+
+        /* each variable matches at most one (or exactly one if closed) cover value */
+        for(int i=0;i<nx;i++){
+            Lin s; memset(&s, 0, sizeof(s));
+            for(int k=0;k<nc;k++) lin_term(&s, z[i*nc + k], 1.0);
+            b_put(b, is_closed ? '=' : '<', 1.0, &s);
+            lin_free(&s);
+        }
+
+        /* count occurrences for each cover value */
+        for(int k=0;k<nc;k++){
+            Lin s; memset(&s, 0, sizeof(s));
+            for(int i=0;i<nx;i++) lin_term(&s, z[i*nc + k], 1.0);
+            if(is_low_up){
+                Lin lo; memset(&lo, 0, sizeof(lo)); lin_into(&lo, &s, 1.0); lin_into(&lo, &lbound[k], -1.0);
+                b_put(b, '>', 0.0, &lo); lin_free(&lo);
+                Lin up; memset(&up, 0, sizeof(up)); lin_into(&up, &s, 1.0); lin_into(&up, &ubound[k], -1.0);
+                b_put(b, '<', 0.0, &up); lin_free(&up);
+            } else {
+                lin_into(&s, &counts[k], -1.0);
+                b_put(b, '=', 0.0, &s);
+            }
+            lin_free(&s);
+        }
+
+        free(z);
+        if(counts) { free_lins(counts,ncnt); }
+        if(lbound) { free_lins(lbound,nlb); }
+        if(ubound) { free_lins(ubound,nub); }
+        free_lins(xs,nx); free_lins(cover,nc);
+        return 0;
+    }
+    /* bin_packing(c, bin[], w[]), bin_packing_capa(c[], bin[], w[]),
+       bin_packing_load(l[], bin[], w[], [minIndex]) */
+    if(strcmp(p,"bin_packing")==0||strcmp(p,"fzn_bin_packing")==0||
+       strcmp(p,"bin_packing_capa")==0||strcmp(p,"fzn_bin_packing_capa")==0||
+       strcmp(p,"bin_packing_load")==0||strcmp(p,"fzn_bin_packing_load")==0||
+       strcmp(p,"gecode_bin_packing_load")==0){
+        int is_gec = (strcmp(p,"gecode_bin_packing_load")==0);
+        int is_load = (strstr(p,"load")!=NULL);
+        int is_capa_arr = (strstr(p,"capa")!=NULL);
+        int min_args = is_gec ? 4 : 3;
+        if(c->nargs < min_args) return -1;
+
+        int minIndex = 1;
+        if(is_gec){
+            Lin mol; if(parse_lin(m,c->args[3],&mol)!=0) return -1;
+            if(mol.n!=0) { lin_free(&mol); return 1; }
+            minIndex = (int)llround(mol.constant); lin_free(&mol);
+        }
+
+        Lin *load_arr = NULL; int nload = 0;
+        Lin *capa_arr = NULL; int ncapa = 0;
+        Lin capa_scalar; memset(&capa_scalar, 0, sizeof(capa_scalar));
+        Lin *bin_arr = NULL; int nbin = 0;
+        Lin *w_arr = NULL; int nw = 0;
+
+        if(is_load){
+            if(parse_array(m,c->args[0],&load_arr,&nload)!=0) return -1;
+            if(parse_array(m,c->args[1],&bin_arr,&nbin)!=0){free_lins(load_arr,nload);return -1;}
+            if(parse_array(m,c->args[2],&w_arr,&nw)!=0){free_lins(load_arr,nload);free_lins(bin_arr,nbin);return -1;}
+        } else if(is_capa_arr){
+            if(parse_array(m,c->args[0],&capa_arr,&ncapa)!=0) return -1;
+            if(parse_array(m,c->args[1],&bin_arr,&nbin)!=0){free_lins(capa_arr,ncapa);return -1;}
+            if(parse_array(m,c->args[2],&w_arr,&nw)!=0){free_lins(capa_arr,ncapa);free_lins(bin_arr,nbin);return -1;}
+        } else {
+            if(parse_lin(m,c->args[0],&capa_scalar)!=0) return -1;
+            if(parse_array(m,c->args[1],&bin_arr,&nbin)!=0){lin_free(&capa_scalar);return -1;}
+            if(parse_array(m,c->args[2],&w_arr,&nw)!=0){lin_free(&capa_scalar);free_lins(bin_arr,nbin);return -1;}
+        }
+
+        if(nbin != nw){
+            if(load_arr)free_lins(load_arr,nload);
+            if(capa_arr)free_lins(capa_arr,ncapa);
+            lin_free(&capa_scalar);
+            free_lins(bin_arr,nbin); free_lins(w_arr,nw);
+            return -1;
+        }
+
+        int m_bins = is_load ? nload : (is_capa_arr ? ncapa : 0);
+        if(!is_load && !is_capa_arr){
+            double max_b = 0;
+            for(int i=0;i<nbin;i++){
+                int bv;
+                if(lin_unit_var(&bin_arr[i],&bv)==0 && bv>=0 && bv<b->nvars && b->hashi[bv]){
+                    if(b->hi[bv] > max_b) max_b = b->hi[bv];
+                }
+            }
+            m_bins = (int)llround(max_b) - minIndex + 1;
+            if(m_bins < 1) m_bins = nbin;
+        }
+
+        if(nbin > 0 && m_bins > 0 && nbin * m_bins > 4096){
+            if(load_arr)free_lins(load_arr,nload);
+            if(capa_arr)free_lins(capa_arr,ncapa);
+            lin_free(&capa_scalar);
+            free_lins(bin_arr,nbin); free_lins(w_arr,nw);
+            return 1;
+        }
+
+        size_t sz_z = (nbin > 0 && m_bins > 0) ? (size_t)nbin * (size_t)m_bins : 1;
+        int *z = (int*)psolve_malloc(sz_z * sizeof(int));
+        for(int i=0;i<nbin;i++){
+            for(int j=0;j<m_bins;j++){
+                z[i*m_bins + j] = b_newvar(b, 0.0, 1.0);
+                Lin di; memset(&di, 0, sizeof(di)); lin_into(&di, &bin_arr[i], 1.0); di.constant -= (double)(minIndex + j);
+                add_int_reif(b, &di, z[i*m_bins + j], 0);
+                lin_free(&di);
+            }
+            Lin s; memset(&s, 0, sizeof(s));
+            for(int j=0;j<m_bins;j++) lin_term(&s, z[i*m_bins + j], 1.0);
+            b_put(b, '=', 1.0, &s);
+            lin_free(&s);
+        }
+
+        for(int j=0;j<m_bins;j++){
+            Lin load_j; memset(&load_j, 0, sizeof(load_j));
+            for(int i=0;i<nbin;i++){
+                if(w_arr[i].n == 0){
+                    lin_term(&load_j, z[i*m_bins + j], w_arr[i].constant);
+                } else {
+                    free(z);
+                    if(load_arr)free_lins(load_arr,nload);
+                    if(capa_arr)free_lins(capa_arr,ncapa);
+                    lin_free(&capa_scalar);
+                    free_lins(bin_arr,nbin); free_lins(w_arr,nw);
+                    return 1;
+                }
+            }
+            if(is_load){
+                Lin eq; memset(&eq, 0, sizeof(eq)); lin_into(&eq, &load_arr[j], 1.0); lin_into(&eq, &load_j, -1.0);
+                b_put(b, '=', 0.0, &eq); lin_free(&eq);
+            } else if(is_capa_arr){
+                Lin le; memset(&le, 0, sizeof(le)); lin_into(&le, &load_j, 1.0); lin_into(&le, &capa_arr[j], -1.0);
+                b_put(b, '<', 0.0, &le); lin_free(&le);
+            } else {
+                Lin le; memset(&le, 0, sizeof(le)); lin_into(&le, &load_j, 1.0); lin_into(&le, &capa_scalar, -1.0);
+                b_put(b, '<', 0.0, &le); lin_free(&le);
+            }
+            lin_free(&load_j);
+        }
+
+        free(z);
+        if(load_arr)free_lins(load_arr,nload);
+        if(capa_arr)free_lins(capa_arr,ncapa);
+        lin_free(&capa_scalar);
+        free_lins(bin_arr,nbin); free_lins(w_arr,nw);
+        return 0;
+    }
+    /* disjunctive(s[], d[]): non-overlapping task scheduling */
+    if(strcmp(p,"disjunctive")==0||strcmp(p,"fzn_disjunctive")==0||
+       strcmp(p,"gecode_schedule_unary")==0||
+       strcmp(p,"disjunctive_strict")==0||strcmp(p,"fzn_disjunctive_strict")==0){
+        if(c->nargs<2)return -1;
+        Lin*sarr;int ns; Lin*darr;int nd;
+        if(parse_array(m,c->args[0],&sarr,&ns)!=0)return -1;
+        if(parse_array(m,c->args[1],&darr,&nd)!=0){free_lins(sarr,ns);return -1;}
+        if(ns!=nd){free_lins(sarr,ns);free_lins(darr,nd);return -1;}
+        if(ns>128){free_lins(sarr,ns);free_lins(darr,nd);return 1;}
+
+        for(int i=0;i<ns;i++){
+            if(darr[i].n!=0){free_lins(sarr,ns);free_lins(darr,nd);return 1;}
+        }
+
+        for(int i=0;i<ns;i++){
+            double di = darr[i].constant;
+            if(di <= 0.0) continue;
+            for(int j=i+1;j<ns;j++){
+                double dj = darr[j].constant;
+                if(dj <= 0.0) continue;
+
+                Lin dij; memset(&dij,0,sizeof(dij));
+                lin_into(&dij, &sarr[i], 1.0); lin_into(&dij, &sarr[j], -1.0); dij.constant += di;
+                double Lij, Uij;
+                if(lin_bounds(b, &dij, &Lij, &Uij)!=0){
+                    lin_free(&dij); free_lins(sarr,ns); free_lins(darr,nd); return 1;
+                }
+
+                Lin dji; memset(&dji,0,sizeof(dji));
+                lin_into(&dji, &sarr[j], 1.0); lin_into(&dji, &sarr[i], -1.0); dji.constant += dj;
+                double Lji, Uji;
+                if(lin_bounds(b, &dji, &Lji, &Uji)!=0){
+                    lin_free(&dij); lin_free(&dji); free_lins(sarr,ns); free_lins(darr,nd); return 1;
+                }
+
+                /* If both orderings are infeasible: model is infeasible */
+                if(Lij > 0.0 && Lji > 0.0){
+                    Lin nf; memset(&nf,0,sizeof(nf)); b_put(b, '=', 1.0, &nf); lin_free(&nf);
+                    lin_free(&dij); lin_free(&dji); continue;
+                }
+
+                int bij = b_newvar(b, 0.0, 1.0);
+                double Mij = fmax(fabs(Lij), fabs(Uij)) + 1.0;
+                double Mji = fmax(fabs(Lji), fabs(Uji)) + 1.0;
+
+                /* bij=1 => dij <= 0 => dij + Mij*bij <= Mij */
+                Lin r1; memset(&r1,0,sizeof(r1));
+                lin_into(&r1, &dij, 1.0); lin_term(&r1, bij, Mij);
+                b_put(b, '<', Mij, &r1); lin_free(&r1);
+
+                /* bij=0 => dji <= 0 => dji - Mji*bij <= 0 */
+                Lin r2; memset(&r2,0,sizeof(r2));
+                lin_into(&r2, &dji, 1.0); lin_term(&r2, bij, -Mji);
+                b_put(b, '<', 0.0, &r2); lin_free(&r2);
+
+                lin_free(&dij); lin_free(&dji);
+            }
+        }
+
+        free_lins(sarr,ns); free_lins(darr,nd);
+        return 0;
+    }
+    /* inverse(f[], invf[]) / inverse_offsets(f, foff, invf, invfoff) */
+    if(strcmp(p,"inverse")==0||strcmp(p,"fzn_inverse")==0||
+       strcmp(p,"gecode_inverse")==0||strcmp(p,"inverse_offsets")==0){
+        int is_off = (strcmp(p,"inverse_offsets")==0);
+        if(c->nargs < (is_off ? 4 : 2)) return -1;
+        int foff = 1, invfoff = 1;
+        Lin *farr; int nf; Lin *invarr; int ninv;
+        if(is_off){
+            if(parse_array(m,c->args[0],&farr,&nf)!=0) return -1;
+            Lin ol1; if(parse_lin(m,c->args[1],&ol1)!=0){free_lins(farr,nf);return -1;}
+            foff = (int)llround(ol1.constant); lin_free(&ol1);
+            if(parse_array(m,c->args[2],&invarr,&ninv)!=0){free_lins(farr,nf);return -1;}
+            Lin ol2; if(parse_lin(m,c->args[3],&ol2)!=0){free_lins(farr,nf);free_lins(invarr,ninv);return -1;}
+            invfoff = (int)llround(ol2.constant); lin_free(&ol2);
+        } else {
+            if(parse_array(m,c->args[0],&farr,&nf)!=0) return -1;
+            if(parse_array(m,c->args[1],&invarr,&ninv)!=0){free_lins(farr,nf);return -1;}
+        }
+
+        if(nf != ninv || nf > 64){ free_lins(farr,nf); free_lins(invarr,ninv); return 1; }
+
+        size_t sz_z = (size_t)nf * (size_t)nf;
+        int *z = (int*)psolve_malloc(sz_z * sizeof(int));
+        for(int i=0;i<nf;i++)for(int j=0;j<nf;j++) z[i*nf + j] = b_newvar(b, 0.0, 1.0);
+
+        for(int i=0;i<nf;i++){
+            Lin s; memset(&s, 0, sizeof(s));
+            for(int j=0;j<nf;j++) lin_term(&s, z[i*nf + j], 1.0);
+            b_put(b, '=', 1.0, &s); lin_free(&s);
+
+            Lin eq_f; memset(&eq_f, 0, sizeof(eq_f)); lin_into(&eq_f, &farr[i], 1.0);
+            for(int j=0;j<nf;j++) lin_term(&eq_f, z[i*nf + j], -(double)(j + invfoff));
+            b_put(b, '=', 0.0, &eq_f); lin_free(&eq_f);
+        }
+        for(int j=0;j<nf;j++){
+            Lin s; memset(&s, 0, sizeof(s));
+            for(int i=0;i<nf;i++) lin_term(&s, z[i*nf + j], 1.0);
+            b_put(b, '=', 1.0, &s); lin_free(&s);
+
+            Lin eq_inv; memset(&eq_inv, 0, sizeof(eq_inv)); lin_into(&eq_inv, &invarr[j], 1.0);
+            for(int i=0;i<nf;i++) lin_term(&eq_inv, z[i*nf + j], -(double)(i + foff));
+            b_put(b, '=', 0.0, &eq_inv); lin_free(&eq_inv);
+        }
+
+        free(z); free_lins(farr,nf); free_lins(invarr,ninv);
+        return 0;
+    }
+    /* member(x[], y): y appears in array x */
+    if(strcmp(p,"member")==0||strcmp(p,"member_int")==0||strcmp(p,"fzn_member_int")==0||
+       strcmp(p,"member_bool")==0||strcmp(p,"fzn_member_bool")==0||
+       strcmp(p,"member_float")==0||strcmp(p,"fzn_member_float")==0){
+        if(c->nargs<2)return -1;
+        Lin*arr;int narr; Lin yl;
+        if(parse_array(m,c->args[0],&arr,&narr)!=0)return -1;
+        if(parse_lin(m,c->args[1],&yl)!=0){free_lins(arr,narr);return -1;}
+        if(narr == 0){
+            Lin nf; memset(&nf, 0, sizeof(nf)); b_put(b, '=', 1.0, &nf); lin_free(&nf);
+            free_lins(arr,narr); lin_free(&yl); return 0;
+        }
+        if(narr > 1024){ free_lins(arr,narr); lin_free(&yl); return 1; }
+
+        int is_float = (strstr(p,"float")!=NULL);
+        if(is_float){
+            int *zs = (int*)psolve_malloc((size_t)narr * sizeof(int));
+            for(int i=0;i<narr;i++){
+                zs[i] = b_newvar(b, 0.0, 1.0);
+                Lin di; memset(&di, 0, sizeof(di)); lin_into(&di, &yl, 1.0); lin_into(&di, &arr[i], -1.0);
+                double L, U;
+                if(lin_bounds(b, &di, &L, &U) != 0){ free(zs); lin_free(&di); free_lins(arr,narr); lin_free(&yl); return 1; }
+                double M = fmax(fabs(L), fabs(U)); if(M < 1.0) M = 1.0;
+                Lin up; memset(&up, 0, sizeof(up)); lin_into(&up, &di, 1.0); lin_term(&up, zs[i], M);
+                b_put(b, '<', M, &up); lin_free(&up);
+                Lin lo; memset(&lo, 0, sizeof(lo)); lin_into(&lo, &di, 1.0); lin_term(&lo, zs[i], -M);
+                b_put(b, '>', -M, &lo); lin_free(&lo);
+                lin_free(&di);
+            }
+            Lin sum; memset(&sum, 0, sizeof(sum));
+            for(int i=0;i<narr;i++) lin_term(&sum, zs[i], 1.0);
+            b_put(b, '>', 1.0, &sum); lin_free(&sum);
+            free(zs);
+        } else {
+            int *zs = (int*)psolve_malloc((size_t)narr * sizeof(int));
+            for(int i=0;i<narr;i++){
+                zs[i] = b_newvar(b, 0.0, 1.0);
+                Lin di; memset(&di, 0, sizeof(di)); lin_into(&di, &arr[i], 1.0); lin_into(&di, &yl, -1.0);
+                add_int_reif(b, &di, zs[i], 0);
+                lin_free(&di);
+            }
+            Lin sum; memset(&sum, 0, sizeof(sum));
+            for(int i=0;i<narr;i++) lin_term(&sum, zs[i], 1.0);
+            b_put(b, '>', 1.0, &sum); lin_free(&sum);
+            free(zs);
+        }
+        free_lins(arr,narr); lin_free(&yl);
+        return 0;
+    }
+    /* alldifferent_except_0(x[]) and alldifferent_except(x[], S) */
+    if(strcmp(p,"alldifferent_except_0")==0||strcmp(p,"fzn_alldifferent_except_0")==0||
+       strcmp(p,"all_different_except_0")==0||
+       strcmp(p,"alldifferent_except")==0||strcmp(p,"fzn_alldifferent_except")==0){
+        if(c->nargs<1)return -1;
+        Lin*arr;int narr;
+        if(parse_array(m,c->args[0],&arr,&narr)!=0)return -1;
+        if(narr<=1){free_lins(arr,narr);return 0;}
+        double dlo=1e18, dhi=-1e18;
+        for(int i=0;i<narr;i++){
+            double lo_i, hi_i;
+            if(lin_bounds(b, &arr[i], &lo_i, &hi_i)!=0){free_lins(arr,narr);return 1;}
+            if(lo_i<dlo)dlo=lo_i;
+            if(hi_i>dhi)dhi=hi_i;
+        }
+        long ndom=(long)(dhi-dlo)+1;
+        if(ndom<=0||ndom>128){free_lins(arr,narr);return 1;}
+
+        for(long v=(long)dlo; v<=(long)dhi; v++){
+            if(v == 0) continue; /* except 0 */
+            Lin sum; memset(&sum, 0, sizeof(sum));
+            for(int i=0;i<narr;i++){
+                int z = b_newvar(b, 0.0, 1.0);
+                Lin di; memset(&di, 0, sizeof(di)); lin_into(&di, &arr[i], 1.0); di.constant -= (double)v;
+                add_int_reif(b, &di, z, 0);
+                lin_free(&di);
+                lin_term(&sum, z, 1.0);
+            }
+            b_put(b, '<', 1.0, &sum);
+            lin_free(&sum);
+        }
+
+        free_lins(arr,narr);
+        return 0;
+    }
+    /* sliding_sum(low, up, seq, vs[]) */
+    if(strcmp(p,"sliding_sum")==0||strcmp(p,"fzn_sliding_sum")==0){
+        if(c->nargs<4)return -1;
+        Lin low, up, seql; Lin*vs; int nvs;
+        if(parse_lin(m,c->args[0],&low)!=0)return -1;
+        if(parse_lin(m,c->args[1],&up)!=0){lin_free(&low);return -1;}
+        if(parse_lin(m,c->args[2],&seql)!=0){lin_free(&low);lin_free(&up);return -1;}
+        if(parse_array(m,c->args[3],&vs,&nvs)!=0){lin_free(&low);lin_free(&up);lin_free(&seql);return -1;}
+        if(seql.n!=0||seql.constant<1.0||seql.constant>(double)nvs){
+            lin_free(&low);lin_free(&up);lin_free(&seql);free_lins(vs,nvs);return 1;
+        }
+        int seq = (int)llround(seql.constant);
+        for(int i=0; i + seq <= nvs; i++){
+            Lin win; memset(&win, 0, sizeof(win));
+            for(int k=0; k<seq; k++) lin_into(&win, &vs[i+k], 1.0);
+            Lin lo_row; memset(&lo_row, 0, sizeof(lo_row)); lin_into(&lo_row, &win, 1.0); lin_into(&lo_row, &low, -1.0);
+            b_put(b, '>', 0.0, &lo_row); lin_free(&lo_row);
+            Lin up_row; memset(&up_row, 0, sizeof(up_row)); lin_into(&up_row, &win, 1.0); lin_into(&up_row, &up, -1.0);
+            b_put(b, '<', 0.0, &up_row); lin_free(&up_row);
+            lin_free(&win);
+        }
+        lin_free(&low);lin_free(&up);lin_free(&seql);free_lins(vs,nvs);
+        return 0;
+    }
+    /* nvalue(n, x[]): number of distinct values in x equals n */
+    if(strcmp(p,"nvalue")==0||strcmp(p,"fzn_nvalue")==0){
+        if(c->nargs<2)return -1;
+        Lin nl; Lin*arr; int narr;
+        if(parse_lin(m,c->args[0],&nl)!=0)return -1;
+        if(parse_array(m,c->args[1],&arr,&narr)!=0){lin_free(&nl);return -1;}
+        if(narr==0){
+            Lin eq; memset(&eq, 0, sizeof(eq)); lin_into(&eq, &nl, 1.0); b_put(b, '=', 0.0, &eq); lin_free(&eq);
+            lin_free(&nl); free_lins(arr,narr); return 0;
+        }
+        double dlo=1e18, dhi=-1e18;
+        for(int i=0;i<narr;i++){
+            double lo_i, hi_i;
+            if(lin_bounds(b, &arr[i], &lo_i, &hi_i)!=0){lin_free(&nl);free_lins(arr,narr);return 1;}
+            if(lo_i<dlo)dlo=lo_i;
+            if(hi_i>dhi)dhi=hi_i;
+        }
+        long ndom=(long)(dhi-dlo)+1;
+        if(ndom<=0||ndom>256){lin_free(&nl);free_lins(arr,narr);return 1;}
+
+        Lin sum_u; memset(&sum_u, 0, sizeof(sum_u));
+        for(long v=(long)dlo; v<=(long)dhi; v++){
+            int uv = b_newvar(b, 0.0, 1.0);
+            lin_term(&sum_u, uv, 1.0);
+            Lin sum_z; memset(&sum_z, 0, sizeof(sum_z));
+            for(int i=0;i<narr;i++){
+                int ziv = b_newvar(b, 0.0, 1.0);
+                Lin di; memset(&di, 0, sizeof(di)); lin_into(&di, &arr[i], 1.0); di.constant -= (double)v;
+                add_int_reif(b, &di, ziv, 0); lin_free(&di);
+                Lin c1; memset(&c1, 0, sizeof(c1)); lin_term(&c1, ziv, 1.0); lin_term(&c1, uv, -1.0);
+                b_put(b, '<', 0.0, &c1); lin_free(&c1);
+                lin_term(&sum_z, ziv, 1.0);
+            }
+            Lin c2; memset(&c2, 0, sizeof(c2)); lin_term(&c2, uv, 1.0); lin_into(&c2, &sum_z, -1.0);
+            b_put(b, '<', 0.0, &c2); lin_free(&c2); lin_free(&sum_z);
+        }
+        lin_into(&sum_u, &nl, -1.0);
+        b_put(b, '=', 0.0, &sum_u);
+        lin_free(&sum_u);
+        lin_free(&nl); free_lins(arr,narr);
+        return 0;
+    }
+    /* subcircuit(x[]) / gecode_subcircuit(offset, x[]) */
+    if(strcmp(p,"subcircuit")==0||strcmp(p,"fzn_subcircuit")==0||strcmp(p,"gecode_subcircuit")==0){
+        int offset=1; const char*xarg=NULL; Lin ol;
+        if(strcmp(p,"gecode_subcircuit")==0){
+            if(c->nargs<2)return -1;
+            if(parse_lin(m,c->args[0],&ol)!=0)return -1;
+            if(ol.n!=0) { lin_free(&ol); return 1; }
+            offset=(int)llround(ol.constant); xarg=c->args[1]; lin_free(&ol);
+        } else {
+            if(c->nargs<1)return -1;
+            xarg=c->args[0];
+        }
+        Lin*xs;int nx;
+        if(parse_array(m,xarg,&xs,&nx)!=0)return -1;
+        if(nx<=1){free_lins(xs,nx);return 0;}
+        if(nx>48){free_lins(xs,nx);return 1;}
+
+        int *z = (int*)psolve_malloc((size_t)nx * nx * sizeof(int));
+        int *in_c = (int*)psolve_malloc((size_t)nx * sizeof(int));
+        for(int i=0;i<nx;i++){
+            for(int j=0;j<nx;j++){
+                z[i*nx + j] = b_newvar(b, 0.0, 1.0);
+                Lin dij; memset(&dij, 0, sizeof(dij)); lin_into(&dij, &xs[i], 1.0); dij.constant = -(double)(offset + j);
+                add_int_reif(b, &dij, z[i*nx + j], 0); lin_free(&dij);
+            }
+            in_c[i] = b_newvar(b, 0.0, 1.0);
+            Lin sc; memset(&sc, 0, sizeof(sc)); lin_term(&sc, in_c[i], 1.0); lin_term(&sc, z[i*nx + i], 1.0);
+            b_put(b, '=', 1.0, &sc); lin_free(&sc);
+        }
+
+        for(int i=0;i<nx;i++){
+            Lin out; memset(&out, 0, sizeof(out));
+            for(int j=0;j<nx;j++) lin_term(&out, z[i*nx + j], 1.0);
+            b_put(b, '=', 1.0, &out); lin_free(&out);
+        }
+        for(int j=0;j<nx;j++){
+            Lin in; memset(&in, 0, sizeof(in));
+            for(int i=0;i<nx;i++) lin_term(&in, z[i*nx + j], 1.0);
+            b_put(b, '=', 1.0, &in); lin_free(&in);
+        }
+
+        int *ord = (int*)psolve_malloc((size_t)nx * sizeof(int));
+        for(int i=0;i<nx;i++) ord[i] = b_newvar_float(b, 0.0, (double)nx);
+        for(int i=0;i<nx;i++)for(int j=0;j<nx;j++)if(i!=j){
+            Lin mtz; memset(&mtz, 0, sizeof(mtz));
+            lin_term(&mtz, ord[i], 1.0); lin_term(&mtz, ord[j], -1.0);
+            lin_term(&mtz, z[i*nx + j], (double)nx);
+            lin_term(&mtz, in_c[i], (double)nx); lin_term(&mtz, in_c[j], (double)nx);
+            b_put(b, '<', (double)(3*nx - 1), &mtz); lin_free(&mtz);
+        }
+
+        free(ord); free(in_c); free(z); free_lins(xs,nx);
+        return 0;
+    }
+    /* diffn(x[], y[], dx[], dy[]) / fzn_diffn / gecode_diffn / gecode_nooverlap: 2D non-overlapping boxes */
+    if(strcmp(p,"diffn")==0||strcmp(p,"fzn_diffn")==0||
+       strcmp(p,"diffn_nonstrict")==0||strcmp(p,"fzn_diffn_nonstrict")==0||
+       strcmp(p,"gecode_diffn")==0||strcmp(p,"gecode_nooverlap")==0){
+        if(c->nargs<4)return -1;
+        int is_nooverlap = (strcmp(p,"gecode_nooverlap")==0);
+        int y_arg = is_nooverlap ? 2 : 1;
+        int dx_arg = is_nooverlap ? 1 : 2;
+        Lin *xs; int nx; Lin *ys; int ny; Lin *dxs; int ndx; Lin *dys; int ndy;
+        if(parse_array(m,c->args[0],&xs,&nx)!=0) return -1;
+        if(parse_array(m,c->args[y_arg],&ys,&ny)!=0){free_lins(xs,nx);return -1;}
+        if(parse_array(m,c->args[dx_arg],&dxs,&ndx)!=0){free_lins(xs,nx);free_lins(ys,ny);return -1;}
+        if(parse_array(m,c->args[3],&dys,&ndy)!=0){free_lins(xs,nx);free_lins(ys,ny);free_lins(dxs,ndx);return -1;}
+        if(nx!=ny||nx!=ndx||nx!=ndy){
+            free_lins(xs,nx);free_lins(ys,ny);free_lins(dxs,ndx);free_lins(dys,ndy);return -1;
+        }
+        if(nx>64){ free_lins(xs,nx);free_lins(ys,ny);free_lins(dxs,ndx);free_lins(dys,ndy);return 1; }
+
+        for(int i=0;i<nx;i++){
+            for(int j=i+1;j<nx;j++){
+                if(dxs[i].n!=0||dys[i].n!=0||dxs[j].n!=0||dys[j].n!=0){
+                    free_lins(xs,nx);free_lins(ys,ny);free_lins(dxs,ndx);free_lins(dys,ndy);return 1;
+                }
+                double dxi = dxs[i].constant, dyi = dys[i].constant;
+                double dxj = dxs[j].constant, dyj = dys[j].constant;
+                if(dxi <= 0.0 || dyi <= 0.0 || dxj <= 0.0 || dyj <= 0.0) continue;
+
+                int b1 = b_newvar(b, 0.0, 1.0);
+                int b2 = b_newvar(b, 0.0, 1.0);
+                int b3 = b_newvar(b, 0.0, 1.0);
+                int b4 = b_newvar(b, 0.0, 1.0);
+
+                Lin sum; memset(&sum, 0, sizeof(sum));
+                lin_term(&sum, b1, 1.0); lin_term(&sum, b2, 1.0); lin_term(&sum, b3, 1.0); lin_term(&sum, b4, 1.0);
+                b_put(b, '>', 1.0, &sum); lin_free(&sum);
+
+                double Lx, Ux, Ly, Uy;
+                Lin dxi_lin; memset(&dxi_lin, 0, sizeof(dxi_lin)); lin_into(&dxi_lin, &xs[i], 1.0); lin_into(&dxi_lin, &xs[j], -1.0);
+                lin_bounds(b, &dxi_lin, &Lx, &Ux); lin_free(&dxi_lin);
+                Lin dyi_lin; memset(&dyi_lin, 0, sizeof(dyi_lin)); lin_into(&dyi_lin, &ys[i], 1.0); lin_into(&dyi_lin, &ys[j], -1.0);
+                lin_bounds(b, &dyi_lin, &Ly, &Uy); lin_free(&dyi_lin);
+
+                double Mx = fmax(fabs(Lx), fabs(Ux)) + dxi + dxj + 1.0;
+                double My = fmax(fabs(Ly), fabs(Uy)) + dyi + dyj + 1.0;
+
+                Lin r1; memset(&r1, 0, sizeof(r1)); lin_into(&r1, &xs[i], 1.0); lin_into(&r1, &xs[j], -1.0); lin_term(&r1, b1, Mx);
+                b_put(b, '<', Mx - dxi, &r1); lin_free(&r1);
+
+                Lin r2; memset(&r2, 0, sizeof(r2)); lin_into(&r2, &xs[j], 1.0); lin_into(&r2, &xs[i], -1.0); lin_term(&r2, b2, Mx);
+                b_put(b, '<', Mx - dxj, &r2); lin_free(&r2);
+
+                Lin r3; memset(&r3, 0, sizeof(r3)); lin_into(&r3, &ys[i], 1.0); lin_into(&r3, &ys[j], -1.0); lin_term(&r3, b3, My);
+                b_put(b, '<', My - dyi, &r3); lin_free(&r3);
+
+                Lin r4; memset(&r4, 0, sizeof(r4)); lin_into(&r4, &ys[j], 1.0); lin_into(&r4, &ys[i], -1.0); lin_term(&r4, b4, My);
+                b_put(b, '<', My - dyj, &r4); lin_free(&r4);
+            }
+        }
+
+        free_lins(xs,nx);free_lins(ys,ny);free_lins(dxs,ndx);free_lins(dys,ndy);
+        return 0;
+    }
+    /* array_bool_xor(as[]): parity of sum is 1 */
+    if(strcmp(p,"array_bool_xor")==0){
+        if(c->nargs<1)return -1;
+        Lin*arr;int narr;
+        if(parse_array(m,c->args[0],&arr,&narr)!=0)return -1;
+        if(narr==0){
+            Lin nf; memset(&nf, 0, sizeof(nf)); b_put(b, '=', 1.0, &nf); lin_free(&nf);
+            free_lins(arr,narr); return 0;
+        }
+        if(narr==1){
+            b_put(b, '=', 1.0, &arr[0]);
+            free_lins(arr,narr); return 0;
+        }
+        if(narr==2){
+            Lin s; memset(&s, 0, sizeof(s)); lin_into(&s, &arr[0], 1.0); lin_into(&s, &arr[1], 1.0);
+            b_put(b, '=', 1.0, &s); lin_free(&s);
+            free_lins(arr,narr); return 0;
+        }
+        int k = b_newvar(b, 0.0, (double)((narr-1)/2));
+        Lin s; memset(&s, 0, sizeof(s));
+        for(int i=0;i<narr;i++) lin_into(&s, &arr[i], 1.0);
+        lin_term(&s, k, -2.0);
+        b_put(b, '=', 1.0, &s); lin_free(&s);
+        free_lins(arr,narr);
+        return 0;
+    }
+    /* float_in(x, a, b) / float_in_reif(x, a, b, r) */
+    if(strcmp(p,"float_in")==0||strcmp(p,"float_in_reif")==0){
+        int reif = (strcmp(p,"float_in_reif")==0);
+        if(c->nargs < (reif ? 4 : 3)) return -1;
+        Lin xl, al, bl;
+        if(parse_lin(m,c->args[0],&xl)!=0) return -1;
+        if(parse_lin(m,c->args[1],&al)!=0){lin_free(&xl);return -1;}
+        if(parse_lin(m,c->args[2],&bl)!=0){lin_free(&xl);lin_free(&al);return -1;}
+        if(!reif){
+            Lin lo; memset(&lo, 0, sizeof(lo)); lin_into(&lo, &xl, 1.0); lin_into(&lo, &al, -1.0);
+            b_put(b, '>', 0.0, &lo); lin_free(&lo);
+            Lin hi; memset(&hi, 0, sizeof(hi)); lin_into(&hi, &xl, 1.0); lin_into(&hi, &bl, -1.0);
+            b_put(b, '<', 0.0, &hi); lin_free(&hi);
+        } else {
+            Lin rb; if(parse_lin(m,c->args[3],&rb)!=0){lin_free(&xl);lin_free(&al);lin_free(&bl);return -1;}
+            int r;
+            if(lin_unit_var(&rb,&r)!=0){lin_free(&xl);lin_free(&al);lin_free(&bl);lin_free(&rb);return 1;}
+            double L1, U1, L2, U2;
+            Lin d1; memset(&d1, 0, sizeof(d1)); lin_into(&d1, &xl, 1.0); lin_into(&d1, &al, -1.0);
+            Lin d2; memset(&d2, 0, sizeof(d2)); lin_into(&d2, &xl, 1.0); lin_into(&d2, &bl, -1.0);
+            if(lin_bounds(b,&d1,&L1,&U1)!=0||lin_bounds(b,&d2,&L2,&U2)!=0){
+                lin_free(&d1);lin_free(&d2);lin_free(&xl);lin_free(&al);lin_free(&bl);lin_free(&rb);return 1;
+            }
+            double M1 = fmax(fabs(L1),fabs(U1)); if(M1<1.0) M1=1.0;
+            double M2 = fmax(fabs(L2),fabs(U2)); if(M2<1.0) M2=1.0;
+            Lin r1; memset(&r1, 0, sizeof(r1)); lin_into(&r1, &d1, 1.0); lin_term(&r1, r, -M1);
+            b_put(b, '>', -M1, &r1); lin_free(&r1);
+            Lin r2; memset(&r2, 0, sizeof(r2)); lin_into(&r2, &d2, 1.0); lin_term(&r2, r, M2);
+            b_put(b, '<', M2, &r2); lin_free(&r2);
+            lin_free(&d1); lin_free(&d2); lin_free(&rb);
+        }
+        lin_free(&xl); lin_free(&al); lin_free(&bl);
+        return 0;
+    }
+
     /* everything else: unhandled (return UNKNOWN at top level) */
     return 1;
 }
@@ -2221,7 +3049,7 @@ void fz_solve(const FZModel*m,FZSolution*sol)
                 unhandled=1;
     }
 
-    if(unhandled){for(int r=0;r<b.nrows;r++){free(b.rows[r].idx);free(b.rows[r].coef);}free(b.rows);free(b.lo);free(b.hi);free(b.haslo);free(b.hashi);sol->status=2;return;}
+    if(unhandled){for(int r=0;r<b.nrows;r++){free(b.rows[r].idx);free(b.rows[r].coef);}free(b.rows);free(b.lo);free(b.hi);free(b.haslo);free(b.hashi);free(b.isint);sol->status=2;return;}
 
     int ntot=b.nvars;
     LP lp;memset(&lp,0,sizeof(lp));
@@ -2253,7 +3081,7 @@ void fz_solve(const FZModel*m,FZSolution*sol)
         for(int e=0;e<decl->n;e++){int vi=decl->base_idx+e;if(vi>=0&&vi<ntot&&integer){isint[vi]=1;any_int=1;}}}
     /* introduced (auxiliary) variables for big-M encodings (e.g. the binary
        flag in int_abs) are integer; set them so the MIP keeps them integral. */
-    for(int vi=nv;vi<ntot;vi++){isint[vi]=1;any_int=1;}
+    for(int vi=nv;vi<ntot;vi++){if(b.isint&&b.isint[vi]){isint[vi]=1;any_int=1;}}
     sol->nvars=ntot;
     sol->x=(double*)psolve_realloc((void**)&sol->x,(size_t)(ntot?ntot:1)*sizeof(double));
     FZSolveCtx ctx;memset(&ctx,0,sizeof(ctx));ctx.m=m;ctx.sol=sol;
@@ -2293,9 +3121,9 @@ void fz_solve(const FZModel*m,FZSolution*sol)
         Solver*s=solver_create(&lp);
         int rr=solver_solve(s);
         if(rr==0){
-            double*xo=(double*)psolve_malloc((size_t)nv*sizeof(double));
+            double*xo=(double*)psolve_malloc((size_t)(ntot?ntot:1)*sizeof(double));
             double obj;solver_optimum(s,xo,&obj);
-            memcpy(sol->x,xo,(size_t)nv*sizeof(double));
+            memcpy(sol->x,xo,(size_t)ntot*sizeof(double));
             sol->obj=obj+m->objective.constant;sol->iters=s->iters;sol->status=0;
             if(sol->all_solutions){
                 sol->num_solutions++;
@@ -2327,7 +3155,7 @@ void fz_solve(const FZModel*m,FZSolution*sol)
     fz_solve_ctx_free(&ctx);
     free(isint);
     free(lp.c);free(lp.l);free(lp.u);free(lp.b);free(lp.rel);free(lp.Acolptr);free(lp.Arow);free(lp.Aval);
-    for(int r=0;r<b.nrows;r++){free(b.rows[r].idx);free(b.rows[r].coef);}free(b.rows);free(b.lo);free(b.hi);free(b.haslo);free(b.hashi);
+    for(int r=0;r<b.nrows;r++){free(b.rows[r].idx);free(b.rows[r].coef);}free(b.rows);free(b.lo);free(b.hi);free(b.haslo);free(b.hashi);free(b.isint);
 }
 
 void fz_print_solution(const FZModel*m,const FZSolution*sol)

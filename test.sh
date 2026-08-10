@@ -138,6 +138,8 @@ python3 tools/divmod_verify.py 200 20260808 | sed 's/.*: //'
 if command -v minizinc >/dev/null 2>&1; then
   echo "[8.5/8] MiniZinc differential (compile .mzn -> fzn -> psolve vs Gecode)..."
   python3 tools/mzn_diff.py | tail -1
+  echo "[8.75/8] MiniZinc full benchmark suite (73 models)..."
+  python3 tools/mzn_bench.py | tail -2
 else
   echo "[8.5/8] MiniZinc differential SKIPPED (minizinc not installed)"
 fi

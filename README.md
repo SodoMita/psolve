@@ -45,8 +45,10 @@ with an explicit baseline `ARCH`.
 ./lpsolve [-t ms|--time-limit ms] <problem.lp> [--print]  # LP (revised simplex, double)
 ./qpsolve <qp.qp>                      # convex QP (active-set)
 ./mipsolve [-t ms|--time-limit ms] <problem.lp> <nint> <j...> [--print]   # MIP (branch-and-bound)
-./fznsolve [-a|--all-solutions] <problem.fzn>  # FlatZinc reader + solver (Phase 3)
+./fznsolve [-a|--all-solutions] [-s] [-v] <problem.fzn>  # FlatZinc reader + solver (Phase 3)
 ./fxsolve <problem.lp> [--print]      # LP (exact rational / fixed-point simplex)
+./tools/mzfnsh run <model.mzn> [-s]   # MiniZinc driver & solver shell
+./tools/mzfnsh bench                  # Run 73-model MiniZinc benchmark suite
 ```
 
 `--print` also dumps the optimal variable values. `-t` / `--time-limit` sets a
@@ -55,6 +57,24 @@ or MIP solve cleanly. Both return `STOPPED` rather than presenting a partial
 solution as optimal. For FlatZinc, `-a` enumerates distinct visible finite-domain
 solutions (or improving optimization incumbents). Continuous satisfaction
 outputs cannot be exhaustively enumerated and return `UNKNOWN` under `-a`.
+
+### MiniZinc Integration & `mzfnsh`
+
+psolve is fully registered as a native MiniZinc backend solver:
+```sh
+# Solve directly through MiniZinc CLI:
+minizinc --solver psolve model.mzn
+
+# Or use the mzfnsh shell driver:
+./tools/mzfnsh run model.mzn -s
+./tools/mzfnsh bench                 # 73-instance benchmark suite
+```
+
+The FlatZinc bridge (`src/fzn.c`) natively linearizes and solves:
+- **Linear & Logic:** `int_lin_*`, `bool_lin_*`, `float_lin_*`, `bool_and/or/xor/not/clause`, `array_bool_and/or/xor`.
+- **Global Constraints:** `all_different`, `all_different_except_0`, `all_equal`, `increasing`, `decreasing`, `strictly_increasing`, `strictly_decreasing`, `lex_less`, `lex_lesseq` (and array comparisons `array_int_lq/lt`), `global_cardinality` (including `low_up` and `closed`), `bin_packing` (including `load` and `capa`), `disjunctive` (unary scheduling), `diffn` (2D non-overlapping rectangles), `inverse`, `member`, `sliding_sum`, `nvalue`, `table`, `circuit`, `subcircuit`, and Pritsker time-indexed `cumulative`.
+- **Extrema & Reification:** `int_abs`, `float_abs`, `int_min/max`, `float_min/max`, `array_*_minimum/maximum`, full reification (`*_reif`) and half-reification (`*_imp`).
+- **Exact Evaluation:** See [`docs/MINIZINC_BENCHMARK.md`](docs/MINIZINC_BENCHMARK.md) for full benchmark results across 73 instances.
 
 The LP solver handles: **maximize or minimize**, `<`, `>`, and `=` constraints,
 variables with lower, upper, boxed, or fully free bounds (use `-inf inf`), and

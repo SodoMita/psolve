@@ -281,7 +281,23 @@ feature completeness against a huge standard corpus.
       currently accepted for MiniZinc driver compatibility but is a no-op.
 - [x] **MiniZinc differential** (`tools/mzn_diff.py`): compiles real `.mzn`
       models with the MiniZinc compiler and compares fznsolve vs Gecode
-      (objectives + feasibility).  Models in `examples/mzn/`.
+      (objectives + feasibility). 33 differential instances in `tools/mzn_diff.py`.
+- [x] **Comprehensive MiniZinc Global Constraint Suite** (`src/fzn.c`):
+      natively linearizes `all_different`, `all_different_except_0`, `all_equal`,
+      `increasing`, `decreasing`, `strictly_increasing`, `strictly_decreasing`,
+      `lex_less`, `lex_lesseq`, `global_cardinality` (incl. `low_up` & `closed`),
+      `bin_packing` (incl. `load` & `capa`), `disjunctive`, `diffn` (2D rectangle packing),
+      `inverse`, `member`, `sliding_sum`, `nvalue`, `table`, `circuit`, `subcircuit`,
+      and Pritsker 0-1 time-indexed `cumulative` with 1ms execution.
+- [x] **Half-Reification Support** (`*_imp`): added `add_int_imp` for directional
+      implications across all relational and linear expressions (`int_eq_imp`,
+      `int_lin_le_imp`, `bool_eq_imp`, etc.).
+- [x] **MiniZinc Driver CLI & Solver Config** (`tools/mzfnsh`, `share/minizinc/solvers/psolve.msc`):
+      native MiniZinc integration (`minizinc --solver psolve model.mzn`) and unified
+      `mzfnsh` driver CLI for compilation, benchmarking, and differential testing.
+- [x] **Full 73-Instance MiniZinc Benchmark Suite** (`tools/mzn_bench.py`, `docs/MINIZINC_BENCHMARK.md`):
+      covers Operations Research, Global Constraints, CSP Puzzles, Industrial Scheduling,
+      Float Systems, Proofs of Infeasibility, and All-Solution Enumeration with 100% pass rate.
 - [x] Fuzz the FlatZinc parser (ASan/UBSan), incl. new handlers + MIP path.
       Added a dedicated `tools/fuzz_fzn.py` (well-formed + malformed `.fzn`
       generators) and wired it into `test.sh`; several real leaks in the lexer

@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+"""mzfnsh - MiniZinc / FlatZinc solver shell & driver for psolve.
+
+Provides a unified CLI interface for compiling and solving MiniZinc (.mzn)
+and FlatZinc (.fzn) models using psolve (fznsolve).
+"""
+
+import sys
+import os
+import subprocess
+import argparse
+import time
+
+PSOLVE_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+FZNSOLVE_BIN = os.path.join(PSOLVE_ROOT, "fznsolve")
+SOLVER_MSC = os.path.join(PSOLVE_ROOT, "share", "minizinc", "solvers", "psolve.msc")
+BENCH_SCRIPT = os.path.join(PSOLVE_ROOT, "tools", "mzn_bench.py")
+
+def ensure_binaries():
+    if not os.path.exists(FZNSOLVE_BIN):
+        print(f"[mzfnsh] Building psolve binaries...", file=sys.stderr)
+        res = subprocess.run(["make", "-C", PSOLVE_ROOT, "-j4"])
+        if res.returncode != 0:
+            print(f"[mzfnsh] Error: build failed", file=sys.stderr)
+            sys.exit(1)
+
+def cmd_run(args, extra_args):
+    ensure_binaries()
+    model_path = args.model
+    if not os.path.exists(model_path):
+        print(f"[mzfnsh] Error: model file not found: {model_path}", file=sys.stderr)
+        sys.exit(1)
+
+    tmp_dir = "/tmp/mzfnsh"
+    os.makedirs(tmp_dir, exist_ok=True)
+    base_name = os.path.splitext(os.path.basename(model_path))[0]
+    fzn_path = os.path.join(tmp_dir, f"{base_name}.fzn")
+
+    # 1. Compile MZN -> FZN
+    comp_cmd = ["minizinc", "-c", "--solver", args.solver or "gecode"]
+    if args.globals:
+        comp_cmd.extend(["-G", args.globals])
+
+    comp_cmd.extend(["--output-fzn-to-file", fzn_path, model_path])
+    if args.data:
+        comp_cmd.extend(args.data)
+
+    t0 = time.perf_counter()
+    c_res = subprocess.run(comp_cmd, capture_output=True, text=True)
+    comp_time = time.perf_counter() - t0
+
+    if c_res.returncode != 0:
+        print(f"[mzfnsh] Compilation error:\n{c_res.stderr.strip()}", file=sys.stderr)
+        sys.exit(1)
+
+    # 2. Solve with fznsolve
+    solve_cmd = [FZNSOLVE_BIN]
+    if args.all_solutions: solve_cmd.append("-a")
+    if args.stats: solve_cmd.append("-s")
+    if args.verbose: solve_cmd.append("-v")
+    if args.node_limit: solve_cmd.extend(["-n", str(args.node_limit)])
+    if args.time_limit: solve_cmd.extend(["-t", str(args.time_limit)])
+    solve_cmd.extend(extra_args)
+    solve_cmd.append(fzn_path)
+
+    t1 = time.perf_counter()
+    s_res = subprocess.run(solve_cmd, text=True)
+    solve_time = time.perf_counter() - t1
+
+    if args.stats:
+        print(f"%%%mzn-stat: compileTime={comp_time:.4f}")
+        print(f"%%%mzn-stat: totalWallTime={comp_time + solve_time:.4f}")
+
+def cmd_fzn(args, extra_args):
+    ensure_binaries()
+    fzn_path = args.file
+    if not os.path.exists(fzn_path):
+        print(f"[mzfnsh] Error: FlatZinc file not found: {fzn_path}", file=sys.stderr)
+        sys.exit(1)
+
+    solve_cmd = [FZNSOLVE_BIN]
+    if args.all_solutions: solve_cmd.append("-a")
+    if args.stats: solve_cmd.append("-s")
+    if args.verbose: solve_cmd.append("-v")
+    if args.node_limit: solve_cmd.extend(["-n", str(args.node_limit)])
+    if args.time_limit: solve_cmd.extend(["-t", str(args.time_limit)])
+    solve_cmd.extend(extra_args)
+    solve_cmd.append(fzn_path)
+
+    subprocess.run(solve_cmd)
+
+def cmd_bench(args):
+    ensure_binaries()
+    cmd = [sys.executable, BENCH_SCRIPT]
+    if args.filter:
+        cmd.append(args.filter)
+    subprocess.run(cmd)
+
+def cmd_diff(args):
+    ensure_binaries()
+    diff_script = os.path.join(PSOLVE_ROOT, "tools", "mzn_diff.py")
+    subprocess.run([sys.executable, diff_script])
+
+def cmd_solvers(args):
+    subprocess.run(["minizinc", "--solvers"])
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="mzfnsh",
+        description="MiniZinc / FlatZinc solver shell for psolve (fznsolve)"
+    )
+    subparsers = parser.add_subparsers(dest="command", help="Commands")
+
+    # Command: run
+    p_run = subparsers.add_parser("run", help="Compile and solve a MiniZinc (.mzn) model")
+    p_run.add_argument("model", help="Path to .mzn model file")
+    p_run.add_argument("data", nargs="*", help="Optional .dzn data files")
+    p_run.add_argument("-a", "--all-solutions", action="store_true", help="Output all solutions")
+    p_run.add_argument("-s", "--stats", action="store_true", help="Print solver statistics")
+    p_run.add_argument("-v", "--verbose", action="store_true", help="Verbose solver output")
+    p_run.add_argument("-n", "--node-limit", type=int, help="MIP node limit")
+    p_run.add_argument("-t", "--time-limit", type=int, help="Time limit in milliseconds")
+    p_run.add_argument("-G", "--globals", default=None, help="Global constraint library")
+    p_run.add_argument("--solver", default="gecode", help="MiniZinc backend flattener (default: gecode)")
+
+    # Command: fzn
+    p_fzn = subparsers.add_parser("fzn", help="Solve a FlatZinc (.fzn) file directly")
+    p_fzn.add_argument("file", help="Path to .fzn file")
+    p_fzn.add_argument("-a", "--all-solutions", action="store_true", help="Output all solutions")
+    p_fzn.add_argument("-s", "--stats", action="store_true", help="Print solver statistics")
+    p_fzn.add_argument("-v", "--verbose", action="store_true", help="Verbose solver output")
+    p_fzn.add_argument("-n", "--node-limit", type=int, help="MIP node limit")
+    p_fzn.add_argument("-t", "--time-limit", type=int, help="Time limit in milliseconds")
+
+    # Command: bench
+    p_bench = subparsers.add_parser("bench", help="Run the full MiniZinc benchmark suite")
+    p_bench.add_argument("filter", nargs="?", help="Optional substring filter for model names")
+
+    # Command: diff
+    subparsers.add_parser("diff", help="Run differential tests vs reference solvers")
+
+    # Command: solvers
+    subparsers.add_parser("solvers", help="List available MiniZinc solvers")
+
+    if len(sys.argv) == 1:
+        parser.print_help(sys.stderr)
+        sys.exit(1)
+
+    first = sys.argv[1]
+    if first.endswith(".mzn") and os.path.exists(first):
+        sys.argv.insert(1, "run")
+    elif first.endswith(".fzn") and os.path.exists(first):
+        sys.argv.insert(1, "fzn")
+
+    args, extra = parser.parse_known_args()
+
+    if args.command == "run":
+        cmd_run(args, extra)
+    elif args.command == "fzn":
+        cmd_fzn(args, extra)
+    elif args.command == "bench":
+        cmd_bench(args)
+    elif args.command == "diff":
+        cmd_diff(args)
+    elif args.command == "solvers":
+        cmd_solvers(args)
+    else:
+        parser.print_help(sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

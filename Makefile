@@ -49,6 +49,14 @@ QP_LIB_OBJ = $(QP_LIB_SRC:.c=.o)
 
 all: lpsolve qpsolve mipsolve pgsbench pgfbench fznsolve fxsolve
 
+bench_mzn: fznsolve
+	python3 tools/mzn_bench.py
+
+install_mzn:
+	mkdir -p $(HOME)/.minizinc/solvers
+	cp share/minizinc/solvers/psolve.msc $(HOME)/.minizinc/solvers/psolve.msc
+
+
 lpsolve: $(OBJ)
 	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -o $@ $(OBJ) $(LDFLAGS) $(LDLIBS)
 
