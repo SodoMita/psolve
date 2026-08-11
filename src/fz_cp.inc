@@ -748,7 +748,8 @@ static int cp_parse(FZModel*m,CPCR**out_cr,int*out_n,unsigned char*referenced,in
             else if(cp_pred_is(p,"int_lin_gt")||cp_pred_is(p,"bool_lin_gt"))rel=4;
             else rel=5;
             cp_make_lin(&rec,&L,rel); lin_free(&L);
-            if(cp_pred_is(p,"int_lin_eq")||cp_pred_is(p,"bool_lin_eq")) motivating=1;
+            if(cp_pred_is(p,"int_lin_eq")||cp_pred_is(p,"bool_lin_eq")||
+               cp_pred_is(p,"int_lin_ne")||cp_pred_is(p,"bool_lin_ne")) motivating=1;
         }
         /* ---------- scalar relations ---------- */
         else if(cp_pred_is(p,"int_eq")||cp_pred_is(p,"int_ne")||cp_pred_is(p,"int_le")||
@@ -768,6 +769,7 @@ static int cp_parse(FZModel*m,CPCR**out_cr,int*out_n,unsigned char*referenced,in
             else if(cp_pred_is(p,"int_ge")||cp_pred_is(p,"bool_ge"))rel=2;
             else rel=4;
             cp_make_lin(&rec,&dd,rel); lin_free(&dd);
+            if(cp_pred_is(p,"int_ne")||cp_pred_is(p,"bool_ne")) motivating=1;
         }
         /* ---------- bool_not / bool2int / int_plus / int_minus / int_neg ---------- */
         else if(cp_pred_is(p,"bool_not")){

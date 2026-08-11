@@ -140,7 +140,9 @@ Large discrete constraint satisfaction problems (e.g. 9x9 Sudoku with 729 binary
 #### Mathematical Cause:
 - **CP Solvers:** Apply Régin's bipartite maximum-matching algorithm on AllDifferent graphs to filter values in polynomial time without branching.
 - **MIP Solvers:** The continuous LP relaxation assigns all binary variables fractional values ($\frac{1}{9}$ for Sudoku). The relaxation objective is flat with no gradient to guide branching, requiring deeper search trees unless CP propagation or cutting planes are applied.
-- **psolve (`fznsolve`):** dispatches pure-integer `solve satisfy` CSPs to a finite-domain CP engine (`src/fz_cp.inc`) that uses maximum-matching arc consistency for `all_different`, exact integer interval propagation for linear equalities, and MRV + backtracking with full verification — solving N-Queens 8 and 9×9 Sudoku in milliseconds, and correctly proving UNSAT (e.g. `unsat_sudoku`, `unsat_pigeonhole`).
+- **psolve (`fznsolve`):** dispatches pure-integer `solve satisfy` CSPs to a finite-domain CP engine (`src/fz_cp.inc`) that uses maximum-matching arc consistency for `all_different`, exact integer interval propagation for linear equalities (and `int_lin_ne`/`int_ne` disequalities), and MRV + backtracking with full verification — solving N-Queens 8 and 9×9 Sudoku in milliseconds, and correctly proving UNSAT (e.g. `unsat_sudoku`, `unsat_pigeonhole`).
+  - The engine recognizes `all_different` in **both** common FlatZinc forms: the native `fzn_all_different_int` (Gecode library) and the pairwise `int_lin_ne` disequalities produced by the MiniZinc **std** and **linear** libraries. So N-Queens/Sudoku solve regardless of which library compiled the model, including `minizinc --solver psolve model.mzn` (with `psolve.msc` set to `mznlib: ""`, `supportsMzn: true`, so MiniZinc does not force `-G linear`, which would break `pow` and `all_different` at flatten time).
+  - `src/mip.c` additionally branches on the **most-fractional** integer variable (fraction nearest 0.5), which sharply improves search on the flat weak relaxations of combinatorial models (e.g. `open_shop_3x3` 971 ms → ~190 ms).
 
 ---
 
