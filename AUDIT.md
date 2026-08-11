@@ -1,5 +1,68 @@
 # psolve — audit & hardening notes
 
+> **2026-08-11 (3) — branch `arena/cp-engine-correctness`: merged the CP
+> engine with the correctness layer and audited the union.**  Two new remote
+> branches appeared: `feat/finite-domain-cp-engine` (Régin all_different CP
+> engine, `fz_cp.inc`, N-Queens/Sudoku/divisor products; branched off `main`
+> — a *parallel* implementation, not a descendant of `flatzinc-complete`)
+> and `arena/phase4-interactive-hardening` (ms time limits + QP stop; a
+> thread-local arena redesigned to answer the earlier rejection; left
+> unmerged pending its own review).  The CP branch alone still contained
+> every constant/affine-argument lie class (`bool_clause` UNSAT lies,
+> `subcircuit` infeasibility, `set_in_reif` r=false lies, min/max/abs
+> UNKNOWNs), so this branch merges `arena/fzn-set-const-ops` into it
+> (conflicts were cosmetic: identical most-fractional MIP branching on both
+> sides, description strings, regenerated docs/data).  Auditing the merged
+> `fz_cp.inc` found real defects the CP author missed: heap-buffer-overflow
+> in `cp_prop_setin` on a constant LHS (crash on `set_in(-1, -1..3)`),
+> same -1-index crash in `cp_prop_elem` for an out-of-range constant index,
+> `INT64_MAX+1` signed-overflow sentinel in `cp_prop_pow`, negative-shift UB
+> in dead code (function removed), `strtoll` bare-range parser allocating
+> `(size_t)(hi-lo+1)` on `5..1` (gigabyte OOM), reversed ranges silently
+> swapped (semantics change), and uncapped set materialization (DoS) — all
+> fixed; the engine now builds with zero `-Wall -Wextra` warnings.
+> `divmod_verify` caught 26/300 wrong answers on the naive merge (all the
+> set-in-constant crash class); after the fixes: 0 wrong across seeds,
+> full `test.sh` exit 0, ASan/UBSan + fzn fuzz clean, N-Queens 8 still 3 ms.
+
+> **2026-08-11 (2) — constant/affine-argument audit, phase 2:** a 70-probe
+> sweep of every FlatZinc handler with par (constant) and affine arguments
+> (the branch-review-driven hunt after the `set_in_reif` find) exposed four
+> further wrong-answer classes, all fixed and regression-locked:
+> `bool_clause`/`bool_clause_reif` silently skipped par literals
+> (`bool_clause([true],[])` claimed UNSAT; `bool_clause([], [false])` too),
+> inverted negated-literal signs in the reified big-M row, and divided by
+> zero (NaN row) on all-par clauses; `subcircuit` dropped par successor
+> values (constant-overwrite) AND its MTZ subtour elimination had no anchor
+> node, so every real circuit — even a 2-cycle with variables — was
+> infeasible (rewritten with a single-anchor MTZ: n=3 now enumerates the
+> exact 6 successor mappings); `array_bool_and`/`array_bool_or` skipped par
+> literals leaving r unconstrained; `int_min`/`int_max`/`int_abs` rejected
+> constants (UNKNOWN) and silently dropped affine constant terms (e.g.
+> `int_min(x+1, 5, m)`).  New `lin_materialize()` helper pins constants and
+> affine forms as exact alias vars wherever handlers index bounds directly;
+> `int_negate` alias added; `among` folds par elements and the empty set.
+> New `test_constant_arguments()` in `fzn_semantics_test.py` (fails 10+
+> assertions against the pre-fix binary); full `test.sh` green; ASan/UBSan
+> corpus sweep clean.
+
+> **2026-08-11 — branch review + set-membership constant fold:** all remote
+> branches were re-surveyed from `feat/flatzinc-complete`.  Finding: the
+> `arena/continue-hardening` "floor division" change to `int_div`/`int_mod`
+> must **not** be ported — the MiniZinc Handbook ("Basic Modelling",
+> §2.1.2, and the language spec's arithmetic-operations section) defines
+> `a mod b` with the sign of the **dividend** and `a div b` by truncation
+> toward zero, i.e. exactly C's `/` and `%`, which the current code
+> implements; `divmod_verify.py` pins this.  A genuinely unported bug class
+> was found instead: `set_in_reif`/`set_in` with a constant or affine LHS.
+> `int_eq_reif(5,5,r)` worked, but `set_in_reif(7,{3,7,9},r)` bound `r=false`
+> and non-reified `set_in(265,1..280)` was UNKNOWN — the reified encodings
+> overwrote (`=`) instead of accumulating (`-=`) the difference form's
+> constant term after `lin_into`.  Fixed, folded, and regression-locked
+> (truth tables in `fzn_semantics_test.py`, edges + randomized constant-LHS
+> instances in `divmod_verify.py`; full `test.sh` green, ASan/UBSan corpus
+> sweep clean).  Branch: `arena/fzn-set-const-ops`.
+
 > **2026-08-08 follow-up:** the remaining remote branches were re-audited from
 > `arena/unmerged-audit-and-correctness`. Safe changes were ported, several
 > wrong-answer cases were repaired, and the unsound branch-and-clip commit was

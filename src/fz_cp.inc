@@ -248,29 +248,6 @@ static int cp_divisors(int64_t n,int64_t *out,int cap){
     return total;
 }
 
-/* union of the signed divisors of every value in the finite list dom(v).
-   Returns 1 and fills *out (caller frees), 0 if unbounded/huge/contains 0. */
-static int cp_divisor_union(CP*cp,int v,int64_t **out,int *outn){
-    if(!cp->bounded[v] || cp->nvals[v]==0 || cp->nvals[v]>4096) return 0;
-    for(int i=0;i<cp->nvals[v];i++){
-        int64_t z=cp->vals[v][i];
-        if(z==0 || z>(int64_t)INT64_C(1)<<40 || z<-(int64_t)INT64_C(1)<<40) return 0;
-    }
-    int64_t *set=NULL; int sc=0,scap=0;
-    int64_t *buf=(int64_t*)psolve_malloc(8192*sizeof(int64_t));
-    for(int i=0;i<cp->nvals[v];i++){
-        int nd=cp_divisors(cp->vals[v][i],buf,8192);
-        for(int k=0;k<nd && k<8192;k++){
-            int64_t val=buf[k]; int dup=0;
-            for(int q=0;q<sc;q++) if(set[q]==val){dup=1;break;}
-            if(!dup){ if(sc>=scap){ scap=scap?scap*2:64; set=(int64_t*)psolve_realloc((void**)&set,(size_t)scap*sizeof(int64_t)); } set[sc++]=val; }
-        }
-    }
-    free(buf);
-    *out=set; *outn=sc;
-    return sc>0;
-}
-
 /* ------------------------------------------------------------------ */
 /* Kuhn maximum matching on free variables of an all_different, used   */
 /* both for value removal (Régin-style) and Hall feasibility.          */
@@ -283,7 +260,8 @@ typedef struct { int *col; int n; } ADJ;
 static int cp_aug(int r,int *matchR,int *seen,ADJ*adj,int vc){
     for(int k=0;k<adj[r].n;k++){
         int c=adj[r].col[k];
-        if(seen[c]) continue; seen[c]=1;
+        if(seen[c]) continue;
+        seen[c]=1;
         if(matchR[c]==-1 || cp_aug(matchR[c],matchR,seen,adj,vc)){
             matchR[c]=r; return 1;
         }
@@ -328,9 +306,14 @@ static int cp_prop_alldiff(CP*cp,CPT*terms,int n){
                 }
                 int *matchR=(int*)psolve_malloc((size_t)(vc?vc:1)*sizeof(int)); for(int k=0;k<vc;k++) matchR[k]=-1;
                 int matches=0;
-                for(int r=0;r<nfree;r++){ int *seen=(int*)psolve_calloc((size_t)(vc?vc:1),sizeof(int)); if(cp_aug(r,matchR,seen,adj,vc)) matches++; free(seen); }
+                for(int r=0;r<nfree;r++){
+                    int *seen=(int*)psolve_calloc((size_t)(vc?vc:1),sizeof(int));
+                    if(cp_aug(r,matchR,seen,adj,vc)) matches++;
+                    free(seen);
+                }
                 if(matches<nfree){ /* Hall violated -> UNSAT */
-                    for(int r=0;r<nfree;r++) free(adj[r].col); free(adj); free(matchR); free(fvv); free(vs);
+                    for(int r=0;r<nfree;r++) free(adj[r].col);
+                    free(adj); free(matchR); free(fvv); free(vs);
                     return 1;
                 }
                 /* Value removal: a value val in dom(fvv[r]) is removable iff the edge
@@ -353,21 +336,29 @@ static int cp_prop_alldiff(CP*cp,CPT*terms,int n){
                             }
                             adj2[r2].col=tmp; adj2[r2].n=tn;
                         }
-                        int *mR=(int*)psolve_malloc((size_t)(vc?vc:1)*sizeof(int)); for(int z=0;z<vc;z++) mR[z]=-1;
+                        int *mR=(int*)psolve_malloc((size_t)(vc?vc:1)*sizeof(int));
+                        for(int z=0;z<vc;z++) mR[z]=-1;
                         int m2=0;
-                        for(int r2=0;r2<nfree;r2++){ int *seen2=(int*)psolve_calloc((size_t)(vc?vc:1),sizeof(int)); if(cp_aug(r2,mR,seen2,adj2,vc)) m2++; free(seen2); }
+                        for(int r2=0;r2<nfree;r2++){
+                            int *seen2=(int*)psolve_calloc((size_t)(vc?vc:1),sizeof(int));
+                            if(cp_aug(r2,mR,seen2,adj2,vc)) m2++;
+                            free(seen2);
+                        }
                         int removable=(m2<nfree); /* forcing (r,c) breaks every matching */
-                        for(int r2=0;r2<nfree;r2++) free(adj2[r2].col); free(adj2); free(mR);
+                        for(int r2=0;r2<nfree;r2++) free(adj2[r2].col);
+                        free(adj2); free(mR);
                         if(removable){
                             if(cp_remove_val(cp,v,val)){
-                                for(int r=0;r<nfree;r++) free(adj[r].col); free(adj); free(matchR); free(fvv); free(vs);
+                                for(int r=0;r<nfree;r++) free(adj[r].col);
+                                free(adj); free(matchR); free(fvv); free(vs);
                                 return 1;
                             }
                             changed=1;
                         }
                     }
                 }
-                for(int r=0;r<nfree;r++) free(adj[r].col); free(adj); free(matchR); free(fvv); free(vs);
+                for(int r=0;r<nfree;r++) free(adj[r].col);
+                free(adj); free(matchR); free(fvv); free(vs);
             }
         }
     }
@@ -399,7 +390,7 @@ static int cp_restrict_divisors(CP*cp,int v,int64_t*dvbuf,int nd){
 /* completeness.  Returns 1 if inconsistent, -1 if uncertifiable.      */
 /* ------------------------------------------------------------------ */
 static int cp_prop_times(CP*cp,CPT*a,CPT*b,CPT*c){
-    int64_t av,bv,cv;
+    int64_t av=0,bv=0,cv=0;
     int aF=cp_term_value(cp,a,&av), bF=cp_term_value(cp,b,&bv), cF=cp_term_value(cp,c,&cv);
     int aV=!a->isc, bV=!b->isc, cV=!c->isc;
     int same=(aV&&bV&&a->v==b->v);
@@ -448,7 +439,8 @@ static int cp_prop_times(CP*cp,CPT*a,CPT*b,CPT*c){
             if(nd<=0) return 1;
             int ra=cp_restrict_divisors(cp,a->v,dv,nd);
             int rb=cp_restrict_divisors(cp,b->v,dv,nd);
-            if(ra==1||rb==1) return 1; if(ra==-1||rb==-1) return -1;
+            if(ra==1||rb==1) return 1;
+            if(ra==-1||rb==-1) return -1;
             return 0;
         } else { /* a==b, c fixed */
             if(cv<0) return 1;
@@ -567,7 +559,7 @@ static int cp_prop_elem(CP*cp,CPT*idx,CPT*res,long long*arr,int narr,int offset)
     int iF=cp_term_value(cp,idx,&iv), rF=cp_term_value(cp,res,&rv);
     if(iF){
         long k=(long)(iv-offset);
-        if(k<0||k>=narr){ if(cp_intersect(cp,res->v,1,0)) return 1; return 1; }
+        if(k<0||k>=narr) return 1;   /* infeasible (res may be a constant: no var to touch) */
         int64_t val=arr[k];
         if(rF){ if(rv!=val) return 1; }
         else { if(cp_intersect(cp,res->v,val,val)) return 1; }
@@ -591,6 +583,10 @@ static int cp_prop_elem(CP*cp,CPT*idx,CPT*res,long long*arr,int narr,int offset)
 /* set_in(x, S): x must be one of setvals.  Also x != y via set diff.  */
 /* ------------------------------------------------------------------ */
 static int cp_prop_setin(CP*cp,CPT*x,long long*set,int nset){
+    if(x->isc){ /* constant LHS: membership is decidable immediately */
+        for(int k=0;k<nset;k++) if(set[k]==x->c) return 0;
+        return 1;
+    }
     if(cp->bounded[x->v] && cp->nvals[x->v]<=CP_MAXVALS){
         int64_t *nvals=NULL; int nn=0,cap2=0;
         for(int i=0;i<cp->nvals[x->v];i++){ int64_t val=cp->vals[x->v][i]; for(int k=0;k<nset;k++) if(set[k]==val){ if(nn>=cap2){cap2=cap2?cap2*2:8;nvals=(int64_t*)psolve_realloc((void**)&nvals,(size_t)cap2*sizeof(int64_t));} nvals[nn++]=val; break; } }
@@ -607,7 +603,7 @@ static int cp_prop_setin(CP*cp,CPT*x,long long*set,int nset){
 /* pow: c = base^exp (exp constant >=0), or base const when linear.    */
 /* ------------------------------------------------------------------ */
 static int cp_prop_pow(CP*cp,CPT*base,int64_t expo,CPT*c){
-    if(expo==0){ int64_t one=1; if(c->isc){ if(c->c!=1) return 1; } else if(cp_intersect(cp,c->v,1,1)) return 1; return 0; }
+    if(expo==0){ if(c->isc){ if(c->c!=1) return 1; } else if(cp_intersect(cp,c->v,1,1)) return 1; return 0; }
     int64_t bv,cv;
     int bF=cp_term_value(cp,base,&bv), cF=cp_term_value(cp,c,&cv);
     int cV=!c->isc;
@@ -632,7 +628,7 @@ static int cp_prop_pow(CP*cp,CPT*base,int64_t expo,CPT*c){
         /* find b in dom(base) with b^expo == cv */
         if(cp->bounded[base->v] && cp->nvals[base->v]<=CP_MAXVALS){
             int64_t *nvals=NULL; int nn=0,cap2=0;
-            for(int i=0;i<cp->nvals[base->v];i++){ int64_t b2=cp->vals[base->v][i]; __int128 p=1; for(int64_t e=0;e<expo;e++){ p*=(__int128)b2; if(p>INT64_MAX||p<INT64_MIN){ p=INT64_MAX+1; break; } } if(p==cv){ if(nn>=cap2){cap2=cap2?cap2*2:8;nvals=(int64_t*)psolve_realloc((void**)&nvals,(size_t)cap2*sizeof(int64_t));} nvals[nn++]=b2; } }
+            for(int i=0;i<cp->nvals[base->v];i++){ int64_t b2=cp->vals[base->v][i]; __int128 p=1; int povf=0; for(int64_t e=0;e<expo;e++){ p*=(__int128)b2; if(p>INT64_MAX||p<INT64_MIN){ povf=1; break; } } if(!povf && p==cv){ if(nn>=cap2){cap2=cap2?cap2*2:8;nvals=(int64_t*)psolve_realloc((void**)&nvals,(size_t)cap2*sizeof(int64_t));} nvals[nn++]=b2; } }
             if(nn==0){ free(nvals); return 1; }
             if(cp_set_vals(cp,base->v,nvals,nn)<0){ free(nvals); return -1; } free(nvals);
         }
@@ -661,6 +657,10 @@ static int cp_make_lin(CPCR*cr,const Lin*L,int rel){
     return 0;
 }
 
+/* materialized CP set-literal cap: wider ranges/explicit sets are declined
+   and solved by the MIP bridge (which handles ranges symbolically) */
+#define CP_SET_LIT_CAP 100000
+
 /* parse integer set literal "{a,b,c}" or "lo..hi" into setvals; returns count, -1 on fail */
 static int parse_int_set_lit(FZModel*m,const char*s,long long**out){
     const char*sp=s; while(isspace((unsigned char)*sp))sp++;
@@ -681,8 +681,8 @@ static int parse_int_set_lit(FZModel*m,const char*s,long long**out){
             if(end==sp)return -1;
             long long a=v; sp=end;
             while(isspace((unsigned char)*sp))sp++;
-            if(*sp=='.'&&sp[1]=='.'){ sp+=2; char*end2; long long b=strtoll(sp,&end2,10); sp=end2; if(b<a){long long t=a;a=b;b=t;} for(long long q=a;q<=b;q++){ if(sn>=scap){scap=scap?scap*2:16;sv=(long long*)psolve_realloc((void**)&sv,(size_t)scap*sizeof(long long));} sv[sn++]=q; } }
-            else { if(sn>=scap){scap=scap?scap*2:16;sv=(long long*)psolve_realloc((void**)&sv,(size_t)scap*sizeof(long long));} sv[sn++]=a; }
+            if(*sp=='.'&&sp[1]=='.'){ sp+=2; char*end2; long long b=strtoll(sp,&end2,10); sp=end2; if(b<a || b-a+1>CP_SET_LIT_CAP){ free(sv); return -1; } for(long long q=a;q<=b;q++){ if(sn>=scap){scap=scap?scap*2:16;sv=(long long*)psolve_realloc((void**)&sv,(size_t)scap*sizeof(long long));} sv[sn++]=q; } }
+            else { if(sn>=CP_SET_LIT_CAP){ free(sv); return -1; } if(sn>=scap){scap=scap?scap*2:16;sv=(long long*)psolve_realloc((void**)&sv,(size_t)scap*sizeof(long long));} sv[sn++]=a; }
             while(isspace((unsigned char)*sp))sp++;
             if(*sp==',')sp++;
         }
@@ -694,7 +694,7 @@ static int parse_int_set_lit(FZModel*m,const char*s,long long**out){
         char*end; long long a=strtoll(sp,&end,10); if(end==sp)return -1; long long lo=a; sp=end;
         while(isspace((unsigned char)*sp))sp++;
         if(*sp=='.'&&sp[1]=='.'){ sp+=2; char*end2; long long hi=strtoll(sp,&end2,10); if(end2==sp)return -1;
-            if(hi-lo+1>CP_MAXVALS)return -1;
+            if(hi<lo || hi-lo+1>CP_MAXVALS)return -1;   /* empty/oversize: decline (MIP bridge is exact here) */
             sv=(long long*)psolve_malloc((size_t)(hi-lo+1)*sizeof(long long)); sn=0; for(long long q=lo;q<=hi;q++)sv[sn++]=q; *out=sv; return sn; }
         sv=(long long*)psolve_malloc(sizeof(long long)); sv[0]=lo; *out=sv; return 1;
     }
@@ -963,6 +963,7 @@ static int64_t cp_term_out(const CPT*t,const double*outx){
 
 /* verify all constraints at the fixed assignment outx. returns 1 if satisfied. */
 static int cp_verify(const CP*cp,CPCR*cr,int nc,const double*outx){
+    (void)cp;
     for(int i=0;i<nc;i++){
         const CPCR*r=&cr[i];
         if(r->kind==CPK_LIN){
@@ -1069,7 +1070,7 @@ static int fz_cp_try(const FZModel*m,FZSolution*sol){
     }
     unsigned char *referenced=(unsigned char*)psolve_calloc((size_t)(nv?nv:1),1);
     CPCR*cr=NULL; int nc=0; int motivating=0;
-    int cp_parse_rc=cp_parse(m,&cr,&nc,referenced,&motivating);
+    int cp_parse_rc=cp_parse((FZModel*)m,&cr,&nc,referenced,&motivating);
     if(cp_parse_rc!=0){ free(referenced); return 0; }
 
     CP cp; memset(&cp,0,sizeof(cp));

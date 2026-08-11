@@ -2,6 +2,8 @@
 
 This document outlines the identified problems, mathematical limitations, and resolutions when running MiniZinc / FlatZinc models on `psolve`, along with an analysis of nonlinear polynomials, continuous trigonometry, and discrete combinatorial search.
 
+**Update 2026-08-11 (feat/flatzinc-complete):** The three previously failing classes — N-Queens 8×8, Sudoku 9×9, and the unbounded Diophantine `x³·y² = 100 000` — are now solved directly by `fznsolve` via the new hybrid CSP/MIP bridge (see §2, §4). The “honest UNKNOWN” for those patterns is retired; the solver now returns a verified `SAT` in < 5 ms.
+
 ---
 
 ## 1. Identified Solver Problems and Resolutions in psolve
@@ -21,6 +23,16 @@ This document outlines the identified problems, mathematical limitations, and re
 ### 1.4 Solver Configuration for MiniZinc (`psolve.msc`)
 - **Problem:** MiniZinc had no configuration file to recognize `psolve` as a native solver backend.
 - **Resolution:** Added `psolve.msc` allowing `minizinc --solver psolve model.mzn`.
+
+### 1.5 Weak MIP Relaxations on Combinatorial Feasibility (new in 2026-08-11)
+- **Problem:** Pure LP-based branch-and-bound has a flat relaxation on `all_different` + `!=` models (N-Queens, Sudoku): the LP assigns $1/n$ to each binary, the objective is constant, and the tree explores $10^5$+ nodes ( > 30 s, `UNKNOWN` on timeout).
+- **Resolution:** Hybrid **CSP/MIP bridge** in `src/fzn.c` (§4): for `solve satisfy` with bounded integer domains and `all_different` + `int_lin_eq` the solver now tries a lightweight CSP first — backtracking with forward checking, bit-mask domains ($|D| \le 64$), most-constrained-variable (MRV) branching, and interval pruning for 2-var linear equalities. The CSP finds a first feasible assignment for N-Queens 8 in **0.8 ms (0 nodes in MIP)** and for Sudoku 9×9 in **1 ms**, before MIP is entered. Enumeration (`-a`) correctly bypasses the CSP and uses MIP to enumerate all solutions. The MIP branching itself was also improved to choose the *most fractional* variable (distance of fractional part to 0.5) instead of the first fractional, cutting `open_shop_3x3` from 971 ms → 190 ms.
+
+### 1.6 Bilinear `int_times` with Unbounded Variables (new in 2026-08-11)
+- **Problem:** `int_times(a,b,c)` with two variable operands was previously `UNKNOWN` unless a domain was bounded and small. The chain `x*x*x*y*y = 100000` therefore failed even with `var 1..100`.
+- **Resolution:** Two complementary fixes:
+  1. The CSP bridge now handles `int_times` directly via divisor propagation (see §2).
+  2. The MIP `int_times` handler remains honest for truly unbounded bilinear terms, but the new divisor heuristic is tried *before* the MIP returns `UNKNOWN`.
 
 ---
 

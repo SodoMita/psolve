@@ -82,7 +82,8 @@ def gen_instance(rng, unbounded_r=False):
 
     xlo, xhi = rng.choice([(-6, 6), (-4, 8), (0, 5), (-8, -2)])
     lines.append(f"var {xlo}..{xhi}: x :: output_var;")
-    kind = rng.choice(["div", "mod", "pow", "set_in", "among"])
+    kind = rng.choice(["div", "mod", "pow", "set_in", "set_const",
+                       "set_reif_const", "among"])
 
     if kind in ("div", "mod"):
         K = rng.choice([1, -1, 2, -2, 3, -3, 4, 5, -5])
@@ -114,6 +115,34 @@ def gen_instance(rng, unbounded_r=False):
         lines.append(f"constraint set_in(x, {S});")
         checks.append(lambda v, m=frozenset(members): v["x"] in m)
         assigns.append(lambda v, m=frozenset(members): v.get("x") in m)
+    elif kind in ("set_const", "set_reif_const"):
+        # constant LHS into set membership: decidable at compile time.
+        # set_const:  non-member forces UNSAT, member is a no-op
+        # set_reif_const: r must equal the exact truth value (via bool2int,
+        # since r is bool and the harness only parses int output)
+        lines.pop(0)     # no int r var here
+        c = rng.randint(-9, 9)
+        if rng.random() < 0.5:
+            lo, hi = sorted((rng.randint(-8, 4), rng.randint(-4, 8)))
+            S = f"{lo}..{hi}"
+            members = set(range(lo, hi + 1))
+        else:
+            raw = [rng.randint(-8, 8) for _ in range(rng.randint(1, 6))]
+            raw += raw[: rng.randint(0, 3)]      # duplicates on purpose
+            rng.shuffle(raw)
+            S = "{" + ", ".join(map(str, raw)) + "}"
+            members = set(raw)
+        mem = c in members
+        if kind == "set_const":
+            lines.append(f"constraint set_in({c}, {S});")
+            checks.append(lambda v, mem=mem: mem)
+            assigns.append(lambda v, mem=mem: mem)
+        else:
+            lines.append("var bool: rb;")
+            lines.append("var 0..1: rr :: output_var;")
+            lines.append(f"constraint set_in_reif({c}, {S}, rb);")
+            lines.append("constraint bool2int(rb, rr);")
+            assigns.append(lambda v, mem=mem: v.get("rr") == (1 if mem else 0))
     elif kind == "among":
         lines.pop(0)     # no r var here
         raw = sorted(rng.sample(range(-5, 8), rng.randint(1, 4)))
@@ -230,6 +259,43 @@ EDGE_CASES = [
     ("array [1..2] of var 1..4: xs :: output_array([1..2]);\n"
      "constraint fzn_among(2, xs, {2, 2, 3, 3});\nsolve satisfy;\n",
      "xs = array1d(1..2, ["),
+    # set membership with a constant LHS is decidable at compile time:
+    # non-reified folds to SAT/UNSAT (previously UNKNOWN), reified pins r
+    # (previously lied r=false for members: the difference-form constant was
+    # overwritten instead of accumulated).
+    ("constraint set_in(7, {3, 7, 9});\nsolve satisfy;\n",
+     "----------"),
+    ("constraint set_in(8, {3, 7, 9});\nsolve satisfy;\n",
+     "UNSATISFIABLE"),
+    ("constraint set_in(265, 1..280);\nsolve satisfy;\n",
+     "----------"),
+    ("constraint set_in(300, 1..280);\nsolve satisfy;\n",
+     "UNSATISFIABLE"),
+    ("constraint set_in(3, {});\nsolve satisfy;\n",
+     "UNSATISFIABLE"),
+    ("constraint set_in(3, 1..0);\nsolve satisfy;\n",
+     "UNSATISFIABLE"),
+    ("var bool: r :: output_var;\nconstraint set_in_reif(7, {3, 7, 9}, r);\nsolve satisfy;\n",
+     "r = true;"),
+    ("var bool: r :: output_var;\nconstraint set_in_reif(8, {3, 7, 9}, r);\nsolve satisfy;\n",
+     "r = false;"),
+    # discriminating direction: 0 in S made the old overwrite bug say member
+    ("var bool: r :: output_var;\nconstraint set_in_reif(3, {0, 5}, r);\nsolve satisfy;\n",
+     "r = false;"),
+    ("var bool: r :: output_var;\nconstraint set_in_reif(265, 1..280, r);\nsolve satisfy;\n",
+     "r = true;"),
+    ("var bool: r :: output_var;\nconstraint set_in_reif(999, 1..280, r);\nsolve satisfy;\n",
+     "r = false;"),
+    ("var bool: r :: output_var;\nconstraint set_in_reif(3, {}, r);\nsolve satisfy;\n",
+     "r = false;"),
+    # affine LHS into reified membership: the +3 constant must accumulate
+    ("var 0..10: x :: output_var;\nvar bool: r :: output_var;\n"
+     "constraint int_eq(x, 4);\nconstraint set_in_reif(x + 3, {7}, r);\nsolve satisfy;\n",
+     "r = true;"),
+    # named par constant folds too
+    ("int: k = 7;\nvar bool: r :: output_var;\n"
+     "constraint set_in_reif(k, {3, 7, 9}, r);\nsolve satisfy;\n",
+     "r = true;"),
     # unbounded var with the only solutions outside the synthetic box:
     # false UNSATISFIABLE previously (z = 2e10 is a valid integer point).
     ("var int: z :: output_var;\nconstraint int_lin_eq([1], [z], 20000000000);\nsolve satisfy;\n",

@@ -327,7 +327,7 @@ void mip_solve(const MIP *mip, MIPResult *res)
            closest to 0.5) for branching.  On weak relaxations (the flat
            fractional assignments of combinatorial models) branching on the
            variable nearest the midpoint prunes far more effectively than taking
-           the first fractional variable. */
+           the first fractional variable.  (Convergent change on both branches.) */
         int frac = -1; double fracval = 0.0;
         int allint = 1;
         double best_dist = 2.0;
