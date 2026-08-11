@@ -3041,8 +3041,10 @@ void fz_solve(const FZModel*m,FZSolution*sol)
        (solve satisfy) CSPs with combinatorial/nonlinear predicates; it solves
        all_different puzzles (n-Queens, Sudoku, magic/latin squares) and
        monomial Diophantine products that the LP/MIP bridge handles poorly.
+       For `-a` all-solutions enumeration it enumerates every distinct output
+       solution directly (far faster than the MIP all-solutions enumeration).
        It falls back to the MIP bridge for everything it cannot certify. */
-    if(!sol->all_solutions && m->solve_kind==0 && nv>0){
+    if(m->solve_kind==0 && nv>0){
         if(fz_cp_try(m,sol)) return;
     }
     /* A compiler can propagate every decision variable to a literal (for
