@@ -154,6 +154,12 @@ asan: clean
 %.o: %.c
 	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -I src -c -o $@ $<
 
+# src/main.o is the LP CLI: it shares the millisecond-precision time-limit
+# helper (tools/tlimit.h) with the other CLI drivers, so give it that include
+# path too.
+src/main.o: src/main.c src/parser.h src/solver.h src/err.h tools/tlimit.h
+	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -I src -I tools -c -o $@ $<
+
 clean:
 	rm -f lpsolve qpsolve mipsolve pgsbench pgfbench pgs_vs_lp fznsolve fxsolve fx_bench src/*.o tools/*.o libpsolve.a libpsolve-lp.a libpsolve-qp.a
 

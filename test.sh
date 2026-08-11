@@ -53,6 +53,15 @@ echo "  QP vs scipy: OK=$ok FAIL=$fail"
 # points that an objective comparison against SLSQP cannot.
 python3 tools/qp_diff.py 200 4242 | head -2
 
+echo "[5.2/7] QP cooperative stop + millisecond-precision time limits (Phase 4)..."
+gcc -O2 -march=native -I src tools/qp_stop_test.c src/qp.c src/err.c src/lu.c src/kernels.c -o /tmp/qp_stop_test -lm
+/tmp/qp_stop_test
+# Verifies the CLI -t/--time-limit budget is ITIMER_REAL (microsecond
+# resolution), not alarm() (whole-second, rounds up): a 50ms budget must fire
+# sub-second.
+gcc -O2 -march=native -I tools tools/tlimit_test.c -o /tmp/tlimit_test -lm
+/tmp/tlimit_test
+
 echo "[5.5/7] MIP solver (branch-and-bound) vs brute force..."
 gcc -O2 -march=native -I src tools/mip_test.c src/mip.c src/fx.c src/err.c src/solver.c src/splu.c src/lu.c src/kernels.c src/parser.c -o /tmp/mip_test -lm
 /tmp/mip_test
