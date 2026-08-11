@@ -675,6 +675,27 @@ static int lin_unit_var(const Lin*l,int*out)
     *out=l->idx[0];return 0;
 }
 
+/* Materialize an arbitrary linear form as a plain solver variable: a bare
+   variable (unit coefficient, no constant) maps to its own index; anything
+   else (constant or affine expression) gets a fresh alias variable pinned by
+   v = l exactly.  Returns -1 when the form has no finite bounds.
+   Handlers whose encodings index b->lo[]/b->hi[] directly MUST route their
+   arguments through this: using l->idx[0] on an affine or constant form
+   silently drops the constant term (a wrong-answer bug class). */
+static int lin_materialize(Builder*b,const Lin*l,int is_float)
+{
+    if(l->n==1&&l->coef[0]==1.0&&l->constant==0.0)return l->idx[0];
+    double lo,hi;
+    if(lin_bounds(b,l,&lo,&hi)!=0)return -1;
+    if(!is_float&&(lo!=rint(lo)||hi!=rint(hi)))return -1;
+    int v=is_float?b_newvar_float(b,lo,hi):b_newvar(b,lo,hi);
+    if(v<0)return -1;
+    Lin dd;memset(&dd,0,sizeof(dd));lin_term(&dd,v,1.0);lin_into(&dd,l,-1.0);
+    b_put(b,'=',0.0,&dd);lin_free(&dd);
+    return v;
+}
+
+
 /* Add d != 0 for an integer linear form.  p/n select its positive/negative
    side; this is a true disjunction, unlike conjoining d>=1 and d<=-1. */
 static int add_int_ne(Builder*b,const Lin*d)
@@ -1604,17 +1625,33 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
             r = rb.n==1?rb.idx[0]:-1;
             if(r<0){free_lins(pos,np);free_lins(neg,ng);lin_free(&rb);return -1;}
         }
-        /* t = sum(pos) - sum(neg) + n_neg = number of true literals */
+        /* t = sum(pos) - sum(neg) + n_neg = number of true literals.
+           Par literals fold into the constant term (previously they were
+           silently skipped: bool_clause([true],[]) claimed UNSAT); every
+           literal - par or var - counts toward nli so the reified
+           r >= t/nli stays within [0,1]. */
         Lin t;memset(&t,0,sizeof(t));
-        int nli=0;
-        for(int i=0;i<np;i++){if(pos[i].n==1){lin_term(&t,pos[i].idx[0],1.0);nli++;}}
-        for(int i=0;i<ng;i++){if(neg[i].n==1){lin_term(&t,neg[i].idx[0],-1.0);nli++;t.constant+=1.0;}}
+        int nli=np+ng;
+        for(int i=0;i<np;i++){
+            if(pos[i].n==1&&pos[i].coef[0]==1.0&&pos[i].constant==0.0){lin_term(&t,pos[i].idx[0],1.0);}
+            else if(pos[i].n==0){t.constant+=(pos[i].constant!=0.0)?1.0:0.0;}
+            else {lin_free(&t);free_lins(pos,np);free_lins(neg,ng);if(reified)lin_free(&rb);return 1;}
+        }
+        for(int i=0;i<ng;i++){
+            if(neg[i].n==1&&neg[i].coef[0]==1.0&&neg[i].constant==0.0){lin_term(&t,neg[i].idx[0],-1.0);t.constant+=1.0;}
+            else if(neg[i].n==0){t.constant+=(neg[i].constant==0.0)?1.0:0.0;}
+            else {lin_free(&t);free_lins(pos,np);free_lins(neg,ng);if(reified)lin_free(&rb);return 1;}
+        }
         if(reified){
-            /* r <= t ;  r >= t/nli */
+            /* r <= t ; r >= t/nli  (term-wise sign must follow t.coef:
+               negated literals carry -1; previously hardcoded -1/nli both
+               inverted their sign and divided by zero for all-par clauses) */
             Lin d1;memset(&d1,0,sizeof(d1));lin_term(&d1,r,1.0);lin_into(&d1,&t,-1.0);b_put(b,'<',0.0,&d1);
             Lin d2;memset(&d2,0,sizeof(d2));lin_term(&d2,r,1.0);
-            if(nli>0)for(int i=0;i<t.n;i++)lin_term(&d2,t.idx[i],-1.0/(double)nli);
-            d2.constant = -t.constant/(double)nli;
+            if(nli>0){
+                for(int i=0;i<t.n;i++)lin_term(&d2,t.idx[i],-t.coef[i]/(double)nli);
+                d2.constant = -t.constant/(double)nli;
+            }
             b_put(b,'>',0.0,&d2);
             lin_free(&d1);lin_free(&d2);lin_free(&rb);
         } else {
@@ -1636,10 +1673,27 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
         int r = rb.n==1?rb.idx[0]:-1;
         if(r<0){free_lins(arr,narr);lin_free(&rb);return -1;}
         /* sum x = s ; for AND: r <= x_i (all), r >= sum-(n-1)
-           for OR:  r >= x_i (all), r <= sum */
+           for OR:  r >= x_i (all), r <= sum.
+           Par literals: a par false decides AND (r = 0), a par true decides
+           OR (r = 1); neutral pars drop out.  Previously par literals were
+           silently skipped, leaving r unconstrained (e.g.
+           array_bool_and([true,true],r) did not pin r = 1). */
         Lin sum;memset(&sum,0,sizeof(sum));lin_term(&sum,r,0.0);
-        int nvars=0;
-        for(int i=0;i<narr;i++){ if(arr[i].n==1){lin_term(&sum,arr[i].idx[0],1.0);nvars++;} }
+        int nvars=0, pin_r=-1;
+        for(int i=0;i<narr;i++){
+            if(arr[i].n==1&&arr[i].coef[0]==1.0&&arr[i].constant==0.0){lin_term(&sum,arr[i].idx[0],1.0);nvars++;}
+            else if(arr[i].n==0){
+                int ctrue=(arr[i].constant!=0.0);
+                if((is_and&&!ctrue)||(!is_and&&ctrue))pin_r=is_and?0:1;
+            } else {lin_free(&sum);free_lins(arr,narr);lin_free(&rb);return 1;}
+        }
+        if(pin_r<0&&nvars==0)pin_r=is_and?1:0;   /* all-neutral par array */
+        if(pin_r>=0){
+            Lin d0;memset(&d0,0,sizeof(d0));lin_term(&d0,r,1.0);d0.constant=-(double)pin_r;
+            b_put(b,'=',0.0,&d0);lin_free(&d0);
+            lin_free(&sum);lin_free(&rb);free_lins(arr,narr);
+            return 0;
+        }
         if(is_and){
             for(int i=0;i<narr;i++){ if(arr[i].n==1){ Lin d;memset(&d,0,sizeof(d));lin_term(&d,r,1.0);lin_term(&d,arr[i].idx[0],-1.0);b_put(b,'<',0.0,&d);lin_free(&d);} }
             /* r >= sum - (n-1)  =>  r - sum + (n-1) >= 0 */
@@ -1658,8 +1712,8 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
         lin_free(&sum);lin_free(&rb);free_lins(arr,narr);
         return 0;
     }
-    /* int_neg/float_neg(a,b): b = -a */
-    if(strcmp(p,"int_neg")==0||strcmp(p,"float_neg")==0){
+    /* int_neg/float_neg(a,b): b = -a  (int_negate is the stdlib alias) */
+    if(strcmp(p,"int_neg")==0||strcmp(p,"int_negate")==0||strcmp(p,"float_neg")==0){
         if(c->nargs<2)return -1;
         if(parse_lin(m,c->args[0],&l1)!=0)return -1;
         if(parse_lin(m,c->args[1],&l2)!=0){lin_free(&l1);return -1;}
@@ -1856,11 +1910,16 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
        a bounded x we can do y = x (x>=0) or y=-x (x<=0) but general needs M.
        For bounded x in [lo,hi] with lo>=0: y=x; hi<=0: y=-x; else use big-M. */
     if(strcmp(p,"int_abs")==0||strcmp(p,"float_abs")==0){
+        int abs_flt=(strcmp(p,"float_abs")==0);
         if(c->nargs<2)return -1;
         if(parse_lin(m,c->args[0],&l1)!=0)return -1;
         if(parse_lin(m,c->args[1],&l2)!=0){lin_free(&l1);return -1;}
-        if(l1.n!=1||l2.n!=1){lin_free(&l1);lin_free(&l2);return 1;}
-        int x=l1.idx[0], y=l2.idx[0];
+        /* constants and affine forms are materialized as pinned alias vars
+           (previously: UNKNOWN for constants, silently dropped constant term
+           for affine arguments) */
+        int x=lin_materialize(b,&l1,abs_flt);
+        int y=lin_materialize(b,&l2,abs_flt);
+        if(x<0||y<0){lin_free(&l1);lin_free(&l2);return 1;}
         double xlo=b->lo[x], xhi=b->hi[x];
         if(xlo>=0){ /* y = x */
             Lin dd;memset(&dd,0,sizeof(dd));lin_term(&dd,y,1.0);lin_term(&dd,x,-1.0);b_put(b,'=',0.0,&dd);lin_free(&dd);
@@ -1893,12 +1952,17 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
        strcmp(p,"float_max")==0||strcmp(p,"float_min")==0||
        strcmp(p,"fzn_float_max")==0||strcmp(p,"fzn_float_min")==0){
         int ismax=(strstr(p,"max")!=NULL);
+        int mm_flt=(strstr(p,"float")!=NULL);
         if(c->nargs<3)return -1;
         if(parse_lin(m,c->args[0],&l1)!=0)return -1;
         if(parse_lin(m,c->args[1],&l2)!=0){lin_free(&l1);return -1;}
         if(parse_lin(m,c->args[2],&l3)!=0){lin_free(&l1);lin_free(&l2);return -1;}
-        if(l1.n!=1||l2.n!=1||l3.n!=1){lin_free(&l1);lin_free(&l2);lin_free(&l3);return 1;}
-        int a=l1.idx[0], bb=l2.idx[0], mm=l3.idx[0];
+        /* constants/affine forms materialize as pinned alias vars (same
+           anti-"drop the constant" discipline as int_abs) */
+        int a=lin_materialize(b,&l1,mm_flt);
+        int bb=lin_materialize(b,&l2,mm_flt);
+        int mm=lin_materialize(b,&l3,mm_flt);
+        if(a<0||bb<0||mm<0){lin_free(&l1);lin_free(&l2);lin_free(&l3);return 1;}
         double M = fmax(fabs(b->lo[a]),fabs(b->hi[a]));
         M = fmax(M, fmax(fabs(b->lo[bb]),fabs(b->hi[bb])));
         M = fmax(M,1.0)*2.0;
@@ -1967,8 +2031,10 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
                 }
                 free(vals); lin_free(&xl); return 0;
             }
-            if(xl.n!=1){free(vals);lin_free(&xl);return 1;}
-            int x=xl.idx[0];
+            /* affine forms (constant already folded above) get an exact
+               pinned alias var instead of silently dropping the constant */
+            int x=lin_materialize(b,&xl,0);
+            if(x<0){free(vals);lin_free(&xl);return 1;}
             if(is_range){
                 if(rlo>rhi){ /* empty range: unsatisfiable */
                     Lin nf;memset(&nf,0,sizeof(nf)); b_put(b,'=',1.0,&nf); lin_free(&nf);
@@ -2523,12 +2589,30 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
                 for(long v=rlo;v<=rhi;v++) vals[(int)(v-rlo)]=v;
             }
         }
-        /* per-(element,value) selector binaries: cap the total encoding */
-        if(nvals==0 || (narr>0 && nvals > 4096/narr)){
+        /* per-(element,value) selector binaries: cap the total encoding.
+           Empty set: nothing counts - pin n = 0 (previously UNKNOWN). */
+        if(nvals==0){
+            Lin s0;memset(&s0,0,sizeof(s0));lin_into(&s0,&nl,1.0);b_put(b,'=',0.0,&s0);lin_free(&s0);
+            free(vals); lin_free(&nl); free_lins(arr,narr); return 0;
+        }
+        if(narr>0 && nvals > 4096/narr){
             free(vals); lin_free(&nl); free_lins(arr,narr); return 1;
         }
         int *bs=(int*)psolve_malloc((size_t)(narr?narr:1)*sizeof(int));
+        long nconst=0;
         for(int i=0;i<narr;i++){
+            if(arr[i].n==0){
+                /* par element: fold its membership exactly (previously the
+                   whole constraint reported UNHANDLED) */
+                double cv=arr[i].constant;
+                if(!isfinite(cv)||cv!=rint(cv)||fabs(cv)>0x1p53){free(bs);free(vals);free_lins(arr,narr);lin_free(&nl);return 1;}
+                long v=(long)rint(cv);
+                int lolo=0,hihi=nvals-1,found=0;
+                while(lolo<=hihi){int mid=(lolo+hihi)>>1; if(vals[mid]==v){found=1;break;} if(vals[mid]<v)lolo=mid+1; else hihi=mid-1;}
+                nconst+=found;
+                bs[i]=-1;
+                continue;
+            }
             if(arr[i].n!=1){free(bs);free(vals);free_lins(arr,narr);lin_free(&nl);return 1;}
             int bi=b_newvar(b,0.0,1.0);
             bs[i]=bi;
@@ -2543,8 +2627,8 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
             b_put(b,'=',0.0,&sum); lin_free(&sum);
             free(zs);
         }
-        Lin s;memset(&s,0,sizeof(s));
-        for(int i=0;i<narr;i++) lin_term(&s,bs[i],1.0);
+        Lin s;memset(&s,0,sizeof(s)); s.constant=(double)nconst;
+        for(int i=0;i<narr;i++) if(bs[i]>=0) lin_term(&s,bs[i],1.0);
         lin_into(&s,&nl,-1.0);
         b_put(b,'=',0.0,&s); lin_free(&s);
         free(bs); free(vals); free_lins(arr,narr); lin_free(&nl);
@@ -3304,7 +3388,7 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
         for(int i=0;i<nx;i++){
             for(int j=0;j<nx;j++){
                 z[i*nx + j] = b_newvar(b, 0.0, 1.0);
-                Lin dij; memset(&dij, 0, sizeof(dij)); lin_into(&dij, &xs[i], 1.0); dij.constant = -(double)(offset + j);
+                Lin dij; memset(&dij, 0, sizeof(dij)); lin_into(&dij, &xs[i], 1.0); dij.constant -= (double)(offset + j);
                 add_int_reif(b, &dij, z[i*nx + j], 0); lin_free(&dij);
             }
             in_c[i] = b_newvar(b, 0.0, 1.0);
@@ -3323,17 +3407,40 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
             b_put(b, '=', 1.0, &in); lin_free(&in);
         }
 
+        /* Single-circuit elimination via MTZ ranks with an anchor: the ranks
+           must strictly increase along circuit arcs, which is impossible
+           around a closed loop, so one designated anchor node per circuit
+           exempts the arc into it.  (Previously every arc was constrained:
+           ANY non-trivial (sub)circuit - even a 2-cycle - was infeasible,
+           and par arrays therefore claimed UNSAT for valid inputs.) */
         int *ord = (int*)psolve_malloc((size_t)nx * sizeof(int));
-        for(int i=0;i<nx;i++) ord[i] = b_newvar_float(b, 0.0, (double)nx);
+        int *g   = (int*)psolve_malloc((size_t)nx * sizeof(int));
+        for(int i=0;i<nx;i++){ ord[i] = b_newvar_float(b, 0.0, (double)nx); g[i] = b_newvar(b, 0.0, 1.0); }
+        for(int i=0;i<nx;i++){
+            Lin gl;memset(&gl,0,sizeof(gl));lin_term(&gl,g[i],1.0);lin_term(&gl,in_c[i],-1.0);
+            b_put(b,'<',0.0,&gl);lin_free(&gl);                 /* g_i <= in_c_i */
+            Lin gh;memset(&gh,0,sizeof(gh));lin_term(&gh,in_c[i],1.0);
+            for(int k=0;k<nx;k++)lin_term(&gh,g[k],-1.0);
+            b_put(b,'<',0.0,&gh);lin_free(&gh);                 /* in_c_i <= sum g */
+        }
+        {   Lin gs;memset(&gs,0,sizeof(gs));
+            for(int k=0;k<nx;k++)lin_term(&gs,g[k],1.0);
+            b_put(b,'<',1.0,&gs);lin_free(&gs);                 /* at most one anchor */
+        }
+        for(int i=0;i<nx;i++){                                   /* anchor rank becomes 1 */
+            Lin an;memset(&an,0,sizeof(an));lin_term(&an,ord[i],1.0);lin_term(&an,g[i],(double)nx);
+            b_put(b,'<',(double)(nx+1),&an);lin_free(&an);
+        }
         for(int i=0;i<nx;i++)for(int j=0;j<nx;j++)if(i!=j){
+            /* z_ij = 1 and j not the anchor  =>  ord_j >= ord_i + 1 */
             Lin mtz; memset(&mtz, 0, sizeof(mtz));
             lin_term(&mtz, ord[i], 1.0); lin_term(&mtz, ord[j], -1.0);
             lin_term(&mtz, z[i*nx + j], (double)nx);
-            lin_term(&mtz, in_c[i], (double)nx); lin_term(&mtz, in_c[j], (double)nx);
-            b_put(b, '<', (double)(3*nx - 1), &mtz); lin_free(&mtz);
+            lin_term(&mtz, g[j], -(double)nx);
+            b_put(b, '<', (double)(nx - 1), &mtz); lin_free(&mtz);
         }
 
-        free(ord); free(in_c); free(z); free_lins(xs,nx);
+        free(g); free(ord); free(in_c); free(z); free_lins(xs,nx);
         return 0;
     }
     /* diffn(x[], y[], dx[], dy[]) / fzn_diffn / gecode_diffn / gecode_nooverlap: 2D non-overlapping boxes */

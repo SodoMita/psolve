@@ -372,6 +372,122 @@ def test_set_membership_constants() -> None:
     require("----------" in out, f"affine set_in_reif(x+3 in {{7}}) should hold:\\n{out}")
 
 
+def test_constant_arguments() -> None:
+    """Par (constant) and affine arguments in scalar/bool global handlers.
+
+    Regressions: bool_clause skipped par literals ([true] was UNSAT); its
+    reified encoding inverted negated-literal signs and divided by zero on
+    all-par clauses; array_bool_and/or left r unconstrained; subcircuit
+    dropped par values AND had an anchor-less MTZ that made every real
+    circuit infeasible; int_min/int_max/int_abs rejected constants and
+    silently dropped affine constant terms.
+    """
+    # bool_clause over par literals: OR(pos) or OR(not neg)
+    for pos in ([], ["true"], ["false"]):
+        for neg in ([], ["true"], ["false"]):
+            sat = any(v == "true" for v in pos) or any(v == "false" for v in neg)
+            body = f"constraint bool_clause([{', '.join(pos)}], [{', '.join(neg)}]);\nsolve satisfy;\n"
+            out = run_model(body)
+            require(("----------" in out) == sat,
+                    f"bool_clause({pos}, {neg}) sat={sat}:\\n{out}")
+    # bool_clause_reif truth table incl. a negated variable literal
+    for a in (False, True):
+        for b in (False, True):
+            clause = a or (not b)
+            for want in (False, True):
+                out = run_model(
+                    f"""
+                    var bool: x;
+                    var bool: y;
+                    var bool: r;
+                    constraint bool_clause_reif([x], [y], r);
+                    constraint bool_eq(x, {'true' if a else 'false'});
+                    constraint bool_eq(y, {'true' if b else 'false'});
+                    constraint bool_eq(r, {'true' if want else 'false'});
+                    solve satisfy;
+                    """
+                )
+                require(("----------" in out) == (clause == want),
+                        f"bool_clause_reif([{a}],[neg {b}], r={want}):\\n{out}")
+    # all-par reified clauses pin r exactly (previously NaN / UNKNOWN)
+    for pos, neg, truth in ((["true"], [], True), (["false"], ["true"], False),
+                            ([], [], False), (["false"], ["false"], True)):
+        out = run_model(
+            f"""
+            var bool: r :: output_var;
+            constraint bool_clause_reif([{', '.join(pos)}], [{', '.join(neg)}], r);
+            solve satisfy;
+            """
+        )
+        require(f"r = {'true' if truth else 'false'};" in out,
+                f"bool_clause_reif([{pos}],[{neg}]) -> {truth}:\\n{out}")
+    # array_bool_and/or with par literals
+    for pred, arr, truth in (
+        ("array_bool_and", ["true", "true"], True),
+        ("array_bool_and", ["true", "false"], False),
+        ("array_bool_and", [], True),
+        ("array_bool_or", ["false", "false"], False),
+        ("array_bool_or", ["false", "true"], True),
+        ("array_bool_or", [], False),
+    ):
+        out = run_model(
+            f"""
+            var bool: r :: output_var;
+            constraint {pred}([{', '.join(arr)}], r);
+            solve satisfy;
+            """
+        )
+        require(f"r = {'true' if truth else 'false'};" in out,
+                f"{pred}({arr}, r) -> {truth}:\\n{out}")
+    # int_min/max/abs with constant and affine arguments
+    out = run_model("var int: m :: output_var;\nconstraint int_min(4, 7, m);\nsolve satisfy;\n")
+    require("m = 4;" in out, f"int_min const:\\n{out}")
+    out = run_model("var int: m :: output_var;\nconstraint int_max(4, 7, m);\nsolve satisfy;\n")
+    require("m = 7;" in out, f"int_max const:\\n{out}")
+    out = run_model("var 0..10: y :: output_var;\nconstraint int_abs(-3, y);\nsolve satisfy;\n")
+    require("y = 3;" in out, f"int_abs const:\\n{out}")
+    out = run_model("var int: x :: output_var;\nconstraint int_negate(4, x);\nsolve satisfy;\n")
+    require("x = -4;" in out, f"int_negate const:\\n{out}")
+    out = run_model(
+        """
+        var 0..4: x;
+        var 0..9: m :: output_var;
+        constraint int_eq(x, 1);
+        constraint int_min(x + 1, 5, m);
+        solve satisfy;
+        """
+    )
+    require("m = 2;" in out, f"int_min affine (min(2,5)):\\n{out}")
+    out = run_model("constraint int_min(3, 7, 5);\nsolve satisfy;\n")
+    require("UNSATISFIABLE" in out, f"int_min wrong const result must be UNSAT:\\n{out}")
+    # among with par elements / empty value set
+    out = run_model("constraint fzn_among(2, [1, 2, 1], {1});\nsolve satisfy;\n")
+    require("----------" in out, f"among par hit:\\n{out}")
+    out = run_model("constraint fzn_among(3, [1, 2, 1], {1});\nsolve satisfy;\n")
+    require("UNSATISFIABLE" in out, f"among par miss:\\n{out}")
+    out = run_model("constraint fzn_among(1, [1, 2], {});\nsolve satisfy;\n")
+    require("UNSATISFIABLE" in out, f"among empty set forces n=0:\\n{out}")
+    # subcircuit on par arrays: valid subcircuits / invalid double cycle
+    for arr, sat in (("[2, 3, 1]", True), ("[1, 2, 3]", True),
+                     ("[2, 1, 3]", True), ("[2, 1, 4, 3]", False)):
+        out = run_model(f"constraint fzn_subcircuit({arr});\nsolve satisfy;\n")
+        require(("----------" in out) == sat, f"fzn_subcircuit({arr}) sat={sat}:\\n{out}")
+    # subcircuit enumeration: n=3 has exactly 1 (identity) + 3 (2-cycles) +
+    # 2 (3-cycles) = 6 distinct successor mappings
+    res = run_model(
+        """
+        array [1..3] of var 1..3: xs :: output_array([1..3]);
+        constraint fzn_subcircuit(xs);
+        solve satisfy;
+        """,
+        "-a",
+    )
+    blocks = [b for b in res.split("----------") if "xs =" in b]
+    vals = {re.search(r"\[([^\]]*)\]", b).group(1).replace(" ", "") for b in blocks}
+    require(len(vals) == 6, f"subcircuit n=3 must enumerate 6 mappings, got {len(vals)}:\\n{res}")
+    require("==========" in res, f"subcircuit -a completion marker:\\n{res}")
+
+
 def test_declaration_indices_and_honest_unknown() -> None:
     out = run_model(
         """
@@ -681,6 +797,7 @@ def main() -> int:
         test_table_and_constant_aliases()
         test_circuit()
         test_set_membership_constants()
+        test_constant_arguments()
         test_declaration_indices_and_honest_unknown()
         test_all_solutions_and_extended_constraints()
     except AssertionError as exc:

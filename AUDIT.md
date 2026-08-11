@@ -1,5 +1,26 @@
 # psolve — audit & hardening notes
 
+> **2026-08-11 (2) — constant/affine-argument audit, phase 2:** a 70-probe
+> sweep of every FlatZinc handler with par (constant) and affine arguments
+> (the branch-review-driven hunt after the `set_in_reif` find) exposed four
+> further wrong-answer classes, all fixed and regression-locked:
+> `bool_clause`/`bool_clause_reif` silently skipped par literals
+> (`bool_clause([true],[])` claimed UNSAT; `bool_clause([], [false])` too),
+> inverted negated-literal signs in the reified big-M row, and divided by
+> zero (NaN row) on all-par clauses; `subcircuit` dropped par successor
+> values (constant-overwrite) AND its MTZ subtour elimination had no anchor
+> node, so every real circuit — even a 2-cycle with variables — was
+> infeasible (rewritten with a single-anchor MTZ: n=3 now enumerates the
+> exact 6 successor mappings); `array_bool_and`/`array_bool_or` skipped par
+> literals leaving r unconstrained; `int_min`/`int_max`/`int_abs` rejected
+> constants (UNKNOWN) and silently dropped affine constant terms (e.g.
+> `int_min(x+1, 5, m)`).  New `lin_materialize()` helper pins constants and
+> affine forms as exact alias vars wherever handlers index bounds directly;
+> `int_negate` alias added; `among` folds par elements and the empty set.
+> New `test_constant_arguments()` in `fzn_semantics_test.py` (fails 10+
+> assertions against the pre-fix binary); full `test.sh` green; ASan/UBSan
+> corpus sweep clean.
+
 > **2026-08-11 — branch review + set-membership constant fold:** all remote
 > branches were re-surveyed from `feat/flatzinc-complete`.  Finding: the
 > `arena/continue-hardening` "floor division" change to `int_div`/`int_mod`
