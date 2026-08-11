@@ -1315,23 +1315,58 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
         if(parse_lin(m,c->args[0],&l1)!=0)return -1;
         if(parse_lin(m,c->args[1],&l2)!=0){lin_free(&l1);return -1;}
         if(parse_lin(m,c->args[2],&l3)!=0){lin_free(&l1);lin_free(&l2);return -1;}
-        if(l1.n!=1||l2.n!=1||l3.n!=1){lin_free(&l1);lin_free(&l2);lin_free(&l3);return 1;}
-        int a=l1.idx[0], bb=l2.idx[0], mm=l3.idx[0];
-        double M = fmax(fabs(b->lo[a]),fabs(b->hi[a]));
-        M = fmax(M, fmax(fabs(b->lo[bb]),fabs(b->hi[bb])));
-        M = fmax(M,1.0)*2.0;
+        /* Each operand may be a single unit variable or a constant (the MiniZinc
+           std/linear libraries emit e.g. int_min(a, 1, m) and int_max(a, b, m)
+           with mixed var/const operands).  The result m must be a unit var. */
+        int va=-1, vb=-1; double ca=0, cb=0;
+        int a_is_var=0, b_is_var=0;
+        if(l1.n==1 && fabs(l1.coef[0]-1.0)<1e-9 && fabs(l1.constant)<1e-9){ va=l1.idx[0]; a_is_var=1; }
+        else if(l1.n==0 && isfinite(l1.constant)){ ca=l1.constant; a_is_var=0; }
+        else { lin_free(&l1);lin_free(&l2);lin_free(&l3);return 1; }
+        if(l2.n==1 && fabs(l2.coef[0]-1.0)<1e-9 && fabs(l2.constant)<1e-9){ vb=l2.idx[0]; b_is_var=1; }
+        else if(l2.n==0 && isfinite(l2.constant)){ cb=l2.constant; b_is_var=0; }
+        else { lin_free(&l1);lin_free(&l2);lin_free(&l3);return 1; }
+        if(l3.n!=1 || fabs(l3.coef[0]-1.0)>1e-9){ lin_free(&l1);lin_free(&l2);lin_free(&l3);return 1; }
+        int mm=l3.idx[0];
+        /* bound M over the operand magnitudes */
+        double M=1.0;
+        if(a_is_var) M=fmax(M,fmax(fabs(b->lo[va]),fabs(b->hi[va])));
+        else M=fmax(M,fabs(ca));
+        if(b_is_var) M=fmax(M,fmax(fabs(b->lo[vb]),fabs(b->hi[vb])));
+        else M=fmax(M,fabs(cb));
+        M*=2.0;
         int s=b_newvar(b,0.0,1.0);
+        /* build a Lin equal to (m - contribution(term)) for a term that is a var
+           or a constant, so we can reuse the same big-M encoding. */
+        /* helper macro: emit row  (m - term) rel 0 */
+        #define EMIT_MINMAX(term_is_var,term_v,term_c,REL) do { \
+            Lin dd; memset(&dd,0,sizeof(dd)); lin_term(&dd,mm,1.0); \
+            if(term_is_var) lin_term(&dd,term_v,-1.0); else dd.constant -= (term_c); \
+            b_put(b,REL,0.0,&dd); lin_free(&dd); } while(0)
         if(ismax){
-            Lin d1;memset(&d1,0,sizeof(d1));lin_term(&d1,mm,1.0);lin_term(&d1,a,-1.0);b_put(b,'>',0.0,&d1);lin_free(&d1);
-            Lin d2;memset(&d2,0,sizeof(d2));lin_term(&d2,mm,1.0);lin_term(&d2,bb,-1.0);b_put(b,'>',0.0,&d2);lin_free(&d2);
-            Lin d3;memset(&d3,0,sizeof(d3));lin_term(&d3,mm,1.0);lin_term(&d3,a,-1.0);lin_term(&d3,s,-M);b_put(b,'<',0.0,&d3);lin_free(&d3);
-            Lin d4;memset(&d4,0,sizeof(d4));lin_term(&d4,mm,1.0);lin_term(&d4,bb,-1.0);lin_term(&d4,s,M);d4.constant-=M;b_put(b,'<',0.0,&d4);lin_free(&d4);
+            /* m >= term, for each operand */
+            EMIT_MINMAX(a_is_var,va,ca,'>');
+            EMIT_MINMAX(b_is_var,vb,cb,'>');
+            /* m <= term + M*s  (choose a if s=0, b if s=1) */
+            { Lin d3;memset(&d3,0,sizeof(d3)); lin_term(&d3,mm,1.0);
+              if(a_is_var) lin_term(&d3,va,-1.0); else d3.constant-=ca;
+              lin_term(&d3,s,-M); b_put(b,'<',0.0,&d3); lin_free(&d3); }
+            { Lin d4;memset(&d4,0,sizeof(d4)); lin_term(&d4,mm,1.0);
+              if(b_is_var) lin_term(&d4,vb,-1.0); else d4.constant-=cb;
+              lin_term(&d4,s,M); d4.constant-=M; b_put(b,'<',0.0,&d4); lin_free(&d4); }
         } else {
-            Lin d1;memset(&d1,0,sizeof(d1));lin_term(&d1,mm,1.0);lin_term(&d1,a,-1.0);b_put(b,'<',0.0,&d1);lin_free(&d1);
-            Lin d2;memset(&d2,0,sizeof(d2));lin_term(&d2,mm,1.0);lin_term(&d2,bb,-1.0);b_put(b,'<',0.0,&d2);lin_free(&d2);
-            Lin d3;memset(&d3,0,sizeof(d3));lin_term(&d3,mm,1.0);lin_term(&d3,a,-1.0);lin_term(&d3,s,M);b_put(b,'>',0.0,&d3);lin_free(&d3);
-            Lin d4;memset(&d4,0,sizeof(d4));lin_term(&d4,mm,1.0);lin_term(&d4,bb,-1.0);lin_term(&d4,s,-M);d4.constant+=M;b_put(b,'>',0.0,&d4);lin_free(&d4);
+            /* m <= term, for each operand */
+            EMIT_MINMAX(a_is_var,va,ca,'<');
+            EMIT_MINMAX(b_is_var,vb,cb,'<');
+            /* m >= term - M*s */
+            { Lin d3;memset(&d3,0,sizeof(d3)); lin_term(&d3,mm,1.0);
+              if(a_is_var) lin_term(&d3,va,-1.0); else d3.constant-=ca;
+              lin_term(&d3,s,M); b_put(b,'>',0.0,&d3); lin_free(&d3); }
+            { Lin d4;memset(&d4,0,sizeof(d4)); lin_term(&d4,mm,1.0);
+              if(b_is_var) lin_term(&d4,vb,-1.0); else d4.constant-=cb;
+              lin_term(&d4,s,-M); d4.constant+=M; b_put(b,'>',0.0,&d4); lin_free(&d4); }
         }
+        #undef EMIT_MINMAX
         lin_free(&l1);lin_free(&l2);lin_free(&l3);
         return 0;
     }
