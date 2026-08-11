@@ -138,8 +138,8 @@ static void cp_copy(CP*dst,const CP*src){
 }
 static void cp_free(CP*cp){
     if(!cp) return;
-    if(cp->vals){ for(int v=0;v<cp->nvars;v++) free(cp->vals[v]); }
-    free(cp->bounded);free(cp->isbool);free(cp->lo);free(cp->hi);free(cp->vals);free(cp->nvals);free(cp->cap);
+    if(cp->vals){ for(int v=0;v<cp->nvars;v++) psolve_free(cp->vals[v]); }
+    psolve_free(cp->bounded);psolve_free(cp->isbool);psolve_free(cp->lo);psolve_free(cp->hi);psolve_free(cp->vals);psolve_free(cp->nvals);psolve_free(cp->cap);
     memset(cp,0,sizeof(*cp));
 }
 
@@ -248,7 +248,7 @@ static int cp_divisors(int64_t n,int64_t *out,int cap){
     }
     int total=0;
     for(int i=0;i<cnt;i++){ int64_t p=pos[i]; if(total<cap) out[total++]=p; if(total<cap) out[total++]=-p; }
-    free(pos);
+    psolve_free(pos);
     return total;
 }
 
@@ -301,7 +301,7 @@ static int cp_prop_alldiff(CP*cp,CPT*terms,int n){
                 int c=0; for(int i=0;i<n;i++) if(!terms[i].isc && cp->bounded[terms[i].v] && cp->nvals[terms[i].v]>1) fvv[c++]=terms[i].v;
                 int64_t *vs=NULL; int vc=0,vcap=0;
                 for(int r=0;r<nfree;r++){ int v=fvv[r]; for(int k=0;k<cp->nvals[v];k++){ int64_t val=cp->vals[v][k]; int dup=0; for(int q=0;q<vc;q++) if(vs[q]==val){dup=1;break;} if(!dup){ if(vc>=vcap){vcap=vcap?vcap*2:64;vs=(int64_t*)psolve_realloc((void**)&vs,(size_t)vcap*sizeof(int64_t));} vs[vc++]=val; } } }
-                if(vc==0){ free(fvv); free(vs); continue; }
+                if(vc==0){ psolve_free(fvv); psolve_free(vs); continue; }
                 ADJ *adj=(ADJ*)psolve_calloc((size_t)nfree,sizeof(ADJ));
                 for(int r=0;r<nfree;r++){
                     int v=fvv[r]; int cap2=0; int *tmp=NULL; int tn=0;
@@ -313,11 +313,11 @@ static int cp_prop_alldiff(CP*cp,CPT*terms,int n){
                 for(int r=0;r<nfree;r++){
                     int *seen=(int*)psolve_calloc((size_t)(vc?vc:1),sizeof(int));
                     if(cp_aug(r,matchR,seen,adj,vc)) matches++;
-                    free(seen);
+                    psolve_free(seen);
                 }
                 if(matches<nfree){ /* Hall violated -> UNSAT */
-                    for(int r=0;r<nfree;r++) free(adj[r].col);
-                    free(adj); free(matchR); free(fvv); free(vs);
+                    for(int r=0;r<nfree;r++) psolve_free(adj[r].col);
+                    psolve_free(adj); psolve_free(matchR); psolve_free(fvv); psolve_free(vs);
                     return 1;
                 }
                 /* Value removal: a value val in dom(fvv[r]) is removable iff the edge
@@ -346,23 +346,23 @@ static int cp_prop_alldiff(CP*cp,CPT*terms,int n){
                         for(int r2=0;r2<nfree;r2++){
                             int *seen2=(int*)psolve_calloc((size_t)(vc?vc:1),sizeof(int));
                             if(cp_aug(r2,mR,seen2,adj2,vc)) m2++;
-                            free(seen2);
+                            psolve_free(seen2);
                         }
                         int removable=(m2<nfree); /* forcing (r,c) breaks every matching */
-                        for(int r2=0;r2<nfree;r2++) free(adj2[r2].col);
-                        free(adj2); free(mR);
+                        for(int r2=0;r2<nfree;r2++) psolve_free(adj2[r2].col);
+                        psolve_free(adj2); psolve_free(mR);
                         if(removable){
                             if(cp_remove_val(cp,v,val)){
-                                for(int r=0;r<nfree;r++) free(adj[r].col);
-                                free(adj); free(matchR); free(fvv); free(vs);
+                                for(int r=0;r<nfree;r++) psolve_free(adj[r].col);
+                                psolve_free(adj); psolve_free(matchR); psolve_free(fvv); psolve_free(vs);
                                 return 1;
                             }
                             changed=1;
                         }
                     }
                 }
-                for(int r=0;r<nfree;r++) free(adj[r].col);
-                free(adj); free(matchR); free(fvv); free(vs);
+                for(int r=0;r<nfree;r++) psolve_free(adj[r].col);
+                psolve_free(adj); psolve_free(matchR); psolve_free(fvv); psolve_free(vs);
             }
         }
     }
@@ -375,15 +375,15 @@ static int cp_restrict_divisors(CP*cp,int v,int64_t*dvbuf,int nd){
         /* keep only values that are in the divisor list */
         int64_t *nvals=NULL; int nn=0,cap2=0;
         for(int i=0;i<cp->nvals[v];i++){ int64_t val=cp->vals[v][i]; int found=0; for(int k=0;k<nd;k++) if(dvbuf[k]==val){found=1;break;} if(found){ if(nn>=cap2){cap2=cap2?cap2*2:16;nvals=(int64_t*)psolve_realloc((void**)&nvals,(size_t)cap2*sizeof(int64_t));} nvals[nn++]=val; } }
-        if(nn==0){ free(nvals); return 1; }
-        if(cp_set_vals(cp,v,nvals,nn)<0){ free(nvals); return -1; } free(nvals);
+        if(nn==0){ psolve_free(nvals); return 1; }
+        if(cp_set_vals(cp,v,nvals,nn)<0){ psolve_free(nvals); return -1; } psolve_free(nvals);
         return 0;
     } else {
         /* interval/unbounded: restrict to divisor list, respecting current bounds */
         int64_t *nvals=NULL; int nn=0,cap2=0;
         for(int k=0;k<nd;k++){ int64_t val=dvbuf[k]; if(val>=cp->lo[v] && val<=cp->hi[v]){ if(nn>=cap2){cap2=cap2?cap2*2:16;nvals=(int64_t*)psolve_realloc((void**)&nvals,(size_t)cap2*sizeof(int64_t));} nvals[nn++]=val; } }
-        if(nn==0){ free(nvals); return 1; }
-        if(cp_set_vals(cp,v,nvals,nn)<0){ free(nvals); return -1; } free(nvals);
+        if(nn==0){ psolve_free(nvals); return 1; }
+        if(cp_set_vals(cp,v,nvals,nn)<0){ psolve_free(nvals); return -1; } psolve_free(nvals);
         return 0;
     }
 }
@@ -412,12 +412,12 @@ static int cp_prop_times(CP*cp,CPT*a,CPT*b,CPT*c){
             if(bV && cp->bounded[c->v]&&cp->nvals[c->v]<=CP_MAXVALS && cp->bounded[b->v]&&cp->nvals[b->v]<=CP_MAXVALS){
                 int64_t *nvals=NULL;int nn=0,cap2=0;
                 for(int i=0;i<cp->nvals[c->v];i++){int64_t cv2=cp->vals[c->v][i]; if(cv2%av==0){int64_t bv2=cv2/av; int dup=0;for(int q=0;q<nn;q++)if(nvals[q]==bv2){dup=1;break;}if(!dup){if(nn>=cap2){cap2=cap2?cap2*2:16;nvals=(int64_t*)psolve_realloc((void**)&nvals,(size_t)cap2*sizeof(int64_t));}nvals[nn++]=bv2;}}}
-                if(nn==0){free(nvals);return 1;}
+                if(nn==0){psolve_free(nvals);return 1;}
                 int64_t *keep=NULL;int kn=0;
                 for(int i=0;i<nn;i++) if(cp_contains(cp,b->v,nvals[i])){ keep=(int64_t*)psolve_realloc((void**)&keep,(size_t)(kn+1)*sizeof(int64_t)); keep[kn++]=nvals[i]; }
-                free(nvals); nvals=keep; nn=kn;
-                if(nn==0){free(nvals);return 1;}
-                if(cp_set_vals(cp,b->v,nvals,nn)<0){free(nvals);return -1;} free(nvals);
+                psolve_free(nvals); nvals=keep; nn=kn;
+                if(nn==0){psolve_free(nvals);return 1;}
+                if(cp_set_vals(cp,b->v,nvals,nn)<0){psolve_free(nvals);return -1;} psolve_free(nvals);
             } else if(bV){
                 int64_t clo=cp_dmin(cp,c->v),chi=cp_dmax(cp,c->v);
                 int64_t blo=(int64_t)ceild(clo,av), bhi=(int64_t)floord(chi,av);
@@ -453,8 +453,8 @@ static int cp_prop_times(CP*cp,CPT*a,CPT*b,CPT*c){
             int64_t cand[2];int ncv=0; if(r!=0){cand[ncv++]=r;cand[ncv++]=-r;} else cand[ncv++]=0;
             int64_t *keep=NULL;int kn=0;
             for(int i=0;i<ncv;i++) if(cp_contains(cp,a->v,cand[i])){ keep=(int64_t*)psolve_realloc((void**)&keep,(size_t)(kn+1)*sizeof(int64_t)); keep[kn++]=cand[i]; }
-            if(kn==0){free(keep);return 1;}
-            if(cp_set_vals(cp,a->v,keep,kn)<0){free(keep);return -1;} free(keep);
+            if(kn==0){psolve_free(keep);return 1;}
+            if(cp_set_vals(cp,a->v,keep,kn)<0){psolve_free(keep);return -1;} psolve_free(keep);
             return 0;
         }
     }
@@ -501,27 +501,27 @@ static int cp_prop_divmod(CP*cp,CPT*a,int64_t k,CPT*c,int is_div){
             if(cp->nvals[a->v]>1){
                 int64_t *nvals=NULL; int nn=0,cap2=0;
                 for(int i=0;i<cp->nvals[a->v];i++){ int64_t av2=cp->vals[a->v][i]; if(cp_contains(cp,c->v,av2/k)){ if(nn>=cap2){cap2=cap2?cap2*2:64;nvals=(int64_t*)psolve_realloc((void**)&nvals,(size_t)cap2*sizeof(int64_t));} nvals[nn++]=av2; } }
-                if(nn==0){ free(nvals); return 1; }
-                if(cp_set_vals(cp,a->v,nvals,nn)<0){ free(nvals); return -1; } free(nvals);
+                if(nn==0){ psolve_free(nvals); return 1; }
+                if(cp_set_vals(cp,a->v,nvals,nn)<0){ psolve_free(nvals); return -1; } psolve_free(nvals);
             }
             if(cp->nvals[c->v]>1){
                 int64_t *nvals=NULL; int nn=0,cap2=0;
                 for(int i=0;i<cp->nvals[a->v];i++){ int64_t av2=cp->vals[a->v][i]; int64_t q=av2/k; if(cp_contains(cp,c->v,q)){ int dup=0; for(int q2=0;q2<nn;q2++) if(nvals[q2]==q){dup=1;break;} if(!dup){ if(nn>=cap2){cap2=cap2?cap2*2:64;nvals=(int64_t*)psolve_realloc((void**)&nvals,(size_t)cap2*sizeof(int64_t));} nvals[nn++]=q; } } }
-                if(nn==0){ free(nvals); return 1; }
-                if(cp_set_vals(cp,c->v,nvals,nn)<0){ free(nvals); return -1; } free(nvals);
+                if(nn==0){ psolve_free(nvals); return 1; }
+                if(cp_set_vals(cp,c->v,nvals,nn)<0){ psolve_free(nvals); return -1; } psolve_free(nvals);
             }
         } else {
             if(cp->nvals[a->v]>1){
                 int64_t *nvals=NULL; int nn=0,cap2=0;
                 for(int i=0;i<cp->nvals[a->v];i++){ int64_t av2=cp->vals[a->v][i]; if(cp_contains(cp,c->v,av2%k)){ if(nn>=cap2){cap2=cap2?cap2*2:64;nvals=(int64_t*)psolve_realloc((void**)&nvals,(size_t)cap2*sizeof(int64_t));} nvals[nn++]=av2; } }
-                if(nn==0){ free(nvals); return 1; }
-                if(cp_set_vals(cp,a->v,nvals,nn)<0){ free(nvals); return -1; } free(nvals);
+                if(nn==0){ psolve_free(nvals); return 1; }
+                if(cp_set_vals(cp,a->v,nvals,nn)<0){ psolve_free(nvals); return -1; } psolve_free(nvals);
             }
             if(cp->nvals[c->v]>1){
                 int64_t *nvals=NULL; int nn=0,cap2=0;
                 for(int i=0;i<cp->nvals[a->v];i++){ int64_t av2=cp->vals[a->v][i]; int64_t r=av2%k; if(cp_contains(cp,c->v,r)){ int dup=0; for(int q=0;q<nn;q++) if(nvals[q]==r){dup=1;break;} if(!dup){ if(nn>=cap2){cap2=cap2?cap2*2:64;nvals=(int64_t*)psolve_realloc((void**)&nvals,(size_t)cap2*sizeof(int64_t));} nvals[nn++]=r; } } }
-                if(nn==0){ free(nvals); return 1; }
-                if(cp_set_vals(cp,c->v,nvals,nn)<0){ free(nvals); return -1; } free(nvals);
+                if(nn==0){ psolve_free(nvals); return 1; }
+                if(cp_set_vals(cp,c->v,nvals,nn)<0){ psolve_free(nvals); return -1; } psolve_free(nvals);
             }
         }
     }
@@ -540,7 +540,7 @@ static int cp_prop_abs(CP*cp,CPT*a,CPT*c){
         int64_t *nvals=NULL; int nn=0;
         if(cv==0){ nvals=(int64_t*)psolve_malloc(sizeof(int64_t)); nvals[nn++]=0; }
         else { nvals=(int64_t*)psolve_malloc(2*sizeof(int64_t)); nvals[nn++]=cv; nvals[nn++]=-cv; }
-        if(cp_set_vals(cp,a->v,nvals,nn)<0){ free(nvals); return -1; } free(nvals);
+        if(cp_set_vals(cp,a->v,nvals,nn)<0){ psolve_free(nvals); return -1; } psolve_free(nvals);
         return 0;
     }
     /* bounds */
@@ -594,8 +594,8 @@ static int cp_prop_elem(CP*cp,CPT*idx,CPT*res,CPT*arrt,int narr,int offset){
                 if(k>=0&&k<narr){ CPT*e=&arrt[k]; int64_t ev; int eF=cp_term_value(cp,e,&ev);
                     int can = eF ? (ev==rv) : (!e->isc && cp_contains(cp,e->v,rv));
                     if(can){ if(nn>=cap2){cap2=cap2?cap2*2:8;nvals=(int64_t*)psolve_realloc((void**)&nvals,(size_t)cap2*sizeof(int64_t));} nvals[nn++]=iv2; } } }
-            if(nn==0){ free(nvals); return 1; }
-            if(cp_set_vals(cp,idx->v,nvals,nn)<0){ free(nvals); return -1; } free(nvals);
+            if(nn==0){ psolve_free(nvals); return 1; }
+            if(cp_set_vals(cp,idx->v,nvals,nn)<0){ psolve_free(nvals); return -1; } psolve_free(nvals);
         }
     }
     /* index range must be within array */
@@ -614,8 +614,8 @@ static int cp_prop_setin(CP*cp,CPT*x,long long*set,int nset){
     if(cp->bounded[x->v] && cp->nvals[x->v]<=CP_MAXVALS){
         int64_t *nvals=NULL; int nn=0,cap2=0;
         for(int i=0;i<cp->nvals[x->v];i++){ int64_t val=cp->vals[x->v][i]; for(int k=0;k<nset;k++) if(set[k]==val){ if(nn>=cap2){cap2=cap2?cap2*2:8;nvals=(int64_t*)psolve_realloc((void**)&nvals,(size_t)cap2*sizeof(int64_t));} nvals[nn++]=val; break; } }
-        if(nn==0){ free(nvals); return 1; }
-        if(cp_set_vals(cp,x->v,nvals,nn)<0){ free(nvals); return -1; } free(nvals);
+        if(nn==0){ psolve_free(nvals); return 1; }
+        if(cp_set_vals(cp,x->v,nvals,nn)<0){ psolve_free(nvals); return -1; } psolve_free(nvals);
     } else {
         int64_t lo=set[0],hi=set[0]; for(int k=1;k<nset;k++){ if(set[k]<lo)lo=set[k]; if(set[k]>hi)hi=set[k]; }
         if(cp_intersect(cp,x->v,lo,hi)) return 1;
@@ -653,8 +653,8 @@ static int cp_prop_pow(CP*cp,CPT*base,int64_t expo,CPT*c){
         if(cp->bounded[base->v] && cp->nvals[base->v]<=CP_MAXVALS){
             int64_t *nvals=NULL; int nn=0,cap2=0;
             for(int i=0;i<cp->nvals[base->v];i++){ int64_t b2=cp->vals[base->v][i]; __int128 p=1; int povf=0; for(int64_t e=0;e<expo;e++){ p*=(__int128)b2; if(p>INT64_MAX||p<INT64_MIN){ povf=1; break; } } if(!povf && p==cv){ if(nn>=cap2){cap2=cap2?cap2*2:8;nvals=(int64_t*)psolve_realloc((void**)&nvals,(size_t)cap2*sizeof(int64_t));} nvals[nn++]=b2; } }
-            if(nn==0){ free(nvals); return 1; }
-            if(cp_set_vals(cp,base->v,nvals,nn)<0){ free(nvals); return -1; } free(nvals);
+            if(nn==0){ psolve_free(nvals); return 1; }
+            if(cp_set_vals(cp,base->v,nvals,nn)<0){ psolve_free(nvals); return -1; } psolve_free(nvals);
         }
         return 0;
     }
@@ -849,8 +849,8 @@ static int parse_int_set_lit(FZModel*m,const char*s,long long**out){
             if(end==sp)return -1;
             long long a=v; sp=end;
             while(isspace((unsigned char)*sp))sp++;
-            if(*sp=='.'&&sp[1]=='.'){ sp+=2; char*end2; long long b=strtoll(sp,&end2,10); sp=end2; if(b<a || b-a+1>CP_SET_LIT_CAP){ free(sv); return -1; } for(long long q=a;q<=b;q++){ if(sn>=scap){scap=scap?scap*2:16;sv=(long long*)psolve_realloc((void**)&sv,(size_t)scap*sizeof(long long));} sv[sn++]=q; } }
-            else { if(sn>=CP_SET_LIT_CAP){ free(sv); return -1; } if(sn>=scap){scap=scap?scap*2:16;sv=(long long*)psolve_realloc((void**)&sv,(size_t)scap*sizeof(long long));} sv[sn++]=a; }
+            if(*sp=='.'&&sp[1]=='.'){ sp+=2; char*end2; long long b=strtoll(sp,&end2,10); sp=end2; if(b<a || b-a+1>CP_SET_LIT_CAP){ psolve_free(sv); return -1; } for(long long q=a;q<=b;q++){ if(sn>=scap){scap=scap?scap*2:16;sv=(long long*)psolve_realloc((void**)&sv,(size_t)scap*sizeof(long long));} sv[sn++]=q; } }
+            else { if(sn>=CP_SET_LIT_CAP){ psolve_free(sv); return -1; } if(sn>=scap){scap=scap?scap*2:16;sv=(long long*)psolve_realloc((void**)&sv,(size_t)scap*sizeof(long long));} sv[sn++]=a; }
             while(isspace((unsigned char)*sp))sp++;
             if(*sp==',')sp++;
         }
@@ -976,7 +976,7 @@ static int cp_parse(FZModel*m,CPCR**out_cr,int*out_n,unsigned char*referenced,in
             int bad=0;
             for(int i=0;i<narr;i++){ if(cp_term_from_lin(&arr[i],&rec.terms[i])!=0){ bad=1; break; } if(!rec.terms[i].isc) referenced[rec.terms[i].v]=1; }
             free_lins(arr,narr);
-            if(bad){ free(rec.terms); ok=0; break; }
+            if(bad){ psolve_free(rec.terms); ok=0; break; }
         }
         /* ---------- int_times ---------- */
         else if(cp_pred_is(p,"int_times")||cp_pred_is(p,"bool_times")){
@@ -988,7 +988,7 @@ static int cp_parse(FZModel*m,CPCR**out_cr,int*out_n,unsigned char*referenced,in
             if(cp_term_from_lin(&l1,&rec.terms[0])!=0||cp_term_from_lin(&l2,&rec.terms[1])!=0||cp_term_from_lin(&l3,&rec.terms[2])!=0){ ok=0; }
             if(ok){ for(int i=0;i<3;i++) if(!rec.terms[i].isc) referenced[rec.terms[i].v]=1; }
             lin_free(&l1);lin_free(&l2);lin_free(&l3);
-            if(!ok){ free(rec.terms); break; }
+            if(!ok){ psolve_free(rec.terms); break; }
             motivating=1;
         }
         /* ---------- int_div / int_mod ---------- */
@@ -1007,7 +1007,7 @@ static int cp_parse(FZModel*m,CPCR**out_cr,int*out_n,unsigned char*referenced,in
             rec.terms[1].isc=1; rec.terms[1].c=(int64_t)K;
             if(ok){ if(!rec.terms[0].isc) referenced[rec.terms[0].v]=1; if(!rec.terms[2].isc) referenced[rec.terms[2].v]=1; }
             lin_free(&l1);lin_free(&l2);lin_free(&l3);
-            if(!ok){ free(rec.terms); break; }
+            if(!ok){ psolve_free(rec.terms); break; }
             motivating=1;
         }
         /* ---------- int_abs ---------- */
@@ -1019,7 +1019,7 @@ static int cp_parse(FZModel*m,CPCR**out_cr,int*out_n,unsigned char*referenced,in
             if(cp_term_from_lin(&l1,&rec.terms[0])!=0||cp_term_from_lin(&l2,&rec.terms[1])!=0){ok=0;}
             if(ok){ if(!rec.terms[0].isc) referenced[rec.terms[0].v]=1; if(!rec.terms[1].isc) referenced[rec.terms[1].v]=1; }
             lin_free(&l1);lin_free(&l2);
-            if(!ok){ free(rec.terms); break; }
+            if(!ok){ psolve_free(rec.terms); break; }
             motivating=1;
         }
         /* ---------- array element (incl. var/bool/array_var forms) ---------- */
@@ -1052,7 +1052,7 @@ static int cp_parse(FZModel*m,CPCR**out_cr,int*out_n,unsigned char*referenced,in
             free_lins(arr,narr);
             if(!bad){ if(cp_term_from_lin(&il,&rec.terms[0])!=0) bad=1; if(cp_term_from_lin(&vl,&rec.terms[1])!=0) bad=1; }
             lin_free(&il);lin_free(&vl);
-            if(bad){ free(rec.terms); free(rec.arr_terms); ok=0; break; }
+            if(bad){ psolve_free(rec.terms); psolve_free(rec.arr_terms); ok=0; break; }
             if(!rec.terms[0].isc) referenced[rec.terms[0].v]=1;
             if(!rec.terms[1].isc) referenced[rec.terms[1].v]=1;
             rec.lvars=(int*)psolve_malloc(sizeof(int)); rec.lvars[0]=(int)offset; /* store offset */
@@ -1070,7 +1070,7 @@ static int cp_parse(FZModel*m,CPCR**out_cr,int*out_n,unsigned char*referenced,in
             if(cp_term_from_lin(&l2,&rec.terms[1])!=0) bad=1;
             if(cp_term_from_lin(&l3,&rec.terms[2])!=0) bad=1;
             lin_free(&l1);lin_free(&l2);lin_free(&l3);
-            if(bad){ free(rec.terms); ok=0; break; }
+            if(bad){ psolve_free(rec.terms); ok=0; break; }
             for(int i=0;i<3;i++) if(!rec.terms[i].isc) referenced[rec.terms[i].v]=1;
             motivating=1;
         }
@@ -1156,7 +1156,7 @@ static int cp_parse(FZModel*m,CPCR**out_cr,int*out_n,unsigned char*referenced,in
             for(int i=0;i<npos;i++){ CPT t; if(cp_term_from_lin(&pos[i],&t)!=0 || t.isc){bad=1;break;} rec.lvars[i]=t.v; referenced[t.v]=1; }
             for(int i=0;i<nneg;i++){ CPT t; if(cp_term_from_lin(&neg[i],&t)!=0 || t.isc){bad=1;break;} rec.terms[i]=t; referenced[t.v]=1; }
             free_lins(pos,npos); free_lins(neg,nneg);
-            if(bad){ free(rec.lvars); free(rec.terms); ok=0; break; }
+            if(bad){ psolve_free(rec.lvars); psolve_free(rec.terms); ok=0; break; }
             motivating=1;
         }
         /* ---------- set_in ---------- */
@@ -1166,7 +1166,7 @@ static int cp_parse(FZModel*m,CPCR**out_cr,int*out_n,unsigned char*referenced,in
             long long*sv; int sn=parse_int_set_lit(m,c->args[1],&sv);
             if(sn<0){lin_free(&xl);ok=0;break;}
             rec.kind=CPK_SETIN; rec.n=1; rec.terms=(CPT*)psolve_calloc(1,sizeof(CPT));
-            if(cp_term_from_lin(&xl,&rec.terms[0])!=0){lin_free(&xl);free(sv);ok=0;break;}
+            if(cp_term_from_lin(&xl,&rec.terms[0])!=0){lin_free(&xl);psolve_free(sv);ok=0;break;}
             lin_free(&xl);
             if(!rec.terms[0].isc) referenced[rec.terms[0].v]=1;
             rec.setvals=sv; rec.nset=sn;
@@ -1184,7 +1184,7 @@ static int cp_parse(FZModel*m,CPCR**out_cr,int*out_n,unsigned char*referenced,in
             if(cp_term_from_lin(&l1,&rec.terms[0])!=0||cp_term_from_lin(&l3,&rec.terms[2])!=0){ok=0;}
             if(ok){ if(!rec.terms[0].isc) referenced[rec.terms[0].v]=1; if(!rec.terms[2].isc) referenced[rec.terms[2].v]=1; }
             lin_free(&l1);lin_free(&l2);lin_free(&l3);
-            if(!ok){ free(rec.terms); break; }
+            if(!ok){ psolve_free(rec.terms); break; }
             motivating=1;
         }
         else {
@@ -1194,8 +1194,8 @@ static int cp_parse(FZModel*m,CPCR**out_cr,int*out_n,unsigned char*referenced,in
         if(nc>=cap){ cap*=2; cr=(CPCR*)psolve_realloc((void**)&cr,(size_t)cap*sizeof(CPCR)); }
         cr[nc++]=rec;
     }
-    if(!ok){ for(int i=0;i<nc;i++){ free(cr[i].lvars);free(cr[i].lcoef);free(cr[i].terms);free(cr[i].setvals);free(cr[i].arr_terms);} free(cr); return -1; }
-    if(!motivating){ for(int i=0;i<nc;i++){ free(cr[i].lvars);free(cr[i].lcoef);free(cr[i].terms);free(cr[i].setvals);free(cr[i].arr_terms);} free(cr); return -2; }
+    if(!ok){ for(int i=0;i<nc;i++){ psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);} psolve_free(cr); return -1; }
+    if(!motivating){ for(int i=0;i<nc;i++){ psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);} psolve_free(cr); return -2; }
     *out_cr=cr; *out_n=nc; *has_cp_motivating=motivating;
     return 0;
 }
@@ -1508,7 +1508,7 @@ static int cp_bound_diophantine(CP*cp,CPCR*cr,int nc){
     int ret=0;
     if(nd<=0) ret=1;
     else for(int v=0;v<cp->nvars;v++) if(mark[v]){ int r=cp_restrict_divisors(cp,v,dv,nd); if(r==1){ret=1;break;} if(r==-1){ret=-1;break;} }
-    free(mark);
+    psolve_free(mark);
     return ret;
 }
 
@@ -1530,8 +1530,8 @@ static int fz_cp_try(const FZModel*m,FZSolution*sol){
         optcoef=(long long*)psolve_malloc((size_t)O->n*sizeof(long long));
         for(int i=0;i<O->n;i++){
             double cf=O->coef[i]; int vi=O->idx[i];
-            if(vi<0||vi>=nv){ free(optcoef); return 0; }
-            if(!isfinite(cf)||cf!=rint(cf)||fabs(cf)>=(double)CP_BIG){ free(optcoef); return 0; }
+            if(vi<0||vi>=nv){ psolve_free(optcoef); return 0; }
+            if(!isfinite(cf)||cf!=rint(cf)||fabs(cf)>=(double)CP_BIG){ psolve_free(optcoef); return 0; }
             optcoef[i]=(long long)llround(cf);
         }
         opt.sense=m->solve_kind; opt.n=O->n; opt.idx=O->idx; opt.coef=optcoef;
@@ -1552,13 +1552,13 @@ static int fz_cp_try(const FZModel*m,FZSolution*sol){
     for(int d=0;d<m->ndecl;d++){
         FZDecl*decl=&m->decls[d];
         if(decl->is_var && !decl->is_alias && decl->kind==FZ_K_FLOAT){
-            free(optcoef); free(opt.bestx); return 0;
+            psolve_free(optcoef); psolve_free(opt.bestx); return 0;
         }
     }
     unsigned char *referenced=(unsigned char*)psolve_calloc((size_t)(nv?nv:1),1);
     CPCR*cr=NULL; int nc=0; int motivating=0;
     int cp_parse_rc=cp_parse((FZModel*)m,&cr,&nc,referenced,&motivating);
-    if(cp_parse_rc!=0){ free(referenced); free(optcoef); free(opt.bestx); return 0; }
+    if(cp_parse_rc!=0){ psolve_free(referenced); psolve_free(optcoef); psolve_free(opt.bestx); return 0; }
     if(m->solve_kind!=0){
         /* CP-B&B engages optimization only when the model has genuinely
            combinatorial structure (element/all_different/reif/...).  A model
@@ -1570,8 +1570,8 @@ static int fz_cp_try(const FZModel*m,FZSolution*sol){
         int combinatorial=0;
         for(int i=0;i<nc;i++) if(cr[i].kind!=CPK_LIN){ combinatorial=1; break; }
         if(!combinatorial){
-            for(int i=0;i<nc;i++){ free(cr[i].lvars);free(cr[i].lcoef);free(cr[i].terms);free(cr[i].setvals);free(cr[i].arr_terms);} free(cr);
-            free(referenced); free(optcoef); free(opt.bestx); return 0;
+            for(int i=0;i<nc;i++){ psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);} psolve_free(cr);
+            psolve_free(referenced); psolve_free(optcoef); psolve_free(opt.bestx); return 0;
         }
         for(int i=0;i<m->objective.n;i++) referenced[m->objective.idx[i]]=1;
     }
@@ -1602,7 +1602,7 @@ static int fz_cp_try(const FZModel*m,FZSolution*sol){
             if(decl->has_lo){ int64_t lo=(int64_t)llround(decl->lo[0]); if(cp.lo[v]<lo)cp.lo[v]=lo; }
             if(decl->has_hi){ int64_t hi=(int64_t)llround(decl->hi[0]); if(cp.hi[v]>hi)cp.hi[v]=hi; }
             if(cp_intersect(&cp,v,cp.lo[v],cp.hi[v])){ /* empty initial domain -> UNSAT */
-                cp_free(&cp); for(int i=0;i<nc;i++){ free(cr[i].lvars);free(cr[i].lcoef);free(cr[i].terms);free(cr[i].setvals);free(cr[i].arr_terms);} free(cr); free(referenced); free(opt.bestx); free(optcoef);
+                cp_free(&cp); for(int i=0;i<nc;i++){ psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);} psolve_free(cr); psolve_free(referenced); psolve_free(opt.bestx); psolve_free(optcoef);
                 sol->status=1; sol->nvars=nv; sol->nodes=0; return 1;
             }
         }
@@ -1612,8 +1612,8 @@ static int fz_cp_try(const FZModel*m,FZSolution*sol){
        x*x*x*y*y = 100000 with unbounded x,y), bound the whole product chain
        to the divisors of that constant so search is finite and correct. */
     int bd=cp_bound_diophantine(&cp,cr,nc);
-    if(bd==1){ cp_free(&cp); for(int i=0;i<nc;i++){ free(cr[i].lvars);free(cr[i].lcoef);free(cr[i].terms);free(cr[i].setvals);free(cr[i].arr_terms);} free(cr); free(referenced); free(opt.bestx); free(optcoef); sol->status=1; sol->nvars=nv; return 1; }
-    if(bd==-1){ cp_free(&cp); for(int i=0;i<nc;i++){ free(cr[i].lvars);free(cr[i].lcoef);free(cr[i].terms);free(cr[i].setvals);free(cr[i].arr_terms);} free(cr); free(referenced); free(opt.bestx); free(optcoef); return 0; }
+    if(bd==1){ cp_free(&cp); for(int i=0;i<nc;i++){ psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);} psolve_free(cr); psolve_free(referenced); psolve_free(opt.bestx); psolve_free(optcoef); sol->status=1; sol->nvars=nv; return 1; }
+    if(bd==-1){ cp_free(&cp); for(int i=0;i<nc;i++){ psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);} psolve_free(cr); psolve_free(referenced); psolve_free(opt.bestx); psolve_free(optcoef); return 0; }
 
     double *outx=sol->x; /* sized nv */
 
@@ -1684,9 +1684,9 @@ static int fz_cp_try(const FZModel*m,FZSolution*sol){
     else { handled=0; } /* fallback: node cap (rr==4) or uncertifiable (rr==-1) */
 
     cp_free(&cp);
-    for(int i=0;i<nc;i++){ free(cr[i].lvars);free(cr[i].lcoef);free(cr[i].terms);free(cr[i].setvals);free(cr[i].arr_terms);} free(cr);
-    free(referenced);
-    free(opt.bestx); free(optcoef);
+    for(int i=0;i<nc;i++){ psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);} psolve_free(cr);
+    psolve_free(referenced);
+    psolve_free(opt.bestx); psolve_free(optcoef);
     if(!handled) return 0;
     return 1;
 }

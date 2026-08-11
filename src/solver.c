@@ -154,7 +154,7 @@ static Solver *solver_create_internal(const LP *lp)
                 pos++;
             }
         }
-        free(mk); free(acc); free(tlist);
+        psolve_free(mk); psolve_free(acc); psolve_free(tlist);
     }
     /* slack columns */
     for (i = 0; i < m; i++) {
@@ -183,7 +183,7 @@ static Solver *solver_create_internal(const LP *lp)
     if (m > 0 && (size_t)m > (size_t)-1 / (size_t)m / sizeof(double)) basis_ok = 0;
     if (pos > INT_MAX || !basis_ok) {
         solver_destroy(s);
-        free(mlt);
+        psolve_free(mlt);
         return NULL;
     }
 
@@ -226,7 +226,7 @@ static Solver *solver_create_internal(const LP *lp)
        in solver_solve() after a sparse solve diverges. */
     solver_reset_to_initial(s);
     s->iteration_limit = 2000000;
-    free(mlt);
+    psolve_free(mlt);
     return s;
 }
 
@@ -305,7 +305,7 @@ static void build_initial_basis(Solver *s)
             s->status[chosen] = LP_BASIC;
         }
     }
-    free(S);
+    psolve_free(S);
 
     /* finalize: every non-basic variable must have basispos = -1 */
     for (int j = 0; j < N; j++)
@@ -319,8 +319,8 @@ static int lp_var_is_free(double lo, double hi)
 
 static void free_normalized_lp(LP *lp)
 {
-    free(lp->c); free(lp->l); free(lp->u);
-    free(lp->Acolptr); free(lp->Arow); free(lp->Aval);
+    psolve_free(lp->c); psolve_free(lp->l); psolve_free(lp->u);
+    psolve_free(lp->Acolptr); psolve_free(lp->Arow); psolve_free(lp->Aval);
     memset(lp, 0, sizeof(*lp));
 }
 
@@ -354,7 +354,7 @@ Solver *solver_create(const LP *lp)
     for (int j = 0; j < n; j++) if (lp_var_is_free(lp->l[j], lp->u[j])) nfree++;
     /* ncore+1 is stored in an int-sized CSC pointer array. */
     if (n >= INT_MAX || nfree > INT_MAX - n - 1) {
-        free(orig_pos); free(orig_neg); return NULL;
+        psolve_free(orig_pos); psolve_free(orig_neg); return NULL;
     }
     int ncore = n + nfree;
     int next = 0;
@@ -379,12 +379,12 @@ Solver *solver_create(const LP *lp)
             long cnt = (long)lp->Acolptr[j+1] - lp->Acolptr[j];
             long mult = orig_neg[j] >= 0 ? 2L : 1L;
             if (cnt < 0 || cnt > (LONG_MAX - nnz) / mult) {
-                free_normalized_lp(&norm); free(orig_pos); free(orig_neg); return NULL;
+                free_normalized_lp(&norm); psolve_free(orig_pos); psolve_free(orig_neg); return NULL;
             }
             nnz += cnt * mult;
         }
         if (nnz > INT_MAX) {
-            free_normalized_lp(&norm); free(orig_pos); free(orig_neg); return NULL;
+            free_normalized_lp(&norm); psolve_free(orig_pos); psolve_free(orig_neg); return NULL;
         }
         norm.Acolptr = (int*)xmalloc((size_t)(ncore + 1) * sizeof(int));
         norm.Arow = (int*)xmalloc((size_t)(nnz ? nnz : 1) * sizeof(int));
@@ -412,7 +412,7 @@ Solver *solver_create(const LP *lp)
         s = solver_create_internal(&norm);
         free_normalized_lp(&norm);
     }
-    if (!s) { free(orig_pos); free(orig_neg); return NULL; }
+    if (!s) { psolve_free(orig_pos); psolve_free(orig_neg); return NULL; }
 
     s->n_orig = n;
     s->n_core = ncore;
@@ -431,18 +431,18 @@ Solver *solver_create(const LP *lp)
 void solver_destroy(Solver *s)
 {
     if (!s) return;
-    for (int i = 0; i < s->eta_cap; i++) free(s->eta[i]);
-    free(s->eta); free(s->eta_piv);
-    free(s->l); free(s->u); free(s->cobj); free(s->c0); free(s->basis); free(s->basispos);
-    free(s->orig_pos); free(s->orig_neg); free(s->orig_c); free(s->orig_l); free(s->orig_u);
-    free(s->status); free(s->x); free(s->rc); free(s->cB);
-    free(s->lu); free(s->piv); free(s->y); free(s->d); free(s->v); free(s->xb);
-    free(s->slackVar); free(s->artVar); free(s->beq); free(s->borig); free(s->mlt); free(s->artSign); free(s->rel);
-    free(s->w); free(s->vw); free(s->piw); free(s->duals);
-    free(s->colptr); free(s->row); free(s->val);
+    for (int i = 0; i < s->eta_cap; i++) psolve_free(s->eta[i]);
+    psolve_free(s->eta); psolve_free(s->eta_piv);
+    psolve_free(s->l); psolve_free(s->u); psolve_free(s->cobj); psolve_free(s->c0); psolve_free(s->basis); psolve_free(s->basispos);
+    psolve_free(s->orig_pos); psolve_free(s->orig_neg); psolve_free(s->orig_c); psolve_free(s->orig_l); psolve_free(s->orig_u);
+    psolve_free(s->status); psolve_free(s->x); psolve_free(s->rc); psolve_free(s->cB);
+    psolve_free(s->lu); psolve_free(s->piv); psolve_free(s->y); psolve_free(s->d); psolve_free(s->v); psolve_free(s->xb);
+    psolve_free(s->slackVar); psolve_free(s->artVar); psolve_free(s->beq); psolve_free(s->borig); psolve_free(s->mlt); psolve_free(s->artSign); psolve_free(s->rel);
+    psolve_free(s->w); psolve_free(s->vw); psolve_free(s->piw); psolve_free(s->duals);
+    psolve_free(s->colptr); psolve_free(s->row); psolve_free(s->val);
     splu_free(&s->splu);
-    free(s->bBp); free(s->bBi); free(s->bBx);
-    free(s);
+    psolve_free(s->bBp); psolve_free(s->bBi); psolve_free(s->bBx);
+    psolve_free(s);
 }
 
 /* ------------------------------------------------------------------ */
@@ -657,7 +657,7 @@ static void solver_reset_to_initial(Solver *s)
                 s->status[chosen] = LP_BASIC;
             }
         }
-        free(S);
+        psolve_free(S);
     }
 
     for (int j = 0; j < n; j++) {
@@ -1028,7 +1028,7 @@ static void recompute_basic(Solver *s)
     }
     ftran(s, rhs);
     for (int i = 0; i < M; i++) s->x[s->basis[i]] = rhs[i];
-    free(rhs);
+    psolve_free(rhs);
 }
 
 static int solve_phase(Solver *s)
@@ -1179,7 +1179,7 @@ static int solver_solve_impl(Solver *s)
             memcpy(tmp, s->duals, (size_t)s->M * sizeof(double));
             btrans(s, tmp);
             memcpy(s->duals, tmp, (size_t)s->M * sizeof(double));
-            free(tmp);
+            psolve_free(tmp);
         }
     }
     return 0;
@@ -1283,8 +1283,8 @@ void solver_set_bounds(Solver *s, const double *l, const double *u)
  * sparse CSC can be recovered without retaining a second matrix copy. */
 static void free_exported_lp(LP *lp)
 {
-    free(lp->c); free(lp->l); free(lp->u); free(lp->b); free(lp->rel);
-    free(lp->Acolptr); free(lp->Arow); free(lp->Aval);
+    psolve_free(lp->c); psolve_free(lp->l); psolve_free(lp->u); psolve_free(lp->b); psolve_free(lp->rel);
+    psolve_free(lp->Acolptr); psolve_free(lp->Arow); psolve_free(lp->Aval);
     memset(lp, 0, sizeof(*lp));
 }
 
@@ -1451,6 +1451,6 @@ int solver_feasible(const Solver *s)
     int ok = 1;
     for (int i = 0; i < M; i++)
         if (fabs(res[i] - s->beq[i]) > 1e-5 * (1.0 + fabs(s->beq[i]))) { ok = 0; break; }
-    free(res);
+    psolve_free(res);
     return ok;
 }
