@@ -43,7 +43,7 @@ with an explicit baseline `ARCH`.
 
 ```sh
 ./lpsolve [-t ms|--time-limit ms] <problem.lp> [--print]  # LP (revised simplex, double)
-./qpsolve <qp.qp>                      # convex QP (active-set)
+./qpsolve [-t ms|--time-limit ms] <qp.qp> [--print]  # convex QP (active-set)
 ./mipsolve [-t ms|--time-limit ms] <problem.lp> <nint> <j...> [--print]   # MIP (branch-and-bound)
 ./fznsolve [-a|--all-solutions] [-s] [-v] <problem.fzn>  # FlatZinc reader + solver (Phase 3)
 ./fxsolve <problem.lp> [--print]      # LP (exact rational / fixed-point simplex)
@@ -86,7 +86,14 @@ See `examples/free_vars.lp` for a runnable model.
 
 The QP solver handles: **minimize** ½xᵀQx + cᵀx subject to Ax ≤ b with Q
 symmetric positive semi-definite (convex), reporting the optimum, Lagrange
-multipliers, and status (solved / infeasible).
+multipliers, and status (solved / infeasible).  It supports the same
+cooperative `-t` / `--time-limit` (and Ctrl-C) stop as the LP/MIP drivers:
+the active-set and Phase-I feasibility loops poll `psolve_stop()` and wind
+down to status `QP_STOPPED`, handing back the feasible best incumbent without
+claiming optimality — no blocking on a UI/input thread.  All CLI drivers arm
+their budget through the shared `tools/tlimit.h` helper using `ITIMER_REAL`
+(microsecond resolution) rather than the whole-second-granularity `alarm()`,
+so small per-frame budgets are honored at the requested precision.
 
 The MIP solver (`mipsolve <lp> <nint> <j0 j1 ...>`) solves mixed-integer
 programs by **branch-and-bound** over the revised-simplex LP relaxation: the

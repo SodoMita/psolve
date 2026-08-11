@@ -450,13 +450,27 @@ only**, removing all ambiguity.  Examples and generators updated; parser fuzzed
 ---
 
 ## Phase 4 — Hardening for interactive use
-- [ ] `--time-limit` with signal/alarm handler and graceful `UNKNOWN` + best
-      incumbent (no blocking on UI/input threads).
+- [x] **`--time-limit` with signal/alarm handler and graceful stop + best
+      incumbent, at millisecond precision.** Every CLI driver (`lpsolve`,
+      `mipsolve`, `fznsolve`, and now `qpsolve`) arms its budget through the
+      shared `tools/tlimit.h` helper, which uses `ITIMER_REAL` (microsecond
+      resolution) instead of the old `alarm()` (whole-second granularity, which
+      rounded *up*: `-t 1` granted a full second, `-t 1500` granted two).  The
+      QP solver (the UI/layout workhorse) gained cooperative-stop support that
+      it previously lacked: `active_set` and the Phase-I feasibility search now
+      poll `psolve_stop()` and wind down to a new `QP_STOPPED` status, handing
+      back the feasible best incumbent (and *no* incumbent, with `x == NULL`,
+      if a stop lands during the Phase-I search) instead of running to a
+      fabricated OPTIMAL or blocking the frame.  See `tools/qp_stop_test.c`
+      and `tools/tlimit_test.c` for the regressions; a 50 ms budget is verified
+      to fire sub-second.
 - [ ] **Fixed-point end-to-end determinism** (bit-identical across platforms
       for UI/VG/physics; the PGS fixed kernel already guarantees this, extend
       to the rest of the pipeline: integration, collision, rendering).
 - [ ] Memory: optional preallocated arena so per-frame solves do zero `malloc`
-      (critical for 60 fps with no GC pauses).
+      (critical for 60 fps with no GC pauses).  (Note: the PGS kernels already
+      do zero-malloc via caller buffers + alloca; the general QP/LP solve paths
+      still allocate.)
 - [ ] Public C API audit: every entry point documented, bounds-checked, and
       returning status codes (no `exit` in library code).
 
