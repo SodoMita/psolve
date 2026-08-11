@@ -1,5 +1,22 @@
 # psolve — audit & hardening notes
 
+> **2026-08-11 — branch review + set-membership constant fold:** all remote
+> branches were re-surveyed from `feat/flatzinc-complete`.  Finding: the
+> `arena/continue-hardening` "floor division" change to `int_div`/`int_mod`
+> must **not** be ported — the MiniZinc Handbook ("Basic Modelling",
+> §2.1.2, and the language spec's arithmetic-operations section) defines
+> `a mod b` with the sign of the **dividend** and `a div b` by truncation
+> toward zero, i.e. exactly C's `/` and `%`, which the current code
+> implements; `divmod_verify.py` pins this.  A genuinely unported bug class
+> was found instead: `set_in_reif`/`set_in` with a constant or affine LHS.
+> `int_eq_reif(5,5,r)` worked, but `set_in_reif(7,{3,7,9},r)` bound `r=false`
+> and non-reified `set_in(265,1..280)` was UNKNOWN — the reified encodings
+> overwrote (`=`) instead of accumulating (`-=`) the difference form's
+> constant term after `lin_into`.  Fixed, folded, and regression-locked
+> (truth tables in `fzn_semantics_test.py`, edges + randomized constant-LHS
+> instances in `divmod_verify.py`; full `test.sh` green, ASan/UBSan corpus
+> sweep clean).  Branch: `arena/fzn-set-const-ops`.
+
 > **2026-08-08 follow-up:** the remaining remote branches were re-audited from
 > `arena/unmerged-audit-and-correctness`. Safe changes were ported, several
 > wrong-answer cases were repaired, and the unsound branch-and-clip commit was

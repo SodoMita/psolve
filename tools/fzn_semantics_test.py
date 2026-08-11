@@ -320,6 +320,58 @@ def test_circuit() -> None:
     require("----------" in out, f"standard fzn_circuit variant failed:\n{out}")
 
 
+def test_set_membership_constants() -> None:
+    """set_in / set_in_reif with constant (or affine) LHS must fold exactly.
+
+    Regression: the reified encodings built the difference form with
+    `d.constant = -v` instead of `-= v`, silently dropping the LHS constant,
+    so e.g. set_in_reif(7, {3,7,9}, r) bound r = false.  The non-reified
+    constant path was UNHANDLED (UNKNOWN) although decidable at compile time.
+    """
+    sets = [
+        ("{3, 7, 9}", {3, 7, 9}),
+        ("2..6", set(range(2, 7))),
+        ("{0, 5}", {0, 5}),
+        ("{}", set()),
+        ("1..0", set()),      # empty range
+    ]
+    cs = [-1, 0, 1, 2, 3, 4, 5, 6, 7, 9]
+    for stext, members in sets:
+        for c in cs:
+            member = c in members
+            out = run_model(f"constraint set_in({c}, {stext});\nsolve satisfy;")
+            solved = "----------" in out
+            unsat = "UNSATISFIABLE" in out
+            require(solved == member and unsat == (not member),
+                    f"set_in({c}, {stext}) member={member}:\\n{out}")
+            # reified truth table, exact both ways via bool_eq
+            for wanted in (False, True):
+                out = run_model(
+                    f"""
+                    var bool: r;
+                    constraint set_in_reif({c}, {stext}, r);
+                    constraint bool_eq(r, {'true' if wanted else 'false'});
+                    solve satisfy;
+                    """
+                )
+                solved = "----------" in out
+                require(solved == (member == wanted),
+                        f"set_in_reif({c}, {stext}, r={wanted}) "
+                        f"member={member}:\\n{out}")
+    # affine LHS must accumulate the constant, not overwrite it
+    out = run_model(
+        """
+        var 0..10: x;
+        var bool: r;
+        constraint int_eq(x, 4);
+        constraint set_in_reif(x + 3, {7}, r);
+        constraint bool_eq(r, true);
+        solve satisfy;
+        """
+    )
+    require("----------" in out, f"affine set_in_reif(x+3 in {{7}}) should hold:\\n{out}")
+
+
 def test_declaration_indices_and_honest_unknown() -> None:
     out = run_model(
         """
@@ -628,6 +680,7 @@ def main() -> int:
         test_float_linear_subset()
         test_table_and_constant_aliases()
         test_circuit()
+        test_set_membership_constants()
         test_declaration_indices_and_honest_unknown()
         test_all_solutions_and_extended_constraints()
     except AssertionError as exc:

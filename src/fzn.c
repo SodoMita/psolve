@@ -1781,7 +1781,7 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
            l2.constant>=0.0&&l2.constant<=1000.0){
             long exp = (long)l2.constant;
             if(exp == 0){
-                Lin eq;memset(&eq,0,sizeof(eq)); lin_into(&eq,&l3,1.0); eq.constant=-1.0;
+                Lin eq;memset(&eq,0,sizeof(eq)); lin_into(&eq,&l3,1.0); eq.constant-=1.0;
                 b_put(b,'=',0.0,&eq); lin_free(&eq);
                 lin_free(&l1);lin_free(&l2);lin_free(&l3); return 0;
             } else if(exp == 1){
@@ -1797,7 +1797,7 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
                    fabs(val)>0x1p53||val!=rint(val)){
                     lin_free(&l1);lin_free(&l2);lin_free(&l3);return 1;
                 }
-                Lin eq;memset(&eq,0,sizeof(eq)); lin_into(&eq,&l3,1.0); eq.constant=-val;
+                Lin eq;memset(&eq,0,sizeof(eq)); lin_into(&eq,&l3,1.0); eq.constant-=val;
                 b_put(b,'=',0.0,&eq); lin_free(&eq);
                 lin_free(&l1);lin_free(&l2);lin_free(&l3); return 0;
             } else if(l1.n==1 && b->haslo[l1.idx[0]] && b->hashi[l1.idx[0]]){
@@ -1808,7 +1808,7 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
                        fabs(val)>0x1p53||val!=rint(val)){
                         lin_free(&l1);lin_free(&l2);lin_free(&l3);return 1;
                     }
-                    Lin eq;memset(&eq,0,sizeof(eq)); lin_into(&eq,&l3,1.0); eq.constant=-val;
+                    Lin eq;memset(&eq,0,sizeof(eq)); lin_into(&eq,&l3,1.0); eq.constant-=val;
                     b_put(b,'=',0.0,&eq); lin_free(&eq);
                     lin_free(&l1);lin_free(&l2);lin_free(&l3); return 0;
                 }
@@ -1818,7 +1818,7 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
                     int *zs = (int*)psolve_malloc((size_t)nvals * sizeof(int));
                     for(int k=0;k<nvals;k++){
                         zs[k] = b_newvar(b,0.0,1.0);
-                        Lin di;memset(&di,0,sizeof(di)); lin_into(&di,&l1,1.0); di.constant=-(double)(vlo + k);
+                        Lin di;memset(&di,0,sizeof(di)); lin_into(&di,&l1,1.0); di.constant-=(double)(vlo + k);
                         add_int_reif(b,&di,zs[k],0); lin_free(&di);
                     }
                     Lin sum;memset(&sum,0,sizeof(sum)); lin_into(&sum,&l3,1.0);
@@ -1946,6 +1946,27 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
             lin_free(&xl); if(reified)lin_free(&rb); return 1;
         }
         if(!reified){
+            if(xl.n==0){
+                /* constant LHS: fold membership exactly (a previously
+                   UNHANDLED case reported UNKNOWN even though the answer is
+                   decidable at compile time).  Beyond 2^53 the double from
+                   parse_lin may have lost precision, so stay honest. */
+                double xv=xl.constant;
+                if(!isfinite(xv)||fabs(xv)>0x1p53){free(vals);lin_free(&xl);return 1;}
+                int member=(xv==rint(xv));
+                if(member){
+                    long v=(long)rint(xv);
+                    if(is_range) member=(rlo<=rhi&&v>=rlo&&v<=rhi);
+                    else {
+                        member=0;
+                        for(int i=0;i<nvals;i++) if(vals[i]==v){member=1;break;}
+                    }
+                }
+                if(!member){ /* constant is not a member: infeasible (0 = 1) */
+                    Lin nf;memset(&nf,0,sizeof(nf)); b_put(b,'=',1.0,&nf); lin_free(&nf);
+                }
+                free(vals); lin_free(&xl); return 0;
+            }
             if(xl.n!=1){free(vals);lin_free(&xl);return 1;}
             int x=xl.idx[0];
             if(is_range){
@@ -1960,7 +1981,10 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
                 }
                 free(vals); lin_free(&xl); return 0;
             }
-            if(nvals==0){free(vals);lin_free(&xl);return 1;}
+            if(nvals==0){ /* empty set: nothing is a member -> UNSAT */
+                Lin nf;memset(&nf,0,sizeof(nf)); b_put(b,'=',1.0,&nf); lin_free(&nf);
+                free(vals);lin_free(&xl);return 0;
+            }
             if(nvals==1){
                 double v=(double)vals[0];
                 /* intersect the singleton with the declared domain: a value
@@ -1990,10 +2014,13 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
                     Lin z;memset(&z,0,sizeof(z)); lin_term(&z,r,1.0); b_put(b,'=',0.0,&z); lin_free(&z);
                     free(vals); lin_free(&xl);lin_free(&rb); return 0;
                 }
-                Lin d1;memset(&d1,0,sizeof(d1)); lin_into(&d1,&xl,1.0); d1.constant=-(double)rlo;
+                /* d = xl - bound: SUBTRACT into the copied constant term.
+                   Overwriting it would drop xl's own constant and mis-pin r
+                   for constant or affine LHS (e.g. set_in_reif(7,S,r)). */
+                Lin d1;memset(&d1,0,sizeof(d1)); lin_into(&d1,&xl,1.0); d1.constant-=(double)rlo;
                 int b1=b_newvar(b,0.0,1.0);
                 add_int_reif(b,&d1,b1,3); lin_free(&d1);
-                Lin d2;memset(&d2,0,sizeof(d2)); lin_into(&d2,&xl,1.0); d2.constant=-(double)rhi;
+                Lin d2;memset(&d2,0,sizeof(d2)); lin_into(&d2,&xl,1.0); d2.constant-=(double)rhi;
                 int b2=b_newvar(b,0.0,1.0);
                 add_int_reif(b,&d2,b2,1); lin_free(&d2);
                 /* r = b1 AND b2 */
@@ -2006,7 +2033,7 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
                 int *zs=(int*)psolve_malloc((size_t)nvals*sizeof(int));
                 for(int i=0;i<nvals;i++){
                     zs[i]=b_newvar(b,0.0,1.0);
-                    Lin di;memset(&di,0,sizeof(di)); lin_into(&di,&xl,1.0); di.constant=-(double)vals[i];
+                    Lin di;memset(&di,0,sizeof(di)); lin_into(&di,&xl,1.0); di.constant-=(double)vals[i];
                     add_int_reif(b,&di,zs[i],0); lin_free(&di);
                 }
                 Lin sum;memset(&sum,0,sizeof(sum)); lin_term(&sum,r,1.0);
@@ -2016,6 +2043,11 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
                 for(int i=0;i<nvals;i++) lin_term(&at_most_one,zs[i],1.0);
                 b_put(b,'<',1.0,&at_most_one); lin_free(&at_most_one);
                 free(zs); free(vals); lin_free(&xl);lin_free(&rb); return 0;
+            } else {
+                /* empty set: membership is false, pin r = 0 */
+                Lin z;memset(&z,0,sizeof(z)); lin_term(&z,r,1.0);
+                b_put(b,'=',0.0,&z); lin_free(&z);
+                free(vals); lin_free(&xl);lin_free(&rb); return 0;
             }
             free(vals); lin_free(&xl);lin_free(&rb); return 1;
         }
@@ -2503,7 +2535,7 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
             int *zs=(int*)psolve_malloc((size_t)nvals*sizeof(int));
             for(int k=0;k<nvals;k++){
                 zs[k]=b_newvar(b,0.0,1.0);
-                Lin di;memset(&di,0,sizeof(di)); lin_into(&di,&arr[i],1.0); di.constant=-(double)vals[k];
+                Lin di;memset(&di,0,sizeof(di)); lin_into(&di,&arr[i],1.0); di.constant-=(double)vals[k];
                 add_int_reif(b,&di,zs[k],0); lin_free(&di);
             }
             Lin sum;memset(&sum,0,sizeof(sum)); lin_term(&sum,bi,1.0);
