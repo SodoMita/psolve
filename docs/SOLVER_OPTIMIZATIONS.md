@@ -2,13 +2,14 @@
 
 **Author:** psolve engineering & research team  
 **Target Architectures:** High-Performance Linear, Mixed-Integer, Quadratic, and Fixed-Point Physics Solvers  
-**Date:** 2026
+**Date:** 2026  
+**Document Version:** 2.0.0 (Extended with Literature, Source Code References & Implementation Snippets)
 
 ---
 
 ## 1. Executive Overview
 
-This document presents a research-backed survey of high-impact optimization techniques across modern mathematical programming and real-time physical simulation. It analyzes the mathematical foundations, algorithmic data structures, empirical speedup factors, and implementation trade-offs for:
+This document presents a research-backed survey of high-impact optimization techniques across modern mathematical programming and real-time physical simulation. It analyzes the mathematical foundations, algorithmic data structures, empirical speedup factors, implementation trade-offs, and provides academic papers and open-source codebase references for:
 
 1. **Linear Programming (LP):** Presolve, Dual Steepest Edge, Crash Bases, and Sparse LU updates.
 2. **Mixed-Integer Programming (MIP):** Conflict Graphs, Cutting Planes, Primal Heuristics (Feasibility Pump, RINS), and Reliability Branching.
@@ -36,11 +37,11 @@ This document presents a research-backed survey of high-impact optimization tech
 
 ### 2.1 Presolve Engine (PaPILO / HiGHS Architecture)
 
-Presolve reduces the constraint matrix dimensions before factorization. In industrial benchmarks, presolve eliminates **30% to 70% of rows and columns**, reducing solve times by **$2\times\text{ to }10\times$**:
+Presolve reduces constraint matrix dimensions prior to factorization. In industrial benchmarks (e.g. Netlib and Mittelmann LP sets), presolve eliminates **30% to 70% of rows and columns**, reducing solve times by **$2\times\text{ to }10\times$**:
 
 1. **Singleton Column / Row Reductions:**
-   - **Row Singleton ($a_i x_j = b_i$):** Instantly fixes $x_j = b_i / a_i$ and eliminates row $i$.
-   - **Column Singleton with Zero Objective ($c_j = 0, x_j$ appears only in row $i$):** Variable $x_j$ can be treated as a slack/free variable to satisfy row $i$, eliminating both $x_j$ and row $i$.
+   - **Row Singleton ($a_{ij} x_j = b_i$):** Instantly fixes $x_j = b_i / a_{ij}$ and eliminates row $i$.
+   - **Column Singleton with Zero Objective ($c_j = 0, x_j$ appears only in row $i$):** Variable $x_j$ is treated as a free slack variable to satisfy row $i$, eliminating both $x_j$ and row $i$.
 2. **Doubleton Equality Substitution ($a x_1 + b x_2 = c$):**
    - Expresses $x_2 = (c - a x_1) / b$, substitutes $x_2$ in all other constraints, updates variable bounds, and eliminates row and column.
 3. **Constraint Activity Bound Strengthening:**
@@ -50,8 +51,26 @@ Presolve reduces the constraint matrix dimensions before factorization. In indus
    - If $\overline{\alpha}_i \le U_i$, the upper bound is **redundant** and can be removed.
    - For variable $k$ with $a_{ik} > 0$, deduce tighter upper bound:
      $$x_k \le l_k + \frac{U_i - \underline{\alpha}_i}{a_{ik}}$$
-4. **Dual Postsolve Stack:**
-   - Store all linear transformations on a LIFO stack to reconstruct original primal and dual ($y, s$) solutions with exact precision.
+
+#### Code Snippet: Row Activity Tightening
+```c
+/* Pseudocode: Forward activity propagation */
+for (int i = 0; i < m; i++) {
+    double min_act = 0.0, max_act = 0.0;
+    for (int k = row_ptr[i]; k < row_ptr[i+1]; k++) {
+        int j = col_idx[k]; double a = val[k];
+        min_act += (a > 0) ? a * lo[j] : a * hi[j];
+        max_act += (a > 0) ? a * hi[j] : a * lo[j];
+    }
+    if (max_act < rhs_lo[i] || min_act > rhs_hi[i]) return INFEASIBLE;
+    /* Bound tightening on column j */
+    for (int k = row_ptr[i]; k < row_ptr[i+1]; k++) {
+        int j = col_idx[k]; double a = val[k];
+        if (a > 0) hi[j] = fmin(hi[j], lo[j] + (rhs_hi[i] - min_act) / a);
+        else if (a < 0) lo[j] = fmax(lo[j], hi[j] + (rhs_hi[i] - min_act) / a);
+    }
+}
+```
 
 ---
 
@@ -62,7 +81,10 @@ Traditional Dantzig pricing selects the pivot with the most negative reduced cos
 $$\gamma_i = \|B^{-1} e_i\|^2$$
 $$\text{Pivot Row } p = \arg\max_{i} \frac{(b_i - x_i)^2}{\gamma_i}$$
 
-- **Update Recurrence:** Instead of recomputing $\gamma_i$ ($O(m^2)$), update $\gamma$ dynamically using the FTRAN/BTRAN vectors in $O(m)$ work.
+#### Exact DSE Weight Update Recurrence:
+Instead of recomputing $\gamma_i$ ($O(m^2)$), update $\gamma$ dynamically after pivot row $p$ and entering column $q$:
+$$\gamma_p^{\text{new}} = \frac{1}{\alpha_{pq}^2} \gamma_p$$
+$$\gamma_i^{\text{new}} = \gamma_i - 2 \frac{\alpha_{iq}}{\alpha_{pq}} (B^{-T} e_i)^T (B^{-T} e_p) + \left(\frac{\alpha_{iq}}{\alpha_{pq}}\right)^2 \gamma_p \quad (\forall i \ne p)$$
 - **Performance Impact:** Cuts total simplex pivot count by **$2\times\text{ to }5\times$** compared to Dantzig and **$1.3\times\text{ to }1.8\times$** compared to Devex.
 
 ---
@@ -125,7 +147,8 @@ A **Conflict Graph $G = (V, E)$** represents mutual exclusivity between binary l
 ### 3.3 Primal Feasibility Heuristics
 
 1. **Feasibility Pump (Fischetti, Glover, Lodi):**
-   - Alternates between LP projection (rounding $x^*$ to nearest integer $\tilde{x}$) and LP feasibility (minimizing $\|x - \tilde{x}\|_1$).
+   - Alternates between LP projection (rounding $x^*$ to nearest integer $\tilde{x}$) and LP feasibility (minimizing $\|x - \tilde{x}\|_1$):
+     $$\min \sum_{j \in I: \tilde{x}_j = 0} x_j + \sum_{j \in I: \tilde{x}_j = 1} (1 - x_j) \quad \text{s.t. } Ax \le b$$
    - Finds initial feasible integer solutions in **$< 10$ iterations** on $90\%$ of industrial MIPs.
 2. **Relaxation Induced Neighborhood Search (RINS):**
    - Fixes all variables where the continuous relaxation $x_{LP}$ agrees with the incumbent $x_{INC}$ ($x_j^{LP} = x_j^{INC}$).
@@ -172,6 +195,23 @@ Standard 1D Projected Gauss-Seidel decouples normal impulse $\lambda_N$ and tang
 - **Coupled Block PGS:** Solves the coupled $2\times 2$ or $3\times 3$ contact block analytically:
   $$\begin{bmatrix} \lambda_N \\ \lambda_T \end{bmatrix}^{k+1} = \text{ProjectCone}\left( \begin{bmatrix} J M^{-1} J^T \end{bmatrix}^{-1} \begin{bmatrix} v_N \\ v_T \end{bmatrix} \right)$$
 - Eliminates slip-stick chatter on steep contact angles and heavy stacks.
+
+#### Code Snippet: Coupled 2x2 Contact Solver
+```c
+/* Exact analytical inverse of 2x2 contact mass matrix K = J * M^-1 * J^T */
+double det = K[0][0] * K[1][1] - K[0][1] * K[1][0];
+double invK[2][2] = {
+    {  K[1][1] / det, -K[0][1] / det },
+    { -K[1][0] / det,  K[0][0] / det }
+};
+/* Unconstrained delta impulses */
+double dN = -(invK[0][0] * vn + invK[0][1] * vt);
+double dT = -(invK[1][0] * vn + invK[1][1] * vt);
+/* Clamping to Coulomb cone: lambda_N >= 0, |lambda_T| <= mu * lambda_N */
+lambda_N = fmax(0.0, prev_lambda_N + dN);
+double maxFriction = mu * lambda_N;
+lambda_T = fmin(maxFriction, fmax(-maxFriction, prev_lambda_T + dT));
+```
 
 ---
 
@@ -290,9 +330,69 @@ Before allocating the simplex tableau in `fz_solve`:
 
 ---
 
-## 7. Implementation Priority & Roadmap
+## 7. Online References & Literature Citations
 
-| Optimization Technique | Component | Expected Speedup | Implementation Complexity | Priority |
+### 7.1 Linear Programming & Simplex Methods
+
+1. **Dual Steepest Edge Pricing:**
+   - Goldfarb, D., & Reid, J. K. (1977). *A Practicable Steepest-Edge Simplex Algorithm*. Mathematical Programming, 12(1), 361–371. [DOI: 10.1007/BF01584347](https://doi.org/10.1007/BF01584347)
+   - Forrest, J. J., & Goldfarb, D. (1992). *Steepest-edge simplex algorithms for linear programming*. Mathematical Programming, 57(1), 341–374. [DOI: 10.1007/BF01581089](https://doi.org/10.1007/BF01581089)
+2. **Parallel Dual Simplex & HiGHS Architecture:**
+   - Huangfu, Q., & Hall, J. A. J. (2018). *Parallelizing the dual revised simplex method*. Mathematical Programming Computation, 10(1), 119–142. [DOI: 10.1007/s12532-017-0130-5](https://doi.org/10.1007/s12532-017-0130-5) | [arXiv: 1503.01889](https://arxiv.org/abs/1503.01889)
+3. **Crash Bases & Factorization Updates:**
+   - Maros, I., & Mitra, G. (1998). *A Crash Procedure for Linear Programming Problems*. Technical Report, Brunel University.
+   - Forrest, J. J., & Tomlin, J. A. (1972). *Updated triangular factors of the basis to maintain sparsity in the product form simplex method*. Mathematical Programming, 2(1), 263–278.
+   - Suhl, U. H., & Suhl, L. M. (1990). *Computing sparse LU factorizations for large-scale linear programming bases*. ORSA Journal on Computing, 2(4), 325–335.
+4. **Presolve Systems:**
+   - Gamrath, G., et al. (2021). *PaPILO - A Parallel Presolve Library for Linear and Mixed-Integer Linear Optimization*. Mathematical Programming Computation. [GitHub: scipopt/papilo](https://github.com/scipopt/papilo)
+
+---
+
+### 7.2 Mixed-Integer Programming (MIP) & Branch-and-Cut
+
+1. **SCIP & Branch-and-Cut Foundation:**
+   - Achterberg, T. (2007). *Constraint Integer Programming*. PhD Thesis, TU Berlin. [ZIB Report 07-27](https://opus4.kobv.de/opus4-zib/frontdoor/index/index/docId/1113)
+   - Achterberg, T., Koch, T., & Martin, A. (2005). *Branching rules revisited*. Operations Research Letters, 33(1), 42–54. [DOI: 10.1016/j.orl.2004.04.002](https://doi.org/10.1016/j.orl.2004.04.002)
+2. **Primal Heuristics:**
+   - Fischetti, M., Glover, F., & Lodi, A. (2005). *The feasibility pump*. Mathematical Programming, 104(1), 91–104. [DOI: 10.1007/s10107-004-0570-3](https://doi.org/10.1007/s10107-004-0570-3)
+   - Danna, E., Rothberg, E., & Le Pape, C. (2005). *Exploring relaxation induced neighborhoods to improve MIP solutions*. Mathematical Programming, 102(1), 71–90. [DOI: 10.1007/s10107-004-0518-7](https://doi.org/10.1007/s10107-004-0518-7)
+   - Fischetti, M., & Monaci, M. (2014). *Proximity search for 0-1 mixed-integer programs*. Journal of Heuristics, 20(6), 709–731. [DOI: 10.1007/s10732-014-9262-4](https://doi.org/10.1007/s10732-014-9262-4)
+3. **Conflict Analysis & Cutting Planes:**
+   - Atamtürk, A., Nemhauser, G. L., & Savelsbergh, M. W. (2000). *Conflict graphs in integer programming*. European Journal of Operational Research, 121(1), 40–55.
+   - Gomory, R. E. (1960). *An Algorithm for the Mixed Integer Problem*. Technical Report RM-2597, The RAND Corporation.
+
+---
+
+### 7.3 Real-Time Physics & Contact LCP
+
+1. **Sequential Impulses & Temporal Coherence:**
+   - Catto, E. (2006). *Iterative Dynamics with Temporal Coherence*. Game Developers Conference (GDC). [Box2D Physics Engine](https://box2d.org/posts/2024/02/solver2d/)
+   - Catto, E. (2009). *Mixed Linear Complementarity Problems in Game Physics*. GDC.
+2. **Warm-Starting in Projected Gauss-Seidel:**
+   - Wang, D., Servin, M., & Berglund, T. (2016). *Warm starting the projected Gauss–Seidel algorithm for granular matter simulation*. Computational Particle Mechanics, 3(1), 43–57. [DOI: 10.1007/s40571-015-0088-x](https://doi.org/10.1007/s40571-015-0088-x)
+3. **Subspace Acceleration & Rigid Body Contact:**
+   - Baraff, D. (1994). *Fast Contact Force Computation for Nonpenetrating Rigid Bodies*. In Proceedings of SIGGRAPH 1994, 23–34. [ACM Digital Library](https://dl.acm.org/doi/10.1145/192161.192168)
+   - Erleben, K. (2007). *Numerical Methods for Linear Complementarity Problems in Physics-Based Animation*. In ACM SIGGRAPH Courses.
+
+---
+
+### 7.4 Open-Source Code References
+
+| System / Solver | Repository / URL | Key Reference Files |
+| :--- | :--- | :--- |
+| **HiGHS** | [GitHub: ERGO-Code/HiGHS](https://github.com/ERGO-Code/HiGHS) | `src/simplex/HDual.cpp` (DSE Simplex), `src/presolve/HPresolve.cpp`, `src/mip/HighsCutPool.cpp` |
+| **SCIP** | [GitHub: scipopt/scip](https://github.com/scipopt/scip) | `src/scip/branch_relpscost.c`, `src/scip/heur_feaspump.c`, `src/scip/heur_rins.c` |
+| **COIN-OR Cgl / CBC** | [GitHub: coin-or/Cgl](https://github.com/coin-or/Cgl) | `CglGomory.cpp` (GMI cuts), `CglKnapsackCover.cpp`, `CglClique.cpp` |
+| **PaPILO** | [GitHub: scipopt/papilo](https://github.com/scipopt/papilo) | `papilo/core/Presolve.hpp` (Activity propagation & substitutions) |
+| **Box2D v3** | [GitHub: erincatto/box2d](https://github.com/erincatto/box2d) | `src/solver.c` (TGS/PGS contact solver), `src/contact_solver.c` |
+| **Bullet Physics** | [GitHub: bulletphysics/bullet3](https://github.com/bulletphysics/bullet3) | `src/BulletDynamics/ConstraintSolver/btSequentialImpulseConstraintSolver.cpp` |
+| **QSopt_ex** | [QSopt_ex Exact LP](https://www.math.uwaterloo.ca/~bico/qsopt/ex/) | Exact rational arithmetic simplex implementation |
+
+---
+
+## 8. Implementation Priority & Roadmap
+
+| Optimization Technique | Target Module | Expected Speedup | Implementation Complexity | Priority |
 | :--- | :--- | :---: | :---: | :---: |
 | **Pritsker 0-1 Cumulative Formulation** | `src/fzn.c` | **$30,000\times$** on scheduling | Low | Completed |
 | **Directional Half-Reification (`*_imp`)** | `src/fzn.c` | Enables 20+ global constraints | Low | Completed |
