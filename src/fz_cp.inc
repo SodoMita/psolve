@@ -153,6 +153,7 @@ typedef struct {
     int    *lvars;  long long *lcoef;  long long rhs; int rel;
     CPT   *terms;
     int    nset; long long *setvals;
+    CPT   *arr_terms;  /* element array entries (CPT, const or var) */
 } CPCR;
 
 #define CPK_LIN 0
@@ -563,24 +564,44 @@ static int cp_prop_abs(CP*cp,CPT*a,CPT*c){
 
 /* ------------------------------------------------------------------ */
 /* element: res = arr[idx - offset], idx in [offset, offset+narr-1].   */
-/* terms[0]=idx, terms[1]=res; arr values in setvals (int).            */
+/* terms[0]=idx, terms[1]=res; arr entries in arrt (CPT, const or var).*/
 /* ------------------------------------------------------------------ */
-static int cp_prop_elem(CP*cp,CPT*idx,CPT*res,long long*arr,int narr,int offset){
+static int cp_prop_elem(CP*cp,CPT*idx,CPT*res,CPT*arrt,int narr,int offset){
     int64_t iv,rv;
     int iF=cp_term_value(cp,idx,&iv), rF=cp_term_value(cp,res,&rv);
     if(iF){
         long k=(long)(iv-offset);
-        if(k<0||k>=narr){ if(cp_intersect(cp,res->v,1,0)) return 1; return 1; }
-        int64_t val=arr[k];
-        if(rF){ if(rv!=val) return 1; }
-        else { if(cp_intersect(cp,res->v,val,val)) return 1; }
+        if(k<0||k>=narr) return 1;
+        CPT *e=&arrt[k];
+        int64_t ev;
+        int eF=cp_term_value(cp,e,&ev);
+        if(eF){
+            if(rF){ if(rv!=ev) return 1; }
+            else if(!res->isc && cp_intersect(cp,res->v,ev,ev)) return 1;
+        } else if(res->isc){
+            /* res fixed, e is a var: e must equal res */
+            if(cp_intersect(cp,e->v,res->c,res->c)) return 1;
+        } else if(!res->isc && e->v==res->v){
+            return 0; /* res == res always true */
+        } else if(!res->isc){
+            /* res and e both vars: e must equal res -> bound both to intersection */
+            int64_t elo=cp_dmin(cp,e->v),ehi=cp_dmax(cp,e->v);
+            int64_t rlo=cp_dmin(cp,res->v),rhi=cp_dmax(cp,res->v);
+            int64_t nlo=(elo>rlo?elo:rlo), nhi=(ehi<rhi?ehi:rhi);
+            if(cp_intersect(cp,e->v,nlo,nhi)) return 1;
+            if(cp_intersect(cp,res->v,nlo,nhi)) return 1;
+            if(cp_fixed(cp,e->v)&&cp_fixed(cp,res->v)&&cp->vals[e->v][0]!=cp->vals[res->v][0]) return 1;
+        }
         return 0;
     }
-    /* index not fixed.  If res fixed, restrict index to positions holding res. */
+    /* index not fixed.  If res fixed, restrict index to positions that can hold res. */
     if(rF){
         if(cp->bounded[idx->v] && cp->nvals[idx->v]<=CP_MAXVALS){
             int64_t *nvals=NULL; int nn=0,cap2=0;
-            for(int i=0;i<cp->nvals[idx->v];i++){ int64_t iv2=cp->vals[idx->v][i]; long k=(long)(iv2-offset); if(k>=0&&k<narr&&arr[k]==rv){ if(nn>=cap2){cap2=cap2?cap2*2:8;nvals=(int64_t*)psolve_realloc((void**)&nvals,(size_t)cap2*sizeof(int64_t));} nvals[nn++]=iv2; } }
+            for(int i=0;i<cp->nvals[idx->v];i++){ int64_t iv2=cp->vals[idx->v][i]; long k=(long)(iv2-offset);
+                if(k>=0&&k<narr){ CPT*e=&arrt[k]; int64_t ev; int eF=cp_term_value(cp,e,&ev);
+                    int can = eF ? (ev==rv) : (!e->isc && cp_contains(cp,e->v,rv));
+                    if(can){ if(nn>=cap2){cap2=cap2?cap2*2:8;nvals=(int64_t*)psolve_realloc((void**)&nvals,(size_t)cap2*sizeof(int64_t));} nvals[nn++]=iv2; } } }
             if(nn==0){ free(nvals); return 1; }
             if(cp_set_vals(cp,idx->v,nvals,nn)<0){ free(nvals); return -1; } free(nvals);
         }
@@ -983,14 +1004,19 @@ static int cp_parse(FZModel*m,CPCR**out_cr,int*out_n,unsigned char*referenced,in
             Lin*arr;int narr; if(parse_array(m,c->args[arr_arg],&arr,&narr)!=0){lin_free(&il);ok=0;break;}
             Lin vl; if(parse_lin(m,c->args[val_arg],&vl)!=0){lin_free(&il);free_lins(arr,narr);ok=0;break;}
             rec.kind=CPK_ELEM; rec.n=2; rec.terms=(CPT*)psolve_calloc(2,sizeof(CPT));
-            rec.setvals=(long long*)psolve_malloc((size_t)(narr?narr:1)*sizeof(long long));
-            int bad=0;
-            for(int i=0;i<narr;i++){ if(arr[i].n!=0 || !isfinite(arr[i].constant)||arr[i].constant!=rint(arr[i].constant)){bad=1;break;} rec.setvals[i]=(long long)arr[i].constant; }
+            rec.arr_terms=(CPT*)psolve_calloc((size_t)(narr?narr:1),sizeof(CPT));
             rec.nset=narr;
+            int bad=0;
+            /* array entries may be constants OR variables (the MiniZinc std
+               library builds element arrays like [1, X7, X8, X9]). */
+            for(int i=0;i<narr;i++){
+                if(cp_term_from_lin(&arr[i],&rec.arr_terms[i])!=0){ bad=1; break; }
+                if(!rec.arr_terms[i].isc) referenced[rec.arr_terms[i].v]=1;
+            }
             free_lins(arr,narr);
             if(!bad){ if(cp_term_from_lin(&il,&rec.terms[0])!=0) bad=1; if(cp_term_from_lin(&vl,&rec.terms[1])!=0) bad=1; }
             lin_free(&il);lin_free(&vl);
-            if(bad){ free(rec.terms); free(rec.setvals); ok=0; break; }
+            if(bad){ free(rec.terms); free(rec.arr_terms); ok=0; break; }
             if(!rec.terms[0].isc) referenced[rec.terms[0].v]=1;
             if(!rec.terms[1].isc) referenced[rec.terms[1].v]=1;
             rec.lvars=(int*)psolve_malloc(sizeof(int)); rec.lvars[0]=(int)offset; /* store offset */
@@ -1130,8 +1156,8 @@ static int cp_parse(FZModel*m,CPCR**out_cr,int*out_n,unsigned char*referenced,in
         if(nc>=cap){ cap*=2; cr=(CPCR*)psolve_realloc((void**)&cr,(size_t)cap*sizeof(CPCR)); }
         cr[nc++]=rec;
     }
-    if(!ok){ for(int i=0;i<nc;i++){ free(cr[i].lvars);free(cr[i].lcoef);free(cr[i].terms);free(cr[i].setvals);} free(cr); return -1; }
-    if(!motivating){ for(int i=0;i<nc;i++){ free(cr[i].lvars);free(cr[i].lcoef);free(cr[i].terms);free(cr[i].setvals);} free(cr); return -2; }
+    if(!ok){ for(int i=0;i<nc;i++){ free(cr[i].lvars);free(cr[i].lcoef);free(cr[i].terms);free(cr[i].setvals);free(cr[i].arr_terms);} free(cr); return -1; }
+    if(!motivating){ for(int i=0;i<nc;i++){ free(cr[i].lvars);free(cr[i].lcoef);free(cr[i].terms);free(cr[i].setvals);free(cr[i].arr_terms);} free(cr); return -2; }
     *out_cr=cr; *out_n=nc; *has_cp_motivating=motivating;
     return 0;
 }
@@ -1159,7 +1185,7 @@ static int cp_propagate(CP*cp,CPCR*cr,int nc){
                 case CPK_DIV: r=cp_prop_divmod(cp,&cr[i].terms[0],cr[i].terms[1].c,&cr[i].terms[2],1); break;
                 case CPK_MOD: r=cp_prop_divmod(cp,&cr[i].terms[0],cr[i].terms[1].c,&cr[i].terms[2],0); break;
                 case CPK_ABS: r=cp_prop_abs(cp,&cr[i].terms[0],&cr[i].terms[1]); break;
-                case CPK_ELEM: r=cp_prop_elem(cp,&cr[i].terms[0],&cr[i].terms[1],cr[i].setvals,cr[i].nset,(int)cr[i].lvars[0]); break;
+                case CPK_ELEM: r=cp_prop_elem(cp,&cr[i].terms[0],&cr[i].terms[1],cr[i].arr_terms,cr[i].nset,(int)cr[i].lvars[0]); break;
                 case CPK_SETIN: r=cp_prop_setin(cp,&cr[i].terms[0],cr[i].setvals,cr[i].nset); break;
                 case CPK_POW: r=cp_prop_pow(cp,&cr[i].terms[0],cr[i].terms[1].c,&cr[i].terms[2]); break;
                 case CPK_REIF: r=cp_prop_reif(cp,&cr[i]); break;
@@ -1195,7 +1221,7 @@ static int cp_verify(const CP*cp,CPCR*cr,int nc,const double*outx){
         } else if(r->kind==CPK_DIV){ if(cp_term_out(&r->terms[2],outx) != cp_term_out(&r->terms[0],outx)/r->terms[1].c) return 0; }
         else if(r->kind==CPK_MOD){ if(cp_term_out(&r->terms[2],outx) != cp_term_out(&r->terms[0],outx)%r->terms[1].c) return 0; }
         else if(r->kind==CPK_ABS){ int64_t a=cp_term_out(&r->terms[0],outx); if(cp_term_out(&r->terms[1],outx) != (a<0?-a:a)) return 0; }
-        else if(r->kind==CPK_ELEM){ int64_t idx=cp_term_out(&r->terms[0],outx); long k=(long)(idx - (int)r->lvars[0]); if(k<0||k>=r->nset)return 0; if(cp_term_out(&r->terms[1],outx)!=r->setvals[k]) return 0; }
+        else if(r->kind==CPK_ELEM){ int64_t idx=cp_term_out(&r->terms[0],outx); long k=(long)(idx - (int)r->lvars[0]); if(k<0||k>=r->nset)return 0; if(cp_term_out(&r->terms[1],outx)!=cp_term_out(&r->arr_terms[k],outx)) return 0; }
         else if(r->kind==CPK_SETIN){ int64_t x=cp_term_out(&r->terms[0],outx); int found=0; for(int k=0;k<r->nset;k++) if(r->setvals[k]==x){found=1;break;} if(!found)return 0; }
         else if(r->kind==CPK_POW){ int64_t b=cp_term_out(&r->terms[0],outx), e=r->terms[1].c, c=cp_term_out(&r->terms[2],outx); __int128 p=1; for(int64_t q=0;q<e;q++){p*=(__int128)b;if(p>INT64_MAX||p<INT64_MIN)return 0;} if(p!=c)return 0; }
         else if(r->kind==CPK_REIF){
@@ -1357,7 +1383,7 @@ static int fz_cp_try(const FZModel*m,FZSolution*sol){
             if(decl->has_lo){ int64_t lo=(int64_t)llround(decl->lo[0]); if(cp.lo[v]<lo)cp.lo[v]=lo; }
             if(decl->has_hi){ int64_t hi=(int64_t)llround(decl->hi[0]); if(cp.hi[v]>hi)cp.hi[v]=hi; }
             if(cp_intersect(&cp,v,cp.lo[v],cp.hi[v])){ /* empty initial domain -> UNSAT */
-                cp_free(&cp); for(int i=0;i<nc;i++){ free(cr[i].lvars);free(cr[i].lcoef);free(cr[i].terms);free(cr[i].setvals);} free(cr); free(referenced);
+                cp_free(&cp); for(int i=0;i<nc;i++){ free(cr[i].lvars);free(cr[i].lcoef);free(cr[i].terms);free(cr[i].setvals);free(cr[i].arr_terms);} free(cr); free(referenced);
                 sol->status=1; sol->nvars=nv; sol->nodes=0; return 1;
             }
         }
@@ -1367,8 +1393,8 @@ static int fz_cp_try(const FZModel*m,FZSolution*sol){
        x*x*x*y*y = 100000 with unbounded x,y), bound the whole product chain
        to the divisors of that constant so search is finite and correct. */
     int bd=cp_bound_diophantine(&cp,cr,nc);
-    if(bd==1){ cp_free(&cp); for(int i=0;i<nc;i++){ free(cr[i].lvars);free(cr[i].lcoef);free(cr[i].terms);free(cr[i].setvals);} free(cr); free(referenced); sol->status=1; sol->nvars=nv; return 1; }
-    if(bd==-1){ cp_free(&cp); for(int i=0;i<nc;i++){ free(cr[i].lvars);free(cr[i].lcoef);free(cr[i].terms);free(cr[i].setvals);} free(cr); free(referenced); return 0; }
+    if(bd==1){ cp_free(&cp); for(int i=0;i<nc;i++){ free(cr[i].lvars);free(cr[i].lcoef);free(cr[i].terms);free(cr[i].setvals);free(cr[i].arr_terms);} free(cr); free(referenced); sol->status=1; sol->nvars=nv; return 1; }
+    if(bd==-1){ cp_free(&cp); for(int i=0;i<nc;i++){ free(cr[i].lvars);free(cr[i].lcoef);free(cr[i].terms);free(cr[i].setvals);free(cr[i].arr_terms);} free(cr); free(referenced); return 0; }
 
     double *outx=sol->x; /* sized nv */
 
@@ -1415,7 +1441,7 @@ static int fz_cp_try(const FZModel*m,FZSolution*sol){
     else { handled=0; } /* fallback */
 
     cp_free(&cp);
-    for(int i=0;i<nc;i++){ free(cr[i].lvars);free(cr[i].lcoef);free(cr[i].terms);free(cr[i].setvals);} free(cr);
+    for(int i=0;i<nc;i++){ free(cr[i].lvars);free(cr[i].lcoef);free(cr[i].terms);free(cr[i].setvals);free(cr[i].arr_terms);} free(cr);
     free(referenced);
     if(!handled) return 0;
     return 1;
