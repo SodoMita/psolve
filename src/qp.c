@@ -111,11 +111,11 @@ static int solve_kkt(const QP *qp, const int *W, int k,
             r = lu_factor(K, N, piv);
         }
     }
-    if (!good) { free(blk); free(piv); return -1; }
+    if (!good) { psolve_free(blk); psolve_free(piv); return -1; }
     for (int i = 0; i < n; i++) p[i] = rhs[i];
     for (int c = 0; c < k; c++) mu[c] = rhs[n+c];
 
-    free(blk); free(piv);
+    psolve_free(blk); psolve_free(piv);
     return 0;
 }
 
@@ -340,7 +340,7 @@ static void active_set(const QP *qp, const double *xstart, QPResult *res)
     res->iterations = it;
     res->obj = eval_obj(qp, x);
     res->status = status;
-    free(W); free(orth); free(tmp); free(g); free(p); free(mu); free(xnew);
+    psolve_free(W); psolve_free(orth); psolve_free(tmp); psolve_free(g); psolve_free(p); psolve_free(mu); psolve_free(xnew);
 }
 
 /* Find a feasible point for A x <= b, or accept a provided one.
@@ -388,7 +388,7 @@ static int find_feasible(const QP *qp, const double *x0, double *x)
     int ok = 0;
     if (r1.status == QP_STOPPED) {
         qp_result_free(&r1);
-        free(Q1); free(c1); free(A1); free(b1); free(z0);
+        psolve_free(Q1); psolve_free(c1); psolve_free(A1); psolve_free(b1); psolve_free(z0);
         return 2;   /* stopped during Phase-I feasibility search */
     }
     if (r1.status == 0) {
@@ -408,7 +408,7 @@ static int find_feasible(const QP *qp, const double *x0, double *x)
     }
 
     qp_result_free(&r1);
-    free(Q1); free(c1); free(A1); free(b1); free(z0);
+    psolve_free(Q1); psolve_free(c1); psolve_free(A1); psolve_free(b1); psolve_free(z0);
     return ok;
 }
 
@@ -458,7 +458,7 @@ void qp_solve(const QP *qp, QPResult *res)
     double *x = (double*)xmalloc((size_t)qp->n * sizeof(double));
     memset(x, 0, (size_t)qp->n * sizeof(double));
     int fr = find_feasible(qp, qp->x0, x);
-    if (fr == 0) { free(x); return; }   /* status stays -1: no feasible start */
+    if (fr == 0) { psolve_free(x); return; }   /* status stays -1: no feasible start */
     if (fr == 2) {
         /* Cooperatively stopped while searching for a feasible point, so there
            is no feasible incumbent to hand back.  Report QP_STOPPED with an
@@ -468,16 +468,16 @@ void qp_solve(const QP *qp, QPResult *res)
         res->x = NULL;
         res->obj = 0.0;
         res->iterations = 0;
-        free(x);
+        psolve_free(x);
         return;
     }
     active_set(qp, x, res);
-    free(x);
+    psolve_free(x);
 }
 
 void qp_result_free(QPResult *res)
 {
     if (!res) return;
-    free(res->x); free(res->mult);
+    psolve_free(res->x); psolve_free(res->mult);
     memset(res, 0, sizeof(*res));
 }

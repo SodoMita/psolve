@@ -62,6 +62,15 @@ gcc -O2 -march=native -I src tools/qp_stop_test.c src/qp.c src/err.c src/lu.c sr
 gcc -O2 -march=native -I tools tools/tlimit_test.c -o /tmp/tlimit_test -lm
 /tmp/tlimit_test
 
+echo "[5.3/7] Re-entrant zero-malloc arena (QP/LP/fx, Phase 4)..."
+# Links --wrap=malloc/calloc/realloc/free so every libc heap call is counted;
+# verifies the solve paths make ZERO libc heap calls while an arena is active.
+gcc -O2 -march=native -DARENA_TEST_WRAP -I src tools/arena_test.c src/qp.c \
+    src/mip.c src/fx.c src/err.c src/solver.c src/splu.c src/lu.c src/kernels.c \
+    src/parser.c -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=realloc \
+    -Wl,--wrap=free -o /tmp/arena_test -lm
+/tmp/arena_test
+
 echo "[5.5/7] MIP solver (branch-and-bound) vs brute force..."
 gcc -O2 -march=native -I src tools/mip_test.c src/mip.c src/fx.c src/err.c src/solver.c src/splu.c src/lu.c src/kernels.c src/parser.c -o /tmp/mip_test -lm
 /tmp/mip_test

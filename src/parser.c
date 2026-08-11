@@ -48,7 +48,7 @@ int lp_read(const char *path, LP *out)
     /* Keep every cleanup-owned pointer in function scope and initialize it
        before any path can jump to `err`.  The previous layout declared these
        halfway through the function, so early parse errors jumped past their
-       initializers and then passed indeterminate pointers to free(). */
+       initializers and then passed indeterminate pointers to psolve_free(). */
     int *tr = NULL, *tc = NULL;
     double *tv = NULL;
     int *colcount = NULL;
@@ -124,19 +124,19 @@ int lp_read(const char *path, LP *out)
         do { c = fgetc(f); } while (c != EOF && (c==' '||c=='\t'||c=='\n'||c=='\r'));
         for (; c != EOF && c!=' ' && c!='\t' && c!='\n' && c!='\r'; c = fgetc(f)) {
             if (pos < rel_len) { relbuf[pos++] = (char)c; got = 1; }
-            else { free(relbuf); goto err; }       /* token longer than m */
+            else { psolve_free(relbuf); goto err; }       /* token longer than m */
         }
         relbuf[pos] = '\0';
-        if (!got || pos != rel_len) { free(relbuf); goto err; }
+        if (!got || pos != rel_len) { psolve_free(relbuf); goto err; }
         for (int i = 0; i < m; i++) {
             char ch = relbuf[i];
             if (ch != '<' && ch != '>' && ch != '=') {
                 fprintf(stderr, "invalid relation at index %d\n", i);
-                free(relbuf); goto err;
+                psolve_free(relbuf); goto err;
             }
             lp->rel[i] = ch;
         }
-        free(relbuf);
+        psolve_free(relbuf);
     }
 
     for (int j = 0; j < n; j++) {
@@ -186,7 +186,7 @@ int lp_read(const char *path, LP *out)
     colcount = (int*)psolve_calloc((size_t)(n + 1), sizeof(int));
     out_r = (int*)psolve_malloc((size_t)(nnz ? nnz : 1) * sizeof(int));
     out_v = (double*)psolve_malloc((size_t)(nnz ? nnz : 1) * sizeof(double));
-    if (!colcount || !out_r || !out_v) { free(colcount); free(out_r); free(out_v); colcount = NULL; out_r = NULL; out_v = NULL; goto err2; }
+    if (!colcount || !out_r || !out_v) { psolve_free(colcount); psolve_free(out_r); psolve_free(out_v); colcount = NULL; out_r = NULL; out_v = NULL; goto err2; }
     for (long k = 0; k < nnz; k++) colcount[tc[k] + 1]++;
     for (int j = 0; j < n; j++) colcount[j + 1] += colcount[j];
     for (long k = 0; k < nnz; k++) {
@@ -194,7 +194,7 @@ int lp_read(const char *path, LP *out)
         out_r[pos] = tr[k];
         out_v[pos] = tv[k];
     }
-    free(tr); free(tc); free(tv);
+    psolve_free(tr); psolve_free(tc); psolve_free(tv);
     tr = NULL; tc = NULL; tv = NULL;
 
     lp->Acolptr = (int*)psolve_malloc((size_t)(n + 1) * sizeof(int));
@@ -204,7 +204,7 @@ int lp_read(const char *path, LP *out)
     lp->Acolptr[0] = 0;
     for (int j = 0; j < n; j++) lp->Acolptr[j + 1] = colcount[j];
     for (long k = 0; k < nnz; k++) { lp->Arow[k] = out_r[k]; lp->Aval[k] = out_v[k]; }
-    free(colcount); free(out_r); free(out_v);
+    psolve_free(colcount); psolve_free(out_r); psolve_free(out_v);
     fclose(f);
     *out=storage;
     return 0;
@@ -217,8 +217,8 @@ err:
     /* Every temporary is initialized at function entry and owned until this
        single cleanup point, so early errors cannot free garbage or double-free
        an allocation already released by an intermediate error path. */
-    free(tr); free(tc); free(tv);
-    free(colcount); free(out_r); free(out_v);
+    psolve_free(tr); psolve_free(tc); psolve_free(tv);
+    psolve_free(colcount); psolve_free(out_r); psolve_free(out_v);
     lp_free(lp);
     return -1;
 }
@@ -226,8 +226,8 @@ err:
 void lp_free(LP *lp)
 {
     if (!lp) return;
-    free(lp->c); free(lp->b); free(lp->l); free(lp->u); free(lp->rel);
-    free(lp->Acolptr); free(lp->Arow); free(lp->Aval);
+    psolve_free(lp->c); psolve_free(lp->b); psolve_free(lp->l); psolve_free(lp->u); psolve_free(lp->rel);
+    psolve_free(lp->Acolptr); psolve_free(lp->Arow); psolve_free(lp->Aval);
     lp->c = lp->b = lp->l = lp->u = NULL;
     lp->rel = NULL; lp->Acolptr = NULL; lp->Arow = NULL; lp->Aval = NULL;
 }

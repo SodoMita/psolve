@@ -78,9 +78,45 @@ Full `./test.sh` (minus the MiniZinc differential, which needs the `minizinc`
 compiler) passes with zero wrong answers; the changed drivers are fuzz-clean
 and OOM-injection-clean under ASan/UBSan.
 
+## Zero-malloc arena (added later on this branch)
+
+The next Phase 4 bullet — *optional preallocated arena for zero-`malloc`
+per-frame solves* — was completed.  A prior remote branch (`arena/audit-hardening`)
+had attempted this with a **process-global** active arena, which the branch
+audit rejected as unsound: global mutable state violates the project's
+"re-entrant, no-global-state" rule, and its `realloc` read a header from a
+pointer that might not be arena-owned (a libc pointer in scope → garbage read).
+
+The implementation on this branch (`src/err.c`, `src/err.h`) is sound by
+construction:
+
+- **Thread-local**: each thread has its own active-arena stack
+  (`_Thread_local`), so concurrent frames on different threads never corrupt
+  one another.  `psolve_arena_use(a)` pushes, `psolve_arena_end()` pops;
+  nesting is supported.
+- **Ownership-checked `free` / `realloc`**: a pointer is only treated as
+  arena-owned if it lies inside the active arena's buffer range.  A libc
+  pointer realloc'd under an active arena falls back to libc — no header is
+  ever read from a non-arena block.
+- **Every library allocation now routes through `psolve_*`**: the solver,
+  QP, MIP, fx (including `fx_core.inc`), sparse-LU, parser and FlatZinc paths
+  were converted from raw `malloc`/`calloc`/`free` to `psolve_malloc` /
+  `psolve_calloc` / `psolve_free`.  This is what makes the zero-malloc
+  guarantee real: while an arena is active, all of these bump-allocate from
+  the arena and their frees are no-ops (reclaimed on `psolve_arena_reset`).
+- **Correctness & budget**: an undersized arena reports OOM through the
+  existing `psolve_fail` protocol rather than corrupting memory.
+
+`tools/arena_test.c` (wired into `test.sh` as `[5.3/7]`) links with
+`--wrap=malloc,calloc,realloc,free` and asserts that the QP, LP and exact-fx
+**solve** calls make zero libc heap calls under an active arena, return the
+same objective as a non-arena solve, and remain correct under nested scopes.
+It also verifies ownership (non-arena pointer realloc → libc), reset reuse, and
+a clean failure on an undersized arena.  Full `./test.sh` (minus the MiniZinc
+differential, which needs the `minizinc` compiler) passes with zero wrong
+answers.
+
 ## Remaining Phase 4 items (not in this branch)
 
 - Fixed-point end-to-end determinism for the wider pipeline.
-- Optional preallocated arena for zero-`malloc` per-frame QP/LP solves (the PGS
-  physics kernels already do zero-malloc via caller buffers + alloca).
 - Public C API audit completion.

@@ -89,8 +89,8 @@ static void work_update(Work *w, int r, int c, double delta, double tol)
 
 static void work_free(Work *w)
 {
-    free(w->row_of); free(w->col_of); free(w->row_next); free(w->col_next);
-    free(w->val_of); free(w->row_head); free(w->col_head); free(w->elim_row);
+    psolve_free(w->row_of); psolve_free(w->col_of); psolve_free(w->row_next); psolve_free(w->col_next);
+    psolve_free(w->val_of); psolve_free(w->row_head); psolve_free(w->col_head); psolve_free(w->elim_row);
 }
 
 int splu_factor(SPLU *s, const int *Bp, const int *Bi, const double *Bx, int m)
@@ -218,18 +218,18 @@ int splu_factor(SPLU *s, const int *Bp, const int *Bi, const double *Bx, int m)
                 int j = Urj[t];
                 Uci[fill[j]] = k; Ucx[fill[j]] = Urx[t]; fill[j]++;
             }
-        free(fill); free(colcnt);
+        psolve_free(fill); psolve_free(colcnt);
         s->Lp = Lp; s->Li = Li; s->Lx = Lx;
         s->Urp = Urp; s->Urj = Urj; s->Urx = Urx;
         s->Ucp = Ucp; s->Uci = Uci; s->Ucx = Ucx;
     } else {
-        free(Lp); free(Li); free(Lx);
-        free(Urp); free(Urj); free(Urx);
-        free(s->piv); free(s->qinv); free(s->udiag);
+        psolve_free(Lp); psolve_free(Li); psolve_free(Lx);
+        psolve_free(Urp); psolve_free(Urj); psolve_free(Urx);
+        psolve_free(s->piv); psolve_free(s->qinv); psolve_free(s->udiag);
         s->piv = s->qinv = NULL; s->udiag = NULL;
     }
 
-    free(colorder); free(colpos);
+    psolve_free(colorder); psolve_free(colpos);
     work_free(&w);
     return ok;
 }
@@ -237,10 +237,10 @@ int splu_factor(SPLU *s, const int *Bp, const int *Bi, const double *Bx, int m)
 void splu_free(SPLU *s)
 {
     if (!s) return;
-    free(s->piv); free(s->qinv); free(s->udiag);
-    free(s->Lp); free(s->Li); free(s->Lx);
-    free(s->Urp); free(s->Urj); free(s->Urx);
-    free(s->Ucp); free(s->Uci); free(s->Ucx);
+    psolve_free(s->piv); psolve_free(s->qinv); psolve_free(s->udiag);
+    psolve_free(s->Lp); psolve_free(s->Li); psolve_free(s->Lx);
+    psolve_free(s->Urp); psolve_free(s->Urj); psolve_free(s->Urx);
+    psolve_free(s->Ucp); psolve_free(s->Uci); psolve_free(s->Ucx);
     memset(s, 0, sizeof(*s));
 }
 
@@ -287,9 +287,9 @@ void splu_solve(const SPLU *s, const double *b, double *x)
         double *w = (double*)psolve_malloc((size_t)m * sizeof(double));
         memcpy(w, x, (size_t)m * sizeof(double));
         for (int j = 0; j < m; j++) x[s->qinv[j]] = w[j];
-        free(w);
+        psolve_free(w);
     }
-    free(rinv);
+    psolve_free(rinv);
 }
 
 void splu_solve_t(const SPLU *s, const double *b, double *x)
@@ -321,7 +321,7 @@ void splu_solve_t(const SPLU *s, const double *b, double *x)
         double *v = (double*)psolve_malloc((size_t)m * sizeof(double));
         memcpy(v, x, (size_t)m * sizeof(double));
         for (int i = 0; i < m; i++) x[s->piv[i]] = v[i];
-        free(v);
+        psolve_free(v);
     }
-    free(rinv);
+    psolve_free(rinv);
 }

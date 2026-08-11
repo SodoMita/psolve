@@ -459,10 +459,19 @@ only**, removing all ambiguity.  Examples and generators updated; parser fuzzed
 - [ ] **Fixed-point end-to-end determinism** (bit-identical across platforms
       for UI/VG/physics; the PGS fixed kernel already guarantees this, extend
       to the rest of the pipeline: integration, collision, rendering).
-- [ ] Memory: optional preallocated arena so per-frame solves do zero `malloc`
-      (critical for 60 fps with no GC pauses).  (Note: the PGS kernels already
-      do zero-malloc via caller buffers + alloca; the general QP/LP solve paths
-      still allocate.)
+- [x] **Re-entrant, thread-local preallocated arena for zero-malloc per-frame
+      solves** (critical for 60 fps with no GC pauses).  `tools/arena_test.c`
+      verifies the QP, LP and exact-`fx` solve paths make **zero** libc heap
+      calls while an arena is active (`--wrap`-counted), give identical answers
+      to a non-arena solve, and are re-entrant (nested `use`/`end` scopes) with
+      sound ownership-checked `realloc`/`free`.  This deliberately supersedes
+      the *unsound* global-arena design previously rejected in the remote-branch
+      audit: the arena is thread-local (no cross-thread corruption, satisfies
+      the "re-entrant, no-global-state" rule), is scoped and nestable, and
+      `psolve_free`/`psolve_realloc` verify ownership before touching a block so
+      a libc pointer is never misread as arena memory.  The PGS kernels were
+      already zero-malloc (caller buffers + alloca); this extends the guarantee
+      to the general LP/QP/MIP/exact solve paths.
 - [ ] Public C API audit: every entry point documented, bounds-checked, and
       returning status codes (no `exit` in library code).
 

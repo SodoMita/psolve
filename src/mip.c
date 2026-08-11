@@ -25,14 +25,14 @@ static int mip_build_fxlp(const MIP *mip, const double *lo, const double *hi, Fx
     cells = m ? (size_t)m * (size_t)n : 1;
     if(cells > (size_t)-1 / sizeof(Fx)) return -1;
     flp->n = n; flp->m = m; flp->maximize = mip->maximize;
-    flp->c = (Fx*)calloc((size_t)n, sizeof(Fx));
-    flp->b = (Fx*)calloc((size_t)(m ? m : 1), sizeof(Fx));
-    flp->l = (Fx*)calloc((size_t)n, sizeof(Fx));
-    flp->u = (Fx*)calloc((size_t)n, sizeof(Fx));
-    flp->lfinite = (int*)calloc((size_t)n, sizeof(int));
-    flp->ufinite = (int*)calloc((size_t)n, sizeof(int));
-    flp->rel = (char*)malloc((size_t)(m ? m : 1));
-    flp->A = (Fx*)calloc(cells, sizeof(Fx));
+    flp->c = (Fx*)psolve_calloc((size_t)n, sizeof(Fx));
+    flp->b = (Fx*)psolve_calloc((size_t)(m ? m : 1), sizeof(Fx));
+    flp->l = (Fx*)psolve_calloc((size_t)n, sizeof(Fx));
+    flp->u = (Fx*)psolve_calloc((size_t)n, sizeof(Fx));
+    flp->lfinite = (int*)psolve_calloc((size_t)n, sizeof(int));
+    flp->ufinite = (int*)psolve_calloc((size_t)n, sizeof(int));
+    flp->rel = (char*)psolve_malloc((size_t)(m ? m : 1));
+    flp->A = (Fx*)psolve_calloc(cells, sizeof(Fx));
     if(!flp->c || !flp->b || !flp->l || !flp->u ||
        !flp->lfinite || !flp->ufinite || !flp->rel || !flp->A){ fx_free(flp); return -1; }
     for(int j = 0; j < n; j++) if(fx_from_double(mip->c[j], &flp->c[j]) != 0) goto fail;
@@ -106,7 +106,7 @@ static int try_rounding_heuristic(const MIP *mip, const double *x,
         else if (r == '<') { if (rs[i] > b + MIP_TOL) ok = 0; }
         else if (r == '>') { if (rs[i] < b - MIP_TOL) ok = 0; }
     }
-    free(rs);
+    psolve_free(rs);
     return ok;
 }
 
@@ -162,13 +162,13 @@ static int solve_relaxation(const MIP *mip, const Node *node,
     for (int j = 0; j < n; j++) {
         double lj = node->lo[j] > mip->l[j] ? node->lo[j] : mip->l[j];
         double uj = node->hi[j] < mip->u[j] ? node->hi[j] : mip->u[j];
-        if (lj > uj) { free(lo); free(hi); return -1; }   /* infeasible node */
+        if (lj > uj) { psolve_free(lo); psolve_free(hi); return -1; }   /* infeasible node */
         lo[j] = lj; hi[j] = uj;
     }
     lp.l = lo; lp.u = hi;
 
     Solver *s = solver_create(&lp);
-    if (!s) { free(lo); free(hi); return -1; }
+    if (!s) { psolve_free(lo); psolve_free(hi); return -1; }
     if (mip->lp_iter_limit > 0) s->iteration_limit = mip->lp_iter_limit;
     int r = solver_solve(s);
     int status = r;
@@ -176,7 +176,7 @@ static int solve_relaxation(const MIP *mip, const Node *node,
         double *xo = (double*)psolve_malloc((size_t)n * sizeof(double));
         solver_optimum(s, xo, obj);
         for (int j = 0; j < n; j++) x[j] = xo[j];
-        free(xo);
+        psolve_free(xo);
     } else if (r == SOLVE_NUMERICAL || r == 1) {
         /* The double revised-simplex either diverged (SOLVE_NUMERICAL, its
            solution certificate failed) or declared the relaxation INFEASIBLE.
@@ -204,7 +204,7 @@ static int solve_relaxation(const MIP *mip, const Node *node,
     }
     for (int j = 0; j < n; j++) { lcur[j] = lo[j]; ucur[j] = hi[j]; }
     solver_destroy(s);
-    free(lo); free(hi);
+    psolve_free(lo); psolve_free(hi);
     return status;
 }
 
@@ -276,21 +276,21 @@ void mip_solve(const MIP *mip, MIPResult *res)
 
         double obj;
         int r = solve_relaxation(mip, node, x, &obj, lcur, ucur);
-        if (r == -1) { free(node->lo); free(node->hi); free(node); continue; } /* infeasible */
-        if (r == 3) { free(node->lo); free(node->hi); free(node); status = 3; limit_reached = 1; break; } /* lp limit */
-        if (r == SOLVE_STOPPED) { free(node->lo); free(node->hi); free(node); status = 4; limit_reached = 1; break; } /* stopped */
-        if (r == SOLVE_NUMERICAL) { free(node->lo); free(node->hi); free(node); status = 6; limit_reached = 1; break; } /* numerical */
-        if (r == SOLVE_INVALID) { free(node->lo); free(node->hi); free(node); status = MIP_INVALID; limit_reached = 1; break; }
+        if (r == -1) { psolve_free(node->lo); psolve_free(node->hi); psolve_free(node); continue; } /* infeasible */
+        if (r == 3) { psolve_free(node->lo); psolve_free(node->hi); psolve_free(node); status = 3; limit_reached = 1; break; } /* lp limit */
+        if (r == SOLVE_STOPPED) { psolve_free(node->lo); psolve_free(node->hi); psolve_free(node); status = 4; limit_reached = 1; break; } /* stopped */
+        if (r == SOLVE_NUMERICAL) { psolve_free(node->lo); psolve_free(node->hi); psolve_free(node); status = 6; limit_reached = 1; break; } /* numerical */
+        if (r == SOLVE_INVALID) { psolve_free(node->lo); psolve_free(node->hi); psolve_free(node); status = MIP_INVALID; limit_reached = 1; break; }
         /* infeasible relaxation */
-        if (r == 1) { free(node->lo); free(node->hi); free(node); continue; }
+        if (r == 1) { psolve_free(node->lo); psolve_free(node->hi); psolve_free(node); continue; }
         if (r == 2) {
             /* An unbounded relaxation on the ROOT node (original bounds) means
                the MIP itself is unbounded.  Branching only tightens bounds, so
                an unbounded non-root relaxation cannot happen when the root was
                bounded; if it does (numerical trouble), treat the node as
                infeasible rather than guess. */
-            if (nodes == 1) { free(node->lo); free(node->hi); free(node); status = 2; break; }
-            free(node->lo); free(node->hi); free(node); continue;
+            if (nodes == 1) { psolve_free(node->lo); psolve_free(node->hi); psolve_free(node); status = 2; break; }
+            psolve_free(node->lo); psolve_free(node->hi); psolve_free(node); continue;
         }
 
         /* prune by bound */
@@ -298,8 +298,8 @@ void mip_solve(const MIP *mip, MIPResult *res)
         if (mip->maximize) { if (obj > best_bound) best_bound = obj; }
         else { if (obj < best_bound) best_bound = obj; }
         if (have_incumbent && !mip->stop_at_feasible) {
-            if (mip->maximize && obj <= incumbent + gap * (1.0 + fabs(incumbent))) { free(node->lo); free(node->hi); free(node); continue; }
-            if (!mip->maximize && obj >= incumbent - gap * (1.0 + fabs(incumbent))) { free(node->lo); free(node->hi); free(node); continue; }
+            if (mip->maximize && obj <= incumbent + gap * (1.0 + fabs(incumbent))) { psolve_free(node->lo); psolve_free(node->hi); psolve_free(node); continue; }
+            if (!mip->maximize && obj >= incumbent - gap * (1.0 + fabs(incumbent))) { psolve_free(node->lo); psolve_free(node->hi); psolve_free(node); continue; }
         }
 
         /* LP-rounding feasibility heuristic: if the relaxation is already
@@ -318,7 +318,7 @@ void mip_solve(const MIP *mip, MIPResult *res)
             }
         }
         if (mip->stop_at_feasible && have_incumbent && !mip->all_solutions) {
-            free(node->lo); free(node->hi); free(node);
+            psolve_free(node->lo); psolve_free(node->hi); psolve_free(node);
             stopped_early = 1;
             break;
         }
@@ -367,7 +367,7 @@ void mip_solve(const MIP *mip, MIPResult *res)
                     c2->bound = obj; c2->feasible = 0; c2->next = NULL;
                     push_node(&stack, c2, mip->maximize);
 
-                    free(node->lo); free(node->hi); free(node);
+                    psolve_free(node->lo); psolve_free(node->hi); psolve_free(node);
                     continue;
                 }
             }
@@ -394,14 +394,14 @@ void mip_solve(const MIP *mip, MIPResult *res)
                 if (mip->stop_at_feasible && !mip->all_solutions) {
                     /* solve satisfy: the first feasible integer point is an
                        answer; stop branching instead of proving optimality. */
-                    free(node->lo); free(node->hi); free(node);
+                    psolve_free(node->lo); psolve_free(node->hi); psolve_free(node);
                     stopped_early = 1;
                     break;
                 }
             } else if (mip->all_solutions && mip->stop_at_feasible && mip->on_solution) {
                 mip->on_solution(x, obj, mip->solution_user_data);
             }
-            free(node->lo); free(node->hi); free(node);
+            psolve_free(node->lo); psolve_free(node->hi); psolve_free(node);
             continue;
         }
 
@@ -427,7 +427,7 @@ void mip_solve(const MIP *mip, MIPResult *res)
         c2->bound = obj; c2->feasible = 0; c2->next = NULL;
         push_node(&stack, c2, mip->maximize);
 
-        free(node->lo); free(node->hi); free(node);
+        psolve_free(node->lo); psolve_free(node->hi); psolve_free(node);
     }
 
     res->nodes = nodes;
@@ -451,15 +451,15 @@ void mip_solve(const MIP *mip, MIPResult *res)
 
     /* free remaining nodes */
     Node *n2 = stack;
-    while (n2) { Node *t = n2; n2 = n2->next; free(t->lo); free(t->hi); free(t); }
+    while (n2) { Node *t = n2; n2 = n2->next; psolve_free(t->lo); psolve_free(t->hi); psolve_free(t); }
 
-    free(x); free(lcur); free(ucur); free(bestx); free(xc);
+    psolve_free(x); psolve_free(lcur); psolve_free(ucur); psolve_free(bestx); psolve_free(xc);
 }
 
 void mip_result_free(MIPResult *res)
 {
     if (!res) return;
-    free(res->x);
-    free(res->isint_sol);
+    psolve_free(res->x);
+    psolve_free(res->isint_sol);
     memset(res, 0, sizeof(*res));
 }
