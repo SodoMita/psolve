@@ -323,17 +323,22 @@ void mip_solve(const MIP *mip, MIPResult *res)
             break;
         }
 
-        /* check integrality; find a fractional integer variable */
+        /* check integrality; find most fractional integer variable (closest to 0.5) for stronger pruning */
         int frac = -1; double fracval = 0.0;
         int allint = 1;
+        double best_dist = 2.0;
         for (int j = 0; j < n; j++) {
             if (!mip->isint[j]) continue;
-            if (x[j] < lcur[j] - MIP_TOL || x[j] > ucur[j] + MIP_TOL) { allint = 0; frac = j; fracval = x[j]; break; }
+            int out_of_bounds = (x[j] < lcur[j] - MIP_TOL || x[j] > ucur[j] + MIP_TOL);
             double xj = x[j];
-            if (fabs(xj - floor(xj + 0.5)) > MIP_TOL) {
-                allint = 0; frac = j; fracval = xj; break;
+            double f = out_of_bounds ? 0.0 : fabs(xj - floor(xj + 0.5));
+            if (out_of_bounds || f > MIP_TOL) {
+                allint = 0;
+                double dist = out_of_bounds ? 0.0 : fabs(f - 0.5);
+                if (dist < best_dist) { best_dist = dist; frac = j; fracval = xj; }
             }
         }
+        if (!allint && frac==-1) allint=1; // fallback, should not happen
 
         if (allint) {
             /* In all-solutions satisfaction mode, if any integer variable is
