@@ -822,6 +822,7 @@ static int objective_uses_synthetic_bound(const FZModel*m,const Builder*b,const 
 typedef struct { long lo, hi; uint64_t mask; int has_mask; int assigned; long val; } CspDom;
 typedef struct { int n; int *vars; int nfixed; long *fixed; } CspAllDiff;
 typedef struct { int n; int *vars; long *coefs; long rhs; char rel; } CspLin;
+typedef struct { int a,b; long ca, cb, rhs; } CspNe;
 
 static int csp_contains(CspDom *d, long v){
     if(v < d->lo || v > d->hi) return 0;
@@ -853,7 +854,7 @@ static int csp_assign(CspDom *d, long v){
     if(d->has_mask) d->mask = 1ULL;
     return 0;
 }
-static int csp_propagate(CspDom *doms, int nvars, CspAllDiff *ads, int nads, CspLin *lins, int nlins){
+static int csp_propagate(CspDom *doms, int nvars, CspAllDiff *ads, int nads, CspLin *lins, int nlins, CspNe *nes, int nnes){
     (void)nvars;
     // immediate duplicate among fixed constants => unsat
     for(int ai=0; ai<nads; ai++){
@@ -939,13 +940,40 @@ static int csp_propagate(CspDom *doms, int nvars, CspAllDiff *ads, int nads, Csp
                 if(lc->rel=='>' && cmax < lc->rhs) return -1;
             }
         }
+        for(int ni=0; ni<nnes; ni++){
+            CspNe *ne=&nes[ni];
+            int a=ne->a, b=ne->b; long ca=ne->ca, cb=ne->cb, rhs=ne->rhs;
+            if(doms[a].assigned && doms[b].assigned){
+                if(ca*doms[a].val + cb*doms[b].val == rhs) return -1;
+            } else if(doms[a].assigned && !doms[b].assigned){
+                long num = rhs - ca*doms[a].val;
+                if(num % cb==0){
+                    long vb = num / cb;
+                    if(csp_contains(&doms[b], vb)){
+                        int r=csp_remove(&doms[b], vb);
+                        if(r==-1) return -1;
+                        if(r==1) changed=1;
+                    }
+                }
+            } else if(!doms[a].assigned && doms[b].assigned){
+                long num = rhs - cb*doms[b].val;
+                if(num % ca==0){
+                    long va = num / ca;
+                    if(csp_contains(&doms[a], va)){
+                        int r=csp_remove(&doms[a], va);
+                        if(r==-1) return -1;
+                        if(r==1) changed=1;
+                    }
+                }
+            }
+        }
     }
     return 0;
 }
-static int csp_dfs(CspDom *doms, int nvars, CspAllDiff *ads, int nads, CspLin *lins, int nlins, long *sol, int *nodes, int node_limit){
+static int csp_dfs(CspDom *doms, int nvars, CspAllDiff *ads, int nads, CspLin *lins, int nlins, CspNe *nes, int nnes, long *sol, int *nodes, int node_limit){
     if(psolve_stop()) return 2;
     if((*nodes)++ > node_limit) return 2;
-    if(csp_propagate(doms,nvars,ads,nads,lins,nlins)==-1) return 0;
+    if(csp_propagate(doms,nvars,ads,nads,lins,nlins,nes,nnes)==-1) return 0;
     int best=-1; int best_sz=1000;
     for(int i=0;i<nvars;i++) if(!doms[i].assigned){
         int sz;
@@ -969,7 +997,7 @@ static int csp_dfs(CspDom *doms, int nvars, CspAllDiff *ads, int nads, CspLin *l
         CspDom *copy=(CspDom*)psolve_malloc((size_t)nvars*sizeof(CspDom));
         memcpy(copy,doms,(size_t)nvars*sizeof(CspDom));
         if(csp_assign(&copy[best], vals[k])==-1){ free(copy); continue; }
-        int r=csp_dfs(copy,nvars,ads,nads,lins,nlins,sol,nodes,node_limit);
+        int r=csp_dfs(copy,nvars,ads,nads,lins,nlins,nes,nnes,sol,nodes,node_limit);
         free(copy);
         if(r==1) return 1;
         if(r==2) return 2;
@@ -1025,6 +1053,7 @@ static int csp_try_alldiff(const FZModel *m, double *out){
     // collect constraints
     CspAllDiff *ads=NULL; int nads=0, cap_ads=0;
     CspLin *lins=NULL; int nlins=0, cap_lins=0;
+    CspNe *nes=NULL; int nnes=0, cap_nes=0;
     int unsupported=0;
     for(FZConstr *c=m->constr;c;c=c->next){
         const char *p=c->pred;
@@ -1055,6 +1084,37 @@ static int csp_try_alldiff(const FZModel *m, double *out){
             if(nfixed){ ads[nads].fixed=(long*)psolve_malloc((size_t)nfixed*sizeof(long)); memcpy(ads[nads].fixed,fixed,(size_t)nfixed*sizeof(long)); } else ads[nads].fixed=NULL;
             free(fixed);
             nads++;
+            continue;
+        }
+        // int_lin_ne and int_ne as disequality (for N-Queens linear compilations)
+        if(strcmp(p,"int_lin_ne")==0 || strcmp(p,"bool_lin_ne")==0){
+            if(c->nargs<3){ unsupported=1; break; }
+            Lin *coefArr; int ncoef; Lin *varArr; int nvar; Lin rhs;
+            if(parse_array((FZModel*)m,c->args[0],&coefArr,&ncoef)!=0){ unsupported=1; break; }
+            if(parse_array((FZModel*)m,c->args[1],&varArr,&nvar)!=0){ free_lins(coefArr,ncoef); unsupported=1; break; }
+            if(parse_lin((FZModel*)m,c->args[2],&rhs)!=0){ free_lins(coefArr,ncoef); free_lins(varArr,nvar); unsupported=1; break; }
+            if(ncoef!=nvar || nvar!=2){ free_lins(coefArr,ncoef); free_lins(varArr,nvar); lin_free(&rhs); unsupported=1; break; }
+            int ok=1;
+            for(int i=0;i<ncoef;i++) if(coefArr[i].n!=0) ok=0;
+            if(!ok || rhs.n!=0){ free_lins(coefArr,ncoef); free_lins(varArr,nvar); lin_free(&rhs); unsupported=1; break; }
+            if(varArr[0].n!=1 || varArr[1].n!=1){ free_lins(coefArr,ncoef); free_lins(varArr,nvar); lin_free(&rhs); unsupported=1; break; }
+            long ca=(long)llround(coefArr[0].constant);
+            long cb=(long)llround(coefArr[1].constant);
+            long rhsval=(long)llround(rhs.constant);
+            int va=varArr[0].idx[0], vb=varArr[1].idx[0];
+            free_lins(coefArr,ncoef); free_lins(varArr,nvar); lin_free(&rhs);
+            if(nnes>=cap_nes){ cap_nes=cap_nes?cap_nes*2:8; nes=(CspNe*)psolve_realloc((void**)&nes,(size_t)cap_nes*sizeof(CspNe)); }
+            nes[nnes].a=va; nes[nnes].b=vb; nes[nnes].ca=ca; nes[nnes].cb=cb; nes[nnes].rhs=rhsval; nnes++;
+            continue;
+        }
+        if(strcmp(p,"int_ne")==0 || strcmp(p,"bool_ne")==0){
+            if(c->nargs<2){ unsupported=1; break; }
+            Lin a,b; if(parse_lin((FZModel*)m,c->args[0],&a)!=0){ unsupported=1; break; } if(parse_lin((FZModel*)m,c->args[1],&b)!=0){ lin_free(&a); unsupported=1; break; }
+            if(a.n!=1 || b.n!=1){ lin_free(&a); lin_free(&b); unsupported=1; break; }
+            int va=a.idx[0], vb=b.idx[0];
+            lin_free(&a); lin_free(&b);
+            if(nnes>=cap_nes){ cap_nes=cap_nes?cap_nes*2:8; nes=(CspNe*)psolve_realloc((void**)&nes,(size_t)cap_nes*sizeof(CspNe)); }
+            nes[nnes].a=va; nes[nnes].b=vb; nes[nnes].ca=1; nes[nnes].cb=-1; nes[nnes].rhs=0; nnes++;
             continue;
         }
         if(strcmp(p,"int_lin_eq")==0 || strcmp(p,"int_lin_ne")==0 || strcmp(p,"int_lin_le")==0 || strcmp(p,"int_lin_lt")==0 || strcmp(p,"int_lin_ge")==0 || strcmp(p,"int_lin_gt")==0 ||
@@ -1130,21 +1190,24 @@ static int csp_try_alldiff(const FZModel *m, double *out){
     if(unsupported){
         for(int i=0;i<nads;i++){ free(ads[i].vars); free(ads[i].fixed); } free(ads);
         for(int i=0;i<nlins;i++){ free(lins[i].vars); free(lins[i].coefs); } free(lins);
+        for(int i=0;i<nnes;i++){ /* CspNe has no heap */ } free(nes);
         free(doms);
         return 0;
     }
-    // quick check: if no alldiff, heuristic not needed
-    if(nads==0){
+    // quick check: if no alldiff and no disequalities, heuristic not needed
+    if(nads==0 && nnes==0){
         for(int i=0;i<nads;i++){ free(ads[i].vars); free(ads[i].fixed); } free(ads);
         for(int i=0;i<nlins;i++){ free(lins[i].vars); free(lins[i].coefs); } free(lins);
+        free(nes);
         free(doms);
         return 0;
     }
     long *sol=(long*)psolve_malloc((size_t)nvars*sizeof(long));
     int nodes=0, node_limit=500000;
-    int res=csp_dfs(doms,nvars,ads,nads,lins,nlins,sol,&nodes,node_limit);
+    int res=csp_dfs(doms,nvars,ads,nads,lins,nlins,nes,nnes,sol,&nodes,node_limit);
     for(int i=0;i<nads;i++){ free(ads[i].vars); free(ads[i].fixed); } free(ads);
     for(int i=0;i<nlins;i++){ free(lins[i].vars); free(lins[i].coefs); } free(lins);
+    free(nes);
     free(doms);
     if(res==1){
         for(int i=0;i<nvars;i++) out[i]=(double)sol[i];
