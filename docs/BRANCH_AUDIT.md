@@ -168,6 +168,33 @@ sign. Bound propagation can be reconsidered only with outward-rounded activity
 bounds, no coefficient dropping, a documented reduced-cost convention, and
 adversarial differential tests.
 
+**Reconsidered soundly on `arena/phase4-interactive-hardening`.**  The bound
+tightening was re-implemented (`fbbt_tighten` in `src/mip.c`) satisfying every
+rejected property:
+
+- **No coefficient dropping** — every |a|, however small, is kept.  The audit's
+  counterexample now solves to the true optimum `y = 2` (the rejected commit
+  reported `y = 1`).
+- **Outward-rounded activity bounds** — the "other variables" activity that
+  feeds a bound is biased conservatively (small for the `rest_min` used by
+  `'<'`/`'='` rows, large for the `rest_max` used by `'>'` rows) and the final
+  bound is rounded outward, so a tightened bound never excludes a feasible
+  point.
+- **Correct extremum** — a `'<'`/`'='` row derives both the upper (a>0) and
+  lower (a<0) bounds of `x_j` from the *minimum* activity of the others; a
+  `'>'` row from the *maximum*.  (The rejected commit used the wrong extremum
+  for the a<0 cases, which could prune feasible points.)
+- **Integer-only bound updates** — FBBT tightens only integer-variable bounds
+  (snapped to the lattice).  It deliberately does not tighten float-variable
+  bounds, which would perturb the reported LP vertex for no pruning benefit.
+- **No reduced-cost fixing** — deliberately omitted until the solver's
+  reduced-cost sign convention is documented.
+- **Adversarial differential tests** — `tools/fbbt_verify.py` (wired into
+  `test.sh`) enumerates the true optimum over the integer box for random MIPs
+  mixing tiny coefficients (1e-13) with large variable magnitudes and all three
+  relation types, plus the audit counterexample.  Zero wrong answers over
+  thousands of cases; ASan/UBSan clean.
+
 ## Additional `main` flaws fixed during the audit
 
 - The latest parser cleanup declared temporary pointers below early `goto err`

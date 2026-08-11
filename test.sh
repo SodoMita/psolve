@@ -80,6 +80,11 @@ gcc -O2 -march=native -I src tools/mip_test.c src/mip.c src/fx.c src/err.c src/s
 # objective of runs that happened to come back OPTIMAL.
 python3 tools/mip_diff.py 400 12345 | head -2
 python3 tools/mip_verify.py 0 | tail -1
+# Adversarial differential test for the sound FBBT bound tightening: mixes
+# tiny coefficients (1e-13) with large variable magnitudes and all three
+# relation types, checking status + objective + returned point vs brute force,
+# plus the audit counterexample (1e-13*x + y <= 1 with x=-1e13 must yield y=2).
+python3 tools/fbbt_verify.py 200 4242 | tail -1
 
 echo "[5.75/7] Fully free LP/MIP variables + incremental API..."
 gcc -O2 -march=native -I src tools/free_var_test.c src/mip.c src/fx.c src/err.c src/solver.c src/splu.c src/lu.c src/kernels.c -o /tmp/free_var_test -lm

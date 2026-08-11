@@ -52,6 +52,11 @@ is a different algorithm family tuned for that latency.
 - AVX-512 revised-simplex LP (sparse LU + steepest edge), ~1.4× GLPK on sparse LPs
 - Convex QP (active-set), verified vs scipy
 - MIP via branch-and-bound, verified vs brute force
+- Sound feasibility-based bound tightening (FBBT) at the MIP root: outward-
+  rounded activity bounds, no coefficient dropping, integer-only bound updates,
+  verified vs brute force incl. tiny-coefficient/large-magnitude adversarial
+  cases (`tools/fbbt_verify.py`). Prunes the branch-and-bound tree without
+  changing the optimum.
 - Incremental (warm-start) LP solving
 - Hardened parsers + fuzzing + sanitizers (untrusted-input safe)
 - OOM/error protocol, sensitivity (duals), iteration limits
