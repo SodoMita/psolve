@@ -127,7 +127,7 @@ solve satisfy;
 ```
 1. **Gecode (Finite-Domain CP):** Compiles chained `int_times` constraints. However, because domains are $(-\infty, +\infty)$, interval bound propagation cannot prune infinite bounds, causing Gecode to spin indefinitely.
 2. **HiGHS / Linear MIP Backends (`-G linear`):** Throws a compilation error (`comprehension iterates over an infinite set in redefinitions.mzn`) because MiniZinc cannot generate a Cartesian discretization table over infinite sets.
-3. **`psolve` (`fznsolve`):** Correctly detects unbounded non-linear products and immediately reports **`=====UNKNOWN=====`** in $0.1\text{ ms}$ under the **Honesty Principle**, avoiding false optimums or crashes.
+3. **`psolve` (`fznsolve`):** **Now solved natively** by the finite-domain CP engine (`src/fz_cp.inc`). It detects the monomial product chain equal to the fixed constant, bounds every chain variable to the signed divisors of that constant, and searches the small divisor domains with exact verification — returning $x = 10, y = \pm 10$ in $< 1\text{ ms}$ on the fully unbounded model. (For non-monomial or non-bounded non-linearities it still honestly returns **`=====UNKNOWN=====`**.)
 4. **Bounded Case (`var 1..100: x, y`):** When given finite bounds, the system simplifies to integer factorization, and solvers immediately find $x = 10, y = 10$ ($10^3 \cdot 10^2 = 100,000$).
 
 ---
@@ -140,6 +140,7 @@ Large discrete constraint satisfaction problems (e.g. 9x9 Sudoku with 729 binary
 #### Mathematical Cause:
 - **CP Solvers:** Apply Régin's bipartite maximum-matching algorithm on AllDifferent graphs to filter values in polynomial time without branching.
 - **MIP Solvers:** The continuous LP relaxation assigns all binary variables fractional values ($\frac{1}{9}$ for Sudoku). The relaxation objective is flat with no gradient to guide branching, requiring deeper search trees unless CP propagation or cutting planes are applied.
+- **psolve (`fznsolve`):** dispatches pure-integer `solve satisfy` CSPs to a finite-domain CP engine (`src/fz_cp.inc`) that uses maximum-matching arc consistency for `all_different`, exact integer interval propagation for linear equalities, and MRV + backtracking with full verification — solving N-Queens 8 and 9×9 Sudoku in milliseconds, and correctly proving UNSAT (e.g. `unsat_sudoku`, `unsat_pigeonhole`).
 
 ---
 

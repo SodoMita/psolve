@@ -42,8 +42,8 @@ solve satisfy;
    - MiniZinc's linear flattening library attempts to build 2D discretization tables over the Cartesian product of variable domains.
    - For unbounded variables, MiniZinc throws a compilation error: `comprehension iterates over an infinite set`.
 3. **psolve (`fznsolve`):**
-   - In `src/fzn.c`, `int_times(a, b, c)` checks whether operands are constants or booleans.
-   - For general unbounded non-linear variables, `psolve` enforces the **Honesty Principle**: it returns `=====UNKNOWN=====` in 0.1 ms rather than fabricating an invalid relaxation.
+   - **Now solved natively.** `fznsolve` includes a finite-domain constraint-propagation engine (`src/fz_cp.inc`) that detects a monomial product chain equal to a fixed nonzero constant, bounds every variable in the chain to the signed divisors of that constant ($x^3y^2 = 10^5$ forces $x, y, x^2, x^3, x^3y \mid 10^5$), and searches the small divisor domains with exact verification. It returns $x = 10, y = \pm 10$ in < 1 ms on the fully unbounded model (`var int: x; var int: y;`).
+   - If the product is not a monomial-equals-constant (or a variable cannot be bounded), `psolve` still enforces the **Honesty Principle**: it returns `=====UNKNOWN=====` rather than fabricating an invalid relaxation.
 4. **Bounded Alternative (`var 1..100: x, y;`):**
    - With finite bounds, integer factorization succeeds immediately ($x = 10, y = 10$, since $10^3 \cdot 10^2 = 1000 \cdot 100 = 100,000$).
 
@@ -67,7 +67,8 @@ Continuous trigonometric constraints (e.g. `y = sin(x)`) cannot be solved native
 ## 4. Analysis of Pure Discrete Permutations (Sudoku 9x9, N-Queens 8)
 
 1. **CP Solvers (Gecode):** Use Régin's bipartite maximum-matching algorithm on AllDifferent graphs to filter values in polynomial time ($<10\text{ ms}$) without branching.
-2. **MIP Solvers (psolve, CBC, HiGHS):** Translate discrete constraints into 0-1 binaries. The LP relaxation assigns fractional values ($\frac{1}{n}$), creating flat relaxation objectives that require deeper branch-and-bound trees unless domain propagation or specialized cuts are applied.
+2. **MIP Solvers (CBC, HiGHS):** Translate discrete constraints into 0-1 binaries. The LP relaxation assigns fractional values ($\frac{1}{n}$), creating flat relaxation objectives that require deeper branch-and-bound trees unless domain propagation or specialized cuts are applied.
+3. **psolve (`fznsolve`):** dispatches pure integer `solve satisfy` CSPs to a finite-domain CP engine (`src/fz_cp.inc`) that propagates `all_different` with maximum-matching (Régin) arc consistency, propagates linear equalities by exact integer interval arithmetic, and searches with MRV + backtracking + full verification. It solves N-Queens 8 ($q = [1,5,8,6,3,7,2,4]$) and 9×9 Sudoku in milliseconds, where the LP/MIP branch-and-bound bridge previously stalled on the weak flat relaxations.
 
 ---
 

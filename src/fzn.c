@@ -2990,6 +2990,8 @@ static void fz_solution_cb(const double *x, double obj, void *user_data)
     (void)obj;
 }
 
+#include "fz_cp.inc"
+
 void fz_solve(const FZModel*m,FZSolution*sol)
 {
     if(!sol)return;
@@ -3000,6 +3002,14 @@ void fz_solve(const FZModel*m,FZSolution*sol)
     sol->all_solutions = all_sol_in;
     if(!m||m->nvars<0||m->ndecl<0){sol->status=3;return;}
     int nv=m->nvars; sol->nvars=nv; sol->x=(double*)psolve_calloc((size_t)(nv?nv:1),sizeof(double));
+    /* Try the finite-domain CP engine first for pure integer satisfaction
+       (solve satisfy) CSPs with combinatorial/nonlinear predicates; it solves
+       all_different puzzles (n-Queens, Sudoku, magic/latin squares) and
+       monomial Diophantine products that the LP/MIP bridge handles poorly.
+       It falls back to the MIP bridge for everything it cannot certify. */
+    if(!sol->all_solutions && m->solve_kind==0 && nv>0){
+        if(fz_cp_try(m,sol)) return;
+    }
     /* A compiler can propagate every decision variable to a literal (for
        example a table call on x = [1,3]).  Keep one fixed dummy column so the
        LP/MIP bridge can still certify SAT/UNSAT instead of reporting UNKNOWN. */
