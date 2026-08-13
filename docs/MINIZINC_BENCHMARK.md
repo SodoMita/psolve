@@ -1,5 +1,5 @@
 # MiniZinc Benchmark Suite Results
-**Date:** 2026-08-11 20:18:16  
+**Date:** 2026-08-11 21:39:37  
 **Overall Result:** 77/77 instances passed (100.0%)  
 
 ## Overview
@@ -9,95 +9,95 @@ This benchmark evaluates accuracy, status honesty, and solve latency across 7 co
 ### Summary by Category
 | Category | Total | Passed | Pass Rate | Avg psolve (ms) | Avg Ref (ms) | Speedup vs Ref |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| Extensional, Structure & Logic | 20 | 20 | 100.0% | 5.81 ms | 146.40 ms | 25.2x |
-| Global Constraints | 16 | 16 | 100.0% | 13.54 ms | 142.94 ms | 10.6x |
-| Other | 4 | 4 | 100.0% | 1.83 ms | 1355.47 ms | 738.7x |
-| Operations Research & LP/MIP | 12 | 12 | 100.0% | 5.61 ms | 148.50 ms | 26.5x |
-| Industrial Scheduling | 4 | 4 | 100.0% | 58.13 ms | 150.98 ms | 2.6x |
-| All-Solution Enumeration (-a) | 3 | 3 | 100.0% | 1171.53 ms | 143.22 ms | 0.1x |
-| Combinatorial Puzzles & CSP | 12 | 12 | 100.0% | 213.40 ms | 151.04 ms | 0.7x |
-| Infeasibility Proofs (UNSAT) | 6 | 6 | 100.0% | 7.59 ms | 170.09 ms | 22.4x |
+| Extensional, Structure & Logic | 20 | 20 | 100.0% | 12.48 ms | 248.51 ms | 19.9x |
+| Global Constraints | 16 | 16 | 100.0% | 33.44 ms | 247.07 ms | 7.4x |
+| Other | 4 | 4 | 100.0% | 9.41 ms | 1433.05 ms | 152.4x |
+| Operations Research & LP/MIP | 12 | 12 | 100.0% | 16.09 ms | 246.00 ms | 15.3x |
+| Industrial Scheduling | 4 | 4 | 100.0% | 159.79 ms | 239.74 ms | 1.5x |
+| All-Solution Enumeration (-a) | 3 | 3 | 100.0% | 7.75 ms | 244.21 ms | 31.5x |
+| Combinatorial Puzzles & CSP | 12 | 12 | 100.0% | 469.40 ms | 255.90 ms | 0.5x |
+| Infeasibility Proofs (UNSAT) | 6 | 6 | 100.0% | 14.91 ms | 275.32 ms | 18.5x |
 
 ## Detailed Results
 | Model | Category | Status | Objective | psolve (ms) | Ref (ms) | Verdict |
 | :--- | :--- | :---: | :---: | :---: | :---: | :---: |
-| `abs.mzn` | Extensional, Structure & Logic | SAT | 5 | 2.72 | 140.00 | PASS |
-| `all_equal_demo.mzn` | Global Constraints | SAT | - | 10.05 | 137.44 | PASS |
-| `alldiff.mzn` | Other | SAT | - | 2.63 | 147.50 | PASS |
-| `alldiff_demo.mzn` | Global Constraints | SAT | - | 2.61 | 141.34 | PASS |
-| `alldiff_except_0_demo.mzn` | Global Constraints | SAT | 8 | 2.00 | 143.26 | PASS |
-| `assignment.mzn` | Operations Research & LP/MIP | SAT | 13 | 6.00 | 159.69 | PASS |
-| `bin_packing_demo.mzn` | Global Constraints | SAT | - | 1.00 | 138.49 | PASS |
-| `bin_packing_load_demo.mzn` | Global Constraints | SAT | - | 3.00 | 144.98 | PASS |
-| `blending.mzn` | Operations Research & LP/MIP | SAT | 4071 | 2.65 | 132.34 | PASS |
-| `bool_and_sat.mzn` | Extensional, Structure & Logic | SAT | - | 2.64 | 160.42 | PASS |
-| `bridge_scheduling.mzn` | Industrial Scheduling | SAT | 22 | 8.52 | 147.22 | PASS |
-| `circuit.mzn` | Other | SAT | - | 1.00 | 119.45 | PASS |
-| `circuit_demo.mzn` | Extensional, Structure & Logic | SAT | - | 1.00 | 136.92 | PASS |
-| `count.mzn` | Extensional, Structure & Logic | SAT | - | 2.91 | 144.73 | PASS |
-| `cumulative_demo.mzn` | Global Constraints | SAT | - | 1.00 | 144.40 | PASS |
-| `cumulative_opt.mzn` | Global Constraints | SAT | 7 | 4.00 | 149.58 | PASS |
-| `cutting_stock.mzn` | Operations Research & LP/MIP | SAT | 3 | 1.00 | 152.36 | PASS |
-| `decreasing_demo.mzn` | Global Constraints | SAT | 23 | 9.17 | 137.30 | PASS |
-| `diet.mzn` | Operations Research & LP/MIP | SAT | 10.25 | 12.06 | 149.48 | PASS |
-| `diffn_demo.mzn` | Global Constraints | SAT | - | 18.49 | 163.42 | PASS |
-| `disjunctive_demo.mzn` | Global Constraints | SAT | 9 | 1.00 | 124.82 | PASS |
-| `element.mzn` | Extensional, Structure & Logic | SAT | 40 | 12.28 | 145.72 | PASS |
-| `enum_permutations_3.mzn` | All-Solution Enumeration (-a) | SAT | - | 3.00 | 157.16 | PASS |
-| `enum_queens_4.mzn` | All-Solution Enumeration (-a) | SAT | - | 3501.00 | 153.66 | PASS |
-| `enum_subsets.mzn` | All-Solution Enumeration (-a) | SAT | - | 10.58 | 118.85 | PASS |
-| `eq_linear.mzn` | Extensional, Structure & Logic | SAT | - | 9.66 | 154.07 | PASS |
-| `facility_loc.mzn` | Operations Research & LP/MIP | SAT | 190 | 3.00 | 148.91 | PASS |
-| `float_lin.mzn` | Extensional, Structure & Logic | SAT | 29 | 2.70 | 157.59 | PASS |
-| `flowshop_3x3.mzn` | Industrial Scheduling | SAT | 9 | 7.00 | 141.25 | PASS |
-| `global_cardinality_demo.mzn` | Global Constraints | SAT | - | 111.00 | 154.77 | PASS |
-| `global_cardinality_low_up_demo.mzn` | Global Constraints | SAT | - | 46.00 | 140.40 | PASS |
-| `golomb_ruler_4.mzn` | Combinatorial Puzzles & CSP | SAT | 6 | 2481.00 | 151.24 | PASS |
-| `graph_coloring.mzn` | Combinatorial Puzzles & CSP | SAT | - | 11.02 | 137.98 | PASS |
-| `increasing_demo.mzn` | Global Constraints | SAT | 40 | 2.65 | 150.18 | PASS |
-| `inverse_demo.mzn` | Extensional, Structure & Logic | SAT | - | 15.18 | 147.33 | PASS |
-| `jobshop_3x3.mzn` | Industrial Scheduling | SAT | 14 | 11.00 | 156.42 | PASS |
-| `knap_lin.mzn` | Operations Research & LP/MIP | SAT | 10 | 2.80 | 159.66 | PASS |
-| `knap_unbounded.mzn` | Operations Research & LP/MIP | SAT | 21 | 2.69 | 153.53 | PASS |
-| `latin_square_4.mzn` | Combinatorial Puzzles & CSP | SAT | - | 13.77 | 143.02 | PASS |
-| `lex_less_demo.mzn` | Global Constraints | SAT | 4 | 1.00 | 134.54 | PASS |
-| `lex_lesseq_demo.mzn` | Global Constraints | SAT | 4 | 1.00 | 140.13 | PASS |
-| `lin_ge.mzn` | Extensional, Structure & Logic | SAT | 10 | 2.63 | 145.20 | PASS |
-| `lin_ne.mzn` | Extensional, Structure & Logic | SAT | 10 | 9.37 | 140.09 | PASS |
-| `magic_square_3.mzn` | Combinatorial Puzzles & CSP | SAT | - | 10.37 | 153.60 | PASS |
-| `magic_square_4.mzn` | Combinatorial Puzzles & CSP | SAT | - | 5.00 | 174.37 | PASS |
-| `max2.mzn` | Extensional, Structure & Logic | SAT | 10 | 2.64 | 143.36 | PASS |
-| `member_demo.mzn` | Extensional, Structure & Logic | SAT | 7 | 2.00 | 148.06 | PASS |
-| `mix_prod.mzn` | Operations Research & LP/MIP | SAT | 10 | 2.70 | 141.52 | PASS |
-| `network_flow.mzn` | Operations Research & LP/MIP | SAT | 130 | 18.53 | 137.52 | PASS |
-| `not_eq.mzn` | Extensional, Structure & Logic | SAT | 10 | 2.64 | 155.91 | PASS |
-| `nqueens_4.mzn` | Combinatorial Puzzles & CSP | SAT | - | 2.78 | 121.51 | PASS |
-| `nqueens_8.mzn` | Combinatorial Puzzles & CSP | SAT | - | 3.00 | 147.52 | PASS |
-| `nvalue_demo.mzn` | Extensional, Structure & Logic | SAT | - | 3.00 | 132.96 | PASS |
-| `open_shop_3x3.mzn` | Industrial Scheduling | SAT | 6 | 206.00 | 159.02 | PASS |
-| `portfolio.mzn` | Operations Research & LP/MIP | SAT | 0.095 | 10.35 | 159.79 | PASS |
-| `prod3.mzn` | Extensional, Structure & Logic | SAT | 57 | 8.99 | 153.69 | PASS |
-| `prodplan.mzn` | Operations Research & LP/MIP | SAT | 263 | 2.84 | 157.19 | PASS |
-| `reif_eq.mzn` | Extensional, Structure & Logic | SAT | 6 | 2.79 | 150.81 | PASS |
-| `send_more_money.mzn` | Combinatorial Puzzles & CSP | SAT | - | 2.76 | 150.99 | PASS |
-| `setdom.mzn` | Extensional, Structure & Logic | SAT | 5 | 2.70 | 155.09 | PASS |
-| `sliding_sum_demo.mzn` | Extensional, Structure & Logic | SAT | 21 | 10.58 | 131.62 | PASS |
-| `strictly_increasing_demo.mzn` | Global Constraints | SAT | 29 | 2.71 | 142.03 | PASS |
-| `subcircuit_demo.mzn` | Extensional, Structure & Logic | SAT | - | 1.00 | 164.69 | PASS |
-| `sudoku_4x4.mzn` | Combinatorial Puzzles & CSP | SAT | - | 17.61 | 155.97 | PASS |
-| `sudoku_9x9.mzn` | Combinatorial Puzzles & CSP | SAT | - | 1.00 | 147.53 | PASS |
-| `table.mzn` | Other | SAT | 3 | 2.71 | 154.94 | PASS |
-| `table_demo.mzn` | Extensional, Structure & Logic | SAT | 3 | 18.81 | 119.83 | PASS |
-| `transport.mzn` | Operations Research & LP/MIP | SAT | 190 | 2.67 | 130.01 | PASS |
-| `tsp_5.mzn` | Combinatorial Puzzles & CSP | SAT | 34 | 2.00 | 160.84 | PASS |
+| `abs.mzn` | Extensional, Structure & Logic | SAT | 5 | 13.64 | 252.13 | PASS |
+| `all_equal_demo.mzn` | Global Constraints | SAT | - | 18.46 | 246.55 | PASS |
+| `alldiff.mzn` | Other | SAT | - | 15.11 | 238.58 | PASS |
+| `alldiff_demo.mzn` | Global Constraints | SAT | - | 17.16 | 247.85 | PASS |
+| `alldiff_except_0_demo.mzn` | Global Constraints | SAT | 8 | 2.00 | 242.05 | PASS |
+| `assignment.mzn` | Operations Research & LP/MIP | SAT | 13 | 22.00 | 237.07 | PASS |
+| `bin_packing_demo.mzn` | Global Constraints | SAT | - | 1.00 | 238.00 | PASS |
+| `bin_packing_load_demo.mzn` | Global Constraints | SAT | - | 11.00 | 255.30 | PASS |
+| `blending.mzn` | Operations Research & LP/MIP | SAT | 4071 | 13.03 | 237.64 | PASS |
+| `bool_and_sat.mzn` | Extensional, Structure & Logic | SAT | - | 17.37 | 244.05 | PASS |
+| `bridge_scheduling.mzn` | Industrial Scheduling | SAT | 22 | 17.17 | 235.30 | PASS |
+| `circuit.mzn` | Other | SAT | - | 1.00 | 241.34 | PASS |
+| `circuit_demo.mzn` | Extensional, Structure & Logic | SAT | - | 2.00 | 241.73 | PASS |
+| `count.mzn` | Extensional, Structure & Logic | SAT | - | 18.83 | 235.76 | PASS |
+| `cumulative_demo.mzn` | Global Constraints | SAT | - | 1.00 | 245.96 | PASS |
+| `cumulative_opt.mzn` | Global Constraints | SAT | 7 | 20.00 | 237.20 | PASS |
+| `cutting_stock.mzn` | Operations Research & LP/MIP | SAT | 3 | 1.00 | 253.87 | PASS |
+| `decreasing_demo.mzn` | Global Constraints | SAT | 23 | 18.46 | 276.21 | PASS |
+| `diet.mzn` | Operations Research & LP/MIP | SAT | 10.25 | 17.27 | 289.48 | PASS |
+| `diffn_demo.mzn` | Global Constraints | SAT | - | 9.17 | 243.89 | PASS |
+| `disjunctive_demo.mzn` | Global Constraints | SAT | 9 | 1.00 | 230.19 | PASS |
+| `element.mzn` | Extensional, Structure & Logic | SAT | 40 | 2.62 | 221.84 | PASS |
+| `enum_permutations_3.mzn` | All-Solution Enumeration (-a) | SAT | - | 7.00 | 251.80 | PASS |
+| `enum_queens_4.mzn` | All-Solution Enumeration (-a) | SAT | - | 5.70 | 236.80 | PASS |
+| `enum_subsets.mzn` | All-Solution Enumeration (-a) | SAT | - | 10.55 | 244.03 | PASS |
+| `eq_linear.mzn` | Extensional, Structure & Logic | SAT | - | 12.26 | 237.50 | PASS |
+| `facility_loc.mzn` | Operations Research & LP/MIP | SAT | 190 | 21.14 | 235.93 | PASS |
+| `float_lin.mzn` | Extensional, Structure & Logic | SAT | 29 | 16.67 | 234.49 | PASS |
+| `flowshop_3x3.mzn` | Industrial Scheduling | SAT | 9 | 7.00 | 236.07 | PASS |
+| `global_cardinality_demo.mzn` | Global Constraints | SAT | - | 327.00 | 241.55 | PASS |
+| `global_cardinality_low_up_demo.mzn` | Global Constraints | SAT | - | 72.00 | 248.57 | PASS |
+| `golomb_ruler_4.mzn` | Combinatorial Puzzles & CSP | SAT | 6 | 5503.00 | 260.25 | PASS |
+| `graph_coloring.mzn` | Combinatorial Puzzles & CSP | SAT | - | 16.35 | 252.08 | PASS |
+| `increasing_demo.mzn` | Global Constraints | SAT | 40 | 18.63 | 252.28 | PASS |
+| `inverse_demo.mzn` | Extensional, Structure & Logic | SAT | - | 17.17 | 260.37 | PASS |
+| `jobshop_3x3.mzn` | Industrial Scheduling | SAT | 14 | 35.00 | 211.77 | PASS |
+| `knap_lin.mzn` | Operations Research & LP/MIP | SAT | 10 | 18.61 | 246.45 | PASS |
+| `knap_unbounded.mzn` | Operations Research & LP/MIP | SAT | 21 | 13.15 | 247.89 | PASS |
+| `latin_square_4.mzn` | Combinatorial Puzzles & CSP | SAT | - | 17.11 | 239.88 | PASS |
+| `lex_less_demo.mzn` | Global Constraints | SAT | 4 | 1.00 | 242.78 | PASS |
+| `lex_lesseq_demo.mzn` | Global Constraints | SAT | 4 | 1.00 | 256.57 | PASS |
+| `lin_ge.mzn` | Extensional, Structure & Logic | SAT | 10 | 17.27 | 264.15 | PASS |
+| `lin_ne.mzn` | Extensional, Structure & Logic | SAT | 10 | 17.16 | 249.33 | PASS |
+| `magic_square_3.mzn` | Combinatorial Puzzles & CSP | SAT | - | 16.95 | 247.33 | PASS |
+| `magic_square_4.mzn` | Combinatorial Puzzles & CSP | SAT | - | 13.00 | 245.49 | PASS |
+| `max2.mzn` | Extensional, Structure & Logic | SAT | 10 | 15.00 | 246.52 | PASS |
+| `member_demo.mzn` | Extensional, Structure & Logic | SAT | 7 | 2.00 | 241.98 | PASS |
+| `mix_prod.mzn` | Operations Research & LP/MIP | SAT | 10 | 15.94 | 237.35 | PASS |
+| `network_flow.mzn` | Operations Research & LP/MIP | SAT | 130 | 18.51 | 238.56 | PASS |
+| `not_eq.mzn` | Extensional, Structure & Logic | SAT | 10 | 13.15 | 232.00 | PASS |
+| `nqueens_4.mzn` | Combinatorial Puzzles & CSP | SAT | - | 8.40 | 254.08 | PASS |
+| `nqueens_8.mzn` | Combinatorial Puzzles & CSP | SAT | - | 3.00 | 247.88 | PASS |
+| `nvalue_demo.mzn` | Extensional, Structure & Logic | SAT | - | 11.00 | 247.69 | PASS |
+| `open_shop_3x3.mzn` | Industrial Scheduling | SAT | 6 | 580.00 | 275.81 | PASS |
+| `portfolio.mzn` | Operations Research & LP/MIP | SAT | 0.095 | 16.72 | 235.91 | PASS |
+| `prod3.mzn` | Extensional, Structure & Logic | SAT | 57 | 18.66 | 350.40 | PASS |
+| `prodplan.mzn` | Operations Research & LP/MIP | SAT | 263 | 17.20 | 241.39 | PASS |
+| `reif_eq.mzn` | Extensional, Structure & Logic | SAT | 6 | 14.24 | 245.71 | PASS |
+| `send_more_money.mzn` | Combinatorial Puzzles & CSP | SAT | - | 17.21 | 255.82 | PASS |
+| `setdom.mzn` | Extensional, Structure & Logic | SAT | 5 | 9.14 | 233.83 | PASS |
+| `sliding_sum_demo.mzn` | Extensional, Structure & Logic | SAT | 21 | 17.18 | 261.52 | PASS |
+| `strictly_increasing_demo.mzn` | Global Constraints | SAT | 29 | 16.13 | 248.22 | PASS |
+| `subcircuit_demo.mzn` | Extensional, Structure & Logic | SAT | - | 1.00 | 227.82 | PASS |
+| `sudoku_4x4.mzn` | Combinatorial Puzzles & CSP | SAT | - | 13.16 | 252.28 | PASS |
+| `sudoku_9x9.mzn` | Combinatorial Puzzles & CSP | SAT | - | 1.00 | 275.86 | PASS |
+| `table.mzn` | Other | SAT | 3 | 20.51 | 252.27 | PASS |
+| `table_demo.mzn` | Extensional, Structure & Logic | SAT | 3 | 13.20 | 241.31 | PASS |
+| `transport.mzn` | Operations Research & LP/MIP | SAT | 190 | 18.52 | 250.50 | PASS |
+| `tsp_5.mzn` | Combinatorial Puzzles & CSP | SAT | 34 | 2.00 | 259.80 | PASS |
 | `unbounded_product.mzn` | Other | SAT | - | 1.00 | 5000.00 | PASS |
-| `unsat_bin_packing.mzn` | Infeasibility Proofs (UNSAT) | UNSAT | - | 1.00 | 170.80 | PASS |
-| `unsat_bounds.mzn` | Infeasibility Proofs (UNSAT) | UNSAT | - | 10.35 | 163.94 | PASS |
-| `unsat_cumulative.mzn` | Infeasibility Proofs (UNSAT) | UNSAT | - | 10.45 | 168.07 | PASS |
-| `unsat_knapsack.mzn` | Infeasibility Proofs (UNSAT) | UNSAT | - | 10.47 | 164.03 | PASS |
-| `unsat_pigeonhole.mzn` | Infeasibility Proofs (UNSAT) | UNSAT | - | 8.27 | 174.68 | PASS |
-| `unsat_sudoku.mzn` | Infeasibility Proofs (UNSAT) | UNSAT | - | 5.00 | 179.03 | PASS |
-| `zebra.mzn` | Combinatorial Puzzles & CSP | SAT | - | 10.53 | 167.97 | PASS |
+| `unsat_bin_packing.mzn` | Infeasibility Proofs (UNSAT) | UNSAT | - | 1.00 | 273.44 | PASS |
+| `unsat_bounds.mzn` | Infeasibility Proofs (UNSAT) | UNSAT | - | 16.62 | 276.04 | PASS |
+| `unsat_cumulative.mzn` | Infeasibility Proofs (UNSAT) | UNSAT | - | 17.13 | 275.39 | PASS |
+| `unsat_knapsack.mzn` | Infeasibility Proofs (UNSAT) | UNSAT | - | 20.99 | 292.83 | PASS |
+| `unsat_pigeonhole.mzn` | Infeasibility Proofs (UNSAT) | UNSAT | - | 16.74 | 283.08 | PASS |
+| `unsat_sudoku.mzn` | Infeasibility Proofs (UNSAT) | UNSAT | - | 17.00 | 251.15 | PASS |
+| `zebra.mzn` | Combinatorial Puzzles & CSP | SAT | - | 21.68 | 280.05 | PASS |
 
 ## Verification Invariants
 - **Mathematical Exactness:** Integer solutions are certified lattice points; float solutions respect bound invariants.

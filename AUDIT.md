@@ -1,5 +1,77 @@
 # psolve — audit & hardening notes
 
+> **2026-08-13 — branch `arena/cp-engine-correctness`: merged
+> `feat/finite-domain-cp-engine` tip (`49e3680`) and audited the new CP
+> reif/clause/minmax/variable-element/all-solutions work; also fixed a
+> latent unit-lattice-step family in `fzn.c` shared by both branches.**
+> Remote survey: the CP branch gained `8c1d245` (MIP-side int_min/max
+> constant operands — *not ported*: this branch's `lin_materialize` handles
+> the strict superset, incl. arbitrary affine operands; conflict resolved
+> keeping it), `0e38578` (CP `-a` enumeration + CP reif/bool_clause/minmax/
+> element), `49e3680` (CP variable-array element); phase4 gained `3573e3a`
+> (root FBBT, reviewed separately).  The merged tree was then put through
+> the standard reproduce-then-fix audit, which found four real defect
+> classes — every one reproduced on the pre-fix binary before patching:
+>
+> 1. **`cp_prop_minmax` heap underflow + wrong UNSAT** (from `0e38578`):
+>    the const-operand case called `cp_dmin(cp, -1)` on constant terms
+>    (`v==-1` convention) and intersected `m` with per-operand bounds that
+>    are unsound for min *and* max.  Repro: `var 1..10: x,m;
+>    constraint int_min(5,x,m); solve satisfy` printed
+>    `=====UNSATISFIABLE=====` (plain build) and dies with ASan
+>    heap-buffer-overflow `cp_dmin fz_cp.inc:43 <- cp_prop_minmax`.
+>    Fixed by a full rewrite: const-safe operand bounds, exact m-fixed
+>    rules (each operand bounded by m, the unique candidate forced to m),
+>    sound whole-domain bounds when m is free.
+> 2. **Unchecked `llround` in CP parse** (`cp_make_lin` — pre-existing —
+>    plus the two new reif parse sites): fractional coefficients were
+>    silently rounded, changing semantics *and* feeding the verifier the
+>    rounded constraint so wrong answers self-certified.  Repro:
+>    `int_lin_eq([0.6],[x],1)` on `x in 0..2` printed `x = 1` (truth:
+>    UNSAT); `int_le_reif(x,0.6,r)` with `x=1` printed `r = true` (truth:
+>    false).  Fixed with a `cp_lin_is_exact` gate; inexact constraints
+>    decline to the MIP bridge, which now handles them exactly (item 4).
+> 3. **Inverted gecode-element offset guard** (pre-existing): accepted
+>    variable offsets by *dropping the variable part* (crafted
+>    satisfiable models printed UNSATISFIABLE) while declining plain
+>    constant offsets — the only well-formed case.  Guard corrected;
+>    constant-offset gecode elements now engage CP (e.g.
+>    `gecode_int_element(i,1,[5,6,9],v)`), variable offsets honestly
+>    decline to UNKNOWN.
+> 4. **Unit-lattice-step assumption in the integer relation encoders**
+>    (pre-existing on *both* branches): `add_int_reif`/`add_int_imp`/
+>    `add_int_ne`/`add_int_relation_constant` and the plain
+>    `int_lt/int_gt/int_lin_lt/int_lin_gt` handlers encoded "d>0" as
+>    "d>=1" and "d<0" as "d<=-1".  Exact on the integer lattice, but
+>    wrong by up to one lattice unit when `d` lives on `g*Z+f` with
+>    fractional part `f>0` (reachable from any fractional constant in an
+>    int predicate).  Repro: `int_lin_lt([1],[x],0.6)` on `x in 0..2`
+>    printed UNSATISFIABLE (truth: x=0); `int_le_reif(x,0.6,r)` maximize
+>    x returned objective 0 (truth: 1).  Fixed with a shared
+>    `int_lattice_steps()` computing the exact neighbors
+>    `P = f>0?f:1`, `N = f>0?f-1:-1` (sound for every gcd `g`, since
+>    `f in (0,1)` is the fundamental representative); eq/ne on fractional
+>    lattices collapse to constants (pin r / vacuous rows); irregular
+>    (non-integral-coefficient) lattices now decline to UNKNOWN instead
+>    of rounding.  Every emitted row for well-formed integer-lattice
+>    models is byte-identical to before, so this cannot regress real
+>    MiniZinc output.
+>
+> Empirically *verified* claims from the upstream commits (no changes
+> needed): CP `-a` enumeration is distinct-and-complete on bounded
+> integer models (9/9 reif grid + 7/7 clause tuples, completion marker
+> honored), and the variable-entry element propagator (`49e3680`)
+> matched brute force on 120 randomized instances including UNSAT
+> verdicts.  Regression lock: five new groups in
+> `tools/fzn_semantics_test.py` (`test_cp_minmax_constant_operands`,
+> `test_fractional_lattice_relations`, `test_cp_gecode_offset`,
+> `test_cp_variable_element_differential`, `test_cp_allsolutions_reif_clause`);
+> groups 1–3 FAIL on `origin/feat/finite-domain-cp-engine` and on the
+> pre-merge HEAD (discrimination proven), all PASS here.  Full `test.sh`
+> exit 0 (6316-point OOM injection clean), ASan/UBSan clean on the
+> adversarial corpus, `fuzz_fzn` 300 inputs clean, and a 300-instance
+> generative fuzz aimed at the new propagators clean.
+
 > **2026-08-11 (3) — branch `arena/cp-engine-correctness`: merged the CP
 > engine with the correctness layer and audited the union.**  Two new remote
 > branches appeared: `feat/finite-domain-cp-engine` (Régin all_different CP

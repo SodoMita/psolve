@@ -8,14 +8,19 @@ cannot be represented by a closed LP.
 
 from __future__ import annotations
 
+import itertools
+import os
 import pathlib
+import random
 import re
 import subprocess
 import sys
 import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-SOLVER = ROOT / "fznsolve"
+# FZNSOLVE env override: used to prove these regressions discriminate against
+# a known-buggy binary (e.g. FZNSOLVE=/tmp/fzn_remote python3 tools/fzn_semantics_test.py)
+SOLVER = pathlib.Path(os.environ.get("FZNSOLVE", str(ROOT / "fznsolve")))
 
 
 def run_model(source: str, *options: str) -> str:
@@ -785,6 +790,423 @@ def test_all_solutions_and_extended_constraints() -> None:
             f"table_bool failed:\n{out}")
 
 
+def test_cp_minmax_constant_operands() -> None:
+    """int_min/int_max with constant operands through the CP engine.
+
+    Regression: the CP minmax propagator called cp_dmin(cp,-1) on a constant
+    first operand (heap underflow) and intersected m with the wrong operand
+    bounds, fabricating UNSATISFIABLE for satisfiable models such as
+    int_min(5, x, m).  Every case below was UNSAT/crash on the buggy binary.
+    """
+    # const-first, m free, plain satisfy must be SAT (was fabricated UNSAT).
+    out = run_model(
+        """
+        var 1..10: x :: output_var;
+        var 1..10: m :: output_var;
+        constraint int_min(5, x, m);
+        solve satisfy;
+        """
+    )
+    require("=====UNSATISFIABLE=====" not in out and "=====UNKNOWN=====" not in out,
+            f"int_min(5,x,m) must not be UNSAT/UNKNOWN:\n{out}")
+    # exact propagation checks, const first and second, min and max
+    cases = [
+        ("int_min(5, x, m)",  "int_eq(x, 9)", "m = 5;"),
+        ("int_min(5, x, m)",  "int_eq(x, 3)", "m = 3;"),
+        ("int_min(x, 5, m)",  "int_eq(x, 9)", "m = 5;"),
+        ("int_max(3, x, m)",  "int_eq(x, 2)", "m = 3;"),
+        ("int_max(3, x, m)",  "int_eq(x, 7)", "m = 7;"),
+        ("int_max(x, 3, m)",  "int_eq(x, 7)", "m = 7;"),
+        ("int_max(2, 5, m)",  None,           "m = 5;"),
+        ("int_min(2, 5, m)",  None,           "m = 2;"),
+        # m pinned above/below forces operand fixing through minmax
+        ("int_max(3, x, m)",  "int_eq(m, 8)", "x = 8;"),
+        ("int_min(2, x, m)",  "int_eq(m, 1)", "x = 1;"),
+    ]
+    for cons, extra, expect in cases:
+        body = (
+            "var 1..10: x :: output_var;\n"
+            "var 1..10: m :: output_var;\n"
+            f"constraint {cons};\n"
+            + (f"constraint {extra};\n" if extra else "")
+            + "solve satisfy;\n"
+        )
+        out = run_model(body)
+        require(expect in out, f"{cons} with {extra}: expected {expect}:\n{out}")
+    # genuinely infeasible must remain UNSAT (m out of min's reach)
+    out = run_model(
+        """
+        var 1..10: x :: output_var;
+        var 1..10: m :: output_var;
+        constraint int_min(5, x, m);
+        constraint int_eq(m, 7);
+        solve satisfy;
+        """
+    )
+    require("=====UNSATISFIABLE=====" in out,
+            f"int_min(5,x,7) is genuinely infeasible but was not reported:\n{out}")
+    # MIP bridge path (float var forces fallback): constant operands must
+    # materialize, not be dropped.
+    out = run_model(
+        """
+        var 1..10: x :: output_var;
+        var 1..10: m :: output_var;
+        var 0.0..1.0: f;
+        constraint float_eq(f, 0.5);
+        constraint int_max(3, x, m);
+        constraint int_eq(x, 7);
+        solve satisfy;
+        """
+    )
+    require("m = 7;" in out, f"MIP-path int_max(3,x,m) wrong:\n{out}")
+
+
+def test_fractional_lattice_relations() -> None:
+    """Fractional constants inside integer relations / reifications.
+
+    The encodings used to hardcode a +/-1 lattice step around 0.  On a
+    fractional lattice (d in g*Z+f) that fabricated UNSAT/wrong reifications
+    (int_le_reif(x,0.6,r) with x=1 forced r=true) and the CP parser llround'ed
+    coefficients (int_lin_eq([0.6],[x],1) became x=1).  Every answer below is
+    checked against exact float semantics.
+    """
+    # CP must decline, MIP proves 0.6x = 1 has no integer solution.
+    out = run_model(
+        """
+        var 0..2: x :: output_var;
+        constraint int_lin_eq([0.6], [x], 1);
+        solve satisfy;
+        """
+    )
+    require("=====UNSATISFIABLE=====" in out,
+            f"0.6*x == 1 over integers is UNSAT:\n{out}")
+
+    # Full scalar-reif truth table against float semantics.
+    rels = {
+        "int_eq_reif": lambda a, b: a == b,
+        "int_ne_reif": lambda a, b: a != b,
+        "int_le_reif": lambda a, b: a <= b,
+        "int_lt_reif": lambda a, b: a < b,
+        "int_ge_reif": lambda a, b: a >= b,
+        "int_gt_reif": lambda a, b: a > b,
+    }
+    for xval in (0, 1, 2):
+        for name, fn in rels.items():
+            expect_r = "true" if fn(xval, 0.6) else "false"
+            out = run_model(
+                f"""
+                var 0..2: x :: output_var;
+                var bool: r :: output_var;
+                constraint {name}(x, 0.6, r);
+                constraint int_eq(x, {xval});
+                solve satisfy;
+                """
+            )
+            require(f"r = {expect_r};" in out,
+                    f"{name}(x={xval}, 0.6): expected r = {expect_r}:\n{out}")
+
+    # eq/ne on a fractional lattice collapse to constants.
+    out = run_model(
+        """
+        var 0..2: x :: output_var;
+        var bool: r :: output_var;
+        constraint int_eq_reif(x, 0.6, r);
+        constraint bool_eq(r, true);
+        solve satisfy;
+        """
+    )
+    require("=====UNSATISFIABLE=====" in out,
+            f"x == 0.6 is identically false for integer x; r=true must be UNSAT:\n{out}")
+    out = run_model(
+        """
+        var 0..2: x :: output_var;
+        var bool: r :: output_var;
+        constraint int_ne_reif(x, 0.6, r);
+        solve satisfy;
+        """
+    )
+    require("r = true;" in out,
+            f"x != 0.6 is identically true for integer x:\n{out}")
+
+    # Plain int_ne with a fractional bound must not exclude valid integers.
+    out = run_model(
+        """
+        var 0..2: x :: output_var;
+        constraint int_ne(x, 0.6);
+        constraint int_eq(x, 0);
+        solve satisfy;
+        """
+    )
+    require("x = 0;" in out, f"int_ne(x,0.6) must allow x=0:\n{out}")
+
+    # variable on the right-hand side: 0.6 <= x  <=>  x >= 1 for integer x
+    rels2 = {
+        "int_le_reif": lambda a, b: a <= b,
+        "int_lt_reif": lambda a, b: a < b,
+        "int_ge_reif": lambda a, b: a >= b,
+        "int_gt_reif": lambda a, b: a > b,
+    }
+    for xval in (0, 1):
+        for name, fn in rels2.items():
+            expect_r = "true" if fn(0.6, xval) else "false"
+            out = run_model(
+                f"""
+                var 0..1: x :: output_var;
+                var bool: r :: output_var;
+                constraint {name}(0.6, x, r);
+                constraint int_eq(x, {xval});
+                solve satisfy;
+                """
+            )
+            require(f"r = {expect_r};" in out,
+                    f"{name}(0.6, x={xval}): expected r = {expect_r}:\n{out}")
+
+    # Plain strict relations with fractional bounds must use the exact
+    # lattice neighbor (ceil/floor of rhs), not rhs-1 / rhs+1.
+    out = run_model(
+        """
+        var 0..2: x :: output_var;
+        constraint int_lin_lt([1], [x], 0.6);
+        solve maximize x;
+        """
+    )
+    require("x = 0;" in out, f"int_lin_lt(x,0.6): max x must be 0 (was fabricated UNSAT):\n{out}")
+    out = run_model(
+        """
+        var 0..2: x :: output_var;
+        constraint int_lt(x, 0.6);
+        solve maximize x;
+        """
+    )
+    require("x = 0;" in out, f"int_lt(x,0.6): max x must be 0:\n{out}")
+    out = run_model(
+        """
+        var 0..3: x :: output_var;
+        constraint int_gt(x, 0.6);
+        solve minimize x;
+        """
+    )
+    require("x = 1;" in out, f"int_gt(x,0.6): min x must be 1:\n{out}")
+    out = run_model(
+        """
+        var 0..5: x :: output_var;
+        constraint int_lin_gt([1], [x], 2.5);
+        solve minimize x;
+        """
+    )
+    require("x = 3;" in out, f"int_lin_gt(x,2.5): min x must be 3:\n{out}")
+    out = run_model(
+        """
+        var 0..5: x :: output_var;
+        constraint int_lin_lt([1], [x], 2.5);
+        solve maximize x;
+        """
+    )
+    require("x = 2;" in out, f"int_lin_lt(x,2.5): max x must be 2:\n{out}")
+
+    # Half-reification with fractional bound: r=true implies x < 0.6 (x<=0).
+    out = run_model(
+        """
+        var 0..2: x :: output_var;
+        var bool: r :: output_var;
+        constraint int_lt_imp(x, 0.6, r);
+        constraint bool_eq(r, true);
+        solve maximize x;
+        """
+    )
+    require("x = 0;" in out, f"int_lt_imp(x,0.6,true) must cap x at 0:\n{out}")
+
+    # Non-integral lattice (0.6*x) in a reified relation: no exact unit step
+    # exists -> honest UNKNOWN, never a rounded answer.
+    out = run_model(
+        """
+        var 0..2: x :: output_var;
+        var bool: r :: output_var;
+        constraint int_lin_eq_reif([0.6], [x], 1, r);
+        solve satisfy;
+        """
+    )
+    require("=====UNKNOWN=====" in out,
+            f"non-integral reif lattice must decline honestly:\n{out}")
+
+
+def test_cp_gecode_offset() -> None:
+    """gecode_*_element offset handling (const offsets work; the offset guard
+    was inverted -- it declined plain constants and accepted variable offsets
+    by dropping the variable part)."""
+    out = run_model(
+        """
+        var 1..3: i :: output_var;
+        var 0..9: v :: output_var;
+        constraint gecode_int_element(i, 1, [5, 6, 9], v);
+        constraint int_eq(v, 6);
+        solve satisfy;
+        """
+    )
+    require("i = 2;" in out and "v = 6;" in out,
+            f"gecode_int_element with const offset failed:\n{out}")
+    # variable offset is ill-formed: must not produce a wrong answer
+    out = run_model(
+        """
+        var 2..2: y;
+        var 2..3: i :: output_var;
+        var 0..9: v :: output_var;
+        constraint gecode_int_element(i, y, [5, 6], v);
+        solve satisfy;
+        """
+    )
+    # honest outcomes only: UNKNOWN (declined) or a correct SAT witness
+    if "=====UNSATISFIABLE=====" in out:
+        raise AssertionError(f"variable-offset element fabricated UNSAT:\n{out}")
+    if "=====UNKNOWN=====" not in out:
+        m_i = re.search(r"i = (\d+);", out)
+        m_v = re.search(r"v = (\d+);", out)
+        require(m_i and m_v, f"variable-offset element malformed output:\n{out}")
+        iv, vv = int(m_i.group(1)), int(m_v.group(1))
+        require([5, 6][iv - 2] == vv,
+                f"variable-offset element wrong witness i={iv} v={vv}:\n{out}")
+
+
+def test_cp_variable_element_differential() -> None:
+    """Randomized array_var_int_element instances vs brute force.
+
+    Exercises the CP variable-entry propagator (res/entry intersection,
+    support-based index restriction); SAT witnesses are validated and
+    UNSAT/UNKNOWN verdicts are compared against exhaustive enumeration.
+    """
+    rng = random.Random(20260812)
+    for trial in range(120):
+        n = rng.randint(2, 4)
+        # entry i: constant or a variable with a tiny domain
+        decls = []
+        entries = []
+        var_domains = {}
+        for i in range(n):
+            if rng.random() < 0.5:
+                entries.append(f"e{i}")
+                lo, hi = sorted((rng.randint(-3, 3), rng.randint(-3, 3)))
+                decls.append(f"var {lo}..{hi}: e{i} :: output_var;")
+                var_domains[f"e{i}"] = list(range(lo, hi + 1))
+            else:
+                entries.append(str(rng.randint(-3, 3)))
+        ilo, ihi = 1, n
+        vlo, vhi = sorted((rng.randint(-3, 0), rng.randint(0, 3)))
+        parts = decls + [
+            f"array [1..{n}] of var int: arr = [{', '.join(entries)}];",
+            f"var {ilo}..{ihi}: idx :: output_var;",
+            f"var {vlo}..{vhi}: val :: output_var;",
+            "constraint array_var_int_element(idx, arr, val);",
+        ]
+        # sometimes pin val or idx to create infeasible instances
+        pin_val = rng.random() < 0.4
+        if pin_val:
+            parts.append(f"constraint int_eq(val, {rng.randint(vlo, vhi)});")
+        parts.append("solve satisfy;")
+        model = "\n".join(parts)
+
+        # brute force
+        names = list(var_domains)
+        doms = [var_domains[k] for k in names]
+        feasible = False
+        for combo in itertools.product(*doms):
+            env = dict(zip(names, combo))
+            arrvals = [env[e] if e in env else int(e) for e in entries]
+            for idx in range(1, n + 1):
+                val = arrvals[idx - 1]
+                if not (vlo <= val <= vhi):
+                    continue
+                if pin_val:
+                    pinned = int(parts[-2].split("int_eq(val, ")[1].split(")")[0])
+                    if val != pinned:
+                        continue
+                feasible = True
+                break
+            if feasible:
+                break
+
+        out = run_model(model)
+        if feasible:
+            require("=====UNSATISFIABLE=====" not in out,
+                    f"feasible element instance reported UNSAT (trial {trial}):\n{model}\n{out}")
+            require("=====UNKNOWN=====" not in out,
+                    f"feasible element instance reported UNKNOWN (trial {trial}):\n{model}\n{out}")
+            m_i = re.search(r"idx = (-?\d+);", out)
+            m_v = re.search(r"val = (-?\d+);", out)
+            require(m_i and m_v, f"missing witness (trial {trial}):\n{out}")
+            iv, vv = int(m_i.group(1)), int(m_v.group(1))
+            env = {}
+            for e in entries:
+                if e.startswith("e"):
+                    mm = re.search(rf"{e} = (-?\d+);", out)
+                    require(mm, f"entry var {e} missing from output (trial {trial}):\n{out}")
+                    env[e] = int(mm.group(1))
+            arrvals = [env[e] if e in env else int(e) for e in entries]
+            require(1 <= iv <= n and arrvals[iv - 1] == vv,
+                    f"element witness violates val=arr[idx] (trial {trial}): idx={iv} val={vv} arr={arrvals}\n{model}\n{out}")
+        else:
+            require("=====UNSATISFIABLE=====" in out,
+                    f"infeasible element instance not proven UNSAT (trial {trial}):\n{model}\n{out}")
+
+
+def test_cp_allsolutions_reif_clause() -> None:
+    """-a enumeration through the CP engine with reif/bool_clause records:
+    distinctness, exact counts vs brute force, and the completion marker."""
+    out = run_model(
+        """
+        var 1..3: x :: output_var;
+        var 1..3: y :: output_var;
+        var bool: r :: output_var;
+        constraint int_le_reif(x, y, r);
+        solve satisfy;
+        """,
+        "-a",
+    )
+    blocks = [b for b in out.split("----------") if "x =" in b]
+    seen = set()
+    for b in blocks:
+        xm = re.search(r"x = (-?\d+);", b)
+        ym = re.search(r"y = (-?\d+);", b)
+        rm = re.search(r"r = (true|false);", b)
+        require(xm and ym and rm, f"malformed -a block:\n{b}")
+        tup = (int(xm.group(1)), int(ym.group(1)), rm.group(1))
+        expect = "true" if tup[0] <= tup[1] else "false"
+        require(tup[2] == expect, f"-a reif wrong: x={tup[0]} y={tup[1]} r={tup[2]}:\n{out}")
+        require(tup not in seen, f"-a duplicate solution {tup}")
+        seen.add(tup)
+    # r is fully determined by (x,y) through the reif, so the model has
+    # exactly 9 solutions: the complete 3x3 grid, each with its forced r.
+    require(len(seen) == 9, f"expected 9 distinct (x,y,r) tuples on the 3x3 lattice, got {len(seen)}:\n{out}")
+    grid = {(t[0], t[1]) for t in seen}
+    require(grid == {(x, y) for x in (1, 2, 3) for y in (1, 2, 3)},
+            f"-a reif enumeration is not the complete grid: {sorted(grid)}")
+    require("==========" in out, f"-a reif enumeration missing completion:\n{out}")
+
+    out = run_model(
+        """
+        var bool: a :: output_var;
+        var bool: b :: output_var;
+        var bool: c :: output_var;
+        constraint bool_clause([a], [b, c]);
+        solve satisfy;
+        """,
+        "-a",
+    )
+    blocks = [b for b in out.split("----------") if "a =" in b]
+    seen = set()
+    for b in blocks:
+        am = re.search(r"a = (true|false);", b)
+        bm = re.search(r"b = (true|false);", b)
+        cm = re.search(r"c = (true|false);", b)
+        require(am and bm and cm, f"malformed clause block:\n{b}")
+        tup = (am.group(1), bm.group(1), cm.group(1))
+        ok = (tup[0] == "true") or (tup[1] == "false") or (tup[2] == "false")
+        require(ok, f"clause violated in -a solution {tup}:\n{out}")
+        require(tup not in seen, f"duplicate clause solution {tup}")
+        seen.add(tup)
+    require(len(seen) == 7, f"bool_clause([a],[b,c]) has exactly 7 satisfying tuples, got {len(seen)}:\n{out}")
+    require("==========" in out, f"-a clause enumeration missing completion:\n{out}")
+
+
 def main() -> int:
     if not SOLVER.exists():
         print(f"missing solver binary: {SOLVER}", file=sys.stderr)
@@ -800,6 +1222,11 @@ def main() -> int:
         test_constant_arguments()
         test_declaration_indices_and_honest_unknown()
         test_all_solutions_and_extended_constraints()
+        test_cp_minmax_constant_operands()
+        test_fractional_lattice_relations()
+        test_cp_gecode_offset()
+        test_cp_variable_element_differential()
+        test_cp_allsolutions_reif_clause()
     except AssertionError as exc:
         print(f"FlatZinc semantics test FAILED: {exc}", file=sys.stderr)
         return 1

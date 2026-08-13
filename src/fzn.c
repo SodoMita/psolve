@@ -698,16 +698,44 @@ static int lin_materialize(Builder*b,const Lin*l,int is_float)
 
 /* Add d != 0 for an integer linear form.  p/n select its positive/negative
    side; this is a true disjunction, unlike conjoining d>=1 and d<=-1. */
+/* Exact lattice steps around 0 for an integral-coefficient Lin.
+   If every coefficient of d is integral, d's attainable values lie in
+   g*Z + f with f in [0,1) the fractional part of d's constant.  Over that
+   set, d > 0  <=>  d >= P  and  d < 0  <=>  d <= N, where
+     P = (f > 0 ? f : 1)   (smallest representable positive value is >= f,
+                            and values below f are <= f-g < 0 since g >= 1 > f)
+     N = (f > 0 ? f-1 : -1) (dual)
+   The previous hardcoded +/-1 step is exactly the f==0 case; for f>0 it
+   fabricated infeasibility (x-0.6 > 0 already at x=1, but "d>=1" excludes it),
+   e.g. int_le_reif(x,0.6,r) & x=1 wrongfully forced r=true/UNSAT.
+   Returns 1 and sets *P,*N when the lattice is uniform; returns 0 for
+   non-integral or wild-magnitude coefficients, where no exact unit step
+   exists and the caller must decline (the handler then reports UNKNOWN
+   instead of fabricating). */
+static int int_lattice_steps(const Lin*d,double*P,double*N){
+    if(!isfinite(d->constant)||fabs(d->constant)>1e15) return 0;
+    double f=d->constant-floor(d->constant);
+    if(f>1.0-1e-9) f=0.0; else if(f<1e-9) f=0.0;
+    for(int i=0;i<d->n;i++){
+        double cf=d->coef[i];
+        if(!isfinite(cf)||cf!=rint(cf)||fabs(cf)>1e15) return 0;
+    }
+    if(f>0.0){ *P=f; *N=f-1.0; } else { *P=1.0; *N=-1.0; }
+    return 1;
+}
+
 static int add_int_ne(Builder*b,const Lin*d)
 {
-    double L,U;
+    double L,U,P,N;
+    if(int_lattice_steps(d,&P,&N)!=1)return 1; /* non-uniform lattice: decline honestly */
     if(lin_bounds(b,d,&L,&U)!=0)return -1;
+    if(P<1.0) return 0; /* fractional lattice: d != 0 holds identically */
     int pos=b_newvar(b,0.0,1.0), neg=b_newvar(b,0.0,1.0);
     Lin sel;memset(&sel,0,sizeof(sel));lin_term(&sel,pos,1.0);lin_term(&sel,neg,1.0);b_put(b,'=',1.0,&sel);lin_free(&sel);
-    /* pos=1 -> d>=1; pos=0 leaves the valid lower bound L. */
-    Lin low;memset(&low,0,sizeof(low));lin_into(&low,d,1.0);lin_term(&low,pos,-(1.0-L));b_put(b,'>',L,&low);lin_free(&low);
-    /* neg=1 -> d<=-1; neg=0 leaves the valid upper bound U. */
-    Lin high;memset(&high,0,sizeof(high));lin_into(&high,d,1.0);lin_term(&high,neg,U+1.0);b_put(b,'<',U,&high);lin_free(&high);
+    /* pos=1 -> d>=P; pos=0 leaves the valid lower bound L. */
+    Lin low;memset(&low,0,sizeof(low));lin_into(&low,d,1.0);lin_term(&low,pos,-(P-L));b_put(b,'>',L,&low);lin_free(&low);
+    /* neg=1 -> d<=N; neg=0 leaves the valid upper bound U. */
+    Lin high;memset(&high,0,sizeof(high));lin_into(&high,d,1.0);lin_term(&high,neg,U-N);b_put(b,'<',U,&high);lin_free(&high);
     return 0;
 }
 
@@ -716,45 +744,49 @@ static int add_int_ne(Builder*b,const Lin*d)
    lattice value (+/-1), never the non-strict relaxation. */
 static int add_int_reif(Builder*b,const Lin*d,int r,int which)
 {
-    double L,U;
+    double L,U,P,N;
     if(r<0||r>=b->nvars||b->lo[r]<-1e-9||b->hi[r]>1.0+1e-9||lin_bounds(b,d,&L,&U)!=0)return -1;
+    if(int_lattice_steps(d,&P,&N)!=1)return 1; /* irregular lattice: decline honestly */
     if(which==0){
-        /* r=1 => d=0; r=0 selects d>=1 or d<=-1. */
+        /* r=1 => d=0; r=0 selects d>=P or d<=N.  On a fractional lattice d=0
+           is unattainable, so the relation is identically false: pin r=0. */
+        if(P<1.0){ Lin pin;memset(&pin,0,sizeof(pin));lin_term(&pin,r,1.0);b_put(b,'=',0.0,&pin);lin_free(&pin);return 0; }
         int pos=b_newvar(b,0.0,1.0), neg=b_newvar(b,0.0,1.0);
         Lin sel;memset(&sel,0,sizeof(sel));lin_term(&sel,r,1.0);lin_term(&sel,pos,1.0);lin_term(&sel,neg,1.0);b_put(b,'=',1.0,&sel);lin_free(&sel);
         Lin up;memset(&up,0,sizeof(up));lin_into(&up,d,1.0);lin_term(&up,r,U);b_put(b,'<',U,&up);lin_free(&up);
         Lin low0;memset(&low0,0,sizeof(low0));lin_into(&low0,d,1.0);lin_term(&low0,r,L);b_put(b,'>',L,&low0);lin_free(&low0);
-        Lin low;memset(&low,0,sizeof(low));lin_into(&low,d,1.0);lin_term(&low,pos,-(1.0-L));b_put(b,'>',L,&low);lin_free(&low);
-        Lin high;memset(&high,0,sizeof(high));lin_into(&high,d,1.0);lin_term(&high,neg,U+1.0);b_put(b,'<',U,&high);lin_free(&high);
+        Lin low;memset(&low,0,sizeof(low));lin_into(&low,d,1.0);lin_term(&low,pos,-(P-L));b_put(b,'>',L,&low);lin_free(&low);
+        Lin high;memset(&high,0,sizeof(high));lin_into(&high,d,1.0);lin_term(&high,neg,U-N);b_put(b,'<',U,&high);lin_free(&high);
         return 0;
     }
-    if(which==1){                 /* r <-> d <= 0 */
+    if(which==1){                 /* r <-> d <= 0;  r=0 -> d >= P */
         Lin up;memset(&up,0,sizeof(up));lin_into(&up,d,1.0);lin_term(&up,r,U);b_put(b,'<',U,&up);lin_free(&up);
-        Lin low;memset(&low,0,sizeof(low));lin_into(&low,d,1.0);lin_term(&low,r,1.0-L);b_put(b,'>',1.0,&low);lin_free(&low);
+        Lin low;memset(&low,0,sizeof(low));lin_into(&low,d,1.0);lin_term(&low,r,P-L);b_put(b,'>',P,&low);lin_free(&low);
         return 0;
     }
-    if(which==2){                 /* r <-> d < 0, i.e. d <= -1 */
-        Lin up;memset(&up,0,sizeof(up));lin_into(&up,d,1.0);lin_term(&up,r,U+1.0);b_put(b,'<',U,&up);lin_free(&up);
+    if(which==2){                 /* r <-> d < 0, i.e. r=1 -> d <= N; r=0 -> d >= 0 */
+        Lin up;memset(&up,0,sizeof(up));lin_into(&up,d,1.0);lin_term(&up,r,U-N);b_put(b,'<',U,&up);lin_free(&up);
         Lin low;memset(&low,0,sizeof(low));lin_into(&low,d,1.0);lin_term(&low,r,-L);b_put(b,'>',0.0,&low);lin_free(&low);
         return 0;
     }
-    if(which==3){                 /* r <-> d >= 0 */
+    if(which==3){                 /* r <-> d >= 0;  r=0 -> d <= N */
         Lin low;memset(&low,0,sizeof(low));lin_into(&low,d,1.0);lin_term(&low,r,L);b_put(b,'>',L,&low);lin_free(&low);
-        Lin up;memset(&up,0,sizeof(up));lin_into(&up,d,1.0);lin_term(&up,r,-(U+1.0));b_put(b,'<',-1.0,&up);lin_free(&up);
+        Lin up;memset(&up,0,sizeof(up));lin_into(&up,d,1.0);lin_term(&up,r,-(U-N));b_put(b,'<',N,&up);lin_free(&up);
         return 0;
     }
-    if(which==4){                 /* r <-> d > 0, i.e. d >= 1 */
-        Lin low;memset(&low,0,sizeof(low));lin_into(&low,d,1.0);lin_term(&low,r,-(1.0-L));b_put(b,'>',L,&low);lin_free(&low);
+    if(which==4){                 /* r <-> d > 0, i.e. r=1 -> d >= P; r=0 -> d <= 0 */
+        Lin low;memset(&low,0,sizeof(low));lin_into(&low,d,1.0);lin_term(&low,r,-(P-L));b_put(b,'>',L,&low);lin_free(&low);
         Lin up;memset(&up,0,sizeof(up));lin_into(&up,d,1.0);lin_term(&up,r,-U);b_put(b,'<',0.0,&up);lin_free(&up);
         return 0;
     }
     if(which==5){                 /* r <-> d != 0 */
+        if(P<1.0){ Lin pin;memset(&pin,0,sizeof(pin));lin_term(&pin,r,1.0);b_put(b,'=',1.0,&pin);lin_free(&pin);return 0; }
         int pos=b_newvar(b,0.0,1.0), neg=b_newvar(b,0.0,1.0);
         Lin sel;memset(&sel,0,sizeof(sel));lin_term(&sel,r,-1.0);lin_term(&sel,pos,1.0);lin_term(&sel,neg,1.0);b_put(b,'=',0.0,&sel);lin_free(&sel);
         Lin up;memset(&up,0,sizeof(up));lin_into(&up,d,1.0);lin_term(&up,r,-U);b_put(b,'<',0.0,&up);lin_free(&up);
         Lin low0;memset(&low0,0,sizeof(low0));lin_into(&low0,d,1.0);lin_term(&low0,r,-L);b_put(b,'>',0.0,&low0);lin_free(&low0);
-        Lin low;memset(&low,0,sizeof(low));lin_into(&low,d,1.0);lin_term(&low,pos,-(1.0-L));b_put(b,'>',L,&low);lin_free(&low);
-        Lin high;memset(&high,0,sizeof(high));lin_into(&high,d,1.0);lin_term(&high,neg,U+1.0);b_put(b,'<',U,&high);lin_free(&high);
+        Lin low;memset(&low,0,sizeof(low));lin_into(&low,d,1.0);lin_term(&low,pos,-(P-L));b_put(b,'>',L,&low);lin_free(&low);
+        Lin high;memset(&high,0,sizeof(high));lin_into(&high,d,1.0);lin_term(&high,neg,U-N);b_put(b,'<',U,&high);lin_free(&high);
         return 0;
     }
     return -1;
@@ -763,9 +795,11 @@ static int add_int_reif(Builder*b,const Lin*d,int r,int which)
 /* Half-reification r => (d rel 0) for an integer-valued d. */
 static int add_int_imp(Builder*b,const Lin*d,int r,int which)
 {
-    double L,U;
+    double L,U,P,N;
     if(r<0||r>=b->nvars||b->lo[r]<-1e-9||b->hi[r]>1.0+1e-9||lin_bounds(b,d,&L,&U)!=0)return -1;
-    if(which==0){ /* r => d == 0 */
+    if(int_lattice_steps(d,&P,&N)!=1)return 1; /* irregular lattice: decline honestly */
+    if(which==0){ /* r => d == 0 (fractional lattice: identically false -> r=0) */
+        if(P<1.0){ Lin pin;memset(&pin,0,sizeof(pin));lin_term(&pin,r,1.0);b_put(b,'<',0.0,&pin);lin_free(&pin);return 0; }
         Lin up;memset(&up,0,sizeof(up));lin_into(&up,d,1.0);lin_term(&up,r,U);b_put(b,'<',U,&up);lin_free(&up);
         Lin low;memset(&low,0,sizeof(low));lin_into(&low,d,1.0);lin_term(&low,r,L);b_put(b,'>',L,&low);lin_free(&low);
         return 0;
@@ -774,23 +808,24 @@ static int add_int_imp(Builder*b,const Lin*d,int r,int which)
         Lin up;memset(&up,0,sizeof(up));lin_into(&up,d,1.0);lin_term(&up,r,U);b_put(b,'<',U,&up);lin_free(&up);
         return 0;
     }
-    if(which==2){ /* r => d <= -1 */
-        Lin up;memset(&up,0,sizeof(up));lin_into(&up,d,1.0);lin_term(&up,r,U+1.0);b_put(b,'<',U,&up);lin_free(&up);
+    if(which==2){ /* r => d <= N */
+        Lin up;memset(&up,0,sizeof(up));lin_into(&up,d,1.0);lin_term(&up,r,U-N);b_put(b,'<',U,&up);lin_free(&up);
         return 0;
     }
     if(which==3){ /* r => d >= 0 */
         Lin low;memset(&low,0,sizeof(low));lin_into(&low,d,1.0);lin_term(&low,r,L);b_put(b,'>',L,&low);lin_free(&low);
         return 0;
     }
-    if(which==4){ /* r => d >= 1 */
-        Lin low;memset(&low,0,sizeof(low));lin_into(&low,d,1.0);lin_term(&low,r,L-1.0);b_put(b,'>',L,&low);lin_free(&low);
+    if(which==4){ /* r => d >= P */
+        Lin low;memset(&low,0,sizeof(low));lin_into(&low,d,1.0);lin_term(&low,r,-(P-L));b_put(b,'>',L,&low);lin_free(&low);
         return 0;
     }
-    if(which==5){ /* r => d != 0 */
+    if(which==5){ /* r => d != 0 (fractional lattice: vacuously true) */
+        if(P<1.0) return 0;
         int pos=b_newvar(b,0.0,1.0), neg=b_newvar(b,0.0,1.0);
         Lin sel;memset(&sel,0,sizeof(sel));lin_term(&sel,r,-1.0);lin_term(&sel,pos,1.0);lin_term(&sel,neg,1.0);b_put(b,'=',0.0,&sel);lin_free(&sel);
-        Lin low;memset(&low,0,sizeof(low));lin_into(&low,d,1.0);lin_term(&low,pos,-(1.0-L));b_put(b,'>',L,&low);lin_free(&low);
-        Lin high;memset(&high,0,sizeof(high));lin_into(&high,d,1.0);lin_term(&high,neg,U+1.0);b_put(b,'<',U,&high);lin_free(&high);
+        Lin low;memset(&low,0,sizeof(low));lin_into(&low,d,1.0);lin_term(&low,pos,-(P-L));b_put(b,'>',L,&low);lin_free(&low);
+        Lin high;memset(&high,0,sizeof(high));lin_into(&high,d,1.0);lin_term(&high,neg,U-N);b_put(b,'<',U,&high);lin_free(&high);
         return 0;
     }
     return -1;
@@ -798,22 +833,24 @@ static int add_int_imp(Builder*b,const Lin*d,int r,int which)
 
 static int add_int_relation_constant(Builder*b,const Lin*d,int which,int want)
 {
+    double P,N;
+    if(int_lattice_steps(d,&P,&N)!=1)return 1; /* irregular lattice: decline honestly */
     if(want){
-        if(which==0)b_put(b,'=',0.0,d);
+        if(which==0)b_put(b,'=',0.0,d);            /* d==0 row: infeasible on a fractional lattice -> honest UNSAT */
         else if(which==1)b_put(b,'<',0.0,d);
-        else if(which==2)b_put(b,'<',-1.0,d);
+        else if(which==2)b_put(b,'<',N,d);         /* d<0 <=> d<=N */
         else if(which==3)b_put(b,'>',0.0,d);
-        else if(which==4)b_put(b,'>',1.0,d);
+        else if(which==4)b_put(b,'>',P,d);         /* d>0 <=> d>=P */
         else if(which==5)return add_int_ne(b,d);
         else return -1;
         return 0;
     }
     if(which==0)return add_int_ne(b,d);
-    if(which==1)b_put(b,'>',1.0,d);
+    if(which==1)b_put(b,'>',P,d);                  /* !(d<=0) <=> d>=P */
     else if(which==2)b_put(b,'>',0.0,d);
-    else if(which==3)b_put(b,'<',-1.0,d);
+    else if(which==3)b_put(b,'<',N,d);
     else if(which==4)b_put(b,'<',0.0,d);
-    else if(which==5)b_put(b,'=',0.0,d);
+    else if(which==5)b_put(b,'=',0.0,d);           /* !(d!=0) <=> d==0 */
     else return -1;
     return 0;
 }
@@ -1504,6 +1541,17 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
         else if(strcmp(p,"int_lin_lt")==0||strcmp(p,"bool_lin_lt")==0){rel='<';rhs=-1.0;}
         else if(strcmp(p,"int_lin_ge")==0||strcmp(p,"bool_lin_ge")==0||strcmp(p,"float_lin_ge")==0) rel='>';
         else if(strcmp(p,"int_lin_gt")==0||strcmp(p,"bool_lin_gt")==0){rel='>';rhs=1.0;}
+        /* Strict integer relations on a fractional lattice: lin < 0 <=>
+           lin <= N (not lin <= -1) when lin's constant has fractional part
+           f>0.  int_lin_lt([1],[x],0.6) with rhs=-1 fabricated UNSAT; N=-0.4
+           is exact.  Non-uniform lattices (fractional coefficients) decline
+           to UNKNOWN rather than rounding.  f=0 keeps rhs=+/-1 identically. */
+        if((strcmp(p,"int_lin_lt")==0||strcmp(p,"bool_lin_lt")==0||
+            strcmp(p,"int_lin_gt")==0||strcmp(p,"bool_lin_gt")==0)){
+            double P,N;
+            if(int_lattice_steps(&lin,&P,&N)!=1){lin_free(&lin);lin_free(&d);free_lins(arr,narr);free_lins(parr,nparr);return 1;}
+            if(P<1.0) rhs=(rel=='<')?N:P;
+        }
         b_put(b,rel,rhs,&lin);
         lin_free(&lin);lin_free(&d);free_lins(arr,narr);free_lins(parr,nparr);
         return 0;
@@ -1536,7 +1584,10 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
             return 1;
         }
         /* Integer/bool strict relations use the adjacent lattice value
-           (e.g. x < y  ⇒  x ≤ y − 1), which is exact. */
+           (e.g. x < y  ⇒  x ≤ y − 1), which is exact on the integer
+           lattice; on a fractional lattice the exact neighbors of 0 are
+           N = f-1 and P = f (int_lt(x, 0.6) means x <= -0.4 i.e. x <= 0);
+           non-uniform lattices decline to UNKNOWN. */
         if(strcmp(p,"int_le")==0||strcmp(p,"bool_le")==0||strcmp(p,"float_le")==0||
            strcmp(p,"int_lt")==0||strcmp(p,"bool_lt")==0){
             rel='<';
@@ -1545,6 +1596,12 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
                   strcmp(p,"int_gt")==0||strcmp(p,"bool_gt")==0){
             rel='>';
             if(strcmp(p,"int_gt")==0||strcmp(p,"bool_gt")==0) rhs=1.0;
+        }
+        if(strcmp(p,"int_lt")==0||strcmp(p,"bool_lt")==0||
+           strcmp(p,"int_gt")==0||strcmp(p,"bool_gt")==0){
+            double P,N;
+            if(int_lattice_steps(&dd,&P,&N)!=1){lin_free(&l1);lin_free(&l2);lin_free(&dd);return 1;}
+            if(P<1.0) rhs=(rel=='<')?N:P;
         }
         b_put(b,rel,rhs,&dd);
         lin_free(&l1);lin_free(&l2);lin_free(&dd);
@@ -1969,7 +2026,7 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
             Lin d4;memset(&d4,0,sizeof(d4));lin_term(&d4,mm,1.0);lin_term(&d4,bb,-1.0);lin_term(&d4,s,M);d4.constant-=M;b_put(b,'<',0.0,&d4);lin_free(&d4);
         } else {
             Lin d1;memset(&d1,0,sizeof(d1));lin_term(&d1,mm,1.0);lin_term(&d1,a,-1.0);b_put(b,'<',0.0,&d1);lin_free(&d1);
-            Lin d2;memset(&d2,0,sizeof(d2));lin_term(&d2,mm,1.0);lin_term(&d2,bb,-1.0);b_put(b,'<',0.0,&d2);lin_free(&d2);
+            Lin d2;memset(&d2,0,sizeof(d2));lin_term(&d2,bb,-1.0);b_put(b,'<',0.0,&d2);lin_free(&d2);
             Lin d3;memset(&d3,0,sizeof(d3));lin_term(&d3,mm,1.0);lin_term(&d3,a,-1.0);lin_term(&d3,s,M);b_put(b,'>',0.0,&d3);lin_free(&d3);
             Lin d4;memset(&d4,0,sizeof(d4));lin_term(&d4,mm,1.0);lin_term(&d4,bb,-1.0);lin_term(&d4,s,-M);d4.constant+=M;b_put(b,'>',0.0,&d4);lin_free(&d4);
         }
@@ -3722,8 +3779,10 @@ void fz_solve(const FZModel*m,FZSolution*sol)
        (solve satisfy) CSPs with combinatorial/nonlinear predicates; it solves
        all_different puzzles (n-Queens, Sudoku, magic/latin squares) and
        monomial Diophantine products that the LP/MIP bridge handles poorly.
+       For `-a` all-solutions enumeration it enumerates every distinct output
+       solution directly (far faster than the MIP all-solutions enumeration).
        It falls back to the MIP bridge for everything it cannot certify. */
-    if(!sol->all_solutions && m->solve_kind==0 && nv>0){
+    if(m->solve_kind==0 && nv>0){
         if(fz_cp_try(m,sol)) return;
     }
     /* A compiler can propagate every decision variable to a literal (for

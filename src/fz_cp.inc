@@ -153,6 +153,7 @@ typedef struct {
     int    *lvars;  long long *lcoef;  long long rhs; int rel;
     CPT   *terms;
     int    nset; long long *setvals;
+    CPT   *arr_terms;  /* element array entries (CPT, const or var) */
 } CPCR;
 
 #define CPK_LIN 0
@@ -164,6 +165,9 @@ typedef struct {
 #define CPK_ELEM 6
 #define CPK_SETIN 7
 #define CPK_POW 8
+#define CPK_REIF 9     /* r <-> inner linear relation; bool var in terms[0], inner in lvars/lcoef/rhs/rel */
+#define CPK_CLAUSE 10  /* disjunction of literals; pos bools in lvars, neg bools in terms (as terms[].v) */
+#define CPK_MINMAX 11  /* m = min/max(a,b); terms[0]=a,terms[1]=b,terms[2]=m; n set to ismax flag */
 
 static int cp_term_from_lin(const Lin*l,CPT*t){
     if(l->n==0 && fabs(l->constant)<=CP_BIG && l->constant==rint(l->constant)){ t->isc=1; t->c=(int64_t)l->constant; t->v=-1; return 0; }
@@ -552,24 +556,44 @@ static int cp_prop_abs(CP*cp,CPT*a,CPT*c){
 
 /* ------------------------------------------------------------------ */
 /* element: res = arr[idx - offset], idx in [offset, offset+narr-1].   */
-/* terms[0]=idx, terms[1]=res; arr values in setvals (int).            */
+/* terms[0]=idx, terms[1]=res; arr entries in arrt (CPT, const or var).*/
 /* ------------------------------------------------------------------ */
-static int cp_prop_elem(CP*cp,CPT*idx,CPT*res,long long*arr,int narr,int offset){
+static int cp_prop_elem(CP*cp,CPT*idx,CPT*res,CPT*arrt,int narr,int offset){
     int64_t iv,rv;
     int iF=cp_term_value(cp,idx,&iv), rF=cp_term_value(cp,res,&rv);
     if(iF){
         long k=(long)(iv-offset);
-        if(k<0||k>=narr) return 1;   /* infeasible (res may be a constant: no var to touch) */
-        int64_t val=arr[k];
-        if(rF){ if(rv!=val) return 1; }
-        else { if(cp_intersect(cp,res->v,val,val)) return 1; }
+        if(k<0||k>=narr) return 1;   /* infeasible index: no feasible position (const-safe) */
+        CPT *e=&arrt[k];
+        int64_t ev;
+        int eF=cp_term_value(cp,e,&ev);
+        if(eF){
+            if(rF){ if(rv!=ev) return 1; }
+            else if(!res->isc && cp_intersect(cp,res->v,ev,ev)) return 1;
+        } else if(res->isc){
+            /* res fixed, e is a var: e must equal res */
+            if(cp_intersect(cp,e->v,res->c,res->c)) return 1;
+        } else if(!res->isc && e->v==res->v){
+            return 0; /* res == res always true */
+        } else if(!res->isc){
+            /* res and e both vars: e must equal res -> bound both to intersection */
+            int64_t elo=cp_dmin(cp,e->v),ehi=cp_dmax(cp,e->v);
+            int64_t rlo=cp_dmin(cp,res->v),rhi=cp_dmax(cp,res->v);
+            int64_t nlo=(elo>rlo?elo:rlo), nhi=(ehi<rhi?ehi:rhi);
+            if(cp_intersect(cp,e->v,nlo,nhi)) return 1;
+            if(cp_intersect(cp,res->v,nlo,nhi)) return 1;
+            if(cp_fixed(cp,e->v)&&cp_fixed(cp,res->v)&&cp->vals[e->v][0]!=cp->vals[res->v][0]) return 1;
+        }
         return 0;
     }
-    /* index not fixed.  If res fixed, restrict index to positions holding res. */
+    /* index not fixed.  If res fixed, restrict index to positions that can hold res. */
     if(rF){
         if(cp->bounded[idx->v] && cp->nvals[idx->v]<=CP_MAXVALS){
             int64_t *nvals=NULL; int nn=0,cap2=0;
-            for(int i=0;i<cp->nvals[idx->v];i++){ int64_t iv2=cp->vals[idx->v][i]; long k=(long)(iv2-offset); if(k>=0&&k<narr&&arr[k]==rv){ if(nn>=cap2){cap2=cap2?cap2*2:8;nvals=(int64_t*)psolve_realloc((void**)&nvals,(size_t)cap2*sizeof(int64_t));} nvals[nn++]=iv2; } }
+            for(int i=0;i<cp->nvals[idx->v];i++){ int64_t iv2=cp->vals[idx->v][i]; long k=(long)(iv2-offset);
+                if(k>=0&&k<narr){ CPT*e=&arrt[k]; int64_t ev; int eF=cp_term_value(cp,e,&ev);
+                    int can = eF ? (ev==rv) : (!e->isc && cp_contains(cp,e->v,rv));
+                    if(can){ if(nn>=cap2){cap2=cap2?cap2*2:8;nvals=(int64_t*)psolve_realloc((void**)&nvals,(size_t)cap2*sizeof(int64_t));} nvals[nn++]=iv2; } } }
             if(nn==0){ free(nvals); return 1; }
             if(cp_set_vals(cp,idx->v,nvals,nn)<0){ free(nvals); return -1; } free(nvals);
         }
@@ -644,11 +668,155 @@ static int cp_prop_pow(CP*cp,CPT*base,int64_t expo,CPT*c){
 }
 
 /* ------------------------------------------------------------------ */
+/* Reification: r <-> (sum lcoef*x rel rhs).  terms[0] is the bool var r.  */
+/* Conservative but sound: enforce the inner constraint when r is fixed,  */
+/* set r when the inner is fully determined.  Arc consistency is left to  */
+/* search + verification.  Returns 1 if inconsistent.                     */
+/* ------------------------------------------------------------------ */
+static int cp_prop_reif(CP*cp,CPCR*r){
+    int rv=r->terms[0].v;
+    if(r->terms[0].isc || rv<0 || rv>=cp->nvars) return 0;
+    /* is the inner fully determined? */
+    int allfix=1; __int128 val=0;
+    for(int i=0;i<r->n;i++){ int v=r->lvars[i]; if(!cp_fixed(cp,v)){allfix=0;break;} val+=(__int128)r->lcoef[i]*cp->vals[v][0]; }
+    if(cp_fixed(cp,rv)){
+        int rval=(int)cp->vals[rv][0];
+        if(rval==1){ if(cp_prop_lin(cp,r->n,r->lvars,r->lcoef,r->rhs,r->rel)) return 1; }
+        else { /* enforce negation */
+            int negrel;
+            switch(r->rel){case 0:negrel=5;break;case 5:negrel=0;break;case 1:negrel=4;break;case 4:negrel=1;break;case 2:negrel=3;break;case 3:negrel=2;break;default:negrel=r->rel;break;}
+            if(cp_prop_lin(cp,r->n,r->lvars,r->lcoef,r->rhs,negrel)) return 1;
+        }
+        return 0;
+    }
+    /* r free.  If inner determined, set r. */
+    if(allfix){
+        int holds=0;
+        switch(r->rel){case 0:holds=(val==r->rhs);break;case 1:holds=(val<=r->rhs);break;case 2:holds=(val>=r->rhs);break;case 3:holds=(val<r->rhs);break;case 4:holds=(val>r->rhs);break;case 5:holds=(val!=r->rhs);break;}
+        cp_assign(cp,rv,holds?1:0);
+        return 0;
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* bool_clause(pos[], neg[]): at least one pos true OR one neg false.  */
+/* pos bools in lvars (must be 1), neg bools in terms[].v (must be 0).  */
+/* Returns 1 if inconsistent.                                          */
+/* ------------------------------------------------------------------ */
+static int cp_prop_clause(CP*cp,CPCR*c){
+    int npos=c->n, nneg=0;
+    while(c->terms && nneg<0) ; /* noop */
+    /* count neg: terms array sized by nset */
+    nneg=c->nset;
+    /* determine if satisfied: any pos==1 or any neg==0 */
+    int satisfied=0;
+    for(int i=0;i<npos;i++){ int v=c->lvars[i]; if(v<0||v>=cp->nvars) continue; if(cp_fixed(cp,v)&&cp->vals[v][0]==1){satisfied=1;break;} }
+    if(!satisfied) for(int i=0;i<nneg;i++){ int v=c->terms[i].v; if(v<0||v>=cp->nvars) continue; if(cp_fixed(cp,v)&&cp->vals[v][0]==0){satisfied=1;break;} }
+    if(satisfied) return 0;
+    /* count undetermined literals; force the last one if exactly one remains */
+    int undet=0, lastpos=-1, lastneg=-1;
+    for(int i=0;i<npos;i++){ int v=c->lvars[i]; if(v<0||v>=cp->nvars) continue;
+        if(cp_fixed(cp,v)){ if(cp->vals[v][0]==0){} else {satisfied=1;} } else { undet++; lastpos=i; } }
+    for(int i=0;i<nneg;i++){ int v=c->terms[i].v; if(v<0||v>=cp->nvars) continue;
+        if(cp_fixed(cp,v)){ if(cp->vals[v][0]==1){} else {satisfied=1;} } else { undet++; lastneg=i; } }
+    if(satisfied) return 0;
+    if(undet==0) return 1;  /* all forced to fail */
+    if(undet==1){
+        if(lastpos>=0){ cp_assign(cp,c->lvars[lastpos],1); return 0; }
+        if(lastneg>=0){ cp_assign(cp,c->terms[lastneg].v,0); return 0; }
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* minmax: m = min(a,b) (ismax=0) or max(a,b) (ismax=1).               */
+/* terms[0]=a, terms[1]=b, terms[2]=m.  Sound, conservative.          */
+/* Returns 1 if inconsistent.                                         */
+/* ------------------------------------------------------------------ */
+static int cp_prop_minmax(CP*cp,CPCR*c){
+    int ismax=(c->n!=0);
+    CPT*A=&c->terms[0],*B=&c->terms[1],*M=&c->terms[2];
+    int64_t mv=0; int mF=cp_term_value(cp,M,&mv);
+    /* Const-safe operand bounds (terms may be constants: v is -1 then, so
+       cp_dmin/cp_dmax must never be called on them -- the original case split
+       did cp_dmin(cp,-1), a heap underflow that also produced wrong UNSAT). */
+    int64_t amn,amx,bmn,bmx;
+    if(A->isc){ amn=amx=A->c; } else { amn=cp_dmin(cp,A->v); amx=cp_dmax(cp,A->v); }
+    if(B->isc){ bmn=bmx=B->c; } else { bmn=cp_dmin(cp,B->v); bmx=cp_dmax(cp,B->v); }
+    /* 1. both operands determined -> m is determined */
+    if(A->isc&&B->isc){
+        int64_t res=ismax?(amx>bmx?amx:bmx):(amn<bmn?amn:bmn);
+        if(mF) return mv==res?0:1;
+        return cp_intersect(cp,M->v,res,res);
+    }
+    /* 2. m determined: max(a,b)=mv forces each operand <= mv with at least
+          one attaining mv (dually for min).  All domain updates stay inside
+          the operand's current bounds, so they can only restrict. */
+    if(mF){
+        if(ismax){
+            if(amn>mv||bmn>mv) return 1;              /* an operand forced above mv */
+            if(amx<mv&&bmx<mv) return 1;              /* no operand can attain mv */
+            if(!A->isc&&amx>mv){ if(cp_intersect(cp,A->v,amn,mv)) return 1; }
+            if(!B->isc&&bmx>mv){ if(cp_intersect(cp,B->v,bmn,mv)) return 1; }
+            if(amx<mv){ /* B alone can supply mv */
+                if(B->isc){ if(bmx!=mv) return 1; }
+                else if(cp_intersect(cp,B->v,mv,mv)) return 1;
+            }
+            if(bmx<mv){ /* A alone can supply mv */
+                if(A->isc){ if(amx!=mv) return 1; }
+                else if(cp_intersect(cp,A->v,mv,mv)) return 1;
+            }
+        } else {
+            if(amx<mv||bmx<mv) return 1;              /* an operand forced below mv */
+            if(amn>mv&&bmn>mv) return 1;              /* no operand can attain mv */
+            if(!A->isc&&amn<mv){ if(cp_intersect(cp,A->v,mv,amx)) return 1; }
+            if(!B->isc&&bmn<mv){ if(cp_intersect(cp,B->v,mv,bmx)) return 1; }
+            if(amn>mv){ /* B alone can supply mv */
+                if(B->isc){ if(bmn!=mv) return 1; }
+                else if(cp_intersect(cp,B->v,mv,mv)) return 1;
+            }
+            if(bmn>mv){ /* A alone can supply mv */
+                if(A->isc){ if(amn!=mv) return 1; }
+                else if(cp_intersect(cp,A->v,mv,mv)) return 1;
+            }
+        }
+        return 0;
+    }
+    /* 3. m free: sound whole-domain bound only.
+          min: min(amn,bmn) <= m <= min(amx,bmx)
+          max: max(amn,bmn) <= m <= max(amx,bmx)                         */
+    if(!M->isc){
+        int64_t lo,hi;
+        if(ismax){ lo=(amn>bmn?amn:bmn); hi=(amx>bmx?amx:bmx); }
+        else     { lo=(amn<bmn?amn:bmn); hi=(amx<bmx?amx:bmx); }
+        if(cp_intersect(cp,M->v,lo,hi)) return 1;
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /* Parsing FlatZinc constraints into CPCR records                      */
 /* ------------------------------------------------------------------ */
 
-/* build a CPCR linear record from a Lin and a rel code */
+/* Exact-integrality gate for CP linear records: every coefficient and the
+   accumulated constant must be integral and within the CP int64 window,
+   otherwise llround would silently change the constraint's meaning (e.g.
+   int_lin_eq([0.6],[x],1) became x=1) or invoke UB on out-of-range doubles.
+   Callers decline inexact constraints, which fall back to the exact MIP
+   bridge -- honest UNKNOWN-avoidance beats a fabricated answer. */
+static int cp_lin_is_exact(const Lin*L){
+    if(!isfinite(L->constant)||L->constant!=rint(L->constant)||fabs(L->constant)>=(double)CP_BIG) return 0;
+    for(int i=0;i<L->n;i++){
+        double cf=L->coef[i];
+        if(!isfinite(cf)||cf!=rint(cf)||fabs(cf)>=(double)CP_BIG) return 0;
+    }
+    return 1;
+}
+
+/* build a CPCR linear record from a Lin and a rel code; -1 if not exactly integral */
 static int cp_make_lin(CPCR*cr,const Lin*L,int rel){
+    if(!cp_lin_is_exact(L)) return -1;
     cr->kind=CPK_LIN; cr->rel=rel; cr->n=L->n;
     cr->lvars=(int*)psolve_malloc((size_t)(L->n?L->n:1)*sizeof(int));
     cr->lcoef=(long long*)psolve_malloc((size_t)(L->n?L->n:1)*sizeof(long long));
@@ -747,7 +915,7 @@ static int cp_parse(FZModel*m,CPCR**out_cr,int*out_n,unsigned char*referenced,in
             else if(cp_pred_is(p,"int_lin_lt")||cp_pred_is(p,"bool_lin_lt"))rel=3;
             else if(cp_pred_is(p,"int_lin_gt")||cp_pred_is(p,"bool_lin_gt"))rel=4;
             else rel=5;
-            cp_make_lin(&rec,&L,rel); lin_free(&L);
+            if(cp_make_lin(&rec,&L,rel)!=0){lin_free(&L);ok=0;break;} lin_free(&L);
             if(cp_pred_is(p,"int_lin_eq")||cp_pred_is(p,"bool_lin_eq")||
                cp_pred_is(p,"int_lin_ne")||cp_pred_is(p,"bool_lin_ne")) motivating=1;
         }
@@ -768,7 +936,7 @@ static int cp_parse(FZModel*m,CPCR**out_cr,int*out_n,unsigned char*referenced,in
             else if(cp_pred_is(p,"int_lt")||cp_pred_is(p,"bool_lt"))rel=3;
             else if(cp_pred_is(p,"int_ge")||cp_pred_is(p,"bool_ge"))rel=2;
             else rel=4;
-            cp_make_lin(&rec,&dd,rel); lin_free(&dd);
+            if(cp_make_lin(&rec,&dd,rel)!=0){lin_free(&dd);ok=0;break;} lin_free(&dd);
             if(cp_pred_is(p,"int_ne")||cp_pred_is(p,"bool_ne")) motivating=1;
         }
         /* ---------- bool_not / bool2int / int_plus / int_minus / int_neg ---------- */
@@ -777,13 +945,13 @@ static int cp_parse(FZModel*m,CPCR**out_cr,int*out_n,unsigned char*referenced,in
             if(parse_lin(m,c->args[0],&l1)!=0){ok=0;break;}
             if(parse_lin(m,c->args[1],&l2)!=0){lin_free(&l1);ok=0;break;}
             Lin dd;memset(&dd,0,sizeof(dd)); lin_into(&dd,&l1,1.0); lin_into(&dd,&l2,1.0); dd.constant-=1.0;
-            lin_free(&l1);lin_free(&l2); cp_make_lin(&rec,&dd,0); lin_free(&dd);
+            lin_free(&l1);lin_free(&l2); if(cp_make_lin(&rec,&dd,0)!=0){lin_free(&dd);ok=0;break;} lin_free(&dd);
         } else if(cp_pred_is(p,"bool2int")){
             if(c->nargs<2){ok=0;break;}
             if(parse_lin(m,c->args[0],&l1)!=0){ok=0;break;}
             if(parse_lin(m,c->args[1],&l2)!=0){lin_free(&l1);ok=0;break;}
             Lin dd;memset(&dd,0,sizeof(dd)); lin_into(&dd,&l2,1.0); lin_into(&dd,&l1,-1.0);
-            lin_free(&l1);lin_free(&l2); cp_make_lin(&rec,&dd,0); lin_free(&dd);
+            lin_free(&l1);lin_free(&l2); if(cp_make_lin(&rec,&dd,0)!=0){lin_free(&dd);ok=0;break;} lin_free(&dd);
         } else if(cp_pred_is(p,"int_plus")||cp_pred_is(p,"int_minus")){
             int minus=(strcmp(p,"int_minus")==0||strcmp(p,"fzn_int_minus")==0);
             if(c->nargs<3){ok=0;break;}
@@ -791,13 +959,13 @@ static int cp_parse(FZModel*m,CPCR**out_cr,int*out_n,unsigned char*referenced,in
             if(parse_lin(m,c->args[1],&l2)!=0){lin_free(&l1);ok=0;break;}
             if(parse_lin(m,c->args[2],&l3)!=0){lin_free(&l1);lin_free(&l2);ok=0;break;}
             Lin dd;memset(&dd,0,sizeof(dd)); lin_into(&dd,&l3,1.0); lin_into(&dd,&l1,-1.0); lin_into(&dd,&l2,minus?1.0:-1.0);
-            lin_free(&l1);lin_free(&l2);lin_free(&l3); cp_make_lin(&rec,&dd,0); lin_free(&dd);
+            lin_free(&l1);lin_free(&l2);lin_free(&l3); if(cp_make_lin(&rec,&dd,0)!=0){lin_free(&dd);ok=0;break;} lin_free(&dd);
         } else if(cp_pred_is(p,"int_neg")){
             if(c->nargs<2){ok=0;break;}
             if(parse_lin(m,c->args[0],&l1)!=0){ok=0;break;}
             if(parse_lin(m,c->args[1],&l2)!=0){lin_free(&l1);ok=0;break;}
             Lin dd;memset(&dd,0,sizeof(dd)); lin_into(&dd,&l2,1.0); lin_into(&dd,&l1,1.0);
-            lin_free(&l1);lin_free(&l2); cp_make_lin(&rec,&dd,0); lin_free(&dd);
+            lin_free(&l1);lin_free(&l2); if(cp_make_lin(&rec,&dd,0)!=0){lin_free(&dd);ok=0;break;} lin_free(&dd);
         }
         /* ---------- all_different ---------- */
         else if(cp_pred_is(p,"all_different")||cp_pred_is(p,"all_different_int")){
@@ -854,29 +1022,141 @@ static int cp_parse(FZModel*m,CPCR**out_cr,int*out_n,unsigned char*referenced,in
             if(!ok){ free(rec.terms); break; }
             motivating=1;
         }
-        /* ---------- array element ---------- */
-        else if(cp_pred_is(p,"array_int_element")||cp_pred_is(p,"gecode_int_element")){
+        /* ---------- array element (incl. var/bool/array_var forms) ---------- */
+        else if(cp_pred_is(p,"array_int_element")||cp_pred_is(p,"array_var_int_element")||
+                cp_pred_is(p,"array_bool_element")||cp_pred_is(p,"array_var_bool_element")||
+                cp_pred_is(p,"array_int_element_nonshifted")||cp_pred_is(p,"array_var_int_element_nonshifted")||
+                cp_pred_is(p,"array_bool_element_nonshifted")||cp_pred_is(p,"array_var_bool_element_nonshifted")||
+                cp_pred_is(p,"gecode_int_element")||cp_pred_is(p,"gecode_bool_element")||
+                cp_pred_is(p,"gecode_var_int_element")||cp_pred_is(p,"gecode_var_bool_element")){
             int gec=(strncmp(p,"gecode_",7)==0);
+            int nonshifted=(strstr(p,"_nonshifted")!=NULL);
             int na=gec?4:3;
             if(c->nargs<na){ok=0;break;}
             int idx_arg=0, off_arg=1, arr_arg=gec?2:1, val_arg=gec?3:2;
-            long offset=1;
-            if(gec){ Lin ol; if(parse_lin(m,c->args[off_arg],&ol)!=0){ok=0;break;} if(ol.n!=0&&fabs(ol.constant)<=CP_BIG){offset=(long)llround(ol.constant);} else {lin_free(&ol);ok=0;break;} lin_free(&ol); }
+            long offset= nonshifted?0:1;
+            if(gec){ Lin ol; if(parse_lin(m,c->args[off_arg],&ol)!=0){ok=0;break;} if(ol.n==0&&isfinite(ol.constant)&&ol.constant==rint(ol.constant)&&fabs(ol.constant)<=(double)CP_BIG){offset=(long)llround(ol.constant);} else {lin_free(&ol);ok=0;break;} lin_free(&ol); }
             Lin il; if(parse_lin(m,c->args[idx_arg],&il)!=0){ok=0;break;}
             Lin*arr;int narr; if(parse_array(m,c->args[arr_arg],&arr,&narr)!=0){lin_free(&il);ok=0;break;}
             Lin vl; if(parse_lin(m,c->args[val_arg],&vl)!=0){lin_free(&il);free_lins(arr,narr);ok=0;break;}
             rec.kind=CPK_ELEM; rec.n=2; rec.terms=(CPT*)psolve_calloc(2,sizeof(CPT));
-            rec.setvals=(long long*)psolve_malloc((size_t)(narr?narr:1)*sizeof(long long));
-            int bad=0;
-            for(int i=0;i<narr;i++){ if(arr[i].n!=0 || !isfinite(arr[i].constant)||arr[i].constant!=rint(arr[i].constant)){bad=1;break;} rec.setvals[i]=(long long)arr[i].constant; }
+            rec.arr_terms=(CPT*)psolve_calloc((size_t)(narr?narr:1),sizeof(CPT));
             rec.nset=narr;
+            int bad=0;
+            /* array entries may be constants OR variables (the MiniZinc std
+               library builds element arrays like [1, X7, X8, X9]). */
+            for(int i=0;i<narr;i++){
+                if(cp_term_from_lin(&arr[i],&rec.arr_terms[i])!=0){ bad=1; break; }
+                if(!rec.arr_terms[i].isc) referenced[rec.arr_terms[i].v]=1;
+            }
             free_lins(arr,narr);
             if(!bad){ if(cp_term_from_lin(&il,&rec.terms[0])!=0) bad=1; if(cp_term_from_lin(&vl,&rec.terms[1])!=0) bad=1; }
             lin_free(&il);lin_free(&vl);
-            if(bad){ free(rec.terms); free(rec.setvals); ok=0; break; }
+            if(bad){ free(rec.terms); free(rec.arr_terms); ok=0; break; }
             if(!rec.terms[0].isc) referenced[rec.terms[0].v]=1;
             if(!rec.terms[1].isc) referenced[rec.terms[1].v]=1;
             rec.lvars=(int*)psolve_malloc(sizeof(int)); rec.lvars[0]=(int)offset; /* store offset */
+            motivating=1;
+        }
+        /* ---------- int_min / int_max ---------- */
+        else if(cp_pred_is(p,"int_min")||cp_pred_is(p,"int_max")){
+            if(c->nargs<3){ok=0;break;}
+            if(parse_lin(m,c->args[0],&l1)!=0){ok=0;break;}
+            if(parse_lin(m,c->args[1],&l2)!=0){lin_free(&l1);ok=0;break;}
+            if(parse_lin(m,c->args[2],&l3)!=0){lin_free(&l1);lin_free(&l2);ok=0;break;}
+            rec.kind=CPK_MINMAX; rec.n= (cp_pred_is(p,"int_max")?1:0); rec.terms=(CPT*)psolve_calloc(3,sizeof(CPT));
+            int bad=0;
+            if(cp_term_from_lin(&l1,&rec.terms[0])!=0) bad=1;
+            if(cp_term_from_lin(&l2,&rec.terms[1])!=0) bad=1;
+            if(cp_term_from_lin(&l3,&rec.terms[2])!=0) bad=1;
+            lin_free(&l1);lin_free(&l2);lin_free(&l3);
+            if(bad){ free(rec.terms); ok=0; break; }
+            for(int i=0;i<3;i++) if(!rec.terms[i].isc) referenced[rec.terms[i].v]=1;
+            motivating=1;
+        }
+        /* ---------- reified relations: r <-> (sum coef*x rel rhs) ---------- */
+        else if(cp_pred_is(p,"int_lin_eq_reif")||cp_pred_is(p,"int_lin_ne_reif")||
+                cp_pred_is(p,"int_lin_le_reif")||cp_pred_is(p,"int_lin_lt_reif")||
+                cp_pred_is(p,"int_lin_ge_reif")||cp_pred_is(p,"int_lin_gt_reif")||
+                cp_pred_is(p,"bool_lin_eq_reif")||cp_pred_is(p,"bool_lin_ne_reif")||
+                cp_pred_is(p,"bool_lin_le_reif")||cp_pred_is(p,"bool_lin_lt_reif")||
+                cp_pred_is(p,"bool_lin_ge_reif")||cp_pred_is(p,"bool_lin_gt_reif")){
+            if(c->nargs<4){ok=0;break;}
+            Lin*arr;int narr; if(parse_array(m,c->args[0],&arr,&narr)!=0){ok=0;break;}
+            Lin*parr;int nparr; if(parse_array(m,c->args[1],&parr,&nparr)!=0){free_lins(arr,narr);ok=0;break;}
+            Lin d; if(parse_lin(m,c->args[2],&d)!=0){free_lins(arr,narr);free_lins(parr,nparr);ok=0;break;}
+            Lin rl; if(parse_lin(m,c->args[3],&rl)!=0){free_lins(arr,narr);free_lins(parr,nparr);lin_free(&d);ok=0;break;}
+            if(narr!=nparr){free_lins(arr,narr);free_lins(parr,nparr);lin_free(&d);lin_free(&rl);ok=0;break;}
+            Lin L;memset(&L,0,sizeof(L)); int bad=0;
+            for(int i=0;i<narr;i++){ if(arr[i].n!=0||!isfinite(arr[i].constant)){bad=1;break;} lin_into(&L,&parr[i],arr[i].constant); }
+            lin_into(&L,&d,-1.0);
+            free_lins(arr,narr);free_lins(parr,nparr);lin_free(&d);
+            if(bad){lin_free(&L);lin_free(&rl);ok=0;break;}
+            if(!cp_lin_is_exact(&L)){ lin_free(&L); lin_free(&rl); ok=0; break; }
+            CPT rb; if(cp_term_from_lin(&rl,&rb)!=0 || rb.isc){ lin_free(&L);lin_free(&rl);ok=0;break; }
+            lin_free(&rl);
+            int rel;
+            if(cp_pred_is(p,"int_lin_eq_reif")||cp_pred_is(p,"bool_lin_eq_reif"))rel=0;
+            else if(cp_pred_is(p,"int_lin_ne_reif")||cp_pred_is(p,"bool_lin_ne_reif"))rel=5;
+            else if(cp_pred_is(p,"int_lin_le_reif")||cp_pred_is(p,"bool_lin_le_reif"))rel=1;
+            else if(cp_pred_is(p,"int_lin_lt_reif")||cp_pred_is(p,"bool_lin_lt_reif"))rel=3;
+            else if(cp_pred_is(p,"int_lin_ge_reif")||cp_pred_is(p,"bool_lin_ge_reif"))rel=2;
+            else rel=4;
+            rec.kind=CPK_REIF; rec.rel=rel; rec.terms=(CPT*)psolve_calloc(1,sizeof(CPT)); rec.terms[0]=rb;
+            rec.n=L.n; rec.lvars=(int*)psolve_malloc((size_t)(L.n?L.n:1)*sizeof(int));
+            rec.lcoef=(long long*)psolve_malloc((size_t)(L.n?L.n:1)*sizeof(long long));
+            for(int i=0;i<L.n;i++){ rec.lvars[i]=L.idx[i]; rec.lcoef[i]=(long long)llround(L.coef[i]); referenced[L.idx[i]]=1; }
+            rec.rhs= -(long long)llround(L.constant);
+            lin_free(&L);
+            referenced[rb.v]=1;
+            motivating=1;
+        }
+        /* ---------- reified scalar relations ---------- */
+        else if(cp_pred_is(p,"int_eq_reif")||cp_pred_is(p,"int_ne_reif")||
+                cp_pred_is(p,"int_le_reif")||cp_pred_is(p,"int_lt_reif")||
+                cp_pred_is(p,"int_ge_reif")||cp_pred_is(p,"int_gt_reif")||
+                cp_pred_is(p,"bool_eq_reif")||cp_pred_is(p,"bool_ne_reif")||
+                cp_pred_is(p,"bool_le_reif")||cp_pred_is(p,"bool_lt_reif")||
+                cp_pred_is(p,"bool_ge_reif")||cp_pred_is(p,"bool_gt_reif")){
+            if(c->nargs<3){ok=0;break;}
+            if(parse_lin(m,c->args[0],&l1)!=0){ok=0;break;}
+            if(parse_lin(m,c->args[1],&l2)!=0){lin_free(&l1);ok=0;break;}
+            if(parse_lin(m,c->args[2],&l3)!=0){lin_free(&l1);lin_free(&l2);ok=0;break;}
+            Lin dd;memset(&dd,0,sizeof(dd)); lin_into(&dd,&l1,1.0); lin_into(&dd,&l2,-1.0);
+            lin_free(&l1);lin_free(&l2);
+            if(!cp_lin_is_exact(&dd)){ lin_free(&dd); lin_free(&l3); ok=0; break; }
+            CPT rb; if(cp_term_from_lin(&l3,&rb)!=0 || rb.isc){ lin_free(&dd);lin_free(&l3);ok=0;break; }
+            lin_free(&l3);
+            int rel;
+            if(cp_pred_is(p,"int_eq_reif")||cp_pred_is(p,"bool_eq_reif"))rel=0;
+            else if(cp_pred_is(p,"int_ne_reif")||cp_pred_is(p,"bool_ne_reif"))rel=5;
+            else if(cp_pred_is(p,"int_le_reif")||cp_pred_is(p,"bool_le_reif"))rel=1;
+            else if(cp_pred_is(p,"int_lt_reif")||cp_pred_is(p,"bool_lt_reif"))rel=3;
+            else if(cp_pred_is(p,"int_ge_reif")||cp_pred_is(p,"bool_ge_reif"))rel=2;
+            else rel=4;
+            rec.kind=CPK_REIF; rec.rel=rel; rec.terms=(CPT*)psolve_calloc(1,sizeof(CPT)); rec.terms[0]=rb;
+            rec.n=dd.n; rec.lvars=(int*)psolve_malloc((size_t)(dd.n?dd.n:1)*sizeof(int));
+            rec.lcoef=(long long*)psolve_malloc((size_t)(dd.n?dd.n:1)*sizeof(long long));
+            for(int i=0;i<dd.n;i++){ rec.lvars[i]=dd.idx[i]; rec.lcoef[i]=(long long)llround(dd.coef[i]); referenced[dd.idx[i]]=1; }
+            rec.rhs= -(long long)llround(dd.constant);
+            lin_free(&dd);
+            referenced[rb.v]=1;
+            motivating=1;
+        }
+        /* ---------- bool_clause(pos[], neg[]) ---------- */
+        else if(cp_pred_is(p,"bool_clause")){
+            if(c->nargs<1){ok=0;break;}
+            Lin*pos;int npos; if(parse_array(m,c->args[0],&pos,&npos)!=0){ok=0;break;}
+            Lin*neg=NULL;int nneg=0;
+            if(c->nargs>=2){ if(parse_array(m,c->args[1],&neg,&nneg)!=0){free_lins(pos,npos);ok=0;break;} }
+            rec.kind=CPK_CLAUSE; rec.n=npos; rec.nset=nneg;
+            rec.lvars=(int*)psolve_calloc((size_t)(npos?npos:1),sizeof(int));
+            rec.terms=(CPT*)psolve_calloc((size_t)(nneg?nneg:1),sizeof(CPT));
+            int bad=0;
+            for(int i=0;i<npos;i++){ CPT t; if(cp_term_from_lin(&pos[i],&t)!=0 || t.isc){bad=1;break;} rec.lvars[i]=t.v; referenced[t.v]=1; }
+            for(int i=0;i<nneg;i++){ CPT t; if(cp_term_from_lin(&neg[i],&t)!=0 || t.isc){bad=1;break;} rec.terms[i]=t; referenced[t.v]=1; }
+            free_lins(pos,npos); free_lins(neg,nneg);
+            if(bad){ free(rec.lvars); free(rec.terms); ok=0; break; }
             motivating=1;
         }
         /* ---------- set_in ---------- */
@@ -914,8 +1194,8 @@ static int cp_parse(FZModel*m,CPCR**out_cr,int*out_n,unsigned char*referenced,in
         if(nc>=cap){ cap*=2; cr=(CPCR*)psolve_realloc((void**)&cr,(size_t)cap*sizeof(CPCR)); }
         cr[nc++]=rec;
     }
-    if(!ok){ for(int i=0;i<nc;i++){ free(cr[i].lvars);free(cr[i].lcoef);free(cr[i].terms);free(cr[i].setvals);} free(cr); return -1; }
-    if(!motivating){ for(int i=0;i<nc;i++){ free(cr[i].lvars);free(cr[i].lcoef);free(cr[i].terms);free(cr[i].setvals);} free(cr); return -2; }
+    if(!ok){ for(int i=0;i<nc;i++){ free(cr[i].lvars);free(cr[i].lcoef);free(cr[i].terms);free(cr[i].setvals);free(cr[i].arr_terms);} free(cr); return -1; }
+    if(!motivating){ for(int i=0;i<nc;i++){ free(cr[i].lvars);free(cr[i].lcoef);free(cr[i].terms);free(cr[i].setvals);free(cr[i].arr_terms);} free(cr); return -2; }
     *out_cr=cr; *out_n=nc; *has_cp_motivating=motivating;
     return 0;
 }
@@ -943,9 +1223,12 @@ static int cp_propagate(CP*cp,CPCR*cr,int nc){
                 case CPK_DIV: r=cp_prop_divmod(cp,&cr[i].terms[0],cr[i].terms[1].c,&cr[i].terms[2],1); break;
                 case CPK_MOD: r=cp_prop_divmod(cp,&cr[i].terms[0],cr[i].terms[1].c,&cr[i].terms[2],0); break;
                 case CPK_ABS: r=cp_prop_abs(cp,&cr[i].terms[0],&cr[i].terms[1]); break;
-                case CPK_ELEM: r=cp_prop_elem(cp,&cr[i].terms[0],&cr[i].terms[1],cr[i].setvals,cr[i].nset,(int)cr[i].lvars[0]); break;
+                case CPK_ELEM: r=cp_prop_elem(cp,&cr[i].terms[0],&cr[i].terms[1],cr[i].arr_terms,cr[i].nset,(int)cr[i].lvars[0]); break;
                 case CPK_SETIN: r=cp_prop_setin(cp,&cr[i].terms[0],cr[i].setvals,cr[i].nset); break;
                 case CPK_POW: r=cp_prop_pow(cp,&cr[i].terms[0],cr[i].terms[1].c,&cr[i].terms[2]); break;
+                case CPK_REIF: r=cp_prop_reif(cp,&cr[i]); break;
+                case CPK_CLAUSE: r=cp_prop_clause(cp,&cr[i]); break;
+                case CPK_MINMAX: r=cp_prop_minmax(cp,&cr[i]); break;
             }
             if(r==1) return 1;
             if(r==-1) return -1;
@@ -977,17 +1260,43 @@ static int cp_verify(const CP*cp,CPCR*cr,int nc,const double*outx){
         } else if(r->kind==CPK_DIV){ if(cp_term_out(&r->terms[2],outx) != cp_term_out(&r->terms[0],outx)/r->terms[1].c) return 0; }
         else if(r->kind==CPK_MOD){ if(cp_term_out(&r->terms[2],outx) != cp_term_out(&r->terms[0],outx)%r->terms[1].c) return 0; }
         else if(r->kind==CPK_ABS){ int64_t a=cp_term_out(&r->terms[0],outx); if(cp_term_out(&r->terms[1],outx) != (a<0?-a:a)) return 0; }
-        else if(r->kind==CPK_ELEM){ int64_t idx=cp_term_out(&r->terms[0],outx); long k=(long)(idx - (int)r->lvars[0]); if(k<0||k>=r->nset)return 0; if(cp_term_out(&r->terms[1],outx)!=r->setvals[k]) return 0; }
+        else if(r->kind==CPK_ELEM){ int64_t idx=cp_term_out(&r->terms[0],outx); long k=(long)(idx - (int)r->lvars[0]); if(k<0||k>=r->nset)return 0; if(cp_term_out(&r->terms[1],outx)!=cp_term_out(&r->arr_terms[k],outx)) return 0; }
         else if(r->kind==CPK_SETIN){ int64_t x=cp_term_out(&r->terms[0],outx); int found=0; for(int k=0;k<r->nset;k++) if(r->setvals[k]==x){found=1;break;} if(!found)return 0; }
         else if(r->kind==CPK_POW){ int64_t b=cp_term_out(&r->terms[0],outx), e=r->terms[1].c, c=cp_term_out(&r->terms[2],outx); __int128 p=1; for(int64_t q=0;q<e;q++){p*=(__int128)b;if(p>INT64_MAX||p<INT64_MIN)return 0;} if(p!=c)return 0; }
+        else if(r->kind==CPK_REIF){
+            int rv=cp_term_out(&r->terms[0],outx);
+            __int128 s=0; for(int k=0;k<r->n;k++) s+=(__int128)r->lcoef[k]*(int64_t)llround(outx[r->lvars[k]]);
+            int holds=0; switch(r->rel){case 0:holds=(s==r->rhs);break;case 1:holds=(s<=r->rhs);break;case 2:holds=(s>=r->rhs);break;case 3:holds=(s<r->rhs);break;case 4:holds=(s>r->rhs);break;case 5:holds=(s!=r->rhs);break;}
+            if((rv!=0)!=(holds!=0)) return 0;
+        }
+        else if(r->kind==CPK_CLAUSE){
+            int sat=0;
+            for(int k=0;k<r->n;k++){ int64_t bv=cp_term_out(&(CPT){.isc=0,.v=r->lvars[k]},outx); if(bv==1){sat=1;break;} }
+            if(!sat) for(int k=0;k<r->nset;k++){ int64_t bv=cp_term_out(&r->terms[k],outx); if(bv==0){sat=1;break;} }
+            if(!sat) return 0;
+        }
+        else if(r->kind==CPK_MINMAX){
+            int64_t a=cp_term_out(&r->terms[0],outx), b=cp_term_out(&r->terms[1],outx), m=cp_term_out(&r->terms[2],outx);
+            int64_t res=(r->n? (a>b?a:b) : (a<b?a:b));
+            if(res!=m) return 0;
+        }
     }
     return 1;
 }
 
-/* search. returns 2 solution found, 0 exhausted (UNSAT), -1 uncertifiable (fallback). */
-static int cp_solve_rec(CP*cp,CPCR*cr,int nc,unsigned char*referenced,double*outx,int depth){
+/* search.  Returns:
+ *   2 solution found (single mode)
+ *   3 all-solutions mode: enumeration of this subtree complete
+ *   4 all-solutions mode: node limit reached
+ *   0 single mode: exhausted, no solution (UNSAT)
+ *  -1 uncertifiable (unbounded referenced var / node limit / verify failed)
+ * When `all` is set, each complete assignment is emitted via on_solution and
+ * search continues (backtracks) to find the next distinct one.
+ */
+static int cp_solve_rec(CP*cp,CPCR*cr,int nc,unsigned char*referenced,double*outx,int depth,
+                        int all,void(*on_solution)(const double*,double,void*),void*ud){
     cp->nodes++;
-    if(cp->nodes>CP_MAXNODES) return -1;
+    if(cp->nodes>CP_MAXNODES) return all?4:-1;
     int pr=cp_propagate(cp,cr,nc);
     if(pr==1) return 0;
     if(pr==-1) return -1;
@@ -1004,19 +1313,22 @@ static int cp_solve_rec(CP*cp,CPCR*cr,int nc,unsigned char*referenced,double*out
             if(!cp->bounded[v] && referenced[v] && !cp_fixed(cp,v)) return -1;
         }
         for(int v=0;v<cp->nvars;v++){ if(cp_fixed(cp,v)) outx[v]=(double)cp->lo[v]; else outx[v]=0.0; }
-        if(cp_verify(cp,cr,nc,outx)) return 2;
-        return -1; /* verification failed -> do not emit a wrong answer */
+        if(!cp_verify(cp,cr,nc,outx)) return -1;   /* verification failed -> do not emit a wrong answer */
+        if(all && on_solution){ on_solution(outx,0.0,ud); return 3; }
+        return 2;
     }
     int64_t *vals=cp->vals[best]; int nvals=cp->nvals[best];
     for(int i=0;i<nvals;i++){
         CP br; cp_copy(&br,cp);
         cp_assign(&br,best,vals[i]);
-        int rr=cp_solve_rec(&br,cr,nc,referenced,outx,depth+1);
+        int rr=cp_solve_rec(&br,cr,nc,referenced,outx,depth+1,all,on_solution,ud);
         cp_free(&br);
-        if(rr==2) return 2;
-        if(rr==-1) return -1;
+        if(rr==2) return 2;   /* single-mode solution found */
+        if(rr==4) return 4;   /* all-mode node limit */
+        if(rr==-1) return -1; /* uncertifiable */
+        /* rr==3 (all-mode subtree done) or rr==0 (dead branch): try next value */
     }
-    return 0;
+    return all?3:0;
 }
 
 /* Bound every variable in a product-chain that equals a fixed nonzero
@@ -1063,6 +1375,17 @@ static int cp_bound_diophantine(CP*cp,CPCR*cr,int nc){
 static int fz_cp_try(const FZModel*m,FZSolution*sol){
     int nv=m->nvars;
     if(nv<=0) return 0;
+    int all = sol->all_solutions;
+    /* For all-solutions enumeration, only engage CP when every decision
+       variable is finitely bounded (so the enumeration is provably complete)
+       and the model is pure integer. */
+    if(all){
+        for(int d=0;d<m->ndecl;d++){ FZDecl*decl=&m->decls[d];
+            if(!decl->is_var||decl->base_idx<0||decl->is_alias) continue;
+            if(decl->kind==FZ_K_FLOAT) return 0;
+            if(!decl->has_lo || !decl->has_hi) return 0;
+        }
+    }
     /* CP only handles integer models */
     for(int d=0;d<m->ndecl;d++){
         FZDecl*decl=&m->decls[d];
@@ -1099,7 +1422,7 @@ static int fz_cp_try(const FZModel*m,FZSolution*sol){
             if(decl->has_lo){ int64_t lo=(int64_t)llround(decl->lo[0]); if(cp.lo[v]<lo)cp.lo[v]=lo; }
             if(decl->has_hi){ int64_t hi=(int64_t)llround(decl->hi[0]); if(cp.hi[v]>hi)cp.hi[v]=hi; }
             if(cp_intersect(&cp,v,cp.lo[v],cp.hi[v])){ /* empty initial domain -> UNSAT */
-                cp_free(&cp); for(int i=0;i<nc;i++){ free(cr[i].lvars);free(cr[i].lcoef);free(cr[i].terms);free(cr[i].setvals);} free(cr); free(referenced);
+                cp_free(&cp); for(int i=0;i<nc;i++){ free(cr[i].lvars);free(cr[i].lcoef);free(cr[i].terms);free(cr[i].setvals);free(cr[i].arr_terms);} free(cr); free(referenced);
                 sol->status=1; sol->nvars=nv; sol->nodes=0; return 1;
             }
         }
@@ -1109,11 +1432,28 @@ static int fz_cp_try(const FZModel*m,FZSolution*sol){
        x*x*x*y*y = 100000 with unbounded x,y), bound the whole product chain
        to the divisors of that constant so search is finite and correct. */
     int bd=cp_bound_diophantine(&cp,cr,nc);
-    if(bd==1){ cp_free(&cp); for(int i=0;i<nc;i++){ free(cr[i].lvars);free(cr[i].lcoef);free(cr[i].terms);free(cr[i].setvals);} free(cr); free(referenced); sol->status=1; sol->nvars=nv; return 1; }
-    if(bd==-1){ cp_free(&cp); for(int i=0;i<nc;i++){ free(cr[i].lvars);free(cr[i].lcoef);free(cr[i].terms);free(cr[i].setvals);} free(cr); free(referenced); return 0; }
+    if(bd==1){ cp_free(&cp); for(int i=0;i<nc;i++){ free(cr[i].lvars);free(cr[i].lcoef);free(cr[i].terms);free(cr[i].setvals);free(cr[i].arr_terms);} free(cr); free(referenced); sol->status=1; sol->nvars=nv; return 1; }
+    if(bd==-1){ cp_free(&cp); for(int i=0;i<nc;i++){ free(cr[i].lvars);free(cr[i].lcoef);free(cr[i].terms);free(cr[i].setvals);free(cr[i].arr_terms);} free(cr); free(referenced); return 0; }
 
     double *outx=sol->x; /* sized nv */
-    int rr=cp_solve_rec(&cp,cr,nc,referenced,outx,0);
+
+    int rr;
+    if(all){
+        /* set up the dedup context (as the MIP path does) so fz_solution_cb
+           prints each distinct output solution exactly once. */
+        FZSolveCtx ctx; memset(&ctx,0,sizeof(ctx)); ctx.m=m; ctx.sol=sol;
+        ctx.dedupe_outputs=1;
+        for(int d=0;d<m->ndecl;d++)if(m->decls[d].is_output){
+            if((size_t)m->decls[d].n>SIZE_MAX-ctx.key_len)psolve_fail(PSOLVE_ERR_OOM);
+            ctx.key_len+=(size_t)m->decls[d].n;
+        }
+        if(ctx.key_len>SIZE_MAX/sizeof(uint64_t))psolve_fail(PSOLVE_ERR_OOM);
+        ctx.scratch=(uint64_t*)psolve_calloc(ctx.key_len?ctx.key_len:1,sizeof(uint64_t));
+        rr=cp_solve_rec(&cp,cr,nc,referenced,outx,0,1,fz_solution_cb,&ctx);
+        fz_solve_ctx_free(&ctx);
+    } else {
+        rr=cp_solve_rec(&cp,cr,nc,referenced,outx,0,0,NULL,NULL);
+    }
 
     int handled=1;
     if(rr==2){
@@ -1135,10 +1475,12 @@ static int fz_cp_try(const FZModel*m,FZSolution*sol){
         }
     }
     else if(rr==0){ sol->status=1; sol->nodes=cp.nodes; }
+    else if(all && (rr==3)){ sol->status=0; sol->nodes=cp.nodes; }
+    else if(all && rr==4){ sol->nodes=cp.nodes; sol->status=4; }
     else { handled=0; } /* fallback */
 
     cp_free(&cp);
-    for(int i=0;i<nc;i++){ free(cr[i].lvars);free(cr[i].lcoef);free(cr[i].terms);free(cr[i].setvals);} free(cr);
+    for(int i=0;i<nc;i++){ free(cr[i].lvars);free(cr[i].lcoef);free(cr[i].terms);free(cr[i].setvals);free(cr[i].arr_terms);} free(cr);
     free(referenced);
     if(!handled) return 0;
     return 1;
