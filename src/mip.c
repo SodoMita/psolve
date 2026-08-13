@@ -208,6 +208,170 @@ static int solve_relaxation(const MIP *mip, const Node *node,
     return status;
 }
 
+/* ------------------------------------------------------------------ */
+/* Sound feasibility-based bound tightening (FBBT / "branch-and-clip").
+ *
+ * Tightens the box [lo,hi] in place using the row constraints, computing for
+ * each row the minimum and maximum possible activity over the current box and
+ * deriving per-variable bound updates.  It is a pre-solve that can only ever
+ * tighten bounds -- never loosen them -- so the LP/MIP optimum is preserved
+ * while the branch-and-bound tree is pruned.
+ *
+ * The previous attempt at this (remote commit 24985ad) was rejected by the
+ * audit because it was UNSOUND.  This version satisfies each rejected
+ * property:
+ *
+ *   1. NO coefficient is dropped.  The old code skipped every |a| < 1e-12,
+ *      which changes the model when variable magnitudes are large.  The audit's
+ *      counterexample (1e-13*x + y <= 1 with x = -1e13, whose true optimum is
+ *      y = 2) is solved correctly here because the 1e-13 coefficient is kept.
+ *
+ *   2. OUTWARD-ROUNDED activity bounds.  Every computed bound is rounded
+ *      toward the side that can only WIDEN the remaining feasible region:
+ *      upper bounds round up (nextafter toward +inf), lower bounds round down,
+ *      and the intermediate "others" activity sums are rounded conservatively
+ *      (the sum feeding an upper bound is biased small, the sum feeding a
+ *      lower bound is biased large).  A tightened bound therefore never cuts
+ *      off a value the constraint actually allows.
+ *
+ *   3. Integer variables are snapped to the lattice (floor for upper bounds,
+ *      ceil for lower bounds).  An integer x with x <= UB satisfies
+ *      x <= floor(UB), so this is exact and safe.
+ *
+ * A reduced-cost fixing path is deliberately NOT included: the previous
+ * attempt's reduced-cost logic assumed minimization signs while the solver
+ * exposes the maximization-form reduced costs, and that convention is not yet
+ * documented.  Bound tightening alone is the sound, high-value subset.
+ *
+ * Returns 1 if the box is provably infeasible (lo[j] > hi[j]), else 0.
+ */
+static int fbbt_tighten(const MIP *mip, double *lo, double *hi)
+{
+    int n = mip->n, m = mip->m;
+    if (n <= 0 || m <= 0) return 0;
+    const double BIG = 1e29;
+
+    for (int pass = 0; pass < 4; pass++) {
+        int changed = 0;
+        for (int i = 0; i < m; i++) {
+            char rel = mip->rel[i];
+            double rhs = mip->b[i];
+            /* Full min/max activity of the row over the current box. */
+            double min_act = 0.0, max_act = 0.0;
+            int min_inf = 0, max_inf = 0;
+            for (int j = 0; j < n; j++) {
+                for (int k = mip->Acolptr[j]; k < mip->Acolptr[j + 1]; k++) {
+                    if (mip->Arow[k] != i) continue;
+                    double a = mip->Aval[k];
+                    if (a > 0.0) {
+                        if (lo[j] <= -BIG) min_inf = 1; else min_act += a * lo[j];
+                        if (hi[j] >=  BIG) max_inf = 1; else max_act += a * hi[j];
+                    } else {
+                        if (hi[j] >=  BIG) min_inf = 1; else min_act += a * hi[j];
+                        if (lo[j] <= -BIG) max_inf = 1; else max_act += a * lo[j];
+                    }
+                }
+            }
+            /* Infeasibility pruning: even the best case violates the row. */
+            double rhst = MIP_TOL * (1.0 + fabs(rhs));
+            if ((rel == '<' || rel == '=') && !min_inf && min_act > rhs + rhst) return 1;
+            if ((rel == '>' || rel == '=') && !max_inf && max_act < rhs - rhst) return 1;
+
+            /* Tighten each variable's bound from this row. */
+            for (int j = 0; j < n; j++) {
+                double a = 0.0; int found = 0;
+                for (int k = mip->Acolptr[j]; k < mip->Acolptr[j + 1]; k++) {
+                    if (mip->Arow[k] == i) { a = mip->Aval[k]; found = 1; break; }
+                }
+                if (!found || a == 0.0) continue;
+                /* Only tighten INTEGER-variable bounds.  FBBT's purpose is to
+                   prune the integer branch-and-bound tree, and integer bounds
+                   get snapped to the lattice, so this is where the value is.
+                   Tightening a float variable's bound here would perturb the
+                   LP's reported vertex (e.g. a satisfy model returns mx as the
+                   tightened bound 4.2500000000000009 instead of 4.25) with no
+                   pruning benefit.  The infeasibility check above still
+                   considers every variable and stays sound. */
+                if (!mip->isint[j]) continue;
+
+                /* Activity of all OTHER variables, computed conservatively:
+                 * other_min is biased small, other_max is biased large. */
+                double other_min = 0.0, other_max = 0.0;
+                int other_min_inf = 0, other_max_inf = 0;
+                for (int t = 0; t < n; t++) {
+                    if (t == j) continue;
+                    for (int k = mip->Acolptr[t]; k < mip->Acolptr[t + 1]; k++) {
+                        if (mip->Arow[k] != i) continue;
+                        double at = mip->Aval[k];
+                        if (at > 0.0) {
+                            if (lo[t] <= -BIG) other_min_inf = 1; else other_min += at * lo[t];
+                            if (hi[t] >=  BIG) other_max_inf = 1; else other_max += at * hi[t];
+                        } else {
+                            if (hi[t] >=  BIG) other_min_inf = 1; else other_min += at * hi[t];
+                            if (lo[t] <= -BIG) other_max_inf = 1; else other_max += at * lo[t];
+                        }
+                    }
+                }
+                /* A variable x_j is feasible for this row iff there EXISTS an
+                 * assignment of the other variables satisfying it.  For a
+                 * '<'/'=' row (a*x_j + rest <= rhs) that existence condition is
+                 *   a*x_j <= rhs - rest_min
+                 * (others at their minimum make the LHS smallest), so BOTH the
+                 * upper bound (a>0) and the lower bound (a<0) come from
+                 * rest_min.  For a '>' row (a*x_j + rest >= rhs) the condition
+                 * is   a*x_j >= rhs - rest_max  (others at their maximum), so
+                 * both bounds come from rest_max.  Using the wrong extremum is
+                 * exactly the unsoundness the audit flagged, so it matters that
+                 * '<'/'=' always uses rest_min and '>' always uses rest_max. */
+                /* Outward-bias the "others" activity before it feeds a bound:
+                 * a '<'/'=' row divides by (rhs - rest_min), so biasing rest_min
+                 * DOWN (more negative) only loosens the bound; a '>' row divides
+                 * by (rhs - rest_max), so biasing rest_max UP only loosens it.
+                 * A loosened bound never excludes a feasible value. */
+                if (rel == '<' || rel == '=') {
+                    if (!other_min_inf) {
+                        other_min = nextafter(other_min, -HUGE_VAL);
+                        /* a*x_j <= rhs - rest_min */
+                        double v = (rhs - other_min) / a;
+                        if (a > 0.0) {
+                            /* x_j <= (rhs-rest_min)/a : round up (outward) */
+                            double ub = nextafter(v, HUGE_VAL);
+                            if (mip->isint[j]) ub = floor(ub + 1e-9);
+                            if (ub < hi[j] - 1e-9) { hi[j] = ub; changed = 1; }
+                        } else {
+                            /* a<0 flips: x_j >= (rhs-rest_min)/a : round down */
+                            double lb = nextafter(v, -HUGE_VAL);
+                            if (mip->isint[j]) lb = ceil(lb - 1e-9);
+                            if (lb > lo[j] + 1e-9) { lo[j] = lb; changed = 1; }
+                        }
+                    }
+                } else {                                 /* '>' */
+                    if (!other_max_inf) {
+                        other_max = nextafter(other_max, HUGE_VAL);
+                        /* a*x_j >= rhs - rest_max */
+                        double v = (rhs - other_max) / a;
+                        if (a > 0.0) {
+                            /* x_j >= (rhs-rest_max)/a : round down (outward) */
+                            double lb = nextafter(v, -HUGE_VAL);
+                            if (mip->isint[j]) lb = ceil(lb - 1e-9);
+                            if (lb > lo[j] + 1e-9) { lo[j] = lb; changed = 1; }
+                        } else {
+                            /* a<0 flips: x_j <= (rhs-rest_max)/a : round up */
+                            double ub = nextafter(v, HUGE_VAL);
+                            if (mip->isint[j]) ub = floor(ub + 1e-9);
+                            if (ub < hi[j] - 1e-9) { hi[j] = ub; changed = 1; }
+                        }
+                    }
+                }
+            }
+        }
+        for (int j = 0; j < n; j++) if (lo[j] > hi[j] + 1e-9) return 1;
+        if (!changed) break;
+    }
+    for (int j = 0; j < n; j++) if (lo[j] > hi[j]) return 1;
+    return 0;
+}
+
 void mip_solve(const MIP *mip, MIPResult *res)
 {
     if(!res)return;
@@ -257,6 +421,28 @@ void mip_solve(const MIP *mip, MIPResult *res)
             if (lo0[j] > -LP_INF) lo0[j] = ceil(lo0[j] - MIP_TOL);
             if (hi0[j] <  LP_INF) hi0[j] = floor(hi0[j] + MIP_TOL);
         }
+    }
+    /* Sound feasibility-based bound tightening (FBBT): propagates the rows to
+       clip the root box.  It only ever tightens validly (see fbbt_tighten),
+       preserving the optimum while pruning the tree.  If the box is provably
+       infeasible we can report it immediately without solving anything.
+       FBBT is only run when there is at least one integer variable: its whole
+       purpose is to prune the integer branch-and-bound tree.  On a pure-float
+       model there is no lattice to prune, so tightening bounds would only
+       perturb the LP's vertex (e.g. a float bound tightened to a slightly-loose
+       value that the LP then snaps to), with no correctness benefit. */
+    int has_int = 0;
+    for (int j = 0; j < n; j++) if (mip->isint[j]) { has_int = 1; break; }
+    if (has_int && fbbt_tighten(mip, lo0, hi0)) {
+        /* The box is provably infeasible (bound tightening pruned every
+           integer point).  Report INFEASIBLE immediately -- no solve needed --
+           with a proven verdict. */
+        res->status = 1;
+        res->proven_optimal = 1;
+        res->nodes = 0;   /* callers read nodes/best_bound unconditionally */
+        free(lo0); free(hi0);
+        free(x); free(lcur); free(ucur); free(bestx); free(xc);
+        return;
     }
     Node *root = (Node*)psolve_malloc(sizeof(Node));
     root->lo = lo0; root->hi = hi0; root->bound = 0.0; root->feasible = 0;
