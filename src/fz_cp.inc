@@ -1284,6 +1284,51 @@ static int cp_verify(const CP*cp,CPCR*cr,int nc,const double*outx){
     return 1;
 }
 
+/* ------------------------------------------------------------------ */
+/* Branch-and-bound optimization over the finite-domain engine.          */
+/* The objective must be an exactly-integral linear form (verified at    */
+/* entry); every objective variable is forced `referenced`, so a leaf is */
+/* only accepted when all of them are fixed -- the reported objective is */
+/* computed from the verified assignment, never from a bound.            */
+/* Pruning uses the exact activity bound of the objective over current   */
+/* domains (a true lower/upper bound for every assignment in the         */
+/* subtree), so discarded subtrees cannot contain a strictly better      */
+/* solution: when the search exhausts, the incumbent is PROVEN optimal.  */
+/* ------------------------------------------------------------------ */
+typedef struct {
+    int sense;              /* 1 minimize, 2 maximize */
+    int n;                  /* objective terms */
+    const int *idx;
+    const long long *coef;  /* exactly integral, checked at entry */
+    __int128 c0;            /* objective constant (kept out of `best`; added later as double) */
+    __int128 best;          /* best incumbent objective (excl. c0) */
+    int have;               /* an incumbent was recorded */
+    double *bestx;          /* incumbent assignment */
+    int nv;                 /* size of bestx */
+    long scored;            /* verified leaves evaluated */
+} CPOptCtx;
+
+/* Activity bound of the objective over current domains.
+   For minimize: *lb = smallest achievable objective (plus c0 excluded);
+   for maximize: *ub = largest.  Returns 0 when the needed side is unbounded
+   (no pruning possible at this node).  Saturating arithmetic is avoided by
+   bailing out to unbounded whenever a term side is effectively infinite. */
+static int cp_opt_activity(const CP*cp,const CPOptCtx*opt,__int128*out){
+    __int128 acc=0;
+    for(int i=0;i<opt->n;i++){
+        int v=opt->idx[i]; long long c=opt->coef[i];
+        if(c==0) continue;
+        int64_t lo=cp->lo[v], hi=cp->hi[v];
+        if(cp->bounded[v]&&cp->nvals[v]>0){ lo=cp->vals[v][0]; hi=cp->vals[v][cp->nvals[v]-1]; }
+        /* side selection by sense&sign; bail if that side is wild */
+        int64_t side;
+        if(opt->sense==1) side = (c>0)?lo:hi; else side = (c>0)?hi:lo;
+        if(side<=-(INT64_C(1)<<60)||side>=(INT64_C(1)<<60)) return 0;
+        acc+=(__int128)c*(__int128)side;
+    }
+    *out=acc; return 1;
+}
+
 /* search.  Returns:
  *   2 solution found (single mode)
  *   3 all-solutions mode: enumeration of this subtree complete
@@ -1294,12 +1339,26 @@ static int cp_verify(const CP*cp,CPCR*cr,int nc,const double*outx){
  * search continues (backtracks) to find the next distinct one.
  */
 static int cp_solve_rec(CP*cp,CPCR*cr,int nc,unsigned char*referenced,double*outx,int depth,
-                        int all,void(*on_solution)(const double*,double,void*),void*ud){
-    cp->nodes++;
-    if(cp->nodes>CP_MAXNODES) return all?4:-1;
+                        int all,void(*on_solution)(const double*,double,void*),void*ud,
+                        CPOptCtx*opt,long*nodectr){
+    /* search nodes are counted on the caller-owned counter, not on the CP
+       instance: the recursion works on per-branch copies (cp_copy duplicates
+       a parent's counter into the child), so an instance-local count would
+       report path depth instead of total explored nodes */
+    (*nodectr)++;
+    if(*nodectr>CP_MAXNODES) return (all||opt)?4:-1;
     int pr=cp_propagate(cp,cr,nc);
     if(pr==1) return 0;
     if(pr==-1) return -1;
+    if(opt&&opt->have){
+        __int128 act;
+        if(cp_opt_activity(cp,opt,&act)){
+            /* true subtree bound: discard only when NO strictly-better
+               solution can exist below (incumbent stays reachable) */
+            if(opt->sense==1){ if(act>=opt->best) return 0; }
+            else { if(act<=opt->best) return 0; }
+        }
+    }
     int best=-1,bestsz=INT_MAX;
     for(int v=0;v<cp->nvars;v++){
         if(cp->bounded[v] && !cp_fixed(cp,v)){
@@ -1314,6 +1373,18 @@ static int cp_solve_rec(CP*cp,CPCR*cr,int nc,unsigned char*referenced,double*out
         }
         for(int v=0;v<cp->nvars;v++){ if(cp_fixed(cp,v)) outx[v]=(double)cp->lo[v]; else outx[v]=0.0; }
         if(!cp_verify(cp,cr,nc,outx)) return -1;   /* verification failed -> do not emit a wrong answer */
+        if(opt){
+            /* objective vars are all referenced+fixed here (enforced at
+               entry and by the leaf check above), so the score is exact */
+            __int128 ov=0;
+            for(int i=0;i<opt->n;i++){ int v=opt->idx[i]; ov+=(__int128)opt->coef[i]*(int64_t)llround(outx[v]); }
+            opt->scored++;
+            if(!opt->have || (opt->sense==1 ? ov<opt->best : ov>opt->best)){
+                opt->best=ov; opt->have=1;
+                memcpy(opt->bestx,outx,(size_t)opt->nv*sizeof(double));
+            }
+            return 3;   /* keep searching: a later leaf may be better */
+        }
         if(all && on_solution){ on_solution(outx,0.0,ud); return 3; }
         return 2;
     }
@@ -1321,14 +1392,14 @@ static int cp_solve_rec(CP*cp,CPCR*cr,int nc,unsigned char*referenced,double*out
     for(int i=0;i<nvals;i++){
         CP br; cp_copy(&br,cp);
         cp_assign(&br,best,vals[i]);
-        int rr=cp_solve_rec(&br,cr,nc,referenced,outx,depth+1,all,on_solution,ud);
+        int rr=cp_solve_rec(&br,cr,nc,referenced,outx,depth+1,all,on_solution,ud,opt,nodectr);
         cp_free(&br);
         if(rr==2) return 2;   /* single-mode solution found */
-        if(rr==4) return 4;   /* all-mode node limit */
+        if(rr==4) return 4;   /* all/opt-mode node limit: search incomplete */
         if(rr==-1) return -1; /* uncertifiable */
-        /* rr==3 (all-mode subtree done) or rr==0 (dead branch): try next value */
+        /* rr==3 (subtree done) or rr==0 (dead branch): try next value */
     }
-    return all?3:0;
+    return (all||opt)?3:0;
 }
 
 /* Bound every variable in a product-chain that equals a fixed nonzero
@@ -1376,6 +1447,27 @@ static int fz_cp_try(const FZModel*m,FZSolution*sol){
     int nv=m->nvars;
     if(nv<=0) return 0;
     int all = sol->all_solutions;
+    /* Optimization via CP branch-and-bound engages only for exactly-integral
+       objectives on bounded integer variables (otherwise fall back to MIP).
+       "-a with optimize" is left to the MIP incumbent catalog. */
+    CPOptCtx opt; memset(&opt,0,sizeof(opt));
+    long long *optcoef=NULL;
+    if(m->solve_kind!=0){
+        if(all) return 0;
+        const FZLin*O=&m->objective;
+        if(O->n<=0||!O->idx||!O->coef) return 0;
+        if(!isfinite(O->constant)||O->constant!=rint(O->constant)||fabs(O->constant)>=(double)CP_BIG) return 0;
+        optcoef=(long long*)psolve_malloc((size_t)O->n*sizeof(long long));
+        for(int i=0;i<O->n;i++){
+            double cf=O->coef[i]; int vi=O->idx[i];
+            if(vi<0||vi>=nv){ free(optcoef); return 0; }
+            if(!isfinite(cf)||cf!=rint(cf)||fabs(cf)>=(double)CP_BIG){ free(optcoef); return 0; }
+            optcoef[i]=(long long)llround(cf);
+        }
+        opt.sense=m->solve_kind; opt.n=O->n; opt.idx=O->idx; opt.coef=optcoef;
+        opt.c0=(__int128)llround(O->constant); opt.have=0; opt.nv=nv;
+        opt.bestx=(double*)psolve_malloc((size_t)nv*sizeof(double));
+    }
     /* For all-solutions enumeration, only engage CP when every decision
        variable is finitely bounded (so the enumeration is provably complete)
        and the model is pure integer. */
@@ -1389,12 +1481,30 @@ static int fz_cp_try(const FZModel*m,FZSolution*sol){
     /* CP only handles integer models */
     for(int d=0;d<m->ndecl;d++){
         FZDecl*decl=&m->decls[d];
-        if(decl->is_var && !decl->is_alias && decl->kind==FZ_K_FLOAT) return 0;
+        if(decl->is_var && !decl->is_alias && decl->kind==FZ_K_FLOAT){
+            free(optcoef); free(opt.bestx); return 0;
+        }
     }
     unsigned char *referenced=(unsigned char*)psolve_calloc((size_t)(nv?nv:1),1);
     CPCR*cr=NULL; int nc=0; int motivating=0;
     int cp_parse_rc=cp_parse((FZModel*)m,&cr,&nc,referenced,&motivating);
-    if(cp_parse_rc!=0){ free(referenced); return 0; }
+    if(cp_parse_rc!=0){ free(referenced); free(optcoef); free(opt.bestx); return 0; }
+    if(m->solve_kind!=0){
+        /* CP-B&B engages optimization only when the model has genuinely
+           combinatorial structure (element/all_different/reif/...).  A model
+           made of pure linear rows (e.g. -G linear flattened tsp: 63 linear
+           constraints) is MIP territory -- the LP relaxation drives its
+           search, while CP bounds-propagation on interval domains converges
+           in thousands of tiny fixpoint passes (tsp_5: 1166 ms via CP vs
+           4 ms via MIP, same proven optimum). */
+        int combinatorial=0;
+        for(int i=0;i<nc;i++) if(cr[i].kind!=CPK_LIN){ combinatorial=1; break; }
+        if(!combinatorial){
+            for(int i=0;i<nc;i++){ free(cr[i].lvars);free(cr[i].lcoef);free(cr[i].terms);free(cr[i].setvals);free(cr[i].arr_terms);} free(cr);
+            free(referenced); free(optcoef); free(opt.bestx); return 0;
+        }
+        for(int i=0;i<m->objective.n;i++) referenced[m->objective.idx[i]]=1;
+    }
 
     CP cp; memset(&cp,0,sizeof(cp));
     cp.nvars=nv;
@@ -1422,7 +1532,7 @@ static int fz_cp_try(const FZModel*m,FZSolution*sol){
             if(decl->has_lo){ int64_t lo=(int64_t)llround(decl->lo[0]); if(cp.lo[v]<lo)cp.lo[v]=lo; }
             if(decl->has_hi){ int64_t hi=(int64_t)llround(decl->hi[0]); if(cp.hi[v]>hi)cp.hi[v]=hi; }
             if(cp_intersect(&cp,v,cp.lo[v],cp.hi[v])){ /* empty initial domain -> UNSAT */
-                cp_free(&cp); for(int i=0;i<nc;i++){ free(cr[i].lvars);free(cr[i].lcoef);free(cr[i].terms);free(cr[i].setvals);free(cr[i].arr_terms);} free(cr); free(referenced);
+                cp_free(&cp); for(int i=0;i<nc;i++){ free(cr[i].lvars);free(cr[i].lcoef);free(cr[i].terms);free(cr[i].setvals);free(cr[i].arr_terms);} free(cr); free(referenced); free(opt.bestx); free(optcoef);
                 sol->status=1; sol->nvars=nv; sol->nodes=0; return 1;
             }
         }
@@ -1432,12 +1542,13 @@ static int fz_cp_try(const FZModel*m,FZSolution*sol){
        x*x*x*y*y = 100000 with unbounded x,y), bound the whole product chain
        to the divisors of that constant so search is finite and correct. */
     int bd=cp_bound_diophantine(&cp,cr,nc);
-    if(bd==1){ cp_free(&cp); for(int i=0;i<nc;i++){ free(cr[i].lvars);free(cr[i].lcoef);free(cr[i].terms);free(cr[i].setvals);free(cr[i].arr_terms);} free(cr); free(referenced); sol->status=1; sol->nvars=nv; return 1; }
-    if(bd==-1){ cp_free(&cp); for(int i=0;i<nc;i++){ free(cr[i].lvars);free(cr[i].lcoef);free(cr[i].terms);free(cr[i].setvals);free(cr[i].arr_terms);} free(cr); free(referenced); return 0; }
+    if(bd==1){ cp_free(&cp); for(int i=0;i<nc;i++){ free(cr[i].lvars);free(cr[i].lcoef);free(cr[i].terms);free(cr[i].setvals);free(cr[i].arr_terms);} free(cr); free(referenced); free(opt.bestx); free(optcoef); sol->status=1; sol->nvars=nv; return 1; }
+    if(bd==-1){ cp_free(&cp); for(int i=0;i<nc;i++){ free(cr[i].lvars);free(cr[i].lcoef);free(cr[i].terms);free(cr[i].setvals);free(cr[i].arr_terms);} free(cr); free(referenced); free(opt.bestx); free(optcoef); return 0; }
 
     double *outx=sol->x; /* sized nv */
 
     int rr;
+    long cp_nodes=0;
     if(all){
         /* set up the dedup context (as the MIP path does) so fz_solution_cb
            prints each distinct output solution exactly once. */
@@ -1449,15 +1560,16 @@ static int fz_cp_try(const FZModel*m,FZSolution*sol){
         }
         if(ctx.key_len>SIZE_MAX/sizeof(uint64_t))psolve_fail(PSOLVE_ERR_OOM);
         ctx.scratch=(uint64_t*)psolve_calloc(ctx.key_len?ctx.key_len:1,sizeof(uint64_t));
-        rr=cp_solve_rec(&cp,cr,nc,referenced,outx,0,1,fz_solution_cb,&ctx);
+        rr=cp_solve_rec(&cp,cr,nc,referenced,outx,0,1,fz_solution_cb,&ctx,NULL,&cp_nodes);
         fz_solve_ctx_free(&ctx);
     } else {
-        rr=cp_solve_rec(&cp,cr,nc,referenced,outx,0,0,NULL,NULL);
+        rr=cp_solve_rec(&cp,cr,nc,referenced,outx,0,0,NULL,NULL,
+                        m->solve_kind!=0?&opt:NULL,&cp_nodes);
     }
 
     int handled=1;
     if(rr==2){
-        sol->status=0; sol->nodes=cp.nodes;
+        sol->status=0; sol->nodes=cp_nodes;
         /* Honesty convention (mirrors the LP/MIP bridge): an undeclared
            `var int/float` (no explicit bounds) is treated as clamped to the
            synthetic ±FZ_BIG_BOUND box.  A solution that touches that box
@@ -1474,14 +1586,37 @@ static int fz_cp_try(const FZModel*m,FZSolution*sol){
             if(bad){ sol->status=2; break; }
         }
     }
-    else if(rr==0){ sol->status=1; sol->nodes=cp.nodes; }
-    else if(all && (rr==3)){ sol->status=0; sol->nodes=cp.nodes; }
-    else if(all && rr==4){ sol->nodes=cp.nodes; sol->status=4; }
-    else { handled=0; } /* fallback */
+    else if(rr==0){ sol->status=1; sol->nodes=cp_nodes; }
+    else if(all && (rr==3)){ sol->status=0; sol->nodes=cp_nodes; }
+    else if(all && rr==4){ sol->nodes=cp_nodes; sol->status=4; }
+    else if(opt.bestx && rr==3){
+        /* complete B&B search: the incumbent is a PROVEN optimum */
+        if(opt.have){
+            memcpy(sol->x,opt.bestx,(size_t)nv*sizeof(double));
+            sol->obj=(double)opt.best+(double)opt.c0;
+            sol->status=0; sol->nodes=cp_nodes;
+            sol->best_bound=(double)opt.best+(double)opt.c0;
+            /* same honesty convention as the satisfy path: a solution
+               touching the synthetic +-FZ_BIG_BOUND clamp is not certified */
+            for(int d=0;d<m->ndecl;d++){ FZDecl*decl=&m->decls[d];
+                if(!decl->is_var||decl->base_idx<0||decl->is_alias) continue;
+                if(decl->has_lo && decl->has_hi) continue;
+                int bad=0;
+                for(int e=0;e<decl->n;e++){ int v=decl->base_idx+e; if(v<0||v>=nv) continue;
+                    double val=sol->x[v];
+                    if(val>FZ_BIG_BOUND-FZ_BIG_HIT_TOL || val< -FZ_BIG_BOUND+FZ_BIG_HIT_TOL){ bad=1; break; } }
+                if(bad){ sol->status=2; break; }
+            }
+        } else {
+            sol->status=1; sol->nodes=cp_nodes;   /* exhaustive search, no leaf */
+        }
+    }
+    else { handled=0; } /* fallback: node cap (rr==4) or uncertifiable (rr==-1) */
 
     cp_free(&cp);
     for(int i=0;i<nc;i++){ free(cr[i].lvars);free(cr[i].lcoef);free(cr[i].terms);free(cr[i].setvals);free(cr[i].arr_terms);} free(cr);
     free(referenced);
+    free(opt.bestx); free(optcoef);
     if(!handled) return 0;
     return 1;
 }

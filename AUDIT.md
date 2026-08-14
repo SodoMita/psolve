@@ -1,5 +1,106 @@
 # psolve — audit & hardening notes
 
+> **2026-08-14 — branch `arena/cp-engine-correctness`: finite-domain
+> branch-and-bound *optimization* in the CP engine, plus a real wrong-answer
+> bug found by the new cross-path differential, a leak found by the
+> leak-enabled fuzzer, and the first full-MiniZinc validation (77/77).**
+> Remote survey: `main`/`mzfnsh` moved only to `248eb2f` (docs-only
+> literature survey) and are already ancestors here; `fzn-table-constraint`
+> likewise already merged.  Nothing to port this round.
+>
+> **Feature — CP optimization (`fz_cp_try` + `cp_solve_rec`).** `solve
+> minimize/maximize` on pure finite-domain models now engages the CP engine
+> as a sound branch-and-bound instead of always falling back to the MIP
+> bridge: an exact activity bound (128-bit, `cp_opt_activity`, computed from
+> live interval/set domains, declined to "no prune" whenever a coefficient
+> or domain magnitude exceeds the provable threshold) prunes subtrees that
+> cannot beat the incumbent; leaves *verify* assignments against all
+> constraint records before scoring, then snapshot the best verified
+> assignment.  Engagement gates keep the honest surface small: the whole
+> objective (constant and every coefficient) must be exactly integral
+> (`rint` round-trip, magnitude < CP_BIG), `-a` with optimize declines to
+> the MIP incumbent catalog, the node cap and any uncertifiable state
+> fall back to the MIP bridge rather than printing an untruth, and
+> objective variables are forced `referenced` so no leaf is accepted with
+> the objective undetermined.  One deliberate performance gate: an
+> optimization model whose records are *all* plain linear rows declines to
+> MIP — measured on `tsp_5` (`-G linear` flattening, 63 linear rows): CP
+> 1166 ms vs MIP 8 ms, same proven optimum 34; bounds-fixpoint CP gains
+> nothing the LP relaxation does not already provide there, while
+> combinatorial models (alldifferent/element/reif/minmax/...) are where CP
+> wins.  Benchmark suite regenerated with the final binary: 77/77 pass.
+>
+> **Bug 1 (wrong answers, fabricated optimality) — `int_min` disjunction
+> row lost its `m` term in the `e412777` merge resolution.**  While
+> hand-retyping the conflicted min/max block, the min branch's second row
+> `m - b <= 0` became `-b <= 0`.  Bridge semantics silently changed to
+> *forcing the min's second operand non-negative*: wrong optima whenever
+> that operand may be negative, and fabricated UNSAT for `int_min(x,-5,m)`.
+> Repro (prints `obj = -1` + `==========` — a fabricated proven optimality
+> — on the merged binary; truth is -2):
+> `var -1..4: x0; var -4..1: x1; var -60..60: obj;
+> constraint int_min(-1, x0, x1);
+> constraint int_lin_eq([1,1,-1],[x0,x1,obj],0); solve minimize obj;`
+> The satisfy tests never saw it: `int_min` is CP-motivating, so satisfy
+> models never touch the broken bridge row — only optimization (which fell
+> to MIP before the CP gate existed) exposed it.  Diagnosed by diffing the
+> merge output against *both* parents (byte-identical elsewhere; single
+> dropped `lin_term`), confirmed by a stored-row dump (mm term missing in
+> the bridge, correct in the handler args).  Meta-lesson now enforced in
+> process: conflict resolutions are diffed region-by-region against both
+> parents before committing.  Regression lock: four negative-domain cases
+> in `test_cp_minmax_constant_operands` — all FAIL on the `18eb475` binary
+> (fabricated-UNSAT signature reproduced), all PASS here.  The earlier
+> positive-domain tests structurally could not catch this (`b >= 0` is
+> implied by all-positive domains); the generator now mixes signs and
+> operand positions.
+>
+> **Bug 2 (leak) — `fz_cp_try` opt-buffer cleanup on the CP-decline path.**
+> The optimization eligibility block allocates `optcoef`/`bestx` *before*
+> the float-variable scan that declines the model; optimize-models carrying
+> a float variable then leaked 24 bytes per solve.  Found by LeakSanitizer
+> once the fuzzer was made able to see it: `tools/fuzz_fzn.py` previously
+> could not — its well-formed corpus contained no float variables (the
+> leaking path was unreachable), it never set `detect_leaks=1`, and its
+> stderr filter did not match LeakSanitizer output.  All three blind spots
+> fixed (float vars in the corpus, `ASAN_OPTIONS=detect_leaks=1` +
+> `UBSAN_OPTIONS=halt_on_error=1` pinned for fuzz runs, `-fno-sanitize-
+> recover=all` in the fuzz build, LSan/SUMMARY stderr checks, plus a
+> deterministic float-pinned optimize probe run on every fuzz batch), and
+> the probe empirically aborts on a binary rebuilt with the free removed.
+>
+> **Stat honesty — CP node counter.**  `%%mzn-stat: nodes` from the CP
+> path reported *path depth*, not explored nodes: `cp_solve_rec` recurses
+> on per-branch `cp_copy` instances whose constructors duplicate the
+> parent's counter, so every subtree's increments died with its copy.
+> The counter is now a caller-owned `long*` threaded through the recursion
+> (e.g. the small alldifferent-maximize probe reports 482 real nodes
+> instead of ~5).  Same `==========`, same optima — only the statistic is
+> now true.
+>
+> **Verification summary.**  `tools/cp_opt_verify.py` (new, wired into
+> `test.sh`): 250 random FD optimization models/seed × *both* paths per
+> model (dispatcher, which routes combinatorial ones to CP, plus a
+> float-pinned variant that forces the MIP bridge) × seeds {1, 42, 7,
+> 2024, 99, 314, 555, 77} — 0 wrong vs brute force: optima exact, statuses
+> honest (no UNSAT on feasible, no infeasible unproven), witnesses
+> in-domain and constraint-valid, `==========` only with proven bounds.
+> It prints **22 wrong / 500** against the `18eb475` binary (all the
+> int_min class) — discrimination proven.  Full `test.sh` exit 0 on the
+> final tree (incl. 6113-point OOM injection, 120-input fuzz with the new
+> coverage, GLPK differential n/a — glpsol unavailable on this host).
+> ASan+UBSan+LSan sweep over `cp_opt_verify` (300 model-runs), the
+> semantics suite, the fuzzer, and the compiled benchmark models (tsp_5
+> obj 34, open_shop_3x3 obj 6, golomb_ruler_4 obj 6 — all reference-
+> matching): clean.  **First real-MiniZinc run of the whole pipeline:**
+> MiniZinc 2.9.4 IDE bundle (gecode/chuffed/cp-sat referees) registered
+> with `share/minizinc/solvers/psolve.msc`; `tools/mzn_bench.py` gained a
+> `coin-bc`→`cp-sat` linear-referee fallback (coin-bc no longer ships in
+> the bundle) and an availability probe; the 77-instance suite passed
+> 77/77 and `tools/mzn_diff.py` reports OK=33 FAIL=0.  `docs/
+> MINIZINC_BENCHMARK.md` and `tools/benchmark_results.json` regenerated
+> from the final binary as part of `test.sh`.
+
 > **2026-08-13 — branch `arena/cp-engine-correctness`: merged
 > `feat/finite-domain-cp-engine` tip (`49e3680`) and audited the new CP
 > reif/clause/minmax/variable-element/all-solutions work; also fixed a
@@ -329,8 +430,9 @@ specification (see `docs/BRANCH_AUDIT.md` for the full review):
   contributor cannot make the same mistake either direction.
 
 ## Not done (recommended next steps, in priority order)
-1. Re-run the MiniZinc differential suite (`tools/mzn_diff.py`) when
-   `minizinc` is installed (not packaged for this host's distro).
-   The GLPK side is done.
+1. ~~Re-run the MiniZinc differential suite~~ — **done 2026-08-14** with the
+   MiniZinc 2.9.4 IDE bundle (OK=33 FAIL=0, benchmark 77/77; the bundle's
+   referees are gecode/chuffed/cp-sat — coin-bc no longer ships, so
+   `tools/mzn_bench.py` falls back to cp-sat for the linear reference).
 2. Redesign the global `setjmp` allocation-error protocol so a recovering,
    multi-threaded library host can own cleanup without process-global state.

@@ -860,6 +860,87 @@ def test_cp_minmax_constant_operands() -> None:
     )
     require("m = 7;" in out, f"MIP-path int_max(3,x,m) wrong:\n{out}")
 
+    # ---- merge-transcription regression: the m term of the int_min ----
+    # ---- disjunction row "m <= b" was dropped (became "-b <= 0")      ----
+    # A hand-typed conflict resolution in e412777 lost lin_term(&d2,mm,1.0)
+    # from the min branch's second row.  Bridge semantics silently changed to
+    # forcing the second operand b >= 0: wrong optima whenever the min's
+    # second operand may be negative, fabricated UNSAT for int_min(x, -5, m).
+    # The satisfy path masked it (int_min is CP-motivating; the CP propagator
+    # is separate and was correct); the wrong answer only surfaces when the
+    # MIP bridge encoding carries the model.  Found by a cross-path
+    # differential (300 random models, CP-opt binary vs pre-opt MIP binary,
+    # 4 mismatches, all this class).  Earlier positive-domain tests missed it
+    # because b >= 0 is implied there.  Every case below FAILS on a binary
+    # with the dropped term.
+
+    # (1) negative constant second operand: b forced >= 0 makes the row
+    #     infeasible (constant -5 -> +5 <= 0) -> fabricated UNSAT on the
+    #     bridge path; a float var forces the MIP bridge for satisfy.
+    out = run_model(
+        """
+        var -10..10: x :: output_var;
+        var -10..10: m :: output_var;
+        var 0.0..1.0: f;
+        constraint float_eq(f, 0.5);
+        constraint int_min(x, -5, m);
+        constraint int_eq(x, 3);
+        solve satisfy;
+        """
+    )
+    require("m = -5;" in out,
+            f"MIP-path int_min(x,-5,m) must pin m=-5 (dropped mm term fabricates UNSAT):\n{out}")
+
+    # (2) the original optimization repro: true optimum obj = -2 (x0 = -1,
+    #     x1 = min(-1,x0) = -1); the buggy bridge forces x0 >= 0 and prints
+    #     obj = -1 with a fabricated 'proven optimal' marker.
+    out = run_model(
+        """
+        var -1..4: x0 :: output_var;
+        var -4..1: x1 :: output_var;
+        var -60..60: obj :: output_var;
+        constraint int_min(-1, x0, x1);
+        constraint int_lin_eq([1, 1, -1], [x0, x1, obj], 0);
+        solve minimize obj;
+        """
+    )
+    require("obj = -2;" in out,
+            f"int_min optimization must reach obj=-2 (dropped mm term stops at -1):\n{out}")
+    require("==========" in out,
+            f"int_min optimization must be proven optimal:\n{out}")
+
+    # (3) var-var min where the optimum needs a negative second operand:
+    #     m = min(x,y); with y pinned negative the buggy row is infeasible.
+    out = run_model(
+        """
+        var -4..4: x :: output_var;
+        var -4..4: y :: output_var;
+        var -4..4: m :: output_var;
+        var 0.0..1.0: f;
+        constraint float_eq(f, 0.5);
+        constraint int_min(x, y, m);
+        constraint int_eq(y, -3);
+        constraint int_eq(x, 2);
+        solve satisfy;
+        """
+    )
+    require("m = -3;" in out,
+            f"int_min(x,y,m) with y=-3 must give m=-3 (dropped mm term fabricates UNSAT):\n{out}")
+
+    # (4) control: int_max with a negative constant was never broken (the max
+    #     branch kept both terms); must keep passing.
+    out = run_model(
+        """
+        var -5..-1: x :: output_var;
+        var -5..5: m :: output_var;
+        var 0.0..1.0: f;
+        constraint float_eq(f, 0.5);
+        constraint int_max(x, -2, m);
+        solve satisfy;
+        """
+    )
+    require("m = -2;" in out, f"MIP-path int_max(x,-2,m) must give m=-2:\n{out}")
+
 
 def test_fractional_lattice_relations() -> None:
     """Fractional constants inside integer relations / reifications.

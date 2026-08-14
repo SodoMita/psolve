@@ -2026,7 +2026,7 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
             Lin d4;memset(&d4,0,sizeof(d4));lin_term(&d4,mm,1.0);lin_term(&d4,bb,-1.0);lin_term(&d4,s,M);d4.constant-=M;b_put(b,'<',0.0,&d4);lin_free(&d4);
         } else {
             Lin d1;memset(&d1,0,sizeof(d1));lin_term(&d1,mm,1.0);lin_term(&d1,a,-1.0);b_put(b,'<',0.0,&d1);lin_free(&d1);
-            Lin d2;memset(&d2,0,sizeof(d2));lin_term(&d2,bb,-1.0);b_put(b,'<',0.0,&d2);lin_free(&d2);
+            Lin d2;memset(&d2,0,sizeof(d2));lin_term(&d2,mm,1.0);lin_term(&d2,bb,-1.0);b_put(b,'<',0.0,&d2);lin_free(&d2);
             Lin d3;memset(&d3,0,sizeof(d3));lin_term(&d3,mm,1.0);lin_term(&d3,a,-1.0);lin_term(&d3,s,M);b_put(b,'>',0.0,&d3);lin_free(&d3);
             Lin d4;memset(&d4,0,sizeof(d4));lin_term(&d4,mm,1.0);lin_term(&d4,bb,-1.0);lin_term(&d4,s,-M);d4.constant+=M;b_put(b,'>',0.0,&d4);lin_free(&d4);
         }
@@ -3781,8 +3781,13 @@ void fz_solve(const FZModel*m,FZSolution*sol)
        monomial Diophantine products that the LP/MIP bridge handles poorly.
        For `-a` all-solutions enumeration it enumerates every distinct output
        solution directly (far faster than the MIP all-solutions enumeration).
-       It falls back to the MIP bridge for everything it cannot certify. */
-    if(m->solve_kind==0 && nv>0){
+       It falls back to the MIP bridge for everything it cannot certify.
+       Pure integer optimization with an exactly-integral objective is also
+       attempted as CP branch-and-bound first: propagation + activity-bound
+       pruning over finite domains, with the exhaustive search constituting
+       the optimality proof (node cap or unbounded structure -> honest
+       fallback to the MIP bridge, never an unproven "optimum"). */
+    if(nv>0){
         if(fz_cp_try(m,sol)) return;
     }
     /* A compiler can propagate every decision variable to a literal (for

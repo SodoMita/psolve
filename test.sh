@@ -130,6 +130,8 @@ else
 fi
 echo -n "cumulative_verify (randomized, vs brute force): "
 python3 tools/cumulative_verify.py 200 777 | sed 's/.*: //'
+echo -n "cp_opt_verify (CP B&B + MIP bridge optimization, vs brute force, both paths): "
+python3 tools/cp_opt_verify.py 250 20260814 | sed 's/.*: //'
 
 echo "[8.25/8] FlatZinc strict/reified-int + float + table/circuit semantics..."
 python3 tools/fzn_semantics_test.py
@@ -143,7 +145,7 @@ python3 tools/divmod_verify.py 200 20260808 | sed 's/.*: //'
 if command -v minizinc >/dev/null 2>&1; then
   echo "[8.5/8] MiniZinc differential (compile .mzn -> fzn -> psolve vs Gecode)..."
   python3 tools/mzn_diff.py | tail -1
-  echo "[8.75/8] MiniZinc full benchmark suite (73 models)..."
+  echo "[8.75/8] MiniZinc full benchmark suite..."
   python3 tools/mzn_bench.py | tail -2
 else
   echo "[8.5/8] MiniZinc differential SKIPPED (minizinc not installed)"
