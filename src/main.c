@@ -1,6 +1,7 @@
 #include "parser.h"
 #include "solver.h"
 #include "err.h"
+#include "tlimit.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -71,11 +72,13 @@ int main(int argc, char **argv)
 
     /* SIGINT and the optional wall-clock limit are cooperative: solver_solve()
        notices the flag and returns SOLVE_STOPPED rather than leaving a partial
-       result labelled OPTIMAL. alarm() is seconds-granularity, hence round up. */
+       result labelled OPTIMAL.  tlimit_arm() uses ITIMER_REAL (microsecond
+       resolution) so the -t budget is honored at the requested millisecond
+       precision -- alarm(), the old approach, rounds up to whole seconds. */
     signal(SIGINT, on_stop_signal);
     signal(SIGALRM, on_stop_signal);
     psolve_stop_fn = stop_requested;
-    if (time_ms > 0) alarm((unsigned)((time_ms + 999) / 1000));
+    if (tlimit_arm(time_ms) != 0) { fprintf(stderr, "cannot arm time limit\n"); psolve_end(); return 1; }
 
     LP lp;
     memset(&lp, 0, sizeof(LP));
@@ -133,7 +136,7 @@ int main(int argc, char **argv)
 
     solver_destroy(s);
     lp_free(&lp);
-    alarm(0);
+    tlimit_disarm();
     psolve_stop_fn = NULL;
     psolve_end();
     return 0;

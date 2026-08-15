@@ -23,7 +23,7 @@ def parse_args(argv):
 def build_asan(bindir):
     os.makedirs(bindir, exist_ok=True)
     base = ['gcc','-O1','-g','-march=native','-fsanitize=address,undefined',
-            '-fno-omit-frame-pointer','-I','src']
+            '-fno-omit-frame-pointer','-I','src','-I','tools']
     lp = base + ['src/err.c','src/kernels.c','src/lu.c','src/splu.c','src/solver.c',
                  'src/parser.c','src/main.c','-o',os.path.join(bindir,'lpsolve_asan'),'-lm']
     qp = base + ['src/err.c','tools/qpsolve.c','src/qp.c','src/lu.c','src/kernels.c',

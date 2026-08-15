@@ -1,6 +1,7 @@
 #include "mip.h"
 #include "parser.h"
 #include "err.h"
+#include "tlimit.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -47,7 +48,8 @@ int main(int argc, char **argv)
     signal(SIGINT, on_stop_signal);
     signal(SIGALRM, on_stop_signal);
     psolve_stop_fn = stop_requested;
-    if (time_ms > 0) alarm((unsigned)((time_ms + 999) / 1000));
+    /* ITIMER_REAL gives millisecond precision (alarm() rounded up to seconds). */
+    if (tlimit_arm(time_ms) != 0) { fprintf(stderr, "cannot arm time limit\n"); psolve_stop_fn = NULL; psolve_end(); return 1; }
 
     LP lp;
     memset(&lp, 0, sizeof(LP));
@@ -124,7 +126,7 @@ int main(int argc, char **argv)
     mip_result_free(&res);
     free(isint);
     lp_free(&lp);
-    alarm(0);
+    tlimit_disarm();
     psolve_stop_fn = NULL;
     psolve_end();
     return 0;

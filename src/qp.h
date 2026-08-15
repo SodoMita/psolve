@@ -31,15 +31,20 @@ typedef struct {
 #define QP_KKT_FAIL        3  /* KKT solve / stationarity residual not verified */
 #define QP_NON_CONVEX      4  /* Q is not positive semi-definite / symmetric */
 #define QP_INVALID         5  /* NULL or structurally invalid model */
+#define QP_STOPPED         6  /* cooperative abort (time limit / Ctrl-C) */
 
 typedef struct {
     int status;         /* 0 solved, -1 no feasible start, 1 unbounded,
                            2 QP_ITERATION_LIMIT, 3 QP_KKT_FAIL,
-                           4 QP_NON_CONVEX, 5 QP_INVALID */
+                           4 QP_NON_CONVEX, 5 QP_INVALID,
+                           6 QP_STOPPED (time limit / Ctrl-C; best incumbent
+                           in x, feasibility NOT certified for a stop during
+                           the Phase-I feasibility search -- see x/NULL) */
     int n;
-    double *x;          /* solution (n) */
+    double *x;          /* solution (n); NULL if a stop during Phase-I left no
+                           feasible point to hand back */
     double *mult;       /* Lagrange multipliers for A x <= b (m) */
-    double obj;         /* optimal objective value */
+    double obj;         /* optimal objective value (or best incumbent on stop) */
     int iterations;     /* active-set iterations */
 } QPResult;
 
