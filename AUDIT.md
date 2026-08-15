@@ -1,5 +1,76 @@
 # psolve — audit & hardening notes
 
+> **2026-08-15 — branch `arena/cp-engine-correctness`: optimization strength
+> round — CP incumbent-bound propagation, warm-started B&B relaxations, and a
+> fabricated-optimality fix in the public `solver_warm_solve` API.**
+> Remote survey (via API; git smart-HTTP is blocked in this sandbox this
+> round): all 15 remote branches unchanged since 2026-08-13, nothing to port.
+>
+> **Feature 1 — incumbent-bound propagation in the CP B&B
+> (`cp_opt_bb_tighten`, `src/fz_cp.inc`).**  Once the CP optimizer holds an
+> incumbent, only strictly-better assignments matter, so the objective row
+> `Σ cᵢvᵢ ≤ B−1` (min) / `≥ B+1` (max) is propagated onto every objective
+> variable at every node: each term is bounded against the 128-bit-exact
+> side-sum of its classmates (`Aⱼ`), with exact floor/ceil division
+> (`cp_fdiv`/`cp_cdiv`) on possibly-negative coefficients and per-term
+> wild-magnitude (±2⁶⁰) declines — a term with an unbounded classmate is
+> simply never tightened.  Soundness, including when the objective repeats
+> a variable: per-term side sums only ever *relax* the classmates' joint
+> extremum, so an excluded value can never belong to a strictly-better
+> assignment; the incumbent is already recorded.  Cuts tighten domains and
+> are then re-propagated through the constraint records.  Measured: the
+> 5-permutation weighted-all_different probe goes 135 → 52 explored nodes,
+> a 7-permutation one 2161 → 577 (−73 %), same proven optima; the whole
+> `cp_opt_verify` battery (300 models × both solver paths × 5 seeds, then
+> more) agrees with brute force, ASan/LSan clean.  (One false alarm along
+> the way, worth recording for the process file: an apparent "optimum
+> 100 ≠ brute-force 110" discrepancy was a *bad hand repro* — the model
+> declared `obj ∈ 0..100`, my brute force ignored the declared domain.
+> All brute-force references must apply every declared domain, objective
+> variable included.)
+>
+> **Feature 2 — warm-started relaxations across the MIP branch-and-bound
+> (`MipWarm`, `src/mip.c`).**  Successive node relaxations differ only in
+> variable bounds — precisely the supported incremental case — so one
+> persistent `Solver` now serves the whole tree: the first node solves
+> cold (phase 1 included), later nodes go through `solver_set_bounds` +
+> `solver_warm_solve`, with the box intersection hoisted into the caller so
+> the exact-rational cross-check on numerical/infeasible verdicts keeps its
+> box.  Total simplex iterations over a full tree, instrumented: tsp_5
+> 20 695 → **63** (328×), a 26-item knapsack 1 140 → **18**.  *Wall time on
+> the combinatorial-MIP benchmark is unchanged*: its per-node histogram
+> (200 optimal + 153 infeasible-declared over 255 nodes) shows the cost is
+> the exact-rational feasibility cross-check the bridge runs on every
+> "double-infeasible" verdict, not iteration count — recorded as the
+> measured next optimization target (a sound Farkas-certificate check
+> would replace those full exact solves; not done this round).
+> **Measured-and-reverted**: running FBBT on every node box (instead of
+> root-only) regressed tsp_5 255 → 303 nodes / +25 % wall — tighter boxes
+> shift LP vertices and thereby the most-fractional branching picks — so
+> `mip.c` keeps root-only FBBT with a comment carrying the numbers.
+>
+> **Bug fix (public API, honest-status direction) — `solver_warm_solve`
+> fabricated optimality on exhausted iteration/stop budgets.**  The warm
+> path treated only `r==2 || !primal-feasible` as failure and fell through
+> to the OPTIMAL return for **every other** `solve_phase` outcome — so a
+> warm solve halted by the iteration limit (`r==-1`), a cooperative stop
+> (`SOLVE_STOPPED`), or a factorization failure (`SOLVE_NUMERICAL`) with a
+> still-feasible basis reported *optimal*.  With warm starts now driving
+> B&B nodes, that would have converted a per-node LP limit into a bogus
+> bound capable of pruning valid subtrees.  Fixed to mirror
+> `solver_solve_impl`'s status discipline exactly (limit → 3, stop → 4,
+> numerical → 5, plus the missing final-basis-validity check before any
+> optimal verdict).  Regression: `tools/incr_test.c` case "warm-limit"
+> (cap exhausted before a definitively-suboptimal warm re-entry) prints
+> `status=0` on the pre-fix source and `status=3` after — discrimination
+> verified against both builds.
+>
+> Verification: full `test.sh` exit 0 on the final tree (200/200 random
+> incremental warm-vs-fresh, mip_diff 3×300 + default 400 cases 0 wrong,
+> all fz differentials, fuzz, 6 000+-point OOM injection), ASan+UBSan+LSan
+> sweep over tsp_5/knapsack/opt models clean, MiniZinc suite re-run on the
+> final binary: **77/77**, benchmark docs regenerated 2026-08-15.
+
 > **2026-08-14 — branch `arena/cp-engine-correctness`: finite-domain
 > branch-and-bound *optimization* in the CP engine, plus a real wrong-answer
 > bug found by the new cross-path differential, a leak found by the

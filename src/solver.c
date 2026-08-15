@@ -1346,7 +1346,16 @@ int solver_warm_solve(Solver *s)
     refactorize(s);
     recompute_basic(s);     /* restore primal feasibility for the current basis */
     int r = solve_phase(s);
-    if (r == 2 || !solver_feasible(s)) { solver_refresh(s); return s->status_out; }
+    /* Honest-status parity with solver_solve_impl: an iteration limit, a
+       cooperative stop, or a factorization failure must surface as its own
+       status, never fall through to the "optimal" return below (the previous
+       version mapped a still-feasible r==-1 iteration-limit stop to a
+       fabricated OPTIMAL). */
+    if (r == SOLVE_NUMERICAL) { s->status_out = SOLVE_NUMERICAL; return SOLVE_NUMERICAL; }
+    if (r == SOLVE_STOPPED)   { s->status_out = SOLVE_STOPPED;   return SOLVE_STOPPED; }
+    if (r == -1)              { s->status_out = 3;               return 3; }
+    int basis_valid = (s->use_sparse && s->sparse_ok) || (!s->use_sparse && s->lu_valid);
+    if (r == 2 || !basis_valid || !solver_feasible(s)) { solver_refresh(s); return s->status_out; }
     double obj = 0.0;
     for (int i = 0; i < s->M; i++) obj += s->cobj[s->basis[i]] * s->x[s->basis[i]];
     for (int j = 0; j < s->N; j++)

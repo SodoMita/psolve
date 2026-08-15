@@ -1329,6 +1329,70 @@ static int cp_opt_activity(const CP*cp,const CPOptCtx*opt,__int128*out){
     *out=acc; return 1;
 }
 
+/* exact mathematical floor/ceil division on 128-bit (b != 0) */
+static __int128 cp_fdiv(__int128 a,__int128 b){ __int128 q=a/b,r=a%b; if(r&&((r<0)!=(b<0))) q-=1; return q; }
+static __int128 cp_cdiv(__int128 a,__int128 b){ __int128 q=a/b,r=a%b; if(r&&((r<0)==(b<0))) q+=1; return q; }
+
+/* Incumbent-bound propagation on the objective row (sound FBBT).
+   Once an incumbent exists, only strictly-better assignments matter, so
+       min: sum c_i v_i <= B-1        max: sum c_i v_i >= B+1
+   can be propagated onto every objective term:  c_j v_j <= K_j - A_j
+   where A_j is a LOWER (min case) resp. UPPER (max case) bound on the
+   achievable sum of all OTHER terms.  A_j is the sum of per-term side
+   extrema -- a relaxation when terms share a variable, which only ever
+   weakens A_j, so excluded values still cannot belong to a strictly
+   better assignment (the incumbent itself is already recorded).
+   All arithmetic is exact 128-bit floor/ceil; a term side past +-2^60 is
+   "wild" and only ever declines a tightening, never invents one.
+   Returns 1 if the objective row is infeasible below the incumbent here
+   (prune), 2 if at least one domain was tightened, 0 otherwise. */
+static int cp_opt_bb_tighten(CP*cp,const CPOptCtx*opt){
+    int n=opt->n;
+    if(n<=0) return 0;
+    /* pass 1: aggregate bottom (min sense) / top (max sense) side sums */
+    __int128 S=0; int nwild=0;
+    for(int i=0;i<n;i++){
+        long long c=opt->coef[i]; if(c==0) continue;
+        int v=opt->idx[i];
+        int64_t lo=cp_dmin(cp,v), hi=cp_dmax(cp,v);
+        int64_t side;
+        if(opt->sense==1) side=(c>0)?lo:hi; else side=(c>0)?hi:lo;
+        if(side<=-(INT64_C(1)<<60)||side>=(INT64_C(1)<<60)){ nwild++; continue; }
+        S+=(__int128)c*(__int128)side;
+    }
+    if(nwild>1) return 0;      /* two+ wild terms: every classmate set is unbounded */
+    int cut=0;
+    for(int j=0;j<n;j++){
+        long long c=opt->coef[j]; if(c==0) continue;
+        int v=opt->idx[j];
+        int64_t lo=cp_dmin(cp,v), hi=cp_dmax(cp,v);
+        int64_t side;
+        if(opt->sense==1) side=(c>0)?lo:hi; else side=(c>0)?hi:lo;
+        int jwild = (side<=-(INT64_C(1)<<60)||side>=(INT64_C(1)<<60));
+        if(nwild==1 && !jwild) continue;   /* A_j contains the wild term */
+        __int128 A;
+        if(jwild) A=S;                      /* sole wild term: A_j = bounded rest */
+        else A=S-(__int128)c*(__int128)side;
+        /* K = (B-1) - A_j  (min)   resp.   K = (B+1) - A_j  (max) */
+        __int128 K = (opt->sense==1 ? opt->best-1 : opt->best+1) - A;
+        int64_t nlo=lo, nhi=hi;
+        if(opt->sense==1){
+            /* c*v <= K */
+            __int128 bnd = (c>0) ? cp_fdiv(K,c) : cp_cdiv(K,c);
+            if(c>0){ if(bnd>=hi) continue; if(bnd<lo) return 1; nhi=(int64_t)bnd; }
+            else   { if(bnd<=lo) continue; if(bnd>hi) return 1; nlo=(int64_t)bnd; }
+        } else {
+            /* c*v >= K  -- use the opposite classmate sides (already in S) */
+            __int128 bnd = (c>0) ? cp_cdiv(K,c) : cp_fdiv(K,c);
+            if(c>0){ if(bnd<=lo) continue; if(bnd>hi) return 1; nlo=(int64_t)bnd; }
+            else   { if(bnd>=hi) continue; if(bnd<lo) return 1; nhi=(int64_t)bnd; }
+        }
+        if(cp_intersect(cp,v,nlo,nhi)) return 1;
+        cut=1;
+    }
+    return cut?2:0;
+}
+
 /* search.  Returns:
  *   2 solution found (single mode)
  *   3 all-solutions mode: enumeration of this subtree complete
@@ -1358,6 +1422,12 @@ static int cp_solve_rec(CP*cp,CPCR*cr,int nc,unsigned char*referenced,double*out
             if(opt->sense==1){ if(act>=opt->best) return 0; }
             else { if(act<=opt->best) return 0; }
         }
+        /* push the incumbent bound INTO the domains: any objective-variable
+           value that cannot belong to a strictly-better assignment is
+           removed here, and the constraints get to propagate the cut */
+        int bt=cp_opt_bb_tighten(cp,opt);
+        if(bt==1) return 0;              /* objective row infeasible below incumbent */
+        if(bt==2){ pr=cp_propagate(cp,cr,nc); if(pr==1) return 0; if(pr==-1) return -1; }
     }
     int best=-1,bestsz=INT_MAX;
     for(int v=0;v<cp->nvars;v++){

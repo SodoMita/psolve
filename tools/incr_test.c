@@ -105,6 +105,28 @@ int main(void){
     printf("add-row: warm obj=%.6g fresh obj=%.6g  %s\n",o1,o2,(fabs(o1-o2)<1e-6)?"PASS":"FAIL");
     if(fabs(o1-o2)>=1e-6) fails++;
 
+    /* 4. warm-start honesty: a warm solve that still needs pivots when the
+       iteration cap is already exhausted must report 3 (iteration limit),
+       never 0 (OPTIMAL of an unproven vertex).  Pre-fix solver_warm_solve
+       ignored r==-1 and fell through to the optimal return whenever the
+       halted basis happened to stay primal-feasible -- a fabricated optimum
+       that B&B warm starts would have used as a bound. */
+    {
+        LP lp2; build_lp(&lp2);
+        Solver *w = solver_create(&lp2);
+        solver_solve(w);                    /* cold solve: consumes iterations */
+        double nc2[4]={1,5,3,2};
+        solver_set_objective(w,nc2,1);      /* different objective: warm needs pivots */
+        w->iteration_limit = 1;             /* cap below the already-spent count */
+        int rw = solver_warm_solve(w);
+        printf("warm-limit: status=%d  %s\n", rw, rw==3?"PASS":"FAIL");
+        if(rw!=3) fails++;
+        /* a fresh cold solve of the same problem may hit its own limit too;
+           the warm-verdict contract is only about never printing 0 here */
+        solver_destroy(w);
+        free_lp(&lp2);
+    }
+
     solver_destroy(s1); solver_destroy(s2); free_lp(&lp);
     printf(fails==0?"ALL INCREMENTAL TESTS PASSED\n":"%d FAILURES\n",fails);
     return fails==0?0:1;

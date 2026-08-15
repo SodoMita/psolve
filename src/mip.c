@@ -140,37 +140,61 @@ static Node *pop_node(Node **list)
     return n;
 }
 
-/* build an LP from the MIP with per-node tightened bounds, and solve it */
-static int solve_relaxation(const MIP *mip, const Node *node,
+/* Persistent simplex state reused across the whole branch-and-bound tree.
+ * Successive node relaxations differ ONLY in the variable bounds, which is
+ * exactly the supported incremental case (solver_set_bounds +
+ * solver_warm_solve): the warm solve re-factorizes the previous basis and
+ * re-enters phase 2, and transparently falls back to a full cold rebuild
+ * (solver_refresh) whenever the basis cannot be kept feasible -- it never
+ * returns an unverified optimum.  The first node solves cold (phase 1
+ * included), establishing the basis every later node warms from. */
+typedef struct {
+    Solver *s;         /* NULL until the first (cold) solve creates it */
+    int     started;
+    double *blo;       /* intersected per-node box scratch (n each) */
+    double *bhi;
+} MipWarm;
+
+/* build an LP from the MIP with per-node tightened bounds, and solve it;
+ * warm-starts from the previous node's basis whenever possible */
+static int solve_relaxation(const MIP *mip, const Node *node, MipWarm *ws,
                             double *x, double *obj, double *lcur, double *ucur)
 {
     int n = mip->n;
-    LP lp;
-    memset(&lp, 0, sizeof(lp));
-    lp.n = n; lp.m = mip->m; lp.maximize = mip->maximize;
-    lp.c  = (double*)mip->c;
-    lp.Acolptr = (int*)mip->Acolptr;
-    lp.Arow = (int*)mip->Arow;
-    lp.Aval = (double*)mip->Aval;
-    lp.rel = (char*)mip->rel;
-    lp.b  = (double*)mip->b;
-    lp.l  = (double*)mip->l;
-    lp.u  = (double*)mip->u;
-    /* per-node bounds (allocate copies so node can free them) */
-    double *lo = (double*)psolve_malloc((size_t)n * sizeof(double));
-    double *hi = (double*)psolve_malloc((size_t)n * sizeof(double));
+    double *lo = ws->blo;
+    double *hi = ws->bhi;
     for (int j = 0; j < n; j++) {
         double lj = node->lo[j] > mip->l[j] ? node->lo[j] : mip->l[j];
         double uj = node->hi[j] < mip->u[j] ? node->hi[j] : mip->u[j];
-        if (lj > uj) { free(lo); free(hi); return -1; }   /* infeasible node */
+        if (lj > uj) return -1;   /* infeasible node */
         lo[j] = lj; hi[j] = uj;
     }
-    lp.l = lo; lp.u = hi;
 
-    Solver *s = solver_create(&lp);
-    if (!s) { free(lo); free(hi); return -1; }
-    if (mip->lp_iter_limit > 0) s->iteration_limit = mip->lp_iter_limit;
-    int r = solver_solve(s);
+    Solver *s;
+    int r;
+    if (!ws->started) {
+        LP lp;
+        memset(&lp, 0, sizeof(lp));
+        lp.n = n; lp.m = mip->m; lp.maximize = mip->maximize;
+        lp.c  = (double*)mip->c;
+        lp.Acolptr = (int*)mip->Acolptr;
+        lp.Arow = (int*)mip->Arow;
+        lp.Aval = (double*)mip->Aval;
+        lp.rel = (char*)mip->rel;
+        lp.b  = (double*)mip->b;
+        lp.l  = lo;
+        lp.u  = hi;
+        s = solver_create(&lp);
+        if (!s) return -1;
+        if (mip->lp_iter_limit > 0) s->iteration_limit = mip->lp_iter_limit;
+        r = solver_solve(s);
+        ws->s = s;
+        ws->started = 1;
+    } else {
+        s = ws->s;
+        solver_set_bounds(s, lo, hi);
+        r = solver_warm_solve(s);
+    }
     int status = r;
     if (r == 0) {
         double *xo = (double*)psolve_malloc((size_t)n * sizeof(double));
@@ -203,9 +227,7 @@ static int solve_relaxation(const MIP *mip, const Node *node,
         fx_free(&flp);
     }
     for (int j = 0; j < n; j++) { lcur[j] = lo[j]; ucur[j] = hi[j]; }
-    solver_destroy(s);
-    free(lo); free(hi);
-    return status;
+    return status;   /* solver and box scratch live on in the MipWarm context */
 }
 
 /* ------------------------------------------------------------------ */
@@ -449,6 +471,13 @@ void mip_solve(const MIP *mip, MIPResult *res)
     root->next = NULL;
     push_node(&stack, root, mip->maximize);
 
+    /* persistent warm-start context for the per-node relaxations; created
+       only after the root-FBBT early-return so every exit below passes the
+       shared teardown */
+    MipWarm ws; memset(&ws, 0, sizeof(ws));
+    ws.blo = (double*)psolve_malloc((size_t)n * sizeof(double));
+    ws.bhi = (double*)psolve_malloc((size_t)n * sizeof(double));
+
     long nodes = 0;
     int status = 1;   /* assume infeasible until a feasible integer found */
     int limit_reached = 0;   /* the search was cut short (node/time/stop/iter) */
@@ -460,8 +489,16 @@ void mip_solve(const MIP *mip, MIPResult *res)
         Node *node = pop_node(&stack);
         nodes++;
 
+        /* NOTE (measured, 2026-08-14, then reverted): running fbbt_tighten on
+           every popped node box did NOT pay for itself on the benchmark
+           suite -- assignment 19->17 nodes, knap_lin flat, but tsp_5 grew
+           255->303 nodes and +25% wall (tighter boxes shift the LP vertex
+           and thereby the most-fractional branching picks adversarially;
+           the per-node fixpoint cost is not recovered).  Root-only FBBT
+           stays: it is where the sound tightening wins. */
+
         double obj;
-        int r = solve_relaxation(mip, node, x, &obj, lcur, ucur);
+        int r = solve_relaxation(mip, node, &ws, x, &obj, lcur, ucur);
         if (r == -1) { free(node->lo); free(node->hi); free(node); continue; } /* infeasible */
         if (r == 3) { free(node->lo); free(node->hi); free(node); status = 3; limit_reached = 1; break; } /* lp limit */
         if (r == SOLVE_STOPPED) { free(node->lo); free(node->hi); free(node); status = 4; limit_reached = 1; break; } /* stopped */
@@ -648,6 +685,8 @@ void mip_solve(const MIP *mip, MIPResult *res)
     Node *n2 = stack;
     while (n2) { Node *t = n2; n2 = n2->next; free(t->lo); free(t->hi); free(t); }
 
+    if (ws.s) solver_destroy(ws.s);
+    free(ws.blo); free(ws.bhi);
     free(x); free(lcur); free(ucur); free(bestx); free(xc);
 }
 
