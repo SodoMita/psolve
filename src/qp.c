@@ -430,29 +430,110 @@ void qp_solve(const QP *qp, QPResult *res)
         for (int j = 0; j < n; j++) if (!isfinite(qp->A[(size_t)i*n+j])) return;
     }
     res->status = -1;
-    /* Check Q for symmetry and 1x1/2x2 principal-minor positive semi-definiteness.
-       Reject indefinite or non-symmetric Q immediately instead of iterating. */
-    for (int i = 0; i < n; i++) {
-        if (qp->Q[i*n+i] < -1e-9) {
+    /* Convexity gate.  Symmetry first (the factorization assumes it), then a
+       FULL symmetric ~Cholesky scan: the old 1x1/2x2 principal-minor screen
+       passed indefinite matrices n>=3 whose negativity only shows in a
+       larger minor (e.g. diag 1, off-diagonal -0.9: every 2x2 minor is
+       0.19 > 0 yet an eigenvalue is -0.8).  Such a Q made the active-set
+       report the stationary origin as an "optimum" on a problem unbounded
+       below -- a fabricated answer in the verifier-free direction
+       (AUDIT "Not done" 6.5; gadget pinned in tools/qp_psd_verify.py).
+
+       The scan is exact in exact arithmetic: complete it with all pivots
+       >= -tol  <=>  Q is PSD (within tolerance).  Short witnesses:
+         - a negative pivot beyond tol means a negative leading principal
+           submatrix step: the matrix is indefinite;
+         - a zero-ish pivot with a NONZERO residual column means a 2x2
+           block [0 a; a b] with a*a < 0 in the Schur complement:
+           indefinite;
+         - otherwise the eliminated remainder stays PSD, so finishing
+           certifies PSD.
+       tol is scaled (entries of Q and its Schur complements share units):
+       semidefinitedness of doubles can only ever be decided to a relative
+       frontier; past it is the documented tolerance semantics (roadmap 6.8
+       will publish the sheets).  Cost is O(n^3/3) once, the same order as
+       one active-set KKT factorization. */
+    {
+        double qscale = 1.0;
+        for (size_t k = 0; k < (size_t)n * n; k++)
+            qscale = fmax(qscale, fabs(qp->Q[k]));
+        double symtol = 1e-8 * (1.0 + qscale);
+        for (int i = 0; i < n; i++)
+            for (int j = i + 1; j < n; j++) {
+                double diff = fabs(qp->Q[i*n+j] - qp->Q[j*n+i]);
+                if (diff > symtol) {
+                    res->status = QP_NON_CONVEX;
+                    return;
+                }
+            }
+        /* Symmetrize into a workspace (get the same answer for +/-1-ulp
+           asymmetric input), then a complete-pivoting symmetric
+           elimination scan: at each step move the largest remaining
+           diagonal to the pivot position and eliminate it.  Soundness of
+           the verdicts (exact arithmetic):
+             - a pivot < -tol is a negative diagonal of a matrix CONGRUENT
+               to the input (elimination and symmetric permutation are
+               congruences), so by Sylvester's law the input has a
+               negative eigenvalue: indefinite;
+             - if the largest remaining diagonal is within tol of zero,
+               the leftover matrix is PSD iff every off-diagonal is also
+               within tol (a 2x2 [d a; a d'] with |d|,|d'| <= tol and
+               |a| above it has determinant ~ -a^2 < 0, a principal
+               indefinite 2x2);
+             - otherwise the scan finishes with pivots >= -tol, and the
+               accumulated factorization IS a PSD certificate.
+           Complete pivoting matters: without it, a tiny leading diagonal
+           forces the "zero pivot with nonzero column" case to fire on
+           scale-mixed but genuinely PSD blocks like
+           [6e-12 3e-5; 3e-5 1e3] (det > 0), over-blocking valid models;
+           pivoting the 1e3 first eliminates the coupling at its own
+           scale and the small direction is judged against its own
+           magnitude. */
+        double *S = (double*)psolve_malloc((size_t)n * n * sizeof(double));
+        for (int i = 0; i < n; i++) {
+            for (int j = 0; j < n; j++)
+                S[i*n+j] = 0.5 * (qp->Q[i*n+j] + qp->Q[j*n+i]);
+        }
+        double ptol = 1e-9 * (1.0 + qscale);
+        int psd = 1;
+        int k = 0;
+        for (k = 0; k < n; k++) {
+            /* largest remaining diagonal */
+            int p = k;
+            double dmax = S[k*n+k];
+            for (int i = k + 1; i < n; i++)
+                if (S[i*n+i] > dmax) { dmax = S[i*n+i]; p = i; }
+            if (dmax < -ptol) { psd = 0; break; }   /* neg. diagonal: indefinite */
+            if (dmax <= ptol) {
+                /* tail: all remaining diagonals within tol of 0 -> the
+                   leftover is PSD iff it is entirely ~0 (Cauchy-Schwarz);
+                   any larger off-diagonal is an indefinite principal 2x2. */
+                for (int i = k; i < n && psd; i++)
+                    for (int j = i + 1; j < n; j++)
+                        if (fabs(S[i*n+j]) > ptol) { psd = 0; break; }
+                break;
+            }
+            /* symmetric permutation k <-> p (full square) */
+            if (p != k) {
+                for (int j = 0; j < n; j++) {
+                    double t = S[k*n+j]; S[k*n+j] = S[p*n+j]; S[p*n+j] = t;
+                }
+                for (int i = 0; i < n; i++) {
+                    double t = S[i*n+k]; S[i*n+k] = S[i*n+p]; S[i*n+p] = t;
+                }
+            }
+            double d = S[k*n+k];
+            for (int i = k + 1; i < n; i++) {
+                double si = S[i*n+k];
+                if (si == 0.0) continue;
+                for (int j = k + 1; j < n; j++)
+                    S[i*n+j] -= si * S[j*n+k] / d;
+            }
+        }
+        psolve_free(S);
+        if (!psd) {
             res->status = QP_NON_CONVEX;
             return;
-        }
-        for (int j = 0; j < n; j++) {
-            double diff = fabs(qp->Q[i*n+j] - qp->Q[j*n+i]);
-            double scale = fmax(1.0, fmax(fabs(qp->Q[i*n+j]), fabs(qp->Q[j*n+i])));
-            if (diff > 1e-8 * scale) {
-                res->status = QP_NON_CONVEX;
-                return;
-            }
-        }
-        for (int j = i + 1; j < n; j++) {
-            double qii = fmax(0.0, qp->Q[i*n+i]);
-            double qjj = fmax(0.0, qp->Q[j*n+j]);
-            double qij = qp->Q[i*n+j];
-            if (qii * qjj - qij * qij < -1e-8 * fmax(1.0, qii * qjj)) {
-                res->status = QP_NON_CONVEX;
-                return;
-            }
         }
     }
     double *x = (double*)xmalloc((size_t)qp->n * sizeof(double));

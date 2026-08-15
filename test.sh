@@ -52,6 +52,19 @@ echo "  QP vs scipy: OK=$ok FAIL=$fail"
 # recession-direction test, so it catches infeasible/unbounded/non-stationary
 # points that an objective comparison against SLSQP cannot.
 python3 tools/qp_diff.py 200 4242 | head -2
+# QP convexity-gate differential (roadmap 6.5): the pre-change gate screened
+# only 1x1/2x2 principal minors, so n>=3 symmetric indefinite Q whose
+# negativity lives in a larger minor PASSED (diag 1, off-diag -0.9: 2x2
+# minors 0.19, eigenvalue -0.8), and the active-set printed the stationary
+# origin as an "optimum" on problems unbounded below.  Now a complete
+# symmetrized complete-pivoting elimination scan certifies PSD (negative
+# pivot, or an off-diagonal tail beyond the scaled tolerance, refuses with
+# QP_NON_CONVEX).  Discriminating: on the pre-change binary the tool
+# reproduces 103 fabricated status-0 verdicts (25 with objectives wrong vs
+# the true box optima); post-change it must see 0, keep 120 asymmetric/tiny-
+# perturbation over-refusals paperwork-free, and not over-block scale-mixed
+# genuine PSD.  Hard gate: rc matters.
+python3 tools/qp_psd_verify.py 120 20260815 || { echo "qp_psd_verify: FAIL"; exit 1; }
 
 echo "[5.2/7] QP cooperative stop + millisecond-precision time limits (Phase 4)..."
 gcc -O2 -march=native -I src tools/qp_stop_test.c src/qp.c src/err.c src/lu.c src/kernels.c -o /tmp/qp_stop_test -lm

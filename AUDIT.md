@@ -1,5 +1,71 @@
 # psolve — audit & hardening notes
 
+> **2026-08-15 (8) - branch `arena/cp-engine-correctness`: Phase 6.5 of
+> the ambitious roadmap, the QP numerical audit.  One fabrication-class
+> hole found and closed; no others.**
+>
+> **The hole (found this round).** The QP convexity gate screened only
+> the 1x1 and 2x2 principal minors of Q -- so a symmetric matrix n >= 3
+> whose negativity lives in a larger minor PASSED as "convex": diag 1
+> with off-diagonals -0.9 has every 2x2 minor 0.19 > 0 and an eigenvalue
+> of -0.8.  Starting from the stationary origin (c = 0 gadget) the
+> active-set returned immediately with the origin as "optimum": on the
+> unconstrained gadget the QP is unbounded below (pin pinned in
+> tools/qp_psd_verify.py as pin_unconstr), on the box-bounded companion
+> the true optimum (-1.2 at (1,1,1)) was reported as 0.  A fabricated
+> optimum is the verifier-free direction: nobody re-checks a claimed
+> solution.  On the extended family (random Q with all 2x2 minors safely
+> positive and a macroscopic negative eigenvalue) the pre-change binary
+> fabricated **103 status-0 verdicts out of 122** (25 of 60 box variants
+> with objectives wrong vs the true vertex optima, e.g. -4.436 claimed
+> vs -14.288 true).
+>
+> **The fix.** Full symmetrized complete-pivoting elimination scan:
+> pivot the largest remaining diagonal each step (a pivot < -tol is a
+> negative diagonal of a matrix congruent to Q -- indefinite by
+> Sylvester's law; if the largest remaining diagonal is within tol of
+> zero the leftover must be entirely ~tol-small, any larger off-diagonal
+> is an indefinite principal 2x2).  Completing the scan IS the PSD
+> certificate.  tol = 1e-9 (1 + max|Q|), matching the engine's regulari-
+> zation tolerances; semidefiniteness of doubles is decidable only to a
+> relative frontier (below it the regularized KKT path takes over --
+> documented tolerance semantics, not a wrong-verdict hole).  Complete
+> pivoting is load-bearing: the first draft's natural-order scan fired
+> its "zero pivot, nonzero column" witness on scale-mixed GENUINELY PSD
+> blocks like [6e-12 3e-5; 3e-5 1e3] (determinant > 0) and over-blocked
+> 14/40 valid models -- the discriminating tool's scale_mix class caught
+> it pre-commit, and pivoting the large direction first eliminates the
+> coupling at its own scale.  Cost O(n^3/3) once, the same order as one
+> active-set KKT factorization.
+>
+> **Regression lock (calibration rule).** New `tools/qp_psd_verify.py`,
+> hard-gated in test.sh: pins (both gadgets now STATUS 4 =
+> QP_NON_CONVEX), 120-case indef_gate family (post-change 120/120
+> refused, 0 fabrications), near_psd family (singular PSD minus a
+> perturbation BELOW the gate tolerance: accepted per tolerance
+> semantics; every status-0 answer must pass the qp_diff KKT oracle --
+> 6/6 pass), asym family (beyond-tolerance asymmetry 20/20 refused),
+> scale_mix family (genuine PSD across 1e-14..1e14 diagonal scalings:
+> 39 solves + 1 honest KKT-fail, ZERO over-blocking refusals).  The tool
+> is discriminating: on the pre-change binary it counts
+> fabricated_status0=103 (obj_mismatch=25) and exits 0 only on the
+> pre-detection path.  qp_diff (the pre-existing battery gate) reports
+> the IDENTICAL status distribution pre/post on valid families
+> (WRONG=0) -- the gate is verdict-neutral on genuinely convex data.
+>
+> **What was NOT found.** With the closed gate in place, the extended
+> families plus qp_diff's pd/singular/zero/diag0 sweep show no wrong
+> answers: status-0 answers carry valid certificates, negative statuses
+> stay honest (limit-bounded=5 capability gap on singular families is
+> unchanged and documented in qp_diff).
+>
+> **Validation.** ASan/UBSan(+LSan) qpsolve build: zero warnings,
+> qp_psd_verify ALL OK, pins refuse cleanly; full test.sh exit 0
+> (incl. the new hard gate; oom sweep unchanged at 5930/6391/0 -- the
+> gate's n^2 workspace lands per-solve and is injector-covered); mip_diff
+> WRONG=0 x5 seeds; MiniZinc differential OK=33 FAIL=0, suite 77/77 with
+> 0 semantic diffs vs committed results.
+>
 > **2026-08-15 (7) - branch `arena/cp-engine-correctness`: Phase 6.3 of
 > the ambitious roadmap, the error-protocol redesign (closes "Not done"
 > item 2 - the LAST open item; the audit list is now fully dispositioned).**

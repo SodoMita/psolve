@@ -210,14 +210,26 @@ record:
   checker rejects ≥99.9% of perturbed OPTIMAL/UNSAT claims (and 100% of
   large perturbations).
 
-### 6.5 QP numerical audit round
-- **What:** the same adversarial methodology recently applied to LP/MIP/FBBT,
-  applied to `qp.c`: degenerate working sets, duplicated/parallel rows,
-  near-indefinite Q within tolerance of PSD, huge/small scale mixes.
-- **Why:** QP is the least-attacked engine; the 2026 audit found ~5% wrong
-  answers on singular-PSD families *after* hardening assumptions were made.
-- **Acceptance:** extended `tools/qp_diff.py` family, pre/post fail counts
-  recorded; any fabricated-class bug fixed with discriminating regressions.
+### 6.5 QP numerical audit round — **DONE 2026-08-15(8)**
+One fabrication-class hole found and closed: the QP convexity gate screened
+only 1x1/2x2 principal minors, so n ≥ 3 indefinite Q whose negativity lives
+in a larger minor passed (diag 1, off-diag −0.9: minors 0.19, eigenvalue
+−0.8), and the active-set printed the stationary origin as an "optimum" on
+problems unbounded below — **103 fabricated status-0 verdicts in 122 cases**
+on the discrimination family (25 box variants with objectives wrong vs true
+vertex optima, e.g. −4.436 claimed vs −14.288 true).  Fixed with a full
+symmetrized **complete-pivoting** elimination scan (Sylvester-sound in both
+directions in exact arithmetic; scaled tolerance 1e-9·(1+max|Q|)); complete
+pivoting is load-bearing — the natural-order draft over-blocked 14/40
+scale-mixed genuine PSD blocks (caught by the new tool's scale_mix class
+pre-commit).  Acceptance evidence: discriminating hard gate
+`tools/qp_psd_verify.py` in `test.sh` (pre-change
+`fabricated_status0=103, obj_mismatch=25`; post-change 0, ALL OK across the
+indef/near_psd/asym/scale_mix classes and both pinned gadgets at STATUS 4);
+existing `qp_diff.py` status distribution IDENTICAL pre/post (verdict-neutrality
+on convex data, WRONG=0); ASan/UBSan(+LSan) clean; full battery exit 0;
+MiniZinc 77/77 0-semantic-diff.  No other wrong-answer class found in the
+extended sweep; `qp.h` documents the gate.  AUDIT.md addendum 2026-08-15(8).
 
 ### 6.6 Harvest remaining `phase4-interactive-hardening` commits — **DONE 2026-08-15(4/5)**
 Ported by the parallel agent's `arena/phase4-ports` branch and merged to

@@ -15,6 +15,21 @@
  *
  * The KKT system is solved with the dense LU factorization used by the LP
  * solver (src/lu.c).  PSD Q is made positive definite by a tiny regularization.
+ *
+ * Convexity gate (2026-08-15(8)): before iterating, Q is checked for
+ * symmetry (scaled tolerance) and then certified positive semi-definite by a
+ * complete symmetrized COMPLETE-PIVOTING elimination scan (refuse on a
+ * pivot below -(1e-9 * (1 + max|Q_ij|)), or on an off-diagonal tail entry
+ * beyond that tolerance once the remaining diagonal is within it).  The scan
+ * is a certificate in both directions in exact arithmetic -- completing it
+ * proves PSD; a negative pivot or indefinite principal 2x2 tail proves
+ * non-convexity (Sylvester's law) -- and it replaced a 1x1/2x2
+ * principal-minor screen that admitted n >= 3 indefinite matrices whose
+ * negativity only shows in a larger minor (the active-set then printed the
+ * stationary origin as an "optimum" on problems unbounded below; see
+ * tools/qp_psd_verify.py).  Semidefiniteness of doubles is decidable only
+ * to a relative frontier: below it, near-singular data is accepted and
+ * handled by the regularized KKT path (documented tolerance semantics).
  */
 
 typedef struct {
