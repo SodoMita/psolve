@@ -1,0 +1,857 @@
+# psolve — ambitious development roadmap (2026 → 2028)
+
+**Status:** living document. Authored 2026-08-15 on branch
+`arena/cp-engine-correctness` @ `00f5e1f`.
+**Relationship to existing docs:** [`docs/ROADMAP.md`](ROADMAP.md) records the
+original phase plan (Phases 0–5) and its completion history; it stays as the
+historical record. **This** document is the successor plan for everything that
+comes next. [`AUDIT.md`](../AUDIT.md) records the correctness audits; open
+items from it are dispositioned into phases here (Appendix A).
+[`docs/SOLVER_OPTIMIZATIONS.md`](SOLVER_OPTIMIZATIONS.md) is the technique
+survey many phases below draw on; Appendix C maps its sections onto phases.
+
+**How to read this document.** Every item has: *what*, *why it pays*, and
+*acceptance evidence* — the empirical bar it must clear before it can be
+called done. Items marked **[research]** carry real uncertainty: the approach
+may fail, in which case the honest outcome is a written negative result, not
+a half-merged feature. Items marked **[stretch]** are explicitly aggressive;
+they are planning targets, not commitments. Dates in §17 are ambitions, not
+promises; sequencing logic (correctness → trust → speed → reach) is the
+contract, the calendar is not.
+
+---
+
+## 0. The constitution (non-negotiables, bind every phase)
+
+These rules were bought with real bugs — fabricated `UNSAT`, suboptimal
+points printed as `OPTIMAL`, silent set-literal truncation. They are
+reaffirmed here so no roadmap item can quietly trade them away.
+
+1. **Honesty doctrine.** An exact answer or an honest `UNKNOWN`. Never
+   fabricate `UNSATISFIABLE`, a solution, an objective value, or a proof of
+   optimality. The **UNSAT direction is the dangerous one**: no end-user
+   verifier rechecks it, so every UNSAT/infeasibility claim must carry a
+   checkable certificate, internally at minimum, exported where feasible.
+2. **Reproduce → fix → prove.** No fix lands without a reproduction on the
+   pre-fix binary, and every new regression/differential test must be
+   **demonstrated to fail on the pre-fix binary** before it is admitted as
+   evidence for the fix. Calibration claims are re-verified from raw logs
+   (LSan/`_exit` output loss taught us that summaries lie).
+3. **Zero runtime dependencies.** libc/libm only. Optional tooling (MiniZinc,
+   scipy, GLPK/HiGHS, fuzzers) may gate *tests*, never the shipped library.
+4. **Empiricism over authority.** Commit messages, audit reports, other
+   branches, and this document itself are hypotheses. Claims are ported or
+   marked done only after independent empirical verification in this tree.
+5. **Tolerance transparency.** The engines are tolerance-based
+   (`TOL_FEAS=1e-9`, `MIP_TOL=1e-6`). Any exact-arithmetic prune must carry
+   the engine margin; any new tolerance must be documented in a per-module
+   semantics sheet (item 14.6) with its safety direction stated.
+6. **Bounded work / hostile-input safety.** Every solver respects
+   time/node/iteration budgets; every parser is fuzzed under
+   ASan/UBSan/LSan; library code never calls `exit()`/`abort()` on a path
+   reachable from host input; allocation failure is a status, not a crash.
+7. **Determinism.** Same input ⇒ same output, including statuses and counts,
+   on a fixed build. The fixed-point kernels extend this to *bit-identical
+   across platforms*; nothing may regress that without a written disposition.
+8. **Small and auditable.** Prefer deleting code to adding it. A feature that
+   cannot be differentially tested or brute-force verified at some scale is
+   not finished.
+
+---
+
+## 1. Portfolio snapshot (2026-08-15)
+
+| Component | Where | State | Verification level today |
+|---|---|---|---|
+| Double LP (revised simplex, AVX-512) | `src/solver.c`, `splu.c`, `lu.c`, `kernels.c` | Production core; numerically fragile on big-M bases (finding A history) | scipy differential, GLPK sweep, certificates, fuzz |
+| Exact rational/fixed-point LP | `src/fx.c`, `fx_core.inc` | Full-tableau; correct; O(small) only | cross-check vs double on thousands; ASan clean |
+| QP (active-set) | `src/qp.c` | Hardened (KKT certs, recession rays) | KKT-certificate differential 1000/1000 |
+| MIP (B&B + FBBT + warm starts + fx fallback) | `src/mip.c` | Correct after 2026-08 rounds; tree still large on combinatorial models | brute-force differential, fabrication-free UNSAT (directed-rounding certs) |
+| Finite-domain CP engine | `src/fz_cp.inc` | B&B + incumbent-bound FBBT; small propagator set | cp_opt_verify, semantics tests |
+| FlatZinc bridge + globals | `src/fzn.c` | ~30 global families linearized; 77-instance suite green | mzn_diff vs Gecode/cp-sat, brute-force verifiers |
+| PGS / fixed-point PGS | `src/pgs.c`, `pgs_fixed.c` | Foundation complete, zero-malloc, batch API | cross-validation float↔fixed, bench vs LP/QP |
+| MiniZinc integration | `tools/mzfnsh`, `share/minizinc/solvers/psolve.msc` | Native `--solver psolve`; bench driver | 77/77 suite, docs regenerated |
+| Build/QA | `Makefile`, `test.sh`, ~30 tools | Strong for a single-author project | ASan/UBSan/LSan + differentials in-tree; no CI yet |
+
+**Known debts carried into this roadmap** (from `AUDIT.md` "Not done" and
+branch audits): global `setjmp` error protocol; per-node exact re-solve cost
+(121/122 tsp5 re-solves are duality-level infeasibility); exact-or-UNKNOWN
+promotion gap on scale-mixed non-integral LPs; Phase-I degenerate-infeasible
+convergence weakness; `gecode_schedule_unary`/disjunctive still decline to
+MIP; `-f` free search is a no-op; Phase-2 VG/UI kernels unstarted; no CI.
+
+---
+
+## 2. What the roadmap optimizes for
+
+Three pillars, in priority order:
+
+1. **Trust** — every verdict carries evidence; every UNSAT is certified;
+   every claim is reproducible by an adversary with this repository.
+2. **Speed** — within the trust envelope: fewer wasted nodes, fewer wasted
+   pivots, fewer wasted re-solves. Never by weakening a certificate.
+3. **Reach** — more of the MiniZinc semantics natively, more problem classes
+   solved exactly, more platforms (library hosts, embedded, browser) without
+   breaking the zero-dependency rule.
+
+Sequencing: **Phase 6 (correctness closure) gates everything.** Phases 7–13
+may interleave after that; Phases 14–16 are continuous background streams,
+not gates.
+
+---
+
+## 3. Phase 6 — Correctness closure *(top priority; closes all known debts)*
+
+Goal: after this phase there is **no known input class** on which psolve can
+return an uncertified or misleading verdict, and the error-handling protocol
+is safe for a multi-threaded library host.
+
+### 6.1 Exact-or-UNKNOWN promotion for double verdicts
+- **What:** A verdict-grading pass on every LP/MIP/FZ result: classify the
+  instance's data scale-mix (max |aᵢⱼ| / min positive |aᵢⱼ| over the active
+  rows, bound magnitudes, cancellation risk). Verdicts from the double engine
+  on data beyond a measured reliability frontier are *promoted*: re-decided
+  by the exact engine when the data is integral (or exactly representable),
+  otherwise downgraded to `UNKNOWN` with a printed reason code.
+- **Why:** closes AUDIT not-done #4 — double phase-1 can print bare
+  `INFEASIBLE` on ~1e-13-coefficient / ~1e25-bound data where a Fraction
+  reference proves feasibility; `fx` declines non-integral data and the
+  bridges currently *keep* the shaky verdict.
+- **Acceptance:** the preserved 2026-08-15 repro flips from false
+  `INFEASIBLE` to feasible-or-UNKNOWN; a 100+-instance scale-mixed family
+  (`tools/` differential, exact-Fraction reference) shows **0 fabricated
+  verdicts**; the new family is proven to expose the bug on the pre-change
+  binary; no regression on the existing battery (status split identical on
+  well-scaled instances).
+
+### 6.2 Farkas-certificate fast path for infeasible relaxations
+- **What:** when the double solver claims a relaxation infeasible, extract
+  the phase-1 dual ray `y` and verify the Farkas conditions
+  (`yᵀA` against per-column safe bound extremes, `yᵀb < 0`) with
+  **directed rounding / interval arithmetic** — uncertain components take the
+  bound extreme that makes certification *harder*. Only a certified ray
+  yields `INFEASIBLE`; otherwise fall back to the exact re-solve.
+- **Why:** closes AUDIT not-done #3. Instrumentation on 2026-08-15 showed
+  **121 of 122** tsp5 exact re-solves decide duality-level infeasibility that
+  a row scan cannot certify — a ~1% of the cost check replaces ~99% of exact
+  re-solves. This is the single largest known wall-time item in the MIP
+  bridge on combinatorial models.
+- **Acceptance:** instrumented counter drop of exact re-solves ≥90% on the
+  tsp5/cumulative suites with **identical verdicts and identical tree**;
+  adversarial near-degenerate rays (engineered to violate margins) still go
+  to the exact path; directed-rounding implementation itself differential-
+  tested against a Fraction reference on the cancellation family from
+  `tools/fbbt_verify.py`.
+
+### 6.3 Error-protocol redesign: retire process-global `setjmp`
+- **What:** replace the global allocation-failure longjmp with per-context
+  error state: `Solver/ MIP/ FZ` structs carry an optional arena + error
+  record; all fallible operations return status. Public API gains
+  `psolve_set_alloc(ctx, alloc_fn, user)` so a host owns memory policy.
+- **Why:** closes AUDIT not-done #2; a recovering multi-threaded host cannot
+  live with process-global jump state. Also unlocks Phase 12 arena work and
+  Phase 15 threading honesty.
+- **Acceptance:** `tools/oomlib.c` failure-injection sweep passes at every
+  allocation-failure point (already the methodology) *without* any global
+  state under `-fsanitize=thread` smoke runs; API documented in README;
+  all tools migrated.
+
+### 6.4 Unified evidence objects
+- **What:** a small internal `psv_cert_t` per verdict class: OPTIMAL
+  (primal point + dual vector), INFEASIBLE (Farkas ray or exact-engine
+  stamp), UNBOUNDED (primal point + recession ray), with one
+  `psv_cert_check()` entry point used at every exit from every engine.
+- **Why:** today certificates are spread across `solver.c`, `qp.c`, `mip.c`;
+  unifying them is the substrate for Phase 16 proof export and kills whole
+  classes of "forgot to re-check" bugs.
+- **Acceptance:** every CLI verdict path goes through the checker; an
+  error-injection tool that perturbs internal results by 1 ulp shows the
+  checker rejects ≥99.9% of perturbed OPTIMAL/UNSAT claims (and 100% of
+  large perturbations).
+
+### 6.5 QP numerical audit round
+- **What:** the same adversarial methodology recently applied to LP/MIP/FBBT,
+  applied to `qp.c`: degenerate working sets, duplicated/parallel rows,
+  near-indefinite Q within tolerance of PSD, huge/small scale mixes.
+- **Why:** QP is the least-attacked engine; the 2026 audit found ~5% wrong
+  answers on singular-PSD families *after* hardening assumptions were made.
+- **Acceptance:** extended `tools/qp_diff.py` family, pre/post fail counts
+  recorded; any fabricated-class bug fixed with discriminating regressions.
+
+### 6.6 Harvest remaining `phase4-interactive-hardening` commits
+- **What:** `48712f5` (thread-local zero-malloc arena) and `a42be76`
+  (ms-precision time limits + QP cooperative stop) are the only unmerged
+  work on any remote branch. Port each **behind verification**: an earlier
+  global-arena design (`6ebf11d`) was rejected for ownership/alignment/
+  thread-safety bugs, so the arena commit must be audited line-by-line
+  against both parents (meta-lesson: hand-resolved merges get line diffs).
+- **Acceptance:** leak/ASan/TSan evidence; per-frame zero-malloc
+  demonstrated by allocation counters; benefits recorded in AUDIT.md with
+  the same rigor as the FBBT port (`18eb475`).
+
+### 6.7 FlatZinc round-trip & output fuzzing
+- **What:** output-side adversarial tests: re-parse `fznsolve` output with a
+  strict checker (assignments satisfy *every* constraint, objective matches),
+  driven over the fuzz corpus, including `-a` enumeration (no duplicates,
+  completion markers correct) and aliased/mixed-view arrays.
+- **Why:** the bridge's *input* paths are fuzzed; its *output* paths are
+  only spot-tested. An output-layer lie is as dangerous as a solver lie.
+- **Acceptance:** `tools/fzn_output_check.py` (new) green over ≥10k fuzzed
+  models across satisfy/minimize/maximize/`-a`; wired into `test.sh`.
+
+### 6.8 Per-module tolerance semantics sheets
+- **What:** one section in `docs/DESIGN.md` per engine: every tolerance,
+  its direction of safety, what it protects, and what it may never justify
+  (e.g. a margin may never turn feasibility pruning into UNSAT without the
+  directed-rounding certificate).
+- **Why:** the 2026-08-15 `mip_diff` flip (seed 12345 WRONG=5) was caused by
+  an exact prune that ignored the engine margin — a *semantics* bug wearing
+  a numerics costume.
+- **Acceptance:** sheets exist and are cited by the code comments at each
+  tolerance site; `grep` proves every literal tolerance in `src/` has a
+  documented entry.
+
+**Phase 6 exit criteria:** AUDIT.md "Not done" list is empty or each item
+has a written permanent disposition; full battery + sanitizer matrix green;
+no fabricated-verdict family known.
+
+---
+
+## 4. Phase 7 — LP engine v2
+
+Goal: 2–10× on real LP workloads via structural work reduction, plus a
+second engine family (interior point) for the dense/ill-conditioned cases
+where simplex is weak. Techniques and literature pointers are already
+surveyed in `SOLVER_OPTIMIZATIONS.md` §2; this phase is the implementation
+plan for it.
+
+### 7.1 Presolve + postsolve *(highest ROI in the phase)*
+- Singleton rows/columns, doubleton substitution, activity-bound row
+  elimination/redundancy removal, bound tightening on coefficients,
+  dominated/duplicate column and row detection, fixed-variable elimination.
+- **Design constraint:** every reduction must record a reversible
+  *postsolve stack* so primal/dual certificates transfer back exactly
+  (PaPILO-style reduction records, minimal from-scratch subset).
+- **Acceptance:** 30–60% size reduction on the sparse differential corpus
+  with **bit-identical objectives** post-postsolve; presolve off/on A/B
+  shows no verdict change over ≥20k random LPs; reduction records are
+  themselves unit-verified (apply → restore → identical problem).
+
+### 7.2 Dual simplex (bounded-variable, dual steepest edge)
+- **Why:** MIP re-optimization after bound changes/cuts is dual-simplex
+  shaped; today every relaxation re-runs primal (warm starts help — tsp_5
+  20695→63 iterations — but dual is the structurally right answer once cuts
+  land in Phase 8).
+- **Acceptance:** dual vs primal verdict/objective agreement on ≥20k random
+  LPs; on a branching-workload benchmark, dual re-solve beats primal warm
+  start ≥2× on iterations.
+
+### 7.3 Forrest–Tomlin basis updates + Markowitz upgrade
+- Product-form eta file replaced by FT update with bump structure; splu
+  ordering gains Markowitz with tie-breaking (merit function), replacing the
+  current degree-only ordering.
+- **Acceptance:** INVERT frequency and per-iteration cost profiles on the
+  bench corpus; no stability regressions (certificate failure rate on
+  big-M family must not rise).
+
+### 7.4 Crash bases (Maros–Mitra) and advanced-start API
+- **Acceptance:** Phase-I pivot count down ≥30% on equality-heavy families;
+  the fz bridge passes its known-good bases through the new API.
+
+### 7.5 Scaling (Ruiz equilibration + geometric mean, Curtis–Reid option)
+- **Why:** cheap, and directly attacks the big-M conditioning debt
+  (AUDIT finding A lineage) *before* it becomes an exact re-solve.
+- **Acceptance:** conditioning proxy (max/min pivot growth) improved on the
+  big-M corpus; exact re-solve count down measurably; no verdict changes.
+
+### 7.6 Interior-point engine (Mehrotra predictor–corrector) *[research]*
+- From scratch: normal-equation (A·D·Aᵀ) Cholesky with PCG fallback,
+  Gondzio corrections, termination into **crossover** to a basic solution
+  (so MIP and cut machinery still receive a basis).
+- **Why:** dense or highly degenerate LPs (some QPs' KKT systems too) are
+  simplex-hostile; IPM is the standard complement.
+- **Acceptance:** on a documented dense corpus, IPM beats simplex ≥3× with
+  certified equality of objectives; crossover returns a vertex; honest
+  fallback to simplex on numerical distress. Negative result acceptable:
+  if crossover cannot be made certificate-clean, ship IPM as satisfaction-
+  only with UNKNOWN-on-doubt and write the finding.
+
+### 7.7 Iterative refinement + exported rays
+- Refine primal/dual solutions in extended precision (double-double) before
+  certification; export dual rays and Farkas rays via the Phase 6.4
+  evidence objects.
+- **Acceptance:** residual norms reported; refined certificates accepted at
+  strictly tighter tolerances on the adversarial corpus.
+
+### 7.8 Network-row detection + network simplex island *[stretch]*
+- Detect pure ±1 network submatrices (transport/assignment-like models are
+  common in the examples corpus) and solve that island exactly/combinatorially,
+  stitching bounds back.
+- **Acceptance:** examples/transport.lp-class instances ≥10× faster, exact
+  agreement; detection is conservative (a false positive is a correctness
+  bug — detection must be Certifiably exact structure).
+
+### 7.9 LP file format v2 / MPS reader *(scope decision item)*
+- Named rows/columns, ranges, RHS section, comments; strict-mode reject on
+  ambiguity (the `<==` lesson). MPS import only if a from-scratch reader
+  stays under ~600 lines.
+- **Acceptance:** round-trip tests; fuzzed; documented grammar (EBNF) in
+  docs.
+
+**Phase 7 exit criteria:** published A/B table on the standard corpus
+(time, iterations, certificate rate); no verdict regressions; all new paths
+fuzzed + differential-tested.
+
+---
+
+## 5. Phase 8 — MIP engine v2
+
+Goal: from "correct B&B with strong honesty" to a small but real 1995-grade
+MIP solver: cuts + conflict analysis + heuristics + reliability branching.
+Target profile: solve the current 77-instance suite's MIP-viable models in
+≤10% of today's node counts; make the honest-UNKNOWN combinatorial models
+(cumulative/table at scale) *decidable* within budgets.
+
+### 8.1 Reliability branching
+- Pseudocosts → strong branching at top-k unreliable candidates →
+  full reliability branching (per survey §3). Deterministic tie-breaking.
+- **Acceptance:** node count pareto on the differential corpus (geometric
+  mean ≥30% reduction, no instance >2× worse); brute-force agreement intact.
+
+### 8.2 Cut engine
+- Safe rounded Gomory / MIR cuts from tableau rows; cover cuts from
+  knapsack rows; clique cuts from a conflict graph (8.3); flow cover for
+  fixed-charge rows. Cut pool with aging, density cap, and **numerically
+  safe cut certification** (each cut re-checked by directed-rounding
+  violation of the relaxation point before being trusted for bound moves).
+- **Design constraint:** a cut may tighten the relaxation; it may *never*
+  enter an UNSAT/prune proof without the Phase-6 certificate path.
+- **Acceptance:** gap closed at root reported across corpus (target ≥20%
+  average on binary knapsack-like families); wrong-answer differential
+  stays 0 with cuts forced on/off A/B.
+
+### 8.3 Conflict graph + conflict-driven restarts
+- Implication graph from bound changes; on infeasible nodes derive a
+  no-good cut; restart policy with kept incumbent and kept pseudocosts.
+- **Acceptance:** infeasible-heavy families (pigeonhole-style,
+  proof-of-infeasibility suite models) node counts down ≥5×.
+
+### 8.4 Primal heuristics portfolio
+- Feasibility pump (LP-rounding cycles with objective perturbation),
+  diving, RINS (needs 7.2 dual to shine), local branching for binary-heavy
+  models. Deterministic schedules; heuristics *find* incumbents, they never
+  influence proofs.
+- **Acceptance:** time-to-first-incumbent down ≥3× on the optimize-mode
+  suite; fabricated-incumbent injection test (perturb heuristic output)
+  always caught by incumbent verification.
+
+### 8.5 Node selection + tree management
+- Hybrid best-bound / estimate with plunging limits; memory-bounded tree
+  with deterministic evacuation order; node budget honesty (status
+  propagation rules unchanged).
+- **Acceptance:** fixed memory ceiling honored under oomlib injection;
+  identical verdicts under 3 different selection policies on ≥5k models.
+
+### 8.6 Symmetry handling *[research][stretch]*
+- Orbit fixing via automorphism groups on the constraint bipartite graph;
+  a from-scratch canonical-labeling mini-engine is research-grade scope —
+  start with *detection-only* of row/column permutation symmetry classes
+  and lex-leader symmetry-breaking rows for the common all-binary case.
+- **Acceptance:** symmetric CSP families (graph coloring, pigeonhole)
+  ≥10× node reduction; symmetry detection itself brute-force verified on
+  small instances.
+
+### 8.7 Objective-guided propagation
+- Incumbent cutoff already feeds FBBT (2161→577 nodes); extend: objective
+  cut row in the LP, reduced-cost fixing with the unified certificate,
+  and cutoff-aware CP propagation (links Phase 10).
+- **Acceptance:** instrumentation shows fixing counts; verdict parity.
+
+### 8.8 Deterministic parallel B&B *(design in Phase 15; implementation here)*
+- Fixed task split, result reduction in a canonical order, proofs
+  conservative: parallel mode may never accept a prune that sequential mode
+  wouldn't. See 15.1 for platform decisions.
+- **Acceptance:** bit-identical verdicts/incumbent/objective 1 vs N threads
+  over the full corpus; speedup ≥2× at 4 threads on tree-heavy models.
+
+**Phase 8 exit criteria:** suite node/time table published pre/post;
+MIPLIB-relaxation-style public small instances (manually curated, license-
+clean) added as fixed benchmarks; zero fabricated verdicts under cut+heuristic
+stress A/B.
+
+---
+
+## 6. Phase 9 — Exact engine (`fx`) v2
+
+Goal: make exact arithmetic cheap enough that *promote-to-exact* (6.1) and
+*exact relaxation oracle* (fz bridge) are default-affordable, and export
+machine-checkable proofs (substrate for Phase 16).
+
+### 9.1 Sparse exact revised simplex
+- Replace full-tableau exact pivoting (residual 2-gcd-per-cell cost
+  documented in ROADMAP.md) with revised form: rational BTRAN/FTRAN over a
+  sparse exact LU with lazy normalization, growth guards, and periodic exact
+  refactorization.
+- **Acceptance:** ≥5× on the fx_bench corpus at n≥64; objective/status
+  agreement with current fx on 100% of the accumulated corpus (fx results
+  are the project's ground truth — the new engine must match the old one
+  *everywhere*, since the old one is right by construction).
+
+### 9.2 Precision escalation ladder
+- i64 → i128 → fixed multi-limb (from-scratch, bounded limbs, explicit
+  capacity status — never silent wrap). Overflow beyond capacity is an
+  honest status, not a wrong digit.
+- **Acceptance:** adversarial coefficient families that overflow i128
+  deterministically report the capacity status; golden-digit comparisons vs
+  Python `fractions` on the capacity-fitting corpus.
+
+### 9.3 Floating-point-filtered exact arithmetic
+- Double arithmetic + error bounds on the fast path (survey §5 "progressive
+  precision"): exact operations only when the filter's bound straddles a
+  decision. Directed rounding (already in-tree via `mip_box_conflict`) is
+  the filter primitive.
+- **Acceptance:** ≥10× over always-exact on well-conditioned instances
+  with identical outputs; filter-vs-exact disagreement is a build-failing
+  bug in the differential harness.
+
+### 9.4 Exact sensitivity / parametrics lite
+- Exact optimal basis ⇒ exact ranges for c and b (rational output).
+- **Acceptance:** ranges validated by re-solving at interval endpoints.
+
+### 9.5 Exact QP on the fx substrate *[research][stretch]*
+- Active set with rational arithmetic; the KKT verification machinery
+  already exists to police it.
+- **Acceptance:** matches double QP where double is certified; decides
+  families where double QP numerically fails.
+
+**Phase 9 exit criteria:** promote-to-exact costs ≤ target budget on the
+scale-mixed corpus (documented per instance); fx remains the zero-mismatch
+ground truth; capacity semantics documented.
+
+---
+
+## 7. Phase 10 — Finite-domain CP engine v2 (`fz_cp.inc`)
+
+Goal: a real propagation engine, so feasibility-first models stop paying the
+big-M + LP-relaxation toll, and `UNKNOWN` zones of the MiniZinc suite shrink.
+Today's engine: B&B + domain bitmasks + a handful of propagators, already
+correct — this phase is about *strength*.
+
+### 10.1 Propagation infrastructure
+- Priority-queued propagator scheduler, watched-variable lists, trail with
+  timestamped domain events (for no-goods), fixed-point detection, and
+  propagation counters exposed in `%%%mzn-stat`.
+- **Acceptance:** domain histories replayable (deterministic trail);
+  per-propagator cost profiles documented.
+
+### 10.2 Propagator library upgrades
+- `all_different`: bounds-consistency with Hall intervals (Régin domain-
+  consistency is the **[stretch]** upgrade — matching-based, from scratch).
+- `table`: compact-table (bitset supports + watched tuples).
+- `element`: domain-consistent for small tables, bounds otherwise.
+- `cumulative`: timetable + **edge finding**; `disjunctive`: edge finding +
+  not-first/not-last. **This closes the known decline-to-MIP gap**
+  (`gecode_schedule_unary`, open-shop class currently paying MIP prices).
+- `circuit`/`subcircuit`: basic pruning (required/forbidden arcs) on top of
+  the existing exact encodings.
+- `diffn`: sweep + cumulative decomposition consistency.
+- **Acceptance per propagator:** brute-force verified on exhaustive small
+  domains (the project's established pattern); strength demonstrated by
+  pruning-count tables; propagation is *sound by margin* — a propagator may
+  never delete a value that participates in any solution (differentially
+  enforced).
+
+### 10.3 Search v2
+- Activity/impact-based variable selection, Luby restarts, no-good
+  recording from failed subtrees (1-UIP-lite over the trail), LNS for
+  optimization (relax a random fragment, re-impose incumbent bound).
+- **Acceptance:** suite-wide fixpoint counts and times; determinism under
+  restarts (identical trails across runs); optimization objective parity
+  with the exact MIP reference on all bounded models.
+
+### 10.4 CP/MIP portfolio dispatch
+- Feasibility-first: CP races MIP with deterministic arbitration (first
+  *certified* verdict wins; both sides keep budgets; loser state discarded).
+  Optimization: CP finds incumbents, MIP/exact proves bounds (whose
+  certificates remain the LP/fx machinery of Phases 6–9).
+- **Acceptance:** no model in the suite gets slower than the better of the
+  two engines today by more than 10%; portfolio verdicts identical to both
+  solo engines.
+
+### 10.5 Lazy clause generation *[research][stretch]*
+- SAT-style explanation recording from propagators; nogood learning across
+  restarts. Ambitious but the trail infrastructure (10.1) is chosen to be
+  LCG-compatible from the start.
+- **Acceptance:** proof-logging hooks compatible with Phase 16; measured on
+  no-good-heavy families.
+
+**Phase 10 exit criteria:** scheduling-suite wall time down ≥5× vs the
+MIP-decline baseline at equal verdicts; suite UNKNOWN count published and
+reduced; every propagator brute-force certified.
+
+---
+
+## 8. Phase 11 — FlatZinc bridge v2 & MiniZinc completeness
+
+Goal: stop paying for flattening. Keep globals *global* end-to-end, complete
+the predicate surface, and make psolve a credible MiniZinc citizen measured
+the way the community measures.
+
+### 11.1 Native redefinitions library
+- Ship `share/minizinc/psolve/` redefinitions so globals reach the bridge
+  unflattened (predicate dispatch → CP propagator / MIP encoding / declined
+  with honest UNKNOWN, per a documented routing table).
+- **Acceptance:** suite diffs prove routing (statistics show propagator
+  use); a routing-*table doc* in docs lists every predicate → disposition.
+
+### 11.2 Predicate surface audit vs MiniZinc 2.9.x stdlib
+- Mechanical diff of stdlib predicate inventory vs handled set; close the
+  cheap gaps first (string/of-predicate-only variants, `among` families on
+  bool, `arg_sort`, `sliding_sum` variants, set-domain elements where
+  finite).
+- **Acceptance:** docs matrix "supported / declined-by-design / UNKNOWN with
+  reason" regenerated from code, not by hand.
+
+### 11.3 Search annotations & `-f`
+- Honor `int_search`/`bool_search`/`seq_search` variable orders and
+  indomain strategies (map to CP/MIP branching hints); give `-f` (free
+  search) a real, documented policy instead of today's accepted-no-op.
+- **Acceptance:** annotation-driven order changes observable in trails;
+  semantics tests lock each strategy.
+
+### 11.4 Incremental / warm-start FlatZinc *[research]*
+- Re-solve with added constraints or a changed objective without rebuilding:
+  leverages 6.3 contexts and 7.4 advanced starts.
+- **Acceptance:** interactive-driver scenario test (add 1 row × 100 steps)
+  ≥5× vs cold; verdicts identical to cold solves.
+
+### 11.5 Output & statistics parity
+- `-a`/`-i`/`-p` parity with driver expectations, deterministic solution
+  order, full `%%%mzn-stat` set MiniZinc Challenge tooling expects
+  (propagations, conflicts, restarts when those exist).
+- **Acceptance:** `minizinc --solver psolve` driver tests (MiniZinc's own
+  driver test-suite subset) pass locally.
+
+### 11.6 Challenge-track benchmarking
+- Curate a license-clean benchmark set mirroring MiniZinc Challenge
+  categories; track normalized scores vs gecode/chuffed/cp-sat in
+  `docs/MINIZINC_BENCHMARK.md` (regeneration rule preserved: results JSON
+  under version control, semantic diff enforced).
+- **Acceptance:** scoreboard published per release; regressions gated in CI
+  (Phase 14).
+
+**Phase 11 exit criteria:** UNKNOWN and decline counts in the suite reduced
+versus the 2026-08-15 baseline with witnesses; driver parity green.
+
+---
+
+## 9. Phase 12 — Real-time kernels v2 (physics hot loop)
+
+Goal: honor the project's founding latency promise: deterministic,
+zero-malloc, microsecond solves per frame, with the evidence to prove it on
+more than one machine.
+
+### 12.1 Arena + budgets (from 6.6 harvest)
+- Thread-local arena finalized; per-frame solve budget API
+  (`psv_budget{iterations, microseconds}`) on every entry point including
+  batch; overrun ⇒ partial-with-status, never blocking.
+- **Acceptance:** allocation counters prove 0 malloc/solve; latency
+  histograms under worst-case inputs documented.
+
+### 12.2 Contact block solver
+- Box2D-style 2×2 (and 3×3 with friction) block specialization inside the
+  fixed-point kernel: direct solves for diagonal blocks, PGS across blocks.
+- **Acceptance:** iteration-to-tolerance down ≥30% on contact corpora;
+  bit-identical across platforms preserved (fixed-point rules unchanged).
+
+### 12.3 SIMD island batch (AVX-512 first, NEON study after)
+- Gather/scatter over independent contact systems in SoA layout (survey §4
+  "island parallelism"); deterministic reduction order by construction
+  (islands independent ⇒ result placement order fixed).
+- **Acceptance:** ≥4× on 64+ island batches; bitwise equality vs scalar
+  path asserted in tests on every input batch.
+
+### 12.4 Cross-platform bit-determinism harness
+- Golden vectors from the fixed-point kernels recorded in-repo; CI runs
+  (Phase 14) replay them on baseline x86-64, AVX2, AVX-512, and (via qemu)
+  arm64.
+- **Acceptance:** the determinism *promise in the README* becomes a tested
+  property, not prose.
+
+### 12.5 Host-integration kit
+- Island extraction/serialization API (host brings threading; psolve stays
+  thread-agnostic per non-goals), replay log format for physics debugging,
+  and a minimal headless demo loop (text rendering) in examples/.
+- **Acceptance:** an external toy crate (examples/) consumes only the public
+  API; replay dumps diff-clean across repeated runs.
+
+### 12.6 Subspace/acceleration study: Chebyshev/accelerated PGS *[research]*
+- Per survey §3: subspace acceleration over PGS iterates; must keep
+  fixed-point determinism (rational weights) or stay float-reference-only
+  with the fixed kernel authoritative.
+- **Acceptance:** convergence graphs; determinism statement written.
+
+**Phase 12 exit criteria:** published µs budget table per kernel on 2
+machines; zero-malloc proven; determinism harness in CI.
+
+---
+
+## 10. Phase 13 — QP v2
+
+### 13.1 Proximal/ADMM engine (OSQP-style, from scratch)
+- First-order method for large sparse convex QPs; fixed tolerance ladder
+  with honest statuses; warm-start native (MPC-shaped workloads).
+- **Acceptance:** differential vs active-set + scipy on ≥10k QPs;
+  certificates (KKT) decide acceptance of its answers, same as today.
+### 13.2 MPC sequence API
+- Solve-a-sequence with model deltas (c, b, bounds), reusing factorizations
+  where the sparsity pattern is unchanged.
+- **Acceptance:** amortized cost/lookahead δ demonstrated; identical
+  answers to cold solves.
+### 13.3 PSD enforcement honesty
+- Near-indefinite detection with interval-checked minimum-eigenvalue bound;
+  non-PSD inputs get explicit status (never a silent regularize-and-report).
+- **Acceptance:** adversarial Q families classified correctly vs exact
+  reference.
+### 13.4 Box-QP unification study
+- PGS fixed-point kernel vs active-set: crossover solve (PGS warm → active
+  set finish) on box QPs; documented rule for which engine owns which class.
+- **Acceptance:** decision rule + evidence table in DESIGN.md.
+
+---
+
+## 11. Phase 14 — Infrastructure, hardening & QA v2 *(continuous stream)*
+
+### 14.1 CI pipeline (new)
+- Matrix: {gcc, clang} × {baseline, AVX2, AVX-512} × {ASan+UBSan, LSan,
+  TSan-smoke, MSan where feasible}. The full `test.sh` battery per cell;
+  MiniZinc bundle cached for the mzn cells.
+### 14.2 Coverage-guided fuzzing infrastructure
+- libFuzzer/AFL harnesses for all parsers (deps build-time-only, default
+  off); committed seed corpora; crash corpus regression rule (every
+  historical fuzz crash becomes a committed seed).
+### 14.3 Mutation testing of verdicts
+- Deliberate 1-line algorithm mutations (sign flips, off-by-one, margin
+  removal) must be caught by the existing battery; mutations that survive
+  expose test-suite holes → new tests land.
+- **Acceptance:** kill-rate published; ≥95% target on solver-core mutations.
+### 14.4 Benchmark gate
+- Deterministic perf harness (fixed machine docs), A/B gating in CI:
+  >5% regressions fail; results appended to a history file for trend lines.
+### 14.5 Release engineering
+- Semantic versioning, changelog from AUDIT addenda, umbrella header
+  `psolve.h`, **amalgamation target** (single-file `psolve.c` + `psolve.h`
+  distribution — the natural shipping format for a zero-dependency C
+  library), soname policy for the shared build.
+### 14.6 Semantics sheets (backbone for 6.8) + numerical glossary
+### 14.7 Developer docs
+- `docs/INVARIANTS.md`: the certificate invariants per engine in checklist
+  form, linked from every non-obvious prune site.
+
+---
+
+## 12. Phase 15 — Scale & platforms
+
+### 15.1 Threading policy decision (documented)
+- Zero-dependency rule vs parallelism: resolution — core stays
+  thread-*agnostic* and reentrant (per 6.3); an **opt-in** POSIX-threads
+  build flag provides parallel B&B (8.8) and batch islands; embedding hosts
+  may always thread around us.
+### 15.2 WebAssembly target *[stretch]*
+- Emscripten build (build-time toolchain only; runtime stays dependency
+  free); browser demo solving MiniZinc/LP examples client-side;
+  determinism checked against native golden vectors (fixed-point kernels
+  are bit-stable by construction — the float engines get tolerance-checked
+  goldens only).
+### 15.3 Python binding
+- ctypes wrapper + typed convenience layer, examples, and a verification
+  notebook that re-checks answers with fractions (echoing 6.1's ethos).
+### 15.4 Embedded profile
+- `-DPSOLVE_EMBEDDED` build: no stdio kernels, arena-only allocation,
+  documented worst-case stack usage per entry point; pgs_fixed + fx only.
+### 15.5 Large-model memory diet
+- Audited `int32_t` indexing ceilings made explicit with honest overflow
+  statuses (no silent truncation at 2³¹); optional 64-bit index build.
+
+---
+
+## 13. Phase 16 — Certificates, proofs, formal trust *(the ambition apex)*
+
+Goal: psolve's verdicts become **machine-checkable artifacts**, verified by
+an independent in-tree checker small enough to audit in one sitting.
+
+### 16.1 LP certificates
+- Export primal+dual solutions and rays; checker verifies feasibility,
+  complementary slackness, duality gap = 0, Farkas conditions — all in
+  exact rational arithmetic (fx substrate) or directed-rounding intervals
+  with the safe-side rule.
+- **Acceptance:** checker (≤1.5k lines, standalone) re-verifies 100% of the
+  corpus verdicts; adversarially corrupted certificates rejected 100%.
+### 16.2 MIP proof logging (VIPR-style)
+- Exact-rational tree certificate: LP relaxations (16.1), branch bounds,
+  cut derivations with coefficients, objective cuts. Format inspired by
+  VIPR (VERIfied Proof Results); reader+checker in-tree.
+- **Acceptance:** end-to-end: solver logs → independent checker validates
+  optimal AND infeasible MIPs from the suite; corrupted-log rejection 100%.
+### 16.3 CP UNSAT proof logging *[research][stretch]*
+- LCG-style clause logs or a simpler domain-splitting tree proof; checker
+  replays propagation.
+### 16.4 Replay/persistence layer
+- Binary snapshot of any problem + verdict + certificate; `psolve-verify`
+  CLI replays the check offline (audit-friendly artifact for users filing
+  bugs).
+### 16.5 Targeted formal verification *[stretch]*
+- CBMC/Frama-C on the arithmetic heart (fx rational ops, fixed-point PGS
+  division/rounding, fz_cp domain lattice ops): memory safety + absence of
+  overflow on bounded inputs, mechanically.
+- **Acceptance:** reports archived in docs; any found defect fixed with a
+  discriminating regression per the constitution.
+
+---
+
+## 14. Phase 17 — Applications & frontier tracks
+
+Ambitious but bounded; each begins as a **[research]** spike with a written
+go/no-go.
+
+| # | Track | Sketch | First deliverable |
+|---|-------|--------|-------------------|
+| 17.1 | IIS / infeasibility diagnosis | Irreducible infeasible subsets via deletion filter on certified-infeasible rows; bridge prints "why" for failed models | `lpsolve --iis` on the preserved false-infeasible repro |
+| 17.2 | Parametric LP/QP + MPC codegen | Exact optimal-basis partitions for small parametric models; export evaluation code as dependency-free C | examples/ + golden-test vs fx |
+| 17.3 | Lexicographic multi-objective | Sequenced optima with objective-fixing; honest partial reporting | CLI + differential vs brute force |
+| 17.4 | Sensitivity API surface | Shadow prices/ranges through 9.4 exact substrate | documented `psolve.h` section |
+| 17.5 | SOS2 / piecewise-linear | Native SOS2 sets (survey §5) for float PWLA constraints; bridge routes MiniZinc PWLA patterns | semantic tests + suite deltas |
+| 17.6 | Indicator constraints | ν-form via branching not big-M where M is unprovable | UNKNOWN-count reduction on indicator families |
+| 17.7 | Two-stage stochastic LP *[stretch]* | SAA + Benders decomposition on the LP v2 core | spike report |
+| 17.8 | Differentiable-layer demo *[stretch]* | Tiny KKT-differentiation example (ML-adjacent), docs-only experiment | notebook in examples/ |
+| 17.9 | Global/QCQP | **Remains a non-goal** (see Appendix D) — spatial B&B over quadratics is out of charter unless Phase 13.1+16 land and a host project funds it | n/a |
+
+---
+
+## 15. Cross-cutting process (always on)
+
+1. **Harvest rule.** Every merge window starts by surveying *all* remote
+   branches ("see what others do"); unmerged commits get port/reject
+   dispositions in AUDIT.md with evidence — never trusted at face value,
+   never silently dropped. Current inventory: Appendix B.
+2. **Calibration rule.** Every new differential/regression ships with its
+   pre-fix failure count in the commit message; absence of that number is a
+   review blocker.
+3. **Docs regeneration rule.** `tools/mzn_bench.py` results JSON stays under
+   version control; semantic fields diffed (status/objective/verdict/
+   solutions); benchmark docs regenerated whenever engines change.
+4. **Changelog honesty.** Status improvements are reported with both pre
+   and post numbers and the methodology; no claim without a replicable
+   command line.
+5. **Quarterly adversarial review.** One audit-style pass per quarter in the
+   established style (baseline → batteries → addendum → roadmap scorecard
+   update in §18).
+6. **Conflict-merges double-diff rule.** Any hand-resolved merge is diffed
+   line-by-line against *both* parents before sign-off (meta-lesson of
+   record).
+
+---
+
+## 16. Risk register
+
+| Risk | Likelihood | Impact | Mitigation |
+|---|---|---|---|
+| Exact bigint blow-up makes promote-to-exact unaffordable | Medium | High (6.1 stalls) | 9.3 filters; capacity statuses; bounded promote budget with UNKNOWN fallback |
+| Farkas interval check false-negatives flood exact re-solves | Medium | Medium | Margin studies on the 121/122 corpus; bound-extreme rule is conservative by construction |
+| Cuts/heuristics reintroduce wrong answers | Medium | Critical | Constitution 1+2; cut certification gate; A/B forced-on/off differentials per landing |
+| Deterministic parallelism subtly diverges | Medium | High | Canonical reduction order; 1-vs-N bitwise corpus gate in CI; parallel never affects proofs |
+| MiniZinc stdlib churn breaks bridge | High | Medium | Mechanical predicate diff per release (11.2); pinned version per CI cell |
+| Interior point crossover can't be made certificate-clean | Medium | Low (feature is additive) | Ship satisfaction-only or drop with written negative result (constitution 4) |
+| Single-maintainer bandwidth | High | High | Phases are independently shippable; riskiest items are gated behind correctness closure, not interleaved with it |
+| AVX-512 portability shrinks audience | Medium | Low | Baseline/AVX2 builds in CI gate; kernels.c compile-time fallbacks exist |
+| CP propagator strength bugs (unsound value deletion) | Medium | Critical | Brute-force certification per propagator (10.2 rule); sound-by-margin propagation tests |
+| Formal-methods tooling (16.5) proves too costly | High | Low | Stretch-marked from day one; partial artifacts (bounded proofs of fx ops) still valuable |
+
+---
+
+## 17. Milestone schedule (ambitious targets)
+
+| Milestone | Contents | Target |
+|---|---|---|
+| **M1 Trust closure** | Phase 6 complete (6.1–6.8) | 2026 Q4 |
+| **M2 Exact muscle** | Phase 9 (9.1–9.4) | 2027 Q1 |
+| **M3 LP v2 core** | 7.1–7.5 land; perf table published | 2027 Q2 |
+| **M4 MIP v2 core** | 8.1–8.5, 8.7; suite node-count table | 2027 Q3 |
+| **M5 CP v2 core** | 10.1–10.3; scheduling decline-gap closed | 2027 Q3 |
+| **M6 Bridge v2** | 11.1–11.5; challenge-track scoreboard live | 2027 Q4 |
+| **M7 Real-time v2** | Phase 12 + 14.1–14.5 (CI, releases, amalgamation) | 2027 Q4 |
+| **M8 Proof-carrying solver** | Phase 16.1–16.2 (VIPR-grade MIP proofs) | 2028 H1 |
+| **M9 Scale** | 15.x per resourcing; IPM (7.6) go/no-go | 2028 H1 |
+| **M10 Frontier** | 17.x spikes per host-project pull | rolling |
+
+Interleave note: Phases 13/14/15 run as background streams from M2 onward;
+nothing in M3–M6 may land without the Phase-14 CI cell being green first
+(process rule: infrastructure precedes the features it must police).
+
+---
+
+## 18. Scorecard (reviewed quarterly against §15 rule 5)
+
+| KPI | 2026-08-15 baseline | 2027 target | 2028 ambition |
+|---|---|---|---|
+| MiniZinc suite pass | 77/77 | 77/77 + annotation parity | + challenge-track score published |
+| Suite UNKNOWN/declined count | baseline recorded in bench JSON | −30% | −60% |
+| MIP: geomean nodes on differential corpus | 1.0× | ≤0.5× | ≤0.25× |
+| LP: time vs 2026 baseline on sparse corpus | 1.0× | ≤0.6× | ≤0.4× (with IPM where it wins) |
+| Exact re-solves per tsp5-class model | 122 | ≤12 (Farkas) | ≤12 sustained at scale |
+| Verdicts with exported machine-checkable certificate | 0% | LP 100% | MIP 100% of suite models |
+| Fabricated-verdict families known open | 0 | 0 | 0 (defined invariant) |
+| Fuzz crash-free hours (rolling) | n/a | ≥100 | ≥1000 |
+| Mutation kill rate (solver core) | unmeasured | ≥90% | ≥95% |
+| Real-time kernels: golden-vector platforms | 1 | 3 (CI) | 4 (+wasm) |
+| Docs freshness (% of src/ tolerance literals documented) | partial | 100% | 100% enforced by lint |
+
+---
+
+## Appendix A — Disposition of AUDIT.md "Not done" items
+
+| AUDIT item | Disposition |
+|---|---|
+| 2. setjmp protocol redesign | **Phase 6.3** (M1) |
+| 3. Farkas-certificate fast path | **Phase 6.2** (M1), substrate reused by 16.1 |
+| 4. Scale-mixed non-integral honesty gap | **Phase 6.1** (M1); exact substrate 9.x makes promotion cheap (M2) |
+| B. Phase-I degenerate-infeasible convergence | **Phase 7.4/7.5** (crash+scaling) with 6.1 as the honesty backstop |
+| CP scheduling globals decline to MIP | **Phase 10.2** (edge finding) — closes `gecode_schedule_unary`/disjunctive gap |
+| `-f` free search no-op | **Phase 11.3** |
+| Phase-2 VG/UI kernels (unstarted) | **Track 17.x by host pull** — kernels own no frame budget until a consumer exists; physics (12) stays priority |
+| Phase-5 leftovers (SIMD batch, Python, CI budget) | **12.3 / 15.3 / 14.4** respectively |
+
+## Appendix B — Live branch inventory & harvest dispositions (as of 2026-08-15)
+
+| Branch | State | Disposition |
+|---|---|---|
+| `arena/cp-engine-correctness` (HEAD) | active, 16 ahead of main | home of this roadmap |
+| `arena/phase4-interactive-hardening` | +3 vs HEAD | `3573e3a` FBBT **ported** (`18eb475`); `48712f5` + `a42be76` → **6.6** (audit-first port; earlier arena design `6ebf11d` was rejected for ownership/alignment/TSan bugs) |
+| all other `arena/*`, `feat/*`, `fzn-table-constraint`, `mzfnsh` | fully merged (ahead 0) | none standing; re-survey each window (rule §15.1) |
+| `main` | behind 16 | merge candidate after M1 lands and CI exists |
+
+## Appendix C — Technique → implementation map
+
+| `SOLVER_OPTIMIZATIONS.md` section | Phase(s) |
+|---|---|
+| §2.1 presolve | 7.1 |
+| §2.2 dual steepest edge | 7.2 |
+| §2.3 crash bases | 7.4 |
+| §2.4 Forrest–Tomlin sparse LU | 7.3 |
+| §3.x conflict graphs, cuts, FP/RINS, reliability branching | 8.1–8.4 |
+| §3.x block PGS / subspace / islands (physics) | 12.2–12.6 |
+| §5 progressive precision / domain expansion | 9.2–9.3, 6.1 |
+| §5 CSE / SOS2 / bound consistency (bridge) | 11.1–11.2, 17.5, 10.2 (Hall intervals) |
+
+## Appendix D — Non-goals reaffirmed (and new ones)
+
+- No general global/QCQP optimization (unless 17.9's preconditions land).
+- No GUI, asset pipeline, or threading *framework* (host threads around us;
+  opt-in flag only, per 15.1).
+- No runtime third-party dependencies — ever (constitution 3). Bindings and
+  WASM are packaging, not dependencies.
+- No heuristics that can influence a proof (heuristics find, certificates
+  decide — the phase-8 design constraint is permanent).
+- No untested "ports" from other branches or solvers (harvest rule §15.1).
+- No silent precision/semantics changes: any tolerance, margin, or rounding
+  change is a documented event with pre/post differential numbers.
