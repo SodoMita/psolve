@@ -1,5 +1,71 @@
 # psolve — audit & hardening notes
 
+> **2026-08-15 (7) - branch `arena/cp-engine-correctness`: Phase 6.3 of
+> the ambitious roadmap, the error-protocol redesign (closes "Not done"
+> item 2 - the LAST open item; the audit list is now fully dispositioned).**
+>
+> **The redesign.** The retired protocol kept one process-global triple
+> (`jmp_buf psolve_env`, `psolve_active`, `psolve_code`) plus a
+> process-global stop callback (`psolve_stop_fn`): a second thread
+> installing a handler was *refused* (`psolve_try()` returned 1 -
+> demonstrated live on the pre-change err.c with an old-API reproducer),
+> and a failure raised on that thread would have longjmp'd into another
+> thread's stack.  The replacement keeps the same try/catch shape but with
+> caller-owned storage and zero shared state: each thread arms its own
+> `PSolveErrFrame` (jmp_buf + chain link), chained through a single
+> thread-local top pointer; `psolve_fail` records the code in TLS, pops
+> the innermost frame, and jumps to it.  The failure code is read via
+> `psolve_err_code()` rather than a frame field on purpose: a TLS read in
+> the recovery path is not subject to the C11 7.13.2.1 indeterminacy rule
+> for locals modified between setjmp and longjmp (scalars that do cross
+> that boundary in tests are volatile; the pattern is documented in
+> err.h).  The stop callback is per-thread (`psolve_stop_set`).  No frame
+> armed = clean exit(code), as before; popping a non-innermost frame is a
+> checked protocol violation (aborts loudly, like double-free).
+>
+> **Why this is the close and not a shuffle:** the objective claim is
+> machine-checked, not argued - `nm -g --defined-only` over all library
+> objects showed exactly four exported mutable data symbols pre-change
+> (all in err.o, the ones above) and shows **zero** post-change (the only
+> remaining statics are `_Thread_local`: the error chain, the arena
+> stack, the fx scratch).  test.sh gates this so no mutable global can
+> silently return.  With that, *concurrent solves from multiple threads
+> on independent problem objects are supported* - README's threading note
+> was rewritten to say so, and the claim is tested rather than asserted
+> (see below).
+>
+> **Regression lock (project calibration rule).**  New
+> `tools/err_proto_test.c` - 12 single-thread checks: basic unwind with
+> code, real malloc failure, realloc NULL-ing *p, calloc overflow guard,
+> NESTED frames (the old protocol's refusal, now composing: inner catches
+> first failure, still-armed outer catches the second), re-push inside a
+> recovery handler, no-frame forked child exiting with the failure code,
+> and the checked pop-violation abort.  New `tools/err_mt_test.c` - 8
+> threads x 300 rounds of real LP build/solve/destroy with forced
+> arena-based allocation failures (deterministic, libc- and
+> sanitizer-interception-independent) and per-thread stop-callback
+> isolation; clean under ThreadSanitizer (3/3 runs, no reports) - and it
+> first caught a real flaw of its own draft (malloc(SIZE_MAX) is
+> intercepted as allocation-size-too-big under ASan/TSan, which is why
+> the forced failure is arena-based).  **Discrimination:** both tests
+> fail to compile against the pre-change `err.h` (`unknown type name
+> 'PSolveErrFrame'` - the API is absent), and the old-API reproducer
+> shows the second-thread refusal.  All six consumers migrated (lpsolve,
+> mipsolve, qpsolve, fznsolve, arena_test, qp_stop_test).
+>
+> **Validation:** full `test.sh` exit 0 with the oom sweep **unchanged at
+> 5930 injection points over 6391 allocations, failures=0** - CLI
+> failure behavior is byte-identical at every injection point - the new
+> section passing in-battery (proto 12/12, MT plain + TSan, nm gate);
+> lp_scale_verify `checked=250 fabricated=0 rescued=60 promoted=48
+> healthy=120 ALL OK` and farkas_verify `checked=156 (farkas-fired=23)
+> ALL OK` on both the normal and ASan/UBSan(+LSan) builds; mip_diff
+> WRONG=0 at seeds 12345/111/222/333/555; MiniZinc differential OK=33
+> FAIL=0 and suite 77/77 with 0 semantic diffs vs the committed results
+> JSON (timings only); zero compiler warnings with -Wall -Wextra (a draft
+> -Wclobbered hit on the MT test's loop scalars was resolved with
+> volatile, the documented pattern).
+>
 > **2026-08-15 (6) - branch `arena/cp-engine-correctness`: Phase 6.1 of
 > the ambitious roadmap, exact-or-UNKNOWN promotion for extreme
 > scale-mixed *non-integral* LPs (closes "Not done" item 4 - the last
@@ -887,8 +953,15 @@ specification (see `docs/BRANCH_AUDIT.md` for the full review):
    MiniZinc 2.9.4 IDE bundle (OK=33 FAIL=0, benchmark 77/77; the bundle's
    referees are gecode/chuffed/cp-sat — coin-bc no longer ships, so
    `tools/mzn_bench.py` falls back to cp-sat for the linear reference).
-2. Redesign the global `setjmp` allocation-error protocol so a recovering,
-   multi-threaded library host can own cleanup without process-global state.
+2. ~~Redesign the global `setjmp` allocation-error protocol~~ —
+   **done 2026-08-15(7)** (this round): caller-owned `PSolveErrFrame`
+   storage chained through thread-local state replaces the process-global
+   `psolve_env/psolve_active/psolve_code` triple (and `psolve_stop_fn`
+   became a per-thread callback); the library now exports ZERO non-TLS
+   mutable data symbols (nm-gated in test.sh).  Nested scopes — refused
+   by the old protocol — compose; `tools/err_proto_test.c` (12 checks)
+   and the 8-thread TSan-clean `tools/err_mt_test.c` pin the semantics.
+   See the (7) addendum above.
 3. ~~Farkas-certificate check for exact re-solves in the MIP bridge~~ —
    **done 2026-08-15(5)** (this round): `solver_farkas_duals` extracts the
    phase-1 dual ray as a hint and `mip_farkas_certified` interval-checks the

@@ -156,8 +156,36 @@ byte-identical solutions; `tools/farkas_verify.py` discriminating regression
 full battery + MiniZinc 77/77 with 0 semantic diffs. AUDIT.md addendum
 2026-08-15(5).
 
-### 6.3 Error-protocol redesign: retire process-global `setjmp`
-- **What:** replace the global allocation-failure longjmp with per-context
+### 6.3 Error-protocol redesign: retire process-global `setjmp` — **DONE 2026-08-15(7)**
+Implemented as caller-owned per-thread error frames (`PSolveErrFrame`):
+each thread chains its own armed frames through thread-local storage and
+`psolve_fail` unwinds to the calling thread's innermost frame (popped
+before the jump, so recovery may re-push); the retired
+`psolve_env/psolve_active/psolve_code/psolve_try/psolve_end` globals are
+gone from the tree, and the cooperative-stop callback became per-thread
+(`psolve_stop_set`).  The failure code travels in TLS and is read via
+`psolve_err_code()` on purpose — unlike a field of the frame struct it is
+not subject to the C11 7.13.2.1 setjmp/longjmp indeterminacy rule.
+Nested scopes, which the old protocol *refused* (`psolve_try()` returned
+1), now compose; popping a non-innermost frame is a checked protocol
+violation.  With `nm` showing the rest of the library already free of
+exported mutable data (verified at build time), the redesign makes the
+whole library carry **zero process-global mutable state** — gated in
+`test.sh` so it stays that way.  Acceptance evidence: `tools/err_proto_test.c`
+(12 checks: basic/nested/re-push-in-handler flows, realloc NULL-out,
+calloc overflow guard, no-frame `exit(code)`, aborting pop violation) and
+`tools/err_mt_test.c` (8 threads × 300 rounds of real concurrent solves,
+forced arena-OOM recoveries, per-thread stop callbacks) both pass, the
+MT test clean under ThreadSanitizer (3/3 runs, no reports); neither test
+compiles against the pre-change `err.h` (discrimination: API absent) and
+an old-API reproducer shows `psolve_try()` refusing a second thread's
+handler.  All six consumer call sites migrated (4 CLIs + arena_test +
+qp_stop_test); full battery exit 0 with the oom sweep **unchanged at
+5930 injection points over 6391 allocations, failures=0** (CLI behavior
+identical at every injection point); MiniZinc 77/77 with 0 semantic diffs.
+AUDIT.md addendum 2026-08-15(7). Design discussion kept below for the
+record:
+- **What (original design):** replace the global allocation-failure longjmp with per-context
   error state: `Solver/ MIP/ FZ` structs carry an optional arena + error
   record; all fallible operations return status. Public API gains
   `psolve_set_alloc(ctx, alloc_fn, user)` so a host owns memory policy.

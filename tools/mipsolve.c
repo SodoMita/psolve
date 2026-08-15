@@ -38,22 +38,23 @@ int main(int argc, char **argv)
     volatile int nint = atoi(argv[arg_idx++]);
     for (int a = arg_idx; a < argc; a++) if (strcmp(argv[a], "--print") == 0) print = 1;
 
-    if (setjmp(psolve_env) != 0) {
+    PSolveErrFrame ef;
+    psolve_frame_push(&ef);
+    if (setjmp(ef.env) != 0) {
         fprintf(stderr, "mipsolve: %s\n",
-                psolve_code == PSOLVE_ERR_OOM ? "out of memory" : "internal error");
-        return 2;
+                psolve_err_code() == PSOLVE_ERR_OOM ? "out of memory" : "internal error");
+        return 2;   /* the frame is already popped by psolve_fail() */
     }
-    psolve_try();
 
     signal(SIGINT, on_stop_signal);
     signal(SIGALRM, on_stop_signal);
-    psolve_stop_fn = stop_requested;
+    psolve_stop_set(stop_requested);
     /* ITIMER_REAL gives millisecond precision (alarm() rounded up to seconds). */
-    if (tlimit_arm(time_ms) != 0) { fprintf(stderr, "cannot arm time limit\n"); psolve_stop_fn = NULL; psolve_end(); return 1; }
+    if (tlimit_arm(time_ms) != 0) { fprintf(stderr, "cannot arm time limit\n"); psolve_stop_set(NULL); psolve_frame_pop(&ef); return 1; }
 
     LP lp;
     memset(&lp, 0, sizeof(LP));
-    if (lp_read(path, &lp) != 0) { psolve_stop_fn = NULL; psolve_end(); return 1; }
+    if (lp_read(path, &lp) != 0) { psolve_stop_set(NULL); psolve_frame_pop(&ef); return 1; }
 
     unsigned char *isint = (unsigned char*)psolve_calloc((size_t)lp.n, 1);
     int ni = 0;
@@ -62,7 +63,7 @@ int main(int argc, char **argv)
         int j = atoi(argv[a]);
         if (j >= 0 && j < lp.n) { isint[j] = 1; ni++; }
     }
-    if (ni == 0) { fprintf(stderr, "no valid integer variables specified\n"); psolve_end(); return 1; }
+    if (ni == 0) { fprintf(stderr, "no valid integer variables specified\n"); psolve_frame_pop(&ef); return 1; }
 
     /* Zero the whole struct first: MIP has optional fields (stop_at_feasible,
        ...) that this driver does not set.  Leaving them uninitialised is
@@ -133,7 +134,7 @@ int main(int argc, char **argv)
     free(isint);
     lp_free(&lp);
     tlimit_disarm();
-    psolve_stop_fn = NULL;
-    psolve_end();
+    psolve_stop_set(NULL);
+    psolve_frame_pop(&ef);
     return 0;
 }

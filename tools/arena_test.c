@@ -213,17 +213,18 @@ int main(void)
         /* A solve that needs more than 64 bytes should fail via psolve_fail.
            Without a handler installed it exits; here we install one so we can
            assert a clean error path rather than a crash. */
-        if (setjmp(psolve_env) != 0) {
+        PSolveErrFrame ef;
+        psolve_frame_push(&ef);
+        if (setjmp(ef.env) != 0) {
             printf("ok: undersized arena fails cleanly (psolve_fail)\n");
-            psolve_end();
+            /* frame already popped by psolve_fail() */
             return (failures) ? 1 : 0;
         }
-        psolve_try();
         psolve_arena_use(&ta);
         solve_qp_under(&ta, &(int){0});
         printf("FAIL: undersized arena did not report OOM\n");
         failures++;
-        psolve_end();
+        psolve_frame_pop(&ef);
     }
 
     if (failures) { fprintf(stderr, "%d FAILURES\n", failures); return 1; }

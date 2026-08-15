@@ -168,7 +168,8 @@ static Node *pop_node(Node **list)
  * say" is always the answer a degenerate row produces.  The rounding mode
  * is saved and restored around the two sweeps, and nothing in between can
  * allocate or longjmp -- these sweeps run inside error-trapping library
- * code (psolve_env), so no call that can fail is allowed there.
+ * code (an armed PSolveErrFrame), so no call that can fail is allowed
+ * there.
  *
  * This replaces the round-to-nearest, tolerance-padded prune that used to
  * guard FBBT root infeasibility: with catastrophic cancellation the RN

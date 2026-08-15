@@ -233,8 +233,9 @@ attacker-controlled.  The parsers are hardened accordingly:
   their characters validated.
 - **Every allocation is checked.**  All of `src/` and the CLI drivers allocate
   through the `psolve_*` helpers, which report out-of-memory through the
-  `psolve_try()`/`psolve_fail()` protocol (a `longjmp` back to the caller's
-  handler) instead of dereferencing `NULL` or calling `exit()`.  This includes
+  `PSolveErrFrame`/`psolve_fail()` protocol (a `longjmp` back to the
+  caller's own armed frame) instead of dereferencing `NULL` or calling
+  `exit()`.  This includes
   allocating libc calls: `strndup()` allocates inside libc, so the FlatZinc
   tokenizer uses `psolve_strndup()` instead.  The claim is *tested*, not
   asserted -- `tools/oom_test.py` makes the Nth allocation (and every one after
@@ -400,14 +401,36 @@ sensitivity analysis (`solver_duals`, `solver_reduced_costs`).  The QP API
 feasibility search (variable bounds are expressed as rows).  This is the
 integration point used by [SmazkaVG](https://github.com/SodoMita/SmazkaVG).
 
-**Threading note.** Only **one solve may be active per process**: the error
-protocol keeps a process-global `setjmp` buffer (`psolve_env` in
-`src/err.c`), so concurrent `lp_*`/`qp_*`/`mip_*`/`fz_*` calls from multiple
-threads corrupt each other's recovery state (the says-what-it-solves parts —
-LP/QP/MIP/fx/FlatZinc — are otherwise free of shared mutable solver state;
-the exact solver's scratch is already thread-local).  Library users needing
-parallel solves must serialize the entry points externally (a mutex around
-the calls is sufficient) or run them in separate processes.
+**Threading note.**  Concurrent solves from multiple threads **are
+supported** on independent problem objects.  As of 2026-08-15(7) the
+library keeps **no process-global mutable state** (Archive-verified in
+`test.sh`: `nm` on `src/*.o` shows zero exported non-TLS data symbols):
+the error protocol arms a caller-owned `PSolveErrFrame` per scope and
+chains it through thread-local storage, the cooperative-stop callback
+(`psolve_stop_set`) is per-thread and reads only a flag the host
+maintains, the memory arena stack is thread-local with nesting
+save/restore, and the exact solver's scratch is thread-local.  A host
+thread wraps its own calls:
+
+```c
+PSolveErrFrame fr;
+psolve_frame_push(&fr);
+if (setjmp(fr.env) != 0) {
+    /* out-of-memory / internal failure; frame already popped */
+    int code = psolve_err_code();
+    ... recover ...
+}
+... solve ...
+psolve_frame_pop(&fr);
+```
+
+`tools/err_mt_test.c` exercises 8 threads solving real LPs concurrently
+with forced allocation failures and per-thread stop state (run both
+plain and under `-fsanitize=thread` in `test.sh`).  What remains
+per-process is the *drivers'* plumbing, not the library's: Unix signal
+handlers and the interval timers the CLIs arm for `-t` limits are
+process resources, so custom drivers should install their own flags and
+use `psolve_stop_set()` per solving thread.
 
 **License note.** psolve is **AGPL-3.0** (see `LICENSE`): embedding the
 library into a program or exposing it over a network makes that program's
@@ -472,7 +495,8 @@ src/kernels.c   AVX-512/AVX2/scalar dense kernels (daxpy, dot, sparse dot)
 src/lu.c        dense LU factorization + forward/back substitution (BTRAN/FTRAN)
 src/splu.c      sparse LU factorization (fill-reducing order + partial pivoting)
                 with hyper-sparse triangular solves
-src/err.c       error-handling protocol (checked allocation, setjmp/longjmp OOM)
+src/err.c       error-handling protocol (checked allocation, caller-owned per-thread
+                error frames, zero process-global mutable state)
                 + re-entrant thread-local zero-malloc arena (PSolveArena)
 src/solver.c    revised-simplex driver, two-phase method, steepest-edge pricing,
                 sparse/dense dispatch, incremental (warm-start) solving,

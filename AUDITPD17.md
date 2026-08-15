@@ -195,7 +195,12 @@ a permanent tool is tracked as recommended future work below.
 
 ## 7. Remaining risks after fix (carried to `AUDIT.md` "Not done")
 
-1. `setjmp` allocation-error protocol redesign (global state; thread-hostile).
+1. ~~`setjmp` allocation-error protocol redesign (global state; thread-hostile)~~
+   — **resolved 2026-08-15(7)**: caller-owned per-thread `PSolveErrFrame`
+   chain + TLS stop callback; zero exported mutable data symbols in the
+   library (nm-gated in `test.sh`); `tools/err_proto_test.c` + 8-thread
+   `tools/err_mt_test.c` (TSan-clean); old-API reproducer showed a second
+   thread's handler refused.  See `AUDIT.md` addendum (7).
 2. ~~Farkas-certificate fast path for exact re-solves in the MIP bridge~~
    — **resolved 2026-08-15(5)**: directed-rounding Farkas certificate with
    engine margin; tsp5 exact re-solves 122 → 0, 2.1× wall, identical

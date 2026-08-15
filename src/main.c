@@ -62,14 +62,16 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* Install the solver error handler so out-of-memory (and internal solver
-       failures) unwind here and are reported cleanly instead of aborting. */
-    if (setjmp(psolve_env) != 0) {
+    /* Install this thread's error frame in caller-owned storage so
+       out-of-memory (and internal solver failures) unwind here and are
+       reported cleanly instead of aborting. */
+    PSolveErrFrame ef;
+    psolve_frame_push(&ef);
+    if (setjmp(ef.env) != 0) {
         fprintf(stderr, "solver failed: %s\n",
-                psolve_code == PSOLVE_ERR_OOM ? "out of memory" : "internal error");
-        return 2;
+                psolve_err_code() == PSOLVE_ERR_OOM ? "out of memory" : "internal error");
+        return 2;   /* the frame is already popped by psolve_fail() */
     }
-    psolve_try();
 
     /* SIGINT and the optional wall-clock limit are cooperative: solver_solve()
        notices the flag and returns SOLVE_STOPPED rather than leaving a partial
@@ -78,15 +80,15 @@ int main(int argc, char **argv)
        precision -- alarm(), the old approach, rounds up to whole seconds. */
     signal(SIGINT, on_stop_signal);
     signal(SIGALRM, on_stop_signal);
-    psolve_stop_fn = stop_requested;
-    if (tlimit_arm(time_ms) != 0) { fprintf(stderr, "cannot arm time limit\n"); psolve_end(); return 1; }
+    psolve_stop_set(stop_requested);
+    if (tlimit_arm(time_ms) != 0) { fprintf(stderr, "cannot arm time limit\n"); psolve_frame_pop(&ef); return 1; }
 
     LP lp;
     memset(&lp, 0, sizeof(LP));
-    if (lp_read((const char *)path, &lp) != 0) { psolve_stop_fn = NULL; psolve_end(); return 1; }
+    if (lp_read((const char *)path, &lp) != 0) { psolve_stop_set(NULL); psolve_frame_pop(&ef); return 1; }
 
     Solver *s = solver_create(&lp);
-    if (!s) { lp_free(&lp); psolve_stop_fn = NULL; psolve_end(); return 1; }
+    if (!s) { lp_free(&lp); psolve_stop_set(NULL); psolve_frame_pop(&ef); return 1; }
 
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -98,7 +100,7 @@ int main(int argc, char **argv)
     if (r == 0 && !solver_feasible(s) && !psolve_stop()) {
         solver_destroy(s);
         s = solver_create(&lp);
-        if (!s) { lp_free(&lp); psolve_stop_fn = NULL; psolve_end(); return 1; }
+        if (!s) { lp_free(&lp); psolve_stop_set(NULL); psolve_frame_pop(&ef); return 1; }
         s->sparse_disabled = 1;  /* force dense from the start */
         s->use_sparse = 0;
         r = solver_solve(s);
@@ -158,7 +160,7 @@ int main(int argc, char **argv)
     } else {
         double *xo = (double*)malloc((size_t)(lp.n > 0 ? lp.n : 1) * sizeof(double));
         double obj;
-        if (!xo) { solver_destroy(s); lp_free(&lp); psolve_stop_fn = NULL; psolve_end(); return 1; }
+        if (!xo) { solver_destroy(s); lp_free(&lp); psolve_stop_set(NULL); psolve_frame_pop(&ef); return 1; }
         solver_optimum(s, xo, &obj);
         printf("status: OPTIMAL\n");
         printf("objective: %.15g\n", obj);
@@ -172,7 +174,7 @@ int main(int argc, char **argv)
     solver_destroy(s);
     lp_free(&lp);
     tlimit_disarm();
-    psolve_stop_fn = NULL;
-    psolve_end();
+    psolve_stop_set(NULL);
+    psolve_frame_pop(&ef);
     return 0;
 }

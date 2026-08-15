@@ -49,28 +49,29 @@ int main(int argc,char**argv)
     FZModel m; memset(&m, 0, sizeof(m));
     double secs = 0.0;
 
-    if (setjmp(psolve_env) != 0) {
+    PSolveErrFrame ef;
+    psolve_frame_push(&ef);
+    if (setjmp(ef.env) != 0) {
         fprintf(stderr,"fznsolve: %s\n",
-                psolve_code==PSOLVE_ERR_OOM?"out of memory":"internal error");
-        rc = 2; goto done;
+                psolve_err_code()==PSOLVE_ERR_OOM?"out of memory":"internal error");
+        rc = 2; goto done;    /* the frame is already popped by psolve_fail() */
     }
-    psolve_try();
     signal(SIGINT, on_sigint);
     signal(SIGALRM, on_sigint);            /* ITIMER_REAL fires this for -t limit */
-    psolve_stop_fn = stop_requested;       /* cooperative abort polled by solver */
+    psolve_stop_set(stop_requested);       /* cooperative abort polled by solver */
     /* Millisecond precision (alarm() rounded up to whole seconds). */
-    if (tlimit_arm(opt.time_ms) != 0) { psolve_end(); rc = 1; goto done; }
+    if (tlimit_arm(opt.time_ms) != 0) { psolve_frame_pop(&ef); rc = 1; goto done; }
     sol.node_limit = opt.node_limit;       /* wire -n into the MIP node limit */
     sol.all_solutions = opt.all_solutions; /* -a / --all-solutions */
 
     {
         struct timespec t0,t1; clock_gettime(CLOCK_MONOTONIC,&t0);
-        if (fz_read((const char*)pathbuf, &m) != 0) { psolve_end(); rc = 1; goto done; }
+        if (fz_read((const char*)pathbuf, &m) != 0) { psolve_frame_pop(&ef); rc = 1; goto done; }
         fz_solve(&m, &sol);
         clock_gettime(CLOCK_MONOTONIC,&t1);
         secs = (t1.tv_sec-t0.tv_sec)+(t1.tv_nsec-t0.tv_nsec)/1e9;
     }
-    psolve_end();
+    psolve_frame_pop(&ef);
 
     fz_print_solution(&m, &sol);
     if (m.solve_kind != 0 && sol.status == 0 && !opt.all_solutions)
@@ -89,7 +90,7 @@ int main(int argc,char**argv)
         fprintf(stderr, "fznsolve: status=%d nodes=%ld\n", sol.status, sol.nodes);
 done:
     tlimit_disarm();
-    psolve_stop_fn = NULL;
+    psolve_stop_set(NULL);
     fz_solution_free(&sol);
     fz_model_free(&m);
     return rc;

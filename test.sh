@@ -86,6 +86,41 @@ gcc -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -I src \
     src/splu.c src/lu.c src/kernels.c src/parser.c -o /tmp/arena_fzn_asan -lm
 /tmp/arena_fzn_asan
 
+echo "[5.45/7] Error protocol: caller-owned per-thread frames (Phase 6.3, AUDIT #2)..."
+# The retired process-global jmp_buf/active/code triple refused a second
+# thread's handler outright and made any concurrent failure a cross-thread
+# longjmp.  Caller-owned PSolveErrFrame storage + thread-local chain state
+# closes that; these tests pin both the single-thread semantics (nested
+# frames, realloc/calloc guards, no-frame exit, checked pop violation) and
+# 8-thread concurrent solves + forced OOM recoveries + per-thread stop
+# callbacks.  Discriminating: neither test compiles against the pre-change
+# err.h (API absent); an old-API reproducer showed psolve_try() refusing a
+# second thread's handler.
+gcc -O2 -march=native -Wall -Wextra -I src tools/err_proto_test.c src/err.c -o /tmp/err_proto_test -lm
+/tmp/err_proto_test || { echo "err_proto_test: FAIL"; exit 1; }
+gcc -O2 -march=native -Wall -Wextra -pthread -I src tools/err_mt_test.c src/err.c \
+    src/solver.c src/splu.c src/lu.c src/kernels.c src/parser.c -o /tmp/err_mt_test -lm
+/tmp/err_mt_test || { echo "err_mt_test: FAIL"; exit 1; }
+# Same multithreaded test under ThreadSanitizer: must produce no reports.
+# (Skipped with a note if this toolchain lacks TSan.)
+if gcc -O1 -g -fsanitize=thread -pthread -I src tools/err_mt_test.c src/err.c \
+    src/solver.c src/splu.c src/lu.c src/kernels.c src/parser.c -o /tmp/err_mt_tsan -lm 2>/dev/null; then
+    /tmp/err_mt_tsan || { echo "err_mt_tsan: FAIL"; exit 1; }
+else
+    echo "err_mt_tsan: SKIP (no -fsanitize=thread on this toolchain)"
+fi
+# Objective archive gate: the whole library now exports ZERO non-TLS mutable
+# data symbols (pre-change err.o alone had four: psolve_env/psolve_active/
+# psolve_code/psolve_stop_fn); the remaining statics are _Thread_local.
+if nm -g --defined-only src/err.o src/solver.o src/mip.o src/fzn.o src/qp.o \
+     src/fx.o src/parser.o src/splu.o src/lu.o src/kernels.o 2>/dev/null | \
+     awk '$2 ~ /[BCDGS]/ {found=1} END {exit found?0:1}'; then
+    echo "global-state gate: FAIL (library exports mutable data symbols)"
+    exit 1
+else
+    echo "global-state gate: no exported mutable data symbols in the library"
+fi
+
 echo "[5.5/7] MIP solver (branch-and-bound) vs brute force..."
 gcc -O2 -march=native -I src tools/mip_test.c src/mip.c src/fx.c src/err.c src/solver.c src/splu.c src/lu.c src/kernels.c src/parser.c -o /tmp/mip_test -lm
 /tmp/mip_test
