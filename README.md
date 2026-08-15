@@ -358,6 +358,21 @@ sensitivity analysis (`solver_duals`, `solver_reduced_costs`).  The QP API
 feasibility search (variable bounds are expressed as rows).  This is the
 integration point used by [SmazkaVG](https://github.com/SodoMita/SmazkaVG).
 
+**Threading note.** Only **one solve may be active per process**: the error
+protocol keeps a process-global `setjmp` buffer (`psolve_env` in
+`src/err.c`), so concurrent `lp_*`/`qp_*`/`mip_*`/`fz_*` calls from multiple
+threads corrupt each other's recovery state (the says-what-it-solves parts —
+LP/QP/MIP/fx/FlatZinc — are otherwise free of shared mutable solver state;
+the exact solver's scratch is already thread-local).  Library users needing
+parallel solves must serialize the entry points externally (a mutex around
+the calls is sufficient) or run them in separate processes.
+
+**License note.** psolve is **AGPL-3.0** (see `LICENSE`): embedding the
+library into a program or exposing it over a network makes that program's
+offer of source code mandatory under the same license.  If you embed it in
+something like SmazkaVG, plan for AGPL-3.0 obligations (or negotiate a
+separate license with the authors).
+
 ## FlatZinc (Phase 3, linear subset)
 
 `fznsolve <problem.fzn>` reads a MiniZinc-compiled FlatZinc file and solves the

@@ -13,6 +13,28 @@ import json
 import glob
 import subprocess
 import re
+import shutil
+
+
+def _mzn_solver_available(name):
+    """True when `minizinc --solver <name>` resolves (cached in _AVAIL)."""
+    if name in _AVAIL:
+        return _AVAIL[name]
+    ok = False
+    if shutil.which("minizinc"):
+        r = subprocess.run(["minizinc", "--solvers"], capture_output=True, text=True)
+        ok = r.returncode == 0 and name in r.stdout
+    _AVAIL[name] = ok
+    return ok
+
+
+_AVAIL = {}
+
+
+def _linear_solver():
+    # coin-bc (CBC) is the historical linear/flattener reference; fall back to
+    # CP-SAT (bundled with the MiniZinc distribution) when CBC is absent.
+    return "coin-bc" if _mzn_solver_available("coin-bc") else "cp-sat"
 
 BENCHMARK_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "examples", "mzn"))
 BUILD_DIR = "/tmp/psolve_mzn_bench"
@@ -215,7 +237,7 @@ def run_benchmark(filter_pattern=None):
 
         # 1. Compile MZN -> FZN
         t_comp_start = time.perf_counter()
-        comp_solver = "coin-bc" if is_linear_flattener else "gecode"
+        comp_solver = _linear_solver() if is_linear_flattener else "gecode"
         comp_cmd = ["minizinc", "-c", "--solver", comp_solver]
         if is_linear_flattener:
             comp_cmd.extend(["-G", "linear"])
@@ -249,7 +271,7 @@ def run_benchmark(filter_pattern=None):
             p_info = {"status": "TIMEOUT", "objective": None, "nodes": 0, "solutions": 0}
 
         # 3. Run reference solver
-        ref_solver = "coin-bc" if is_float_model else "gecode"
+        ref_solver = _linear_solver() if is_float_model else "gecode"
         cmd_r = ["minizinc", "--solver", ref_solver, "-s"]
         if is_enum: cmd_r.append("-a")
         cmd_r.append(fzn_path)

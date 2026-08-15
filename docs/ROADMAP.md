@@ -52,6 +52,11 @@ is a different algorithm family tuned for that latency.
 - AVX-512 revised-simplex LP (sparse LU + steepest edge), ~1.4× GLPK on sparse LPs
 - Convex QP (active-set), verified vs scipy
 - MIP via branch-and-bound, verified vs brute force
+- Sound feasibility-based bound tightening (FBBT) at the MIP root: outward-
+  rounded activity bounds, no coefficient dropping, integer-only bound updates,
+  verified vs brute force incl. tiny-coefficient/large-magnitude adversarial
+  cases (`tools/fbbt_verify.py`). Prunes the branch-and-bound tree without
+  changing the optimum.
 - Incremental (warm-start) LP solving
 - Hardened parsers + fuzzing + sanitizers (untrusted-input safe)
 - OOM/error protocol, sensitivity (duals), iteration limits
@@ -258,7 +263,10 @@ feature completeness against a huge standard corpus.
       many combinatorial instances return `=====UNKNOWN=====`; the exact
       `fxsolve` solves them.  Follow-up: use the exact solver for MIP
       relaxations.
-- [ ] More handlers: nonlinear/reified float relations.
+- [x] **Nonlinear integer divisor enumeration** (`int_times`/`int_pow` chains with unbounded vars): `csp_try_nonlinear()` enumerates divisors of the constant product (e.g. `x³·y² = 100000 → 2⁵·5⁵ → 36 divisors`) and DFS with `int_times` propagation finds `x=10,y=10` in <1 ms for both `var int` and `var 1..100` (previously `UNKNOWN`). Handles `x*x= C`, `x*y=C`, sign-aware.
+- [x] **Hybrid CSP/MIP for weak relaxations** (N-Queens, Sudoku): `csp_try_alldiff()` — bit-mask domains ($|D|≤64$), MRV branching, forward checking for `all_different` + 2-var `int_lin_eq` + interval pruning — finds first feasible leaf before MIP. N-Queens 8: 358 nodes / 1 s → **0 MIP nodes / 1.9 ms**, Sudoku 9×9: timeout → **1 ms**. Enumeration (`-a`) bypasses CSP and uses MIP to preserve completeness; unsat with duplicate constants correctly detected.
+- [x] **MIP branching improved**: most-fractional variable (distance to 0.5) instead of first fractional, plus tighter `open_shop_3x3` (971 ms → 190 ms).
+- [ ] More handlers: nonlinear/reified float relations (remaining: `float_times` with var·var, `float_sin/cos` etc. stay `UNKNOWN`).
 - [x] **MIP bridge**: when the model has integer vars, `fz_solve` dispatches to
       the MIP branch-and-bound so answers are integral (objectives match brute
       force, e.g. knapsack=10, prod3=57).

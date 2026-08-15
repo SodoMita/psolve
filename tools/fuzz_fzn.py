@@ -24,7 +24,7 @@ def parse_args(argv):
 def build_asan(bindir):
     os.makedirs(bindir, exist_ok=True)
     base = ['gcc','-O1','-g','-march=native','-fsanitize=address,undefined',
-            '-fno-omit-frame-pointer','-I','src']
+            '-fno-sanitize-recover=all','-fno-omit-frame-pointer','-I','src']
     cmd = base + ['src/err.c','src/kernels.c','src/lu.c','src/splu.c',
                   'src/solver.c','src/parser.c','src/qp.c','src/mip.c','src/fx.c',
                   'src/pgs.c','src/pgs_fixed.c','src/fzn.c','tools/fznsolve.c',
@@ -41,7 +41,7 @@ def gen_wellformed(rng):
     # declare vars with mixed domains
     has_gapped = 0
     for i, nm in enumerate(names):
-        style = rng.randint(0, 3)
+        style = rng.randint(0, 4)
         if style == 0:
             L.append(f"var int: {nm} :: output_var;")
         elif style == 1:
@@ -51,8 +51,14 @@ def gen_wellformed(rng):
             vals = sorted(rng.sample(range(-5,6), rng.randint(1,5)))
             L.append(f"var {{{', '.join(map(str,vals))}}}: {nm} :: output_var;")
             if len(vals) < (vals[-1]-vals[0]+1): has_gapped = 1   # non-contiguous set
-        else:
+        elif style == 3:
             L.append(f"var 0..1: {nm} :: output_var;")   # bool-ish
+        else:
+            # float var: drives models out of the pure-finite-domain subset so
+            # the MIP bridge / CP-decline paths (incl. their cleanup) get
+            # sanitizer coverage too
+            flo, fhi = rng.randint(-5,0), rng.randint(0,5)
+            L.append(f"var {flo}.0..{fhi}.0: {nm} :: output_var;")
     # linear constraints
     for _ in range(rng.randint(1, 5)):
         k = rng.randint(1, n)
@@ -137,23 +143,36 @@ def gen_malformed(rng):
 def run(rng, iters, bindir):
     exe = os.path.join(bindir, 'fznsolve_asan')
     tmp = os.path.join(bindir, 'case.fzn')
+    # Deterministic regression probe: an optimization model carrying a float
+    # variable is declined by the CP engine *after* its optimization buffers
+    # are allocated, exercising that cleanup under LeakSanitizer.  (24-byte
+    # leak of optcoef/bestx slipped past this fuzzer before it existed,
+    # because the corpus had no float vars and LSan output was not checked.)
+    probe = ("var 0.0..1.0: __f;\nconstraint float_eq(__f, 0.5);\n"
+             "var 0..4: x :: output_var;\nsolve maximize x;\n")
+    env = dict(os.environ)
+    env['ASAN_OPTIONS'] = 'detect_leaks=1:halt_on_error=1'
+    env['UBSAN_OPTIONS'] = 'halt_on_error=1:print_stacktrace=1'
     bad = 0
-    for i in range(iters):
-        if rng.random() < 0.55:
+    for i in range(iters + 1):
+        if i == 0:
+            content = probe
+        elif rng.random() < 0.55:
             content = gen_wellformed(rng)
         else:
             content = gen_malformed(rng)
         with open(tmp, 'w') as f:
             f.write(content)
         try:
-            r = subprocess.run([exe, tmp], capture_output=True, timeout=10)
+            r = subprocess.run([exe, tmp], capture_output=True, timeout=10, env=env)
         except subprocess.TimeoutExpired:
             # a hard B&B instance may legitimately exceed the case timeout;
             # it is not a memory-safety failure, so log and continue.
             continue
         # sanitizer messages appear on stderr
         if (b'ERROR: AddressSanitizer' in r.stderr or b'runtime error:' in r.stderr
-            or b'AddressSanitizer' in r.stderr or r.returncode < 0):
+            or b'AddressSanitizer' in r.stderr or b'LeakSanitizer' in r.stderr
+            or b'SUMMARY: ' in r.stderr or r.returncode < 0):
             print("SANITIZER FAILURE on input:\n" + content, flush=True)
             print(r.stderr.decode(), flush=True)
             bad += 1

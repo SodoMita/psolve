@@ -56,12 +56,21 @@ python3 tools/qp_diff.py 200 4242 | head -2
 echo "[5.5/7] MIP solver (branch-and-bound) vs brute force..."
 gcc -O2 -march=native -I src tools/mip_test.c src/mip.c src/fx.c src/err.c src/solver.c src/splu.c src/lu.c src/kernels.c src/parser.c -o /tmp/mip_test -lm
 /tmp/mip_test
+# Contradictory variable bounds (l > u => certified INFEASIBLE) and duplicate
+# sparse triplets (merged by summation), each vs an independent reference.
+echo -n "lp_form_verify (l>u bounds + duplicate triplets, vs scipy): "
+python3 tools/lp_form_verify.py 150 20260815 | sed 's/.*: //'
 # NOTE: this used to read `if [ -f /tmp/mip_verify.py ]`, a path that never
 # exists, so the MIP verification silently never ran.  mip_diff.py replaces it
 # and additionally checks statuses and the returned point, not just the
 # objective of runs that happened to come back OPTIMAL.
 python3 tools/mip_diff.py 400 12345 | head -2
 python3 tools/mip_verify.py 0 | tail -1
+# Adversarial differential test for the sound FBBT bound tightening: mixes
+# tiny coefficients (1e-13) with large variable magnitudes and all three
+# relation types, checking status + objective + returned point vs brute force,
+# plus the audit counterexample (1e-13*x + y <= 1 with x=-1e13 must yield y=2).
+python3 tools/fbbt_verify.py 200 4242 | tail -1
 
 echo "[5.75/7] Fully free LP/MIP variables + incremental API..."
 gcc -O2 -march=native -I src tools/free_var_test.c src/mip.c src/fx.c src/err.c src/solver.c src/splu.c src/lu.c src/kernels.c -o /tmp/free_var_test -lm
@@ -77,6 +86,16 @@ echo "[7/7] Fuzz malformed inputs under ASan/UBSan..."
 if command -v gcc >/dev/null; then
   python3 tools/fuzz_inputs.py --iters 80 --seed 7
   python3 tools/fuzz_fzn.py --iters 120 --seed 7
+  echo -n "fz_leak_test (fz_read partial-model cleanup, needs LSan): "
+  gcc -std=gnu11 -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all -I src \
+      -o /tmp/fz_leak_test tools/fz_leak_test.c src/fzn.c src/mip.c src/err.c src/solver.c \
+      src/splu.c src/lu.c src/kernels.c src/parser.c src/fx.c -lm
+  # the accept/reject verdict is printed by the tool; the leak verdict is
+  # LeakSanitizer's exit code (the tool erases its stack so dead-frame
+  # pointers cannot hide a leaked partial model from the root scan)
+  ASAN_OPTIONS=detect_leaks=1 /tmp/fz_leak_test >/dev/null 2>&1 \
+      && echo "OK (no leaks, accept/reject correct)" \
+      || { echo "FAIL"; exit 1; }
 else
   echo "  (skipped: gcc not available)"
 fi
@@ -125,6 +144,8 @@ else
 fi
 echo -n "cumulative_verify (randomized, vs brute force): "
 python3 tools/cumulative_verify.py 200 777 | sed 's/.*: //'
+echo -n "cp_opt_verify (CP B&B + MIP bridge optimization, vs brute force, both paths): "
+python3 tools/cp_opt_verify.py 250 20260814 | sed 's/.*: //'
 
 echo "[8.25/8] FlatZinc strict/reified-int + float + table/circuit semantics..."
 python3 tools/fzn_semantics_test.py
@@ -138,7 +159,7 @@ python3 tools/divmod_verify.py 200 20260808 | sed 's/.*: //'
 if command -v minizinc >/dev/null 2>&1; then
   echo "[8.5/8] MiniZinc differential (compile .mzn -> fzn -> psolve vs Gecode)..."
   python3 tools/mzn_diff.py | tail -1
-  echo "[8.75/8] MiniZinc full benchmark suite (73 models)..."
+  echo "[8.75/8] MiniZinc full benchmark suite..."
   python3 tools/mzn_bench.py | tail -2
 else
   echo "[8.5/8] MiniZinc differential SKIPPED (minizinc not installed)"

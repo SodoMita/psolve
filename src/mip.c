@@ -5,6 +5,7 @@
 #include <string.h>
 #include <math.h>
 #include <stdio.h>
+#include <fenv.h>
 
 #define MIP_TOL 1e-6
 
@@ -140,37 +141,179 @@ static Node *pop_node(Node **list)
     return n;
 }
 
-/* build an LP from the MIP with per-node tightened bounds, and solve it */
-static int solve_relaxation(const MIP *mip, const Node *node,
+/* ------------------------------------------------------------------ */
+/* Rigorous interval row-conflict certificate, O(nnz).
+ *
+ * For every row i the minimum and maximum possible activity over the box
+ * [lo,hi] is accumulated in DIRECTED rounding: the minimum side under
+ * FE_DOWNWARD, the maximum side under FE_UPWARD, so the computed mn[i] is
+ * a proven LOWER bound of the exact row minimum over the double data and
+ * mx[i] a proven UPPER bound of the exact row maximum (every stored double
+ * is an exact dyadic rational; each product and each partial sum rounds
+ * toward the accumulated side, an FMA contraction only rounds once in the
+ * same direction, and reassociation/vectorization cannot break the bound:
+ * the exact total is association-independent while every computed partial
+ * is on the correct side of the corresponding exact partial).
+ *
+ *   '<'/'=' conflict: mn[i] > b[i]   (even the best case violates the row)
+ *   '>'/'=' conflict: mx[i] < b[i]
+ *
+ * There are NO tolerances: a return of 1 is a proof that no point of the
+ * box satisfies all rows.  Unbounded sides (sentinel magnitude ~LP_INF,
+ * gated at 1e29 like the rest of this file) poison the affected
+ * accumulator with NaN so the row cannot certify in that direction; NaN
+ * propagates through every later partial sum and the final isfinite()
+ * filter then excludes it (along with any arithmetic overflow), so "cannot
+ * say" is always the answer a degenerate row produces.  The rounding mode
+ * is saved and restored around the two sweeps, and nothing in between can
+ * allocate or longjmp -- these sweeps run inside error-trapping library
+ * code (psolve_env), so no call that can fail is allowed there.
+ *
+ * This replaces the round-to-nearest, tolerance-padded prune that used to
+ * guard FBBT root infeasibility: with catastrophic cancellation the RN
+ * error exceeds the tolerance (products near 1e12 round by up to ~6e-5
+ * while the margin was 1e-6), and "MN overestimate > rhs + tol" fires on a
+ * FEASIBLE model -- a fabricated-UNSAT verdict reached before any solve
+ * and therefore before the exact-rational cross-check that guards the same
+ * status inside the branch-and-bound loop.  Regression of record:
+ * "maximize x2, x2 == 1, 9.999853740683515e-14*x0 - ...e-14*x1 + 0.75*x2
+ *  <= 0.7504304904478102, x0/x1 fixed near 1e25": the RN activity
+ * 0.75048828125 exceeds rhs + 1.75e-6 while the exact activity
+ * 0.7504294904478... is feasible; mipsolve printed INFEASIBLE.
+ *
+ * Returns 1 if a conflict is PROVEN, else 0 ("cannot say").  mn/mx are
+ * caller-owned m-sized scratch so per-node callers avoid malloc churn. */
+static int mip_box_conflict(const MIP *mip, const double *lo, const double *hi,
+                            double *mn, double *mx)
+{
+    const double BIG = 1e29;
+    int n = mip->n, m = mip->m;
+    if (m > 0) for (int i = 0; i < m; i++) mn[i] = 0.0;
+    int rm = fegetround();
+    fesetround(FE_DOWNWARD);          /* min side: every op rounds down */
+    for (int j = 0; j < n; j++) {
+        double lj = lo[j], hj = hi[j];
+        int lo_inf = (lj <= -BIG), hi_inf = (hj >= BIG);
+        for (int k = mip->Acolptr[j]; k < mip->Acolptr[j + 1]; k++) {
+            int i = mip->Arow[k];
+            double a = mip->Aval[k];
+            if (a > 0.0) {
+                if (lo_inf) { mn[i] = NAN; } else mn[i] += a * lj;
+            } else {
+                if (hi_inf) { mn[i] = NAN; } else mn[i] += a * hj;
+            }
+        }
+    }
+    if (m > 0) for (int i = 0; i < m; i++) mx[i] = 0.0;
+    fesetround(FE_UPWARD);            /* max side: every op rounds up */
+    for (int j = 0; j < n; j++) {
+        double lj = lo[j], hj = hi[j];
+        int lo_inf = (lj <= -BIG), hi_inf = (hj >= BIG);
+        for (int k = mip->Acolptr[j]; k < mip->Acolptr[j + 1]; k++) {
+            int i = mip->Arow[k];
+            double a = mip->Aval[k];
+            if (a > 0.0) {
+                if (hi_inf) { mx[i] = NAN; } else mx[i] += a * hj;
+            } else {
+                if (lo_inf) { mx[i] = NAN; } else mx[i] += a * lj;
+            }
+        }
+    }
+    fesetround(rm);
+    for (int i = 0; i < m; i++) {
+        char rel = mip->rel[i];
+        double rhs = mip->b[i];
+        /* Semantics note (learned the hard way, mip_diff seed 12345 it=236):
+           the engine's row feasibility is TOLERANCE-based (check_solution:
+           MIP_TOL absolute; the LP core: TOL_FEAS=1e-9), so a certificate
+           that prunes on exact arithmetic alone CHANGES the declared
+           semantics -- a borderline row like 2.293*(-3) = -6.879, exact
+           activity 8.9e-16 inside/outside the rhs, is feasible to every
+           layer of this solver and to the independent brute-force
+           reference.  A prune may only fire when not even a tolerance-slack
+           assignment survives, hence the margin.  It cannot reintroduce the
+           cancellation fabrication: mn/mx are rigorous directed-rounding
+           bounds (never an RN overestimate), so firing requires the TRUE
+           extremum to exceed rhs by the full margin. */
+        double mar = MIP_TOL * (1.0 + fabs(rhs));
+        if ((rel == '<' || rel == '=') && isfinite(mn[i]) && mn[i] > rhs + mar) return 1;
+        if ((rel == '>' || rel == '=') && isfinite(mx[i]) && mx[i] < rhs - mar) return 1;
+    }
+    return 0;
+}
+
+/* Persistent simplex state reused across the whole branch-and-bound tree.
+ * Successive node relaxations differ ONLY in the variable bounds, which is
+ * exactly the supported incremental case (solver_set_bounds +
+ * solver_warm_solve): the warm solve re-factorizes the previous basis and
+ * re-enters phase 2, and transparently falls back to a full cold rebuild
+ * (solver_refresh) whenever the basis cannot be kept feasible -- it never
+ * returns an unverified optimum.  The first node solves cold (phase 1
+ * included), establishing the basis every later node warms from. */
+typedef struct {
+    Solver *s;         /* NULL until the first (cold) solve creates it */
+    int     started;
+    double *blo;       /* intersected per-node box scratch (n each) */
+    double *bhi;
+    double *cmin;      /* row-activity scratch for mip_box_conflict (m each) */
+    double *cmax;
+} MipWarm;
+
+/* build an LP from the MIP with per-node tightened bounds, and solve it;
+ * warm-starts from the previous node's basis whenever possible */
+static int solve_relaxation(const MIP *mip, const Node *node, MipWarm *ws,
                             double *x, double *obj, double *lcur, double *ucur)
 {
     int n = mip->n;
-    LP lp;
-    memset(&lp, 0, sizeof(lp));
-    lp.n = n; lp.m = mip->m; lp.maximize = mip->maximize;
-    lp.c  = (double*)mip->c;
-    lp.Acolptr = (int*)mip->Acolptr;
-    lp.Arow = (int*)mip->Arow;
-    lp.Aval = (double*)mip->Aval;
-    lp.rel = (char*)mip->rel;
-    lp.b  = (double*)mip->b;
-    lp.l  = (double*)mip->l;
-    lp.u  = (double*)mip->u;
-    /* per-node bounds (allocate copies so node can free them) */
-    double *lo = (double*)psolve_malloc((size_t)n * sizeof(double));
-    double *hi = (double*)psolve_malloc((size_t)n * sizeof(double));
+    double *lo = ws->blo;
+    double *hi = ws->bhi;
     for (int j = 0; j < n; j++) {
         double lj = node->lo[j] > mip->l[j] ? node->lo[j] : mip->l[j];
         double uj = node->hi[j] < mip->u[j] ? node->hi[j] : mip->u[j];
-        if (lj > uj) { free(lo); free(hi); return -1; }   /* infeasible node */
+        if (lj > uj) return -1;   /* infeasible node */
         lo[j] = lj; hi[j] = uj;
     }
-    lp.l = lo; lp.u = hi;
+    /* Sound certificate before any solve: if one row's best-case activity
+       over the node box already violates its rhs, the relaxation is
+       infeasible and the node prunes -- without running the double LP and,
+       crucially, without the exact-rational cross-check that such nodes
+       previously paid for their returned-INFEASIBLE verdict (the histogram
+       showed those exact re-solves dominating wall time on combinatorial
+       models: 153 of 255 nodes on tsp_5).  The certificate doesn't mutate
+       the box, touch the warm-start state, or change node accounting, so
+       the search evolves exactly as before; only the dead nodes' solve
+       cost disappears.  Corner noted for the record: a certified node whose
+       double LP would previously have hit its iteration limit (honest
+       status 3 search stop) now prunes for free and the search continues --
+       fewer honest limits, never a different verdict. */
+    if (mip->m > 0 &&
+        mip_box_conflict(mip, lo, hi, ws->cmin, ws->cmax)) return -1;
 
-    Solver *s = solver_create(&lp);
-    if (!s) { free(lo); free(hi); return -1; }
-    if (mip->lp_iter_limit > 0) s->iteration_limit = mip->lp_iter_limit;
-    int r = solver_solve(s);
+    Solver *s;
+    int r;
+    if (!ws->started) {
+        LP lp;
+        memset(&lp, 0, sizeof(lp));
+        lp.n = n; lp.m = mip->m; lp.maximize = mip->maximize;
+        lp.c  = (double*)mip->c;
+        lp.Acolptr = (int*)mip->Acolptr;
+        lp.Arow = (int*)mip->Arow;
+        lp.Aval = (double*)mip->Aval;
+        lp.rel = (char*)mip->rel;
+        lp.b  = (double*)mip->b;
+        lp.l  = lo;
+        lp.u  = hi;
+        s = solver_create(&lp);
+        if (!s) return -1;
+        if (mip->lp_iter_limit > 0) s->iteration_limit = mip->lp_iter_limit;
+        r = solver_solve(s);
+        ws->s = s;
+        ws->started = 1;
+    } else {
+        s = ws->s;
+        solver_set_bounds(s, lo, hi);
+        r = solver_warm_solve(s);
+    }
     int status = r;
     if (r == 0) {
         double *xo = (double*)psolve_malloc((size_t)n * sizeof(double));
@@ -203,9 +346,189 @@ static int solve_relaxation(const MIP *mip, const Node *node,
         fx_free(&flp);
     }
     for (int j = 0; j < n; j++) { lcur[j] = lo[j]; ucur[j] = hi[j]; }
-    solver_destroy(s);
-    free(lo); free(hi);
-    return status;
+    return status;   /* solver and box scratch live on in the MipWarm context */
+}
+
+/* ------------------------------------------------------------------ */
+/* Sound feasibility-based bound tightening (FBBT / "branch-and-clip").
+ *
+ * Tightens the box [lo,hi] in place using the row constraints, computing for
+ * each row the minimum and maximum possible activity over the current box and
+ * deriving per-variable bound updates.  It is a pre-solve that can only ever
+ * tighten bounds -- never loosen them -- so the LP/MIP optimum is preserved
+ * while the branch-and-bound tree is pruned.
+ *
+ * The previous attempt at this (remote commit 24985ad) was rejected by the
+ * audit because it was UNSOUND.  This version satisfies each rejected
+ * property:
+ *
+ *   1. NO coefficient is dropped.  The old code skipped every |a| < 1e-12,
+ *      which changes the model when variable magnitudes are large.  The audit's
+ *      counterexample (1e-13*x + y <= 1 with x = -1e13, whose true optimum is
+ *      y = 2) is solved correctly here because the 1e-13 coefficient is kept.
+ *
+ *   2. OUTWARD-ROUNDED activity bounds and candidates, via DIRECTED
+ *      ROUNDING (FE_DOWNWARD / FE_UPWARD regions): the "others" activity
+ *      feeding a '<'/'=' bound is accumulated downward (a proven lower
+ *      bound of the exact rest-minimum), the subtraction and division then
+ *      round in the direction that provably cannot exclude a feasible value
+ *      (up for upper candidates with a>0, down for lower ones...; '>' rows
+ *      mirror with an upward rest-maximum).  The nextafter-biased
+ *      round-to-nearest predecessor was NOT provably outward: at |partial|
+ *      ~1e12 the RN rest-sum error (~1e-4) dwarfs a nextafter step AND the
+ *      absolute 1e-9 slack, and at bound magnitudes ~1e15 even one ulp of
+ *      underestimate overflows the slack -- which is how a fixed x0 near
+ *      1e25 got its box collapsed into a fabricated INFEASIBLE verdict
+ *      (2026-08-15(2) round; regression of record in mip_box_conflict and
+ *      tools/fbbt_verify.py's cancellation family).
+ *
+ *   3. Integer variables are snapped to the lattice (floor for upper bounds,
+ *      ceil for lower bounds) with the historical 1e-9 hysteresis slacks,
+ *      which now only ever widen the interval: the directed candidate
+ *      itself is already on the safe side.
+ *
+ * Infeasibility (return 1) is decided only by mip_box_conflict's rigorous
+ * directed-rounding certificate and by genuine box collapse; the previous
+ * tolerance-padded round-to-nearest prune ("min_act > rhs + 1e-6*(...)"
+ * overflow-margin reasoning) was retired for fabricating UNSAT under
+ * catastrophic cancellation, with a pinned .lp regression and a randomized
+ * exact-referenced family in tools/fbbt_verify.py.
+ *
+ * A reduced-cost fixing path is deliberately NOT included: the previous
+ * attempt's reduced-cost logic assumed minimization signs while the solver
+ * exposes the maximization-form reduced costs, and that convention is not yet
+ * documented.  Bound tightening alone is the sound, high-value subset.
+ *
+ * Returns 1 if the box is provably infeasible (lo[j] > hi[j]), else 0.
+ */
+static int fbbt_tighten(const MIP *mip, double *lo, double *hi)
+{
+    int n = mip->n, m = mip->m;
+    if (n <= 0 || m <= 0) return 0;
+    const double BIG = 1e29;
+    int rc = 0;
+    /* Captured once: every directed-rounding region below restores the mode
+       immediately, so this value is current again after each region. */
+    int old_rm = fegetround();
+    /* scratch for the conflict certificate (freed on every exit below) */
+    double *cmin = (double*)psolve_malloc((size_t)m * sizeof(double));
+    double *cmax = (double*)psolve_malloc((size_t)m * sizeof(double));
+
+    /* Root infeasibility is decided EXCLUSIVELY by the rigorous directed-
+       rounding certificate.  The round-to-nearest, tolerance-padded prune
+       this replaces ("RN min_act > rhs + 1e-6*(1+|rhs|)") fabricated UNSAT
+       under catastrophic cancellation: products near 1e12 round by up to
+       ~6e-5, far beyond the tolerance, so an overestimated min_act pruned
+       FEASIBLE models before any LP ran -- and fbbt's caller reports that
+       return as proven INFEASIBLE without any cross-check.  See
+       mip_box_conflict for the regression of record. */
+    if (mip_box_conflict(mip, lo, hi, cmin, cmax)) { rc = 1; goto done; }
+
+    for (int pass = 0; pass < 4; pass++) {
+        int changed = 0;
+        for (int i = 0; i < m; i++) {
+            char rel = mip->rel[i];
+            double rhs = mip->b[i];
+
+            /* Tighten each variable's bound from this row.  The arithmetic
+               runs in DIRECTED rounding: the nextafter-biased round-to-
+               nearest version this replaces was NOT provably outward at
+               large magnitudes -- the rest-sum cancellation error is
+               bounded by ~eps*max|partial|, which dwarfs both a single
+               nextafter step and the absolute 1e-9 slack once bounds reach
+               ~1e15, so the computed bound could sit below the true one and
+               the box-collapse check would report a FEASIBLE model
+               infeasible (the regression of record in mip_box_conflict goes
+               through exactly this path).
+
+               Derivation.  For a '<'/'=' row, x_j is feasible for the row
+               iff a*x_j <= rhs - rest_min (others at their minimum), i.e.
+               the candidate bound is V = (rhs - rest_min)/a.  With rest_L
+               <= exact rest_min accumulated under FE_DOWNWARD, the exact
+               expression E = (rhs - rest_L)/a satisfies E >= V when a > 0
+               and E <= V when a < 0 -- so rounding both the subtraction and
+               the division UP (a > 0) / DOWN (a < 0) yields a candidate
+               that provably never excludes a feasible value.  '>' rows
+               mirror this: V = (rhs - rest_max)/a with rest_R >= exact
+               rest_max accumulated under FE_UPWARD, so a > 0 rounds DOWN
+               and a < 0 rounds UP.  The lattice snaps (floor/ceil with the
+               1e-9 hysteresis slacks) and the 1e-9 comparison hysteresis
+               can only loosen further. */
+            for (int j = 0; j < n; j++) {
+                double a = 0.0; int found = 0;
+                for (int k = mip->Acolptr[j]; k < mip->Acolptr[j + 1]; k++) {
+                    if (mip->Arow[k] == i) { a = mip->Aval[k]; found = 1; break; }
+                }
+                if (!found || a == 0.0) continue;
+                /* Only tighten INTEGER-variable bounds.  FBBT's purpose is to
+                   prune the integer branch-and-bound tree, and integer bounds
+                   get snapped to the lattice, so this is where the value is.
+                   Tightening a float variable's bound here would perturb the
+                   LP's reported vertex (e.g. a satisfy model returns mx as the
+                   tightened bound 4.2500000000000009 instead of 4.25) with no
+                   pruning benefit.  The conflict certificate above considers
+                   every variable and stays rigorous. */
+                if (!mip->isint[j]) continue;
+
+                /* rest at the required extremum, accumulated in the directed
+                   mode; an overflowed +-inf product (or a NaN from an +-inf
+                   pair) makes every comparison below false: no tighten,
+                   always the sound choice */
+                int down_side = (rel == '<' || rel == '=');
+                double rest = 0.0; int rest_inf = 0;
+                fesetround(down_side ? FE_DOWNWARD : FE_UPWARD);
+                for (int t = 0; t < n; t++) {
+                    if (t == j) continue;
+                    for (int k = mip->Acolptr[t]; k < mip->Acolptr[t + 1]; k++) {
+                        if (mip->Arow[k] != i) continue;
+                        double at = mip->Aval[k];
+                        if (down_side) {          /* minimum-activity terms */
+                            if (at > 0.0) { if (lo[t] <= -BIG) rest_inf = 1; else rest += at * lo[t]; }
+                            else          { if (hi[t] >=  BIG) rest_inf = 1; else rest += at * hi[t]; }
+                        } else {                  /* maximum-activity terms */
+                            if (at > 0.0) { if (hi[t] >=  BIG) rest_inf = 1; else rest += at * hi[t]; }
+                            else          { if (lo[t] <= -BIG) rest_inf = 1; else rest += at * lo[t]; }
+                        }
+                    }
+                }
+                if (!rest_inf) {
+                    if (down_side) {
+                        if (a > 0.0) {              /* upper candidate: round UP */
+                            fesetround(FE_UPWARD);
+                            double ub = (rhs - rest) / a;
+                            if (mip->isint[j]) ub = floor(ub + 1e-9);
+                            if (ub < hi[j] - 1e-9) { hi[j] = ub; changed = 1; }
+                        } else {                    /* lower candidate: stay DOWN */
+                            double lb = (rhs - rest) / a;
+                            if (mip->isint[j]) lb = ceil(lb - 1e-9);
+                            if (lb > lo[j] + 1e-9) { lo[j] = lb; changed = 1; }
+                        }
+                    } else {
+                        if (a > 0.0) {              /* lower candidate: round DOWN */
+                            fesetround(FE_DOWNWARD);
+                            double lb = (rhs - rest) / a;
+                            if (mip->isint[j]) lb = ceil(lb - 1e-9);
+                            if (lb > lo[j] + 1e-9) { lo[j] = lb; changed = 1; }
+                        } else {                    /* upper candidate: stay UP */
+                            double ub = (rhs - rest) / a;
+                            if (mip->isint[j]) ub = floor(ub + 1e-9);
+                            if (ub < hi[j] - 1e-9) { hi[j] = ub; changed = 1; }
+                        }
+                    }
+                }
+                fesetround(old_rm);
+            }
+        }
+        for (int j = 0; j < n; j++) if (lo[j] > hi[j] + 1e-9) { rc = 1; goto done; }
+        /* A pass that tightened the box may expose a row conflict that was
+           not provable on entry; re-certify cheaply (O(nnz)). */
+        if (changed && mip_box_conflict(mip, lo, hi, cmin, cmax)) { rc = 1; goto done; }
+        if (!changed) break;
+    }
+    for (int j = 0; j < n; j++) if (lo[j] > hi[j]) { rc = 1; goto done; }
+done:
+    free(cmin); free(cmax);
+    return rc;
 }
 
 void mip_solve(const MIP *mip, MIPResult *res)
@@ -258,10 +581,41 @@ void mip_solve(const MIP *mip, MIPResult *res)
             if (hi0[j] <  LP_INF) hi0[j] = floor(hi0[j] + MIP_TOL);
         }
     }
+    /* Sound feasibility-based bound tightening (FBBT): propagates the rows to
+       clip the root box.  It only ever tightens validly (see fbbt_tighten),
+       preserving the optimum while pruning the tree.  If the box is provably
+       infeasible we can report it immediately without solving anything.
+       FBBT is only run when there is at least one integer variable: its whole
+       purpose is to prune the integer branch-and-bound tree.  On a pure-float
+       model there is no lattice to prune, so tightening bounds would only
+       perturb the LP's vertex (e.g. a float bound tightened to a slightly-loose
+       value that the LP then snaps to), with no correctness benefit. */
+    int has_int = 0;
+    for (int j = 0; j < n; j++) if (mip->isint[j]) { has_int = 1; break; }
+    if (has_int && fbbt_tighten(mip, lo0, hi0)) {
+        /* The box is provably infeasible (bound tightening pruned every
+           integer point).  Report INFEASIBLE immediately -- no solve needed --
+           with a proven verdict. */
+        res->status = 1;
+        res->proven_optimal = 1;
+        res->nodes = 0;   /* callers read nodes/best_bound unconditionally */
+        free(lo0); free(hi0);
+        free(x); free(lcur); free(ucur); free(bestx); free(xc);
+        return;
+    }
     Node *root = (Node*)psolve_malloc(sizeof(Node));
     root->lo = lo0; root->hi = hi0; root->bound = 0.0; root->feasible = 0;
     root->next = NULL;
     push_node(&stack, root, mip->maximize);
+
+    /* persistent warm-start context for the per-node relaxations; created
+       only after the root-FBBT early-return so every exit below passes the
+       shared teardown */
+    MipWarm ws; memset(&ws, 0, sizeof(ws));
+    ws.blo = (double*)psolve_malloc((size_t)n * sizeof(double));
+    ws.bhi = (double*)psolve_malloc((size_t)n * sizeof(double));
+    ws.cmin = (double*)psolve_malloc((size_t)(mip->m ? mip->m : 1) * sizeof(double));
+    ws.cmax = (double*)psolve_malloc((size_t)(mip->m ? mip->m : 1) * sizeof(double));
 
     long nodes = 0;
     int status = 1;   /* assume infeasible until a feasible integer found */
@@ -274,8 +628,16 @@ void mip_solve(const MIP *mip, MIPResult *res)
         Node *node = pop_node(&stack);
         nodes++;
 
+        /* NOTE (measured, 2026-08-14, then reverted): running fbbt_tighten on
+           every popped node box did NOT pay for itself on the benchmark
+           suite -- assignment 19->17 nodes, knap_lin flat, but tsp_5 grew
+           255->303 nodes and +25% wall (tighter boxes shift the LP vertex
+           and thereby the most-fractional branching picks adversarially;
+           the per-node fixpoint cost is not recovered).  Root-only FBBT
+           stays: it is where the sound tightening wins. */
+
         double obj;
-        int r = solve_relaxation(mip, node, x, &obj, lcur, ucur);
+        int r = solve_relaxation(mip, node, &ws, x, &obj, lcur, ucur);
         if (r == -1) { free(node->lo); free(node->hi); free(node); continue; } /* infeasible */
         if (r == 3) { free(node->lo); free(node->hi); free(node); status = 3; limit_reached = 1; break; } /* lp limit */
         if (r == SOLVE_STOPPED) { free(node->lo); free(node->hi); free(node); status = 4; limit_reached = 1; break; } /* stopped */
@@ -323,17 +685,26 @@ void mip_solve(const MIP *mip, MIPResult *res)
             break;
         }
 
-        /* check integrality; find a fractional integer variable */
+        /* check integrality; pick the most fractional integer variable (fraction
+           closest to 0.5) for branching.  On weak relaxations (the flat
+           fractional assignments of combinatorial models) branching on the
+           variable nearest the midpoint prunes far more effectively than taking
+           the first fractional variable.  (Convergent change on both branches.) */
         int frac = -1; double fracval = 0.0;
         int allint = 1;
+        double best_dist = 2.0;
         for (int j = 0; j < n; j++) {
             if (!mip->isint[j]) continue;
-            if (x[j] < lcur[j] - MIP_TOL || x[j] > ucur[j] + MIP_TOL) { allint = 0; frac = j; fracval = x[j]; break; }
+            int out_of_bounds = (x[j] < lcur[j] - MIP_TOL || x[j] > ucur[j] + MIP_TOL);
             double xj = x[j];
-            if (fabs(xj - floor(xj + 0.5)) > MIP_TOL) {
-                allint = 0; frac = j; fracval = xj; break;
+            double f = out_of_bounds ? 0.0 : fabs(xj - floor(xj + 0.5));
+            if (out_of_bounds || f > MIP_TOL) {
+                allint = 0;
+                double dist = out_of_bounds ? 0.0 : fabs(f - 0.5);
+                if (dist < best_dist) { best_dist = dist; frac = j; fracval = xj; }
             }
         }
+        if (!allint && frac == -1) allint = 1;   /* fallback; should not happen */
 
         if (allint) {
             /* In all-solutions satisfaction mode, if any integer variable is
@@ -453,6 +824,9 @@ void mip_solve(const MIP *mip, MIPResult *res)
     Node *n2 = stack;
     while (n2) { Node *t = n2; n2 = n2->next; free(t->lo); free(t->hi); free(t); }
 
+    if (ws.s) solver_destroy(ws.s);
+    free(ws.blo); free(ws.bhi);
+    free(ws.cmin); free(ws.cmax);
     free(x); free(lcur); free(ucur); free(bestx); free(xc);
 }
 
