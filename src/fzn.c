@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <float.h>
 #include <ctype.h>
 #include <limits.h>
 #include <stdint.h>
@@ -3961,7 +3962,35 @@ void fz_solve(const FZModel*m,FZSolution*sol)
     } else {
         Solver*s=solver_create(&lp);
         int rr=solver_solve(s);
-        if(rr==0){
+        /* Same infeasibility-verdict gate as the LP CLI and the MIP bridge:
+           a phase-1 UNSAT on extreme scale-mixed float data that no
+           directed-rounding Farkas check confirms is numerically shaky
+           noise, not a certified verdict -- report UNKNOWN rather than a
+           fabricated UNSATISFIABLE.  Empty-box infeasibility (farkas_ok==0)
+           is exact and stays UNSAT. */
+        int shaky_unsat=0;
+        if(rr==1 && s->farkas_ok){
+            double*fy=(double*)psolve_malloc((size_t)(lp.m?lp.m:1)*sizeof(double));
+            double*fyc=(double*)psolve_malloc((size_t)(lp.m?lp.m:1)*sizeof(double));
+            double*fzl=(double*)psolve_malloc((size_t)lp.n*sizeof(double));
+            double*fzh=(double*)psolve_malloc((size_t)lp.n*sizeof(double));
+            if(fy&&fyc&&fzl&&fzh){
+                int cert=0;
+                if(solver_farkas_duals(s,fy)==0 &&
+                   solver_farkas_boxcert(lp.n,lp.m,lp.Acolptr,lp.Arow,lp.Aval,
+                                         lp.rel,lp.b,lp.l,lp.u,fy,s->mlt,1e-6,
+                                         fyc,fzl,fzh))
+                    cert=1;
+                if(!cert){
+                    double E=solver_row_exposure(lp.n,lp.m,lp.Acolptr,lp.Arow,
+                                                 lp.Aval,lp.l,lp.u);
+                    if(E*DBL_EPSILON>=5e-7)shaky_unsat=1;
+                }
+            }
+            psolve_free(fy);psolve_free(fyc);psolve_free(fzl);psolve_free(fzh);
+        }
+        if(shaky_unsat)sol->status=2;
+        else if(rr==0){
             double*xo=(double*)psolve_malloc((size_t)(ntot?ntot:1)*sizeof(double));
             double obj;solver_optimum(s,xo,&obj);
             memcpy(sol->x,xo,(size_t)ntot*sizeof(double));

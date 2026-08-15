@@ -103,6 +103,15 @@ python3 tools/mip_diff.py 400 12345 | head -2
 # brute-force verdict parity everywhere (discriminating: fails on a
 # pre-change binary because it has no fast path).  Hard gate: rc matters.
 python3 tools/farkas_verify.py 150 20260815 || { echo "farkas_verify: FAIL"; exit 1; }
+# Exact-or-UNKNOWN promotion for scale-mixed LPs (AUDIT not-done #4, roadmap
+# 6.1): exactly-feasible instances with ~1e-13 coefficients against ~1e25
+# bounds must never be reported INFEASIBLE (the pre-change fabrication of
+# record); exactly-infeasible ones keep their verdict only when the directed-
+# rounding box certificate proves it, else honest NUMERICAL_FAILURE/UNKNOWN;
+# well-scaled data must be untouched (scipy verdict parity).  Discriminating:
+# on the pre-change binary it reproduces 6 fabricated INFEASIBLE verdicts.
+# Hard gate: rc matters.
+python3 tools/lp_scale_verify.py 60 20260815 || { echo "lp_scale_verify: FAIL"; exit 1; }
 python3 tools/mip_verify.py 0 | tail -1
 # Adversarial differential test for the sound FBBT bound tightening: mixes
 # tiny coefficients (1e-13) with large variable magnitudes and all three

@@ -168,6 +168,37 @@ void solver_duals(const Solver *s, double *dual);
  * Phase-I-infeasible state is available.  Fills y[0..M). */
 int solver_farkas_duals(Solver *s, double *y);
 
+/* Directed-rounding Farkas box check over the ORIGINAL rows and a given
+ * variable box, O(m + nnz).  `ys` is a candidate dual ray in the solver's
+ * scaled-row space (see solver_farkas_duals); `mlt` is the +1/-1 per-row
+ * sign.  The complete Farkas conditions are re-verified against the
+ * supplied data: relation-sign consistency (violating components are
+ * clamped to 0, soundly weakening the ray) and the separation
+ * min_box (y^T A)x > y^T b + tol*(1+|R|), with both sides computed under
+ * directed rounding (proven corner bounds for the min side, upward for the
+ * rhs side).  Any NaN/inf, infinite needed bound, or failed margin makes
+ * the check fail ("cannot say") -- it can never fabricate a separation.
+ * y/zl/zh are caller scratch of sizes m/n/n.  Returns 1 iff infeasibility
+ * of the box system is PROVEN. */
+int solver_farkas_boxcert(int n, int m, const int *colptr, const int *row,
+                          const double *val, const char *rel, const double *b,
+                          const double *lo, const double *hi, const double *ys,
+                          const int *mlt, double tol,
+                          double *y, double *zl, double *zh);
+
+/* Scale-mix exposure of a box system: max over rows of
+ * sum_j |a_ij| * min(max(|lo_j|,|hi_j|), 1e29).  The double phase-1 decides
+ * infeasibility against an ABSOLUTE artificial-sum tolerance of 1e-6, while
+ * the products feeding its residuals round by up to ~exposure*DBL_EPSILON
+ * even before accumulation; once exposure*eps approaches that tolerance the
+ * verdict ceases to distinguish infeasibility from rounding noise.  Callers
+ * use exposure*DBL_EPSILON >= 5e-7 (half tolerance) as the "shaky"
+ * frontier: an UNCERTIFIED infeasibility verdict past it must be downgraded
+ * to the honest numerical-failure class rather than pruned/printed. */
+double solver_row_exposure(int n, int m, const int *colptr, const int *row,
+                           const double *val,
+                           const double *lo, const double *hi);
+
 /* Reduced costs for all original variables (c_j - (dual . A_j)); rc must be
  * an n_orig-vector.  For a free x=x+ - x-, this is the reduced cost of the
  * positive/original direction (the negative component has the opposite one). */

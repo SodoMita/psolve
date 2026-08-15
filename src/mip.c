@@ -6,6 +6,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <fenv.h>
+#include <float.h>
 
 #define MIP_TOL 1e-6
 
@@ -283,53 +284,14 @@ static int mip_farkas_certified(const MIP *mip, const double *lo, const double *
                                 const double *ys, const int *mlt,
                                 double *y, double *zl, double *zh)
 {
-    const double BIG = 1e29;
-    int n = mip->n, m = mip->m;
-    if (m <= 0) return 0;
-    for (int i = 0; i < m; i++) {
-        double yi = ys[i] * (double)mlt[i];
-        if (!isfinite(yi)) return 0;
-        if (mip->rel[i] == '<' && yi < 0.0) yi = 0.0;
-        else if (mip->rel[i] == '>' && yi > 0.0) yi = 0.0;
-        y[i] = yi;
-    }
-    int rm = fegetround();
-    /* R = y^T b, rounded UP (proven upper bound) */
-    double R = 0.0;
-    fesetround(FE_UPWARD);
-    for (int i = 0; i < m; i++)
-        if (y[i] != 0.0) R += y[i] * mip->b[i];
-    if (!isfinite(R)) { fesetround(rm); return 0; }
-    /* z = y^T A per column, both directions */
-    for (int j = 0; j < n; j++) zl[j] = 0.0;
-    fesetround(FE_DOWNWARD);
-    for (int j = 0; j < n; j++)
-        for (int k = mip->Acolptr[j]; k < mip->Acolptr[j + 1]; k++)
-            zl[j] += y[mip->Arow[k]] * mip->Aval[k];
-    for (int j = 0; j < n; j++) zh[j] = 0.0;
-    fesetround(FE_UPWARD);
-    for (int j = 0; j < n; j++)
-        for (int k = mip->Acolptr[j]; k < mip->Acolptr[j + 1]; k++)
-            zh[j] += y[mip->Arow[k]] * mip->Aval[k];
-    /* L = min_{box} z.x, proven LOWER bound: corner minima, rounded down */
-    fesetround(FE_DOWNWARD);
-    double L = 0.0;
-    for (int j = 0; j < n; j++) {
-        double a = zl[j], c = zh[j];
-        double lj = lo[j], uj = hi[j];
-        if (!isfinite(a) || !isfinite(c) || lj <= -BIG || uj >= BIG) {
-            fesetround(rm); return 0;
-        }
-        double t = a * lj;
-        double t2 = a * uj; if (t2 < t) t = t2;
-        double t3 = c * lj; if (t3 < t) t = t3;
-        double t4 = c * uj; if (t4 < t) t = t4;
-        L += t;
-    }
-    fesetround(rm);
-    if (!isfinite(L) || !isfinite(R)) return 0;
-    double mar = MIP_TOL * (1.0 + fabs(R));
-    return L > R + mar;
+    if (mip->m <= 0 || mip->n <= 0) return 0;
+    /* shared directed-rounding checker lives in solver.c so the LP CLI and
+       the FlatZinc bridge can gate their own infeasibility verdicts with the
+       same proof shape (the long proof comment stays there); the MIP margin
+       is the engine's MIP_TOL. */
+    return solver_farkas_boxcert(mip->n, mip->m, mip->Acolptr, mip->Arow,
+                                 mip->Aval, mip->rel, mip->b, lo, hi,
+                                 ys, mlt, MIP_TOL, y, zl, zh);
 }
 
 /* Persistent simplex state reused across the whole branch-and-bound tree.
@@ -461,6 +423,23 @@ static int solve_relaxation(const MIP *mip, const Node *node, MipWarm *ws,
             fx_result_free(&fres);
         }
         fx_free(&flp);
+        if (status == 1 && r == 1) {
+            /* Neither the Farkas certificate nor the exact fx engine could
+               arbitrate this infeasibility verdict (non-integral data, an
+               exact-engine limit, or a declined ray).  On extreme scale-mixed
+               boxes the double phase-1's infeasibility proof is numerically
+               shaky: its absolute artificial-sum tolerance (1e-6) is small
+               against the rounding noise of the products feeding it
+               (exposure * eps past half that tolerance).  Pruning the node on
+               an uncertified shaky verdict can fabricate UNSAT -- the
+               dangerous, verifier-free direction (AUDIT.md not-done #4;
+               regression pins in tools/lp_scale_verify.py).  Report the
+               honest numerical failure instead; the verdict was trustworthy
+               whenever the exposure is comfortably below the frontier. */
+            double E = solver_row_exposure(n, mip->m, mip->Acolptr, mip->Arow,
+                                           mip->Aval, lo, hi);
+            if (E * DBL_EPSILON >= 5e-7) status = SOLVE_NUMERICAL;
+        }
         }
     }
     for (int j = 0; j < n; j++) { lcur[j] = lo[j]; ucur[j] = hi[j]; }

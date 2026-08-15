@@ -201,9 +201,16 @@ a permanent tool is tracked as recommended future work below.
    engine margin; tsp5 exact re-solves 122 → 0, 2.1× wall, identical
    verdicts/tree/solutions; discriminating test `tools/farkas_verify.py`.
    See `AUDIT.md` addendum (5).
-3. Honesty gap on extreme scale-mixed *non-integral* LPs: double phase-1 may
-   print bare `INFEASIBLE` on data `fx` declines; an exact-or-UNKNOWN
-   promotion path is the principled close.
+3. ~~Honesty gap on extreme scale-mixed *non-integral* LPs: double phase-1 may
+   print bare `INFEASIBLE` on data `fx` declines~~ — **resolved
+   2026-08-15(6)**: the verdict first attempts a directed-rounding Farkas
+   box certificate (`solver_farkas_boxcert`, rescue: truly infeasible
+   models keep INFEASIBLE, certificate-backed), else is promoted to honest
+   NUMERICAL_FAILURE / SOLVE_NUMERICAL / UNKNOWN at the exposure frontier
+   `E·eps ≥ 5e-7` in all three CLIs.  Discriminating hard gate
+   `tools/lp_scale_verify.py` (reproduces 6 fabricated verdicts pre-change,
+   0 post-change, 120/120 scipy parity on healthy data).  See `AUDIT.md`
+   addendum (6).
 4. Phase-I degeneracy convergence weakness on some genuinely infeasible LPs
    (honest `ITERATION_LIMIT`, completeness gap only).
 5. CP scheduling globals (`gecode_schedule_unary`/disjunctive) still decline

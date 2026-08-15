@@ -1,5 +1,82 @@
 # psolve — audit & hardening notes
 
+> **2026-08-15 (6) - branch `arena/cp-engine-correctness`: Phase 6.1 of
+> the ambitious roadmap, exact-or-UNKNOWN promotion for extreme
+> scale-mixed *non-integral* LPs (closes "Not done" item 4 - the last
+> open wrong-verdict gap).**
+>
+> **The fabrication.**  On a row `Σ s_j·a·x_j + x_f = b` with the `x_j`
+> fixed near 1e25, `a` ~1e-13 (non-integral, so the exact engine
+> correctly declines the data), and `x_f ∈ [0,1]`, the double phase-1
+> needs `x_f = b − Σ s_j·a·x_j` slightly above 1 - the products feeding
+> its artificial sum are ~1e12 and round by ~1.2e-4, four orders of
+> magnitude larger than the engine's absolute 1e-6 artificial-sum
+> tolerance - and phase-1 *certifies* a Farkas-style ray and reports
+> bare INFEASIBLE on a model that is exactly feasible (the planted
+> `x_f*` needs no representability: it is a variable value, not data;
+> exact truth is decidable in Fractions over the parsed doubles).  The
+> MIP and FlatZinc bridges then kept the shaky verdict: pinned repro
+> `/tmp/sm_bare_0.fzn` printed `=====UNSATISFIABLE=====` on a feasible
+> model pre-change, the dangerous, verifier-free direction.
+>
+> **The fix, two parts, applied at every place an INFEASIBLE verdict
+> escapes the LP core** (LP CLI in main.c, MIP bridge `solve_relaxation`
+> in mip.c, FZ pure-LP branch in fzn.c):
+>
+> 1. **Rescue.**  A bare-INFEASIBLE verdict first gets to prove itself:
+>    the phase-1 dual ray is re-verified against the ORIGINAL rows and
+>    the variable box by the new exported `solver_farkas_boxcert`
+>    (directed FE_DOWNWARD/UPWARD sweeps for the component bounds `z`
+>    and the corner-minimum `L = min_box yᵀAx`, `R = yᵀb` upward, margin
+>    `tol·(1+|R|)`, poisoned on NaN/inf/≥1e29 sentinels).  Truly
+>    infeasible models keep their verdict, now certificate-backed.
+> 2. **Promotion.**  If the certificate fails and the instance is
+>    exposure-shaky - `solver_row_exposure` computes
+>    `E = max_i Σ_j |a_ij|·min(max(|lo_j|,|hi_j|),1e29)` and the gate is
+>    `E·DBL_EPSILON ≥ 5e-7` (half the phase-1 tolerance) - the verdict
+>    is downgraded instead of printed/pruned: lpsolve prints
+>    NUMERICAL_FAILURE, the MIP relaxation returns SOLVE_NUMERICAL (the
+>    node is not pruned on an unproven verdict), the FZ branch reports
+>    UNKNOWN.  Well-scaled data never reaches the gate (it only fires at
+>    `status==INFEASIBLE && farkas_ok`), and the feasible/optimal side
+>    is untouched: OPTIMAL verdicts were already protected by the
+>    phase-2 solution certificate, so INFEASIBLE was the only
+>    unverified direction.  The exact engine's documented refusal of
+>    non-integral data is unchanged - this closes the *wrong-verdict*
+>    hole, verdict-neutrally for everything else.
+>
+> **Regression lock (project calibration rule).**  New
+> `tools/lp_scale_verify.py`, wired into test.sh as a hard gate
+> (60 instances + seed 20260815): three instance classes whose exact
+> truth is known by construction (Fractions over the parsed doubles) -
+> `feas_shaky` (must never print INFEASIBLE post-change), `inf_shaky`
+> (INFEASIBLE only if certificate-backed, else honest NUMERICAL), and
+> 120 healthy small LPs held to scipy/HiGHS verdict parity - plus the
+> same `feas_shaky` class through the MIP CLI with fixed integer
+> columns.  On the pre-change binary the tool reproduces **6 fabricated
+> INFEASIBLE verdicts** (5 LP-class, 1 MIP-class: `fs_19/20/51/57/58`,
+> `fm_4`) and exits non-zero / exits 0 only on the pre-detection path.
+> Post-change:
+> `checked=250 fabricated_INFEASIBLE=0 rescued=60 promoted_to_honest=48 healthy_checked=120 ALL OK`
+> - every truly-infeasible shaky instance kept its verdict
+> (certificate-backed), 48 shaky-feasible instances became honest
+> NUMERICAL, zero healthy flips.  FZ pinned pair:
+> `/tmp/sm_bare_0.fzn` UNSATISFIABLE→`=====UNKNOWN=====`,
+> `/tmp/sm_inf_0.fzn` stays UNSATISFIABLE.
+>
+> **Sanitizers and full battery.**  ASan/UBSan(+LSan) builds run
+> lp_scale_verify and farkas_verify with identical counts and zero
+> reports; the pinned instances are clean through all three CLIs
+> (lpsolve/mipsolve/fznsolve).  Full `test.sh` exit 0:
+> lp_form_verify OK=302 WRONG=0, mip_diff WRONG=0 at seeds
+> 12345/111/222/333/555, farkas_verify checked=156 (farkas-fired=23)
+> ALL OK, MiniZinc suite 77/77 with 0 semantic diffs vs the committed
+> results JSON (no healthy float model flipped to UNKNOWN - the
+> frontier `E·eps ≥ 5e-7` stays clear of the ±1e9-box synthetic
+> family), oom_test unchanged at 5930 injection points over 6391
+> allocations with failures=0 (the gate's scratch buffers live on cold
+> paths the injector instances do not reach).
+>
 > **2026-08-15 (5) - branch `arena/cp-engine-correctness`: independent
 > verification of the `main` merge, then Phase 6.2 of the ambitious roadmap:
 > the Farkas fast path for infeasibility verdicts in the MIP engine
@@ -821,13 +898,18 @@ specification (see `docs/BRANCH_AUDIT.md` for the full review):
    certificates, exactResolves 0, 0.455s → 0.218s with identical
    verdicts/tree/solutions; discriminating test `tools/farkas_verify.py` in
    `test.sh`.  See the (5) addendum above.
-4. Honesty gap on extreme scale-mixed *non-integral* LPs (found this
-   round): the double phase-1 may report bare INFEASIBLE on data with
-   ~1e-13 coefficients against ~1e25 bounds (repro preserved at
-   /tmp/fbbt_unsat_repro	lp during the session), `fx` declines non-integral
-   data, and the MIP/FZ bridges then keep the shaky verdict instead of an
-   honest UNKNOWN.  `lpsolve` remains the double-precision engine — for
-   certifiable answers on such data `fxsolve` is the right tool — but an
-   exact-or-UNKNOWN promotion path for borderline double verdicts is the
-   principled close.
+4. ~~Honesty gap on extreme scale-mixed *non-integral* LPs~~ —
+   **done 2026-08-15(6)** (this round): a bare-INFEASIBLE verdict from
+   the double phase-1 is now re-verified by the exported
+   `solver_farkas_boxcert` (directed-rounding check of the dual ray
+   against original rows + box); if the certificate fails and
+   `solver_row_exposure`·eps ≥ 5e-7 the verdict is promoted to honest
+   NUMERICAL_FAILURE / SOLVE_NUMERICAL / UNKNOWN in lpsolve, the MIP
+   bridge, and the FZ pure-LP branch respectively.  Truly infeasible
+   shaky models keep INFEASIBLE, certificate-backed (60/60 rescued);
+   the pre-change fabrications (6 reproduced by the discriminating
+   tool) are gone.  Hard gate `tools/lp_scale_verify.py` in `test.sh`.
+   See the (6) addendum above.  `lpsolve` remains the double-precision
+   engine — for certifiable answers on such data `fxsolve` with
+   integral scaling remains the right tool.
 

@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <limits.h>
+#include <float.h>
 
 /* The simplex loop polls this flag, so signal handling stays async-signal-safe:
    the handler only performs a single assignment to sig_atomic_t. */
@@ -104,6 +105,40 @@ int main(int argc, char **argv)
     }
     clock_gettime(CLOCK_MONOTONIC, &t1);
     double secs = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+
+    if (r == 1 && s->farkas_ok) {
+        /* The phase-1 infeasibility verdict needs an independent proof before
+           it may be printed bare: extract the dual ray and re-verify the full
+           Farkas separation against the original rows and box with directed
+           rounding.  If that fails (dirty ray, poisoned arithmetic, margins)
+           AND the model is extreme scale-mixed -- products feeding the
+           phase-1 residuals round by more than half its absolute 1e-6
+           artificial-sum tolerance -- the double verdict cannot distinguish
+           infeasibility from rounding noise (AUDIT not-done #4; an exactly-
+           feasible model printed INFEASIBLE is a fabrication, and no consumer
+           verifier rechecks the UNSAT direction).  Downgrade to the honest
+           numerical-failure class.  An empty-box verdict (farkas_ok == 0) is
+           exact by construction and stays INFEASIBLE. */
+        int n = lp.n, m = lp.m;
+        double *fr_y  = (double*)malloc((size_t)(m ? m : 1) * sizeof(double));
+        double *fr_yc = (double*)malloc((size_t)(m ? m : 1) * sizeof(double));
+        double *fr_zl = (double*)malloc((size_t)n * sizeof(double));
+        double *fr_zh = (double*)malloc((size_t)n * sizeof(double));
+        if (fr_y && fr_yc && fr_zl && fr_zh) {
+            int certified = 0;
+            if (solver_farkas_duals(s, fr_y) == 0 &&
+                solver_farkas_boxcert(n, m, lp.Acolptr, lp.Arow, lp.Aval,
+                                      lp.rel, lp.b, lp.l, lp.u,
+                                      fr_y, s->mlt, 1e-6, fr_yc, fr_zl, fr_zh))
+                certified = 1;
+            if (!certified) {
+                double E = solver_row_exposure(n, m, lp.Acolptr, lp.Arow,
+                                               lp.Aval, lp.l, lp.u);
+                if (E * DBL_EPSILON >= 5e-7) r = SOLVE_NUMERICAL;
+            }
+        }
+        free(fr_y); free(fr_yc); free(fr_zl); free(fr_zh);
+    }
 
     printf("iterations: %ld\n", s->iters);
     printf("time: %.6f s\n", secs);

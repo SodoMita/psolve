@@ -106,8 +106,30 @@ Goal: after this phase there is **no known input class** on which psolve can
 return an uncertified or misleading verdict, and the error-handling protocol
 is safe for a multi-threaded library host.
 
-### 6.1 Exact-or-UNKNOWN promotion for double verdicts
-- **What:** A verdict-grading pass on every LP/MIP/FZ result: classify the
+### 6.1 Exact-or-UNKNOWN promotion for double verdicts — **DONE 2026-08-15(6)**
+Implemented with a sharper design than the blanket scale-mix classifier
+below, aimed at the only unverified direction (INFEASIBLE — OPTIMAL was
+already protected by the phase-2 solution certificate, and integral data
+already had the fx fallback in the MIP bridge): a bare-INFEASIBLE verdict
+first attempts to **prove itself** — the exported `solver_farkas_boxcert`
+re-verifies the phase-1 dual ray against the original rows and box with
+directed rounding (rescue: truly infeasible models keep the verdict,
+certificate-backed) — and otherwise, when
+`solver_row_exposure`·DBL_EPSILON ≥ 5e-7 (half the phase-1 tolerance), the
+verdict is **promoted** to NUMERICAL_FAILURE / SOLVE_NUMERICAL / UNKNOWN
+in lpsolve, the MIP relaxation, and the FZ pure-LP branch (no pruning on
+an unproven verdict). Acceptance evidence: the pinned repros flip from
+fabricated INFEASIBLE/UNSATISFIABLE to honest UNKNOWN in all three CLIs
+(FZ `/tmp/sm_bare_0.fzn` UNSATISFIABLE→UNKNOWN, feasible model);
+discriminating hard gate `tools/lp_scale_verify.py` in test.sh reproduces
+6 fabricated INFEASIBLE verdicts on the pre-change binary (5 LP-class,
+1 MIP-class) and post-change reports `checked=250 fabricated=0
+rescued=60 promoted=48 healthy_checked=120 ALL OK` (scipy verdict parity
+on well-scaled data, zero flips); ASan/UBSan(+LSan) clean; full battery
+exit 0, mip_diff WRONG=0 ×5 seeds, MiniZinc 77/77 with 0 semantic diffs.
+AUDIT.md addendum 2026-08-15(6). Design discussion kept below for the
+record:
+- **What (original design):** A verdict-grading pass on every LP/MIP/FZ result: classify the
   instance's data scale-mix (max |aᵢⱼ| / min positive |aᵢⱼ| over the active
   rows, bound magnitudes, cancellation risk). Verdicts from the double engine
   on data beyond a measured reliability frontier are *promoted*: re-decided
@@ -804,7 +826,7 @@ nothing in M3–M6 may land without the Phase-14 CI cell being green first
 |---|---|
 | 2. setjmp protocol redesign | **Phase 6.3** (M1) |
 | 3. Farkas-certificate fast path | **DONE 2026-08-15(5)** (Phase 6.2): tsp5 exact re-solves 122 → 0, 2.1× wall |
-| 4. Scale-mixed non-integral honesty gap | **Phase 6.1** (M1); exact substrate 9.x makes promotion cheap (M2) |
+| 4. Scale-mixed non-integral honesty gap | **DONE — Phase 6.1, 2026-08-15(6)** (rescue + exposure-gate promotion; `tools/lp_scale_verify.py`); exact substrate 9.x would make promotion *cheap* (M2) |
 | B. Phase-I degenerate-infeasible convergence | **Phase 7.4/7.5** (crash+scaling) with 6.1 as the honesty backstop |
 | CP scheduling globals decline to MIP | **Phase 10.2** (edge finding) — closes `gecode_schedule_unary`/disjunctive gap |
 | `-f` free search no-op | **Phase 11.3** |

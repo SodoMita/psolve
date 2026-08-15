@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <math.h>
 #include <limits.h>
+#include <fenv.h>
 
 #define TOL_FEAS 1e-9
 #define TOL_PIV  1e-12
@@ -600,6 +601,85 @@ int solver_farkas_duals(Solver *s, double *y)
     for (int i = 0; i < s->M; i++) y[i] = s->cobj[s->basis[i]];
     btrans(s, y);
     return 0;
+}
+
+int solver_farkas_boxcert(int n, int m, const int *colptr, const int *row,
+                          const double *val, const char *rel, const double *b,
+                          const double *lo, const double *hi, const double *ys,
+                          const int *mlt, double tol,
+                          double *y, double *zl, double *zh)
+{
+    const double BIG = 1e29;
+    if (m <= 0 || n <= 0 || !colptr || !rel || !b || !lo || !hi || !ys ||
+        !mlt || !y || !zl || !zh) return 0;
+    for (int i = 0; i < m; i++) {
+        double yi = ys[i] * (double)mlt[i];
+        if (!isfinite(yi)) return 0;
+        if (rel[i] == '<' && yi < 0.0) yi = 0.0;
+        else if (rel[i] == '>' && yi > 0.0) yi = 0.0;
+        y[i] = yi;
+    }
+    int rm = fegetround();
+    /* R = y^T b, rounded UP (proven upper bound) */
+    double R = 0.0;
+    fesetround(FE_UPWARD);
+    for (int i = 0; i < m; i++)
+        if (y[i] != 0.0) R += y[i] * b[i];
+    if (!isfinite(R)) { fesetround(rm); return 0; }
+    /* z = y^T A per column, both directions */
+    for (int j = 0; j < n; j++) zl[j] = 0.0;
+    fesetround(FE_DOWNWARD);
+    for (int j = 0; j < n; j++)
+        for (int k = colptr[j]; k < colptr[j + 1]; k++)
+            zl[j] += y[row[k]] * val[k];
+    for (int j = 0; j < n; j++) zh[j] = 0.0;
+    fesetround(FE_UPWARD);
+    for (int j = 0; j < n; j++)
+        for (int k = colptr[j]; k < colptr[j + 1]; k++)
+            zh[j] += y[row[k]] * val[k];
+    /* L = min_{box} z.x, proven LOWER bound: corner minima, rounded down */
+    fesetround(FE_DOWNWARD);
+    double L = 0.0;
+    for (int j = 0; j < n; j++) {
+        double a = zl[j], c = zh[j];
+        double lj = lo[j], uj = hi[j];
+        if (!isfinite(a) || !isfinite(c) || lj <= -BIG || uj >= BIG) {
+            fesetround(rm); return 0;
+        }
+        double t = a * lj;
+        double t2 = a * uj; if (t2 < t) t = t2;
+        double t3 = c * lj; if (t3 < t) t = t3;
+        double t4 = c * uj; if (t4 < t) t = t4;
+        L += t;
+    }
+    fesetround(rm);
+    if (!isfinite(L) || !isfinite(R)) return 0;
+    double mar = tol * (1.0 + fabs(R));
+    return L > R + mar;
+}
+
+double solver_row_exposure(int n, int m, const int *colptr, const int *row,
+                           const double *val,
+                           const double *lo, const double *hi)
+{
+    const double BIGCAP = 1e29;
+    if (!colptr || !row || !val || !lo || !hi || m < 0 || n <= 0) return 0.0;
+    double worst = 0.0;
+    /* accumulate per-column contributions into a reusable row buffer */
+    double *acc = (double*)psolve_calloc((size_t)(m ? m : 1), sizeof(double));
+    if (!acc) return 0.0;
+    for (int j = 0; j < n; j++) {
+        double bj = fabs(lo[j]) > fabs(hi[j]) ? fabs(lo[j]) : fabs(hi[j]);
+        if (bj > BIGCAP) bj = BIGCAP;
+        for (int k = colptr[j]; k < colptr[j + 1]; k++) {
+            int i = row[k];
+            if (i >= 0 && i < m) acc[i] += fabs(val[k]) * bj;
+        }
+    }
+    for (int i = 0; i < m; i++)
+        if (acc[i] > worst) worst = acc[i];
+    psolve_free(acc);
+    return worst;
 }
 
 /* Re-initialize the solver to its starting basis: every original variable
