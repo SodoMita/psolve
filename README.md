@@ -16,8 +16,11 @@ the fixed-point PGS kernel is cross-validated against the float reference.  So:
 fixed-point for the real-time physics hot loop, double precision for the exact
 LP/QP/MIP backbone.
 
-See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the long-term plan (real-time UI /
-vector graphics / 2D physics / FlatZinc completeness).
+See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the original long-term plan
+(real-time UI / vector graphics / 2D physics / FlatZinc completeness) and
+[`docs/ROADMAP_AMBITIOUS.md`](docs/ROADMAP_AMBITIOUS.md) for the living 2026 →
+2028 development programme (correctness closure, LP/MIP/CP engine v2, exact
+arithmetic at scale, proof-carrying verdicts).
 
 It reads a simple text LP format, solves it, and prints the optimum.  The QP
 solver (`qpsolve`) solves convex QPs (minimize ½xᵀQx + cᵀx s.t. Ax ≤ b).  It

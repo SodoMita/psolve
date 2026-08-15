@@ -1,4 +1,8 @@
 # psolve — long-term roadmap
+> **Successor document:** this file records the original phase plan (Phases
+> 0–5) and its completion history. The living forward plan is
+> [`docs/ROADMAP_AMBITIOUS.md`](ROADMAP_AMBITIOUS.md) (2026 → 2028).
+
 **Goal:** a small, dependency-free, real-time solver library for interactive UI,
 vector graphics, and 2D physics, that also stays feature-complete enough to
 test against FlatZinc/MiniZinc.
