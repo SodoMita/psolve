@@ -17,11 +17,13 @@ int main(int argc, char **argv)
     volatile int print = 0;
     volatile long time_ms = 0;
     volatile int arg_idx = 1;
-    while (arg_idx < argc && argv[arg_idx][0] == '-' && strcmp(argv[arg_idx], "--print") != 0) {
+    while (arg_idx < argc && argv[arg_idx][0] == '-') {
         if (strcmp(argv[arg_idx], "-t") == 0 || strcmp(argv[arg_idx], "--time-limit") == 0) {
             if (arg_idx + 1 >= argc) { fprintf(stderr, "missing time limit\n"); return 1; }
             time_ms = atol(argv[++arg_idx]);
             if (time_ms <= 0) { fprintf(stderr, "invalid time limit\n"); return 1; }
+        } else if (strcmp(argv[arg_idx], "--print") == 0) {
+            print = 1;   /* accepted in any position (was: trailing-only) */
         } else {
             fprintf(stderr, "unknown option: %s\n", argv[arg_idx]); return 1;
         }

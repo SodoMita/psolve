@@ -56,6 +56,10 @@ python3 tools/qp_diff.py 200 4242 | head -2
 echo "[5.5/7] MIP solver (branch-and-bound) vs brute force..."
 gcc -O2 -march=native -I src tools/mip_test.c src/mip.c src/fx.c src/err.c src/solver.c src/splu.c src/lu.c src/kernels.c src/parser.c -o /tmp/mip_test -lm
 /tmp/mip_test
+# Contradictory variable bounds (l > u => certified INFEASIBLE) and duplicate
+# sparse triplets (merged by summation), each vs an independent reference.
+echo -n "lp_form_verify (l>u bounds + duplicate triplets, vs scipy): "
+python3 tools/lp_form_verify.py 150 20260815 | sed 's/.*: //'
 # NOTE: this used to read `if [ -f /tmp/mip_verify.py ]`, a path that never
 # exists, so the MIP verification silently never ran.  mip_diff.py replaces it
 # and additionally checks statuses and the returned point, not just the
@@ -82,6 +86,16 @@ echo "[7/7] Fuzz malformed inputs under ASan/UBSan..."
 if command -v gcc >/dev/null; then
   python3 tools/fuzz_inputs.py --iters 80 --seed 7
   python3 tools/fuzz_fzn.py --iters 120 --seed 7
+  echo -n "fz_leak_test (fz_read partial-model cleanup, needs LSan): "
+  gcc -std=gnu11 -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all -I src \
+      -o /tmp/fz_leak_test tools/fz_leak_test.c src/fzn.c src/mip.c src/err.c src/solver.c \
+      src/splu.c src/lu.c src/kernels.c src/parser.c src/fx.c -lm
+  # the accept/reject verdict is printed by the tool; the leak verdict is
+  # LeakSanitizer's exit code (the tool erases its stack so dead-frame
+  # pointers cannot hide a leaked partial model from the root scan)
+  ASAN_OPTIONS=detect_leaks=1 /tmp/fz_leak_test >/dev/null 2>&1 \
+      && echo "OK (no leaks, accept/reject correct)" \
+      || { echo "FAIL"; exit 1; }
 else
   echo "  (skipped: gcc not available)"
 fi

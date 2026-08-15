@@ -201,9 +201,45 @@ int lp_read(const char *path, LP *out)
     lp->Arow = (int*)psolve_malloc((size_t)(nnz ? nnz : 1) * sizeof(int));
     lp->Aval = (double*)psolve_malloc((size_t)(nnz ? nnz : 1) * sizeof(double));
     if (!lp->Acolptr || !lp->Arow || !lp->Aval) goto err2;
-    lp->Acolptr[0] = 0;
-    for (int j = 0; j < n; j++) lp->Acolptr[j + 1] = colcount[j];
-    for (long k = 0; k < nnz; k++) { lp->Arow[k] = out_r[k]; lp->Aval[k] = out_v[k]; }
+    /* Canonicalize the CSC: duplicate (row,col) triplets are merged by
+       summing coefficients (GLPK semantics).  The plain counting sort passed
+       duplicates through, and the solver core then treated the duplicated
+       row inconsistently (matrix-vector products summed both entries while
+       column reads kept one), degrading a legitimate LP to
+       NUMERICAL_FAILURE (external audit F-2).  Row order inside a column is
+       first-touch order, as before; only the multiplicity changes. */
+    {
+        int *marker = (int*)psolve_calloc((size_t)(m ? m : 1), sizeof(int));
+        double *acc = (double*)psolve_malloc((size_t)(m ? m : 1) * sizeof(double));
+        int *tlist = (int*)psolve_malloc((size_t)(m ? m : 1) * sizeof(int));
+        if (!marker || !acc || !tlist) { free(marker); free(acc); free(tlist); goto err2; }
+        long w = 0;
+        int seg_start = 0;
+        int merge_bad = 0;
+        for (int j = 0; j < n; j++) {
+            int seg_end = colcount[j];         /* end offset of column j */
+            lp->Acolptr[j] = (int)w;
+            int nt = 0;
+            for (int p = seg_start; p < seg_end; p++) {
+                int rr = out_r[p];
+                if (marker[rr] != j + 1) { marker[rr] = j + 1; acc[rr] = out_v[p]; tlist[nt++] = rr; }
+                else acc[rr] += out_v[p];
+            }
+            seg_start = seg_end;
+            for (int t = 0; t < nt; t++) {
+                int rr = tlist[t];
+                if (!isfinite(acc[rr])) {       /* summed coefficients overflowed */
+                    fprintf(stderr, "matrix coefficient overflow merging column %d\n", j);
+                    merge_bad = 1; break;
+                }
+                lp->Arow[w] = rr; lp->Aval[w] = acc[rr]; w++;
+            }
+            if (merge_bad) break;
+        }
+        lp->Acolptr[n] = (int)w;
+        free(marker); free(acc); free(tlist);
+        if (merge_bad) goto err2;
+    }
     free(colcount); free(out_r); free(out_v);
     fclose(f);
     *out=storage;

@@ -165,7 +165,7 @@ static Expr parse_expr(const char*s,size_t*pos,FZModel*m,int*err)
     }
     return e;
 }
-static void expr_free2(Expr*e){ if(e->n>0){for(int i=0;i<e->n;i++)lin_free(&e->els[i]);free(e->els);e->els=NULL;e->n=0;} }
+static void expr_free2(Expr*e){ if(!e)return; for(int i=0;i<e->n;i++)lin_free(&e->els[i]); free(e->els); e->els=NULL; e->n=0; }
 
 /* parse a scalar expression into a Lin */
 static int parse_lin(FZModel*m,const char*s,Lin*out)
@@ -173,7 +173,7 @@ static int parse_lin(FZModel*m,const char*s,Lin*out)
     size_t pos=0;int err=0;
     Expr e=parse_expr(s,&pos,m,&err);
     while(isspace((unsigned char)s[pos]))pos++;
-    if(err||s[pos]!='\0'||e.is_array||e.n!=1){ if(e.n>0){for(int i=0;i<e.n;i++)lin_free(&e.els[i]);free(e.els);} return -1; }
+    if(err||s[pos]!='\0'||e.is_array||e.n!=1){ expr_free2(&e); return -1; }
     *out=e.els[0]; free(e.els);
     return 0;
 }
@@ -225,7 +225,7 @@ static int parse_array(FZModel*m,const char*s,Lin**out,int*outn)
     size_t pos=0;int err=0;
     Expr e=parse_expr(s,&pos,m,&err);
     while(isspace((unsigned char)s[pos]))pos++;
-    if(err||s[pos]!='\0'||!e.is_array){ if(e.n>0){for(int i=0;i<e.n;i++)lin_free(&e.els[i]);free(e.els);} return -1; }
+    if(err||s[pos]!='\0'||!e.is_array){ expr_free2(&e); return -1; }
     *out=e.els;*outn=e.n; return 0;
 }
 static void free_lins(Lin*arr,int n){for(int i=0;i<n;i++)lin_free(&arr[i]);free(arr);}
@@ -360,10 +360,11 @@ int fz_read(const char*path,FZModel*m)
     memset(m,0,sizeof(*m));
     FILE*f=fopen(path,"r");if(!f){fprintf(stderr,"cannot open %s\n",path);return -1;}
     fseek(f,0,SEEK_END);long sz=ftell(f);fseek(f,0,SEEK_SET);
+    if(sz<0){fclose(f);return -1;}   /* defensive: ftell failure (external audit F-4) */
     char*src=(char*)psolve_malloc((size_t)(sz+1));size_t rd=fread(src,1,(size_t)sz,f);src[rd]=0;fclose(f);
     m->file=psolve_strdup(path);
     Token*toks=0;int nt=0;
-    if(lex(src,&toks,&nt)!=0){free(src);return -1;}
+    if(lex(src,&toks,&nt)!=0){free(src);fz_model_free(m);return -1;}
     int ti=0;
     while(ti<nt){
         Token*tk=&toks[ti];
@@ -458,7 +459,26 @@ int fz_read(const char*path,FZModel*m)
                 }
                 /* optional 'var' before the type (array ... of var int) */
                 if(ti<nt&&is_kw(toks[ti].text,"var")){ is_var=1; d->is_var=1; ti++; }
-                if(ti<nt&&toks[ti].kind==TK_IDENT){if(is_kw(toks[ti].text,"int"))d->kind=FZ_K_INT;else if(is_kw(toks[ti].text,"float"))d->kind=FZ_K_FLOAT;else if(is_kw(toks[ti].text,"bool"))d->kind=FZ_K_BOOL;ti++;}
+                if(ti<nt&&toks[ti].kind==TK_IDENT){
+                    if(is_kw(toks[ti].text,"int"))d->kind=FZ_K_INT;
+                    else if(is_kw(toks[ti].text,"float"))d->kind=FZ_K_FLOAT;
+                    else if(is_kw(toks[ti].text,"bool"))d->kind=FZ_K_BOOL;
+                    else{
+                        /* The only legal FlatZinc construct with an identifier
+                           in type position is a set-parameter domain (var D: x)
+                           -- and this reader resolves no declared names here,
+                           so accepting it would silently drop the domain and
+                           solve the wrong problem over the +-1e9 sentinel box
+                           (an interior optimum would not even trip the
+                           sentinel-hit UNKNOWN guard).  The MiniZinc compiler
+                           grounds every domain to a literal range/set, so
+                           rejecting unresolvable domains costs nothing
+                           legitimate; a silent wrong domain would be a
+                           fabricated answer. */
+                        free_toks(toks,nt);free(src);fz_model_free(m);return -1;
+                    }
+                    ti++;
+                }
                 /* FlatZinc set domain: var {1,3,5}: x. */
                 if(ti<nt&&toks[ti].kind==TK_SYM&&strcmp(toks[ti].text,"{")==0){
                     long vmin=1000000000L,vmax=-1000000000L; int nv=0;
@@ -486,13 +506,13 @@ int fz_read(const char*path,FZModel*m)
                 if(ti<nt&&(toks[ti].kind==TK_INT||toks[ti].kind==TK_FLOAT)){
                     int lo_kind=toks[ti].kind, hi_kind=TK_INT;
                     double lo,hi;
-                    if(tok_number(&toks[ti],&lo)!=0){free_toks(toks,nt);free(src);return -1;}
+                    if(tok_number(&toks[ti],&lo)!=0){free_toks(toks,nt);free(src);fz_model_free(m);return -1;}
                     ti++;
-                    if(!(ti<nt&&toks[ti].kind==TK_SYM&&strcmp(toks[ti].text,"..")==0)){free_toks(toks,nt);free(src);return -1;}
+                    if(!(ti<nt&&toks[ti].kind==TK_SYM&&strcmp(toks[ti].text,"..")==0)){free_toks(toks,nt);free(src);fz_model_free(m);return -1;}
                     ti++;
-                    if(ti>=nt||tok_number(&toks[ti],&hi)!=0){free_toks(toks,nt);free(src);return -1;}
+                    if(ti>=nt||tok_number(&toks[ti],&hi)!=0){free_toks(toks,nt);free(src);fz_model_free(m);return -1;}
                     hi_kind=toks[ti].kind;ti++;
-                    if(hi<lo){free_toks(toks,nt);free(src);return -1;}
+                    if(hi<lo){free_toks(toks,nt);free(src);fz_model_free(m);return -1;}
                     if(d->kind==FZ_K_NONE)d->kind=(lo_kind==TK_FLOAT||hi_kind==TK_FLOAT)?FZ_K_FLOAT:FZ_K_INT;
                     d->has_lo=1;d->has_hi=1;d->lo=(double*)psolve_malloc(sizeof(double));d->hi=(double*)psolve_malloc(sizeof(double));
                     d->lo[0]=lo;d->hi[0]=hi;
@@ -530,7 +550,7 @@ int fz_read(const char*path,FZModel*m)
                         Lin*arr=NULL;int narr=0;
                         if(parse_array(m,rhs,&arr,&narr)!=0 || (d->n>0&&narr!=d->n)){
                             if(arr)free_lins(arr,narr);
-                            free(rhs);free_toks(toks,nt);free(src);return -1;
+                            free(rhs);free_toks(toks,nt);free(src);fz_model_free(m);return -1;
                         }
                         d->n=narr;d->is_alias=1;
                         d->alias_idx=(int*)psolve_calloc((size_t)(narr?narr:1),sizeof(int));
@@ -545,7 +565,7 @@ int fz_read(const char*path,FZModel*m)
                                 else if(d->alias_idx[q]!=first+q)contiguous=0;
                             } else {ok=0;break;}
                         }
-                        if(!ok){free_lins(arr,narr);free(rhs);free_toks(toks,nt);free(src);return -1;}
+                        if(!ok){free_lins(arr,narr);free(rhs);free_toks(toks,nt);free(src);fz_model_free(m);return -1;}
                         d->base_idx=contiguous&&first>=0?first:-1;
                         free_lins(arr,narr);
                     } else if(d->is_array){
@@ -558,7 +578,7 @@ int fz_read(const char*path,FZModel*m)
                         Lin l;memset(&l,0,sizeof(l));
                         if(parse_lin(m,rhs,&l)!=0 ||
                            !(l.n==0 || (l.n==1&&fabs(l.coef[0]-1.0)<=1e-12&&fabs(l.constant)<=1e-12))){
-                            lin_free(&l);free(rhs);free_toks(toks,nt);free(src);return -1;
+                            lin_free(&l);free(rhs);free_toks(toks,nt);free(src);fz_model_free(m);return -1;
                         }
                         d->is_alias=1;d->alias_idx=(int*)psolve_calloc(1,sizeof(int));d->alias_const=(double*)psolve_calloc(1,sizeof(double));
                         if(l.n==0){d->alias_idx[0]=-1;d->alias_const[0]=l.constant;d->base_idx=-1;}

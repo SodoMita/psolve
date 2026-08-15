@@ -1,5 +1,113 @@
 # psolve — audit & hardening notes
 
+> **2026-08-15 (2) — branch `arena/cp-engine-correctness`: external-audit
+> round.**  An independent audit of `main`@248eb2f (report supplied by the
+> repository owner) reached a "well-hardened" verdict with one Medium and a
+> handful of minor findings.  All six actionable findings were reproduced on
+> this branch first, fixed, and regression-locked with differential tests
+> proven to fail on the pre-fix binaries; the round also surfaced a parser
+> hole the audit did **not** find (silently swallowed identifier domains),
+> caught because the new leak tool's own calibration was wrong (LSan hides
+> block-buffered stdout — see below).
+>
+> | # | Severity | Finding | Disposition |
+> |---|----------|---------|-------------|
+> | F-1 | Medium | False `UNBOUNDED` on contradictory bounds (`l > u`) | fixed + gated |
+> | F-2 | Low | Duplicate `(row,col)` triplets not merged | fixed (parser + API) |
+> | F-3 | Low | `fz_read` leaks the partial model on parse errors | fixed (8 paths) + deeper container leak |
+> | F-4 | nit | `ftell() < 0` unchecked in `fz_read` | fixed |
+> | F-5 | Low | single-active-solve `setjmp` protocol undocumented | documented (redesign still open — "Not done" #2) |
+> | F-6 | nit | `mipsolve --print` only accepted trailing | fixed |
+> | F-7 | info | AGPL-3.0 not surfaced in README | documented |
+>
+> **F-1 — false `UNBOUNDED`, mechanism.**  The parser and the API both accept
+> a contradictory box (`l[j] > u[j]`); only generators never emit one.  The
+> entering rules skip the stuck variable, so a phase-2 walk could ride a ray
+> on a *free* one and report `UNBOUNDED` — a status that asserts a feasible
+> ray, i.e. implies feasibility of an empty problem: a wrong answer
+> (`maximize 2x₁`, `x₁ ∈ [5,2]`, one free variable reported `UNBOUNDED`).
+> Fix, two layers: (a) an up-front empty-box scan in `solver_solve_impl` and,
+> for parity, in `solver_warm_solve` (a warm solve may follow
+> `solver_set_bounds`, which accepts any pair) reports **certified
+> `INFEASIBLE`** — no constraint examination is needed when a variable admits
+> no assignment; (b) belt-and-braces, the `r==2` UNBOUNDED return is now
+> gated by the same `solver_feasible()` primal certificate that gates
+> OPTIMAL, degrading to `SOLVE_NUMERICAL` instead of a false status.
+>
+> **F-2 — duplicate triplets, mechanism.**  The counting sort in `lp_read`
+> passed duplicate `(row,col)` entries through, after which the core treated
+> the duplicated row inconsistently (matrix-vector products summed both
+> entries while column reads kept one), degrading `x+x≤4, max x` (*OPTIMAL
+> 2*) to `NUMERICAL_FAILURE`.  Fix: canonicalize by summing duplicates (GLPK
+> semantics) in both ingestion paths — `lp_read` during CSC materialization
+> (epoch-marker accumulator, `isfinite` overflow reject on merged sums) and
+> `solver_create_internal` for API callers.  Cancellations to exactly 0.0 are
+> kept as explicit zeros: inert for products and reads, and dropping them
+> would churn allocation bookkeeping for no correctness benefit.
+>
+> **F-3 — partial-model leaks, plus a deeper one the audit did not name.**
+> All 8 `fz_read` error returns now call `fz_model_free(m)` (`fz_new_decl`
+> counts its slot immediately, so partial frees are safe).  Additionally
+> `expr_free2`'s `if (e->n > 0)` guard skipped `free(e->els)` for an
+> empty-but-allocated container, leaking a cap-8 (256 B) elements array on
+> any `[`-primary that errored before its first element; the guard is gone
+> and `parse_lin`/`parse_array` now share `expr_free2`.  **Why a C harness,
+> not the fuzzer:** LSan's root scan treats pointers left in dead stack
+> frames as reachable, so a leak inside a caller's just-returned frame is
+> *invisible* through the CLI; `tools/fz_leak_test.c` reads each malformed
+> input in a `noinline` helper and then clobbers 32 KB of stack, after which
+> the leak is genuinely unreachable and LSan reports it.  Proven
+> discriminating: pre-fix build exits 1 with
+> `5878 bytes leaked in 24 allocations`; fixed build exits 0 clean.
+> Wired into `test.sh` as a hard gate under ASan with `detect_leaks=1`.
+>
+> **Self-found this round (the audit did not report it): identifier domains
+> silently swallowed in `fz_read`.**  The new tool's case
+> `var foo..bar: q;` was expected-reject — and *parsed*.  An identifier in
+> type position was consumed and ignored, degrading the declaration to an
+> unbounded variable over the ±1e9 bridge sentinel box (`FZ_BIG_BOUND`);
+> interior optima over that box do not even trip the sentinel-hit UNKNOWN
+> guard, so this was a silent wrong-answer path (e.g. `var opt int: x` or the
+> legal-looking `var D: x` with `D` a declared set parameter — unsupported
+> here).  Why it went unnoticed earlier: LSan at exit terminates via
+> `_exit()` *before* libc flushes block-buffered stdout when piped, so the
+> pre-fix log contained the leak report but no accept/reject lines, and the
+> tool's calibration had never actually been validated against either build.
+> Fix: an unknown identifier in type position is now a hard parse error.
+> MiniZinc's compiler grounds every domain to a literal range/set (verified
+> against 2.9.4 output for `var D: x` and `var 1..n: y` models), so no
+> legitimate input is lost; rejection replaces a fabricated domain.
+> Discrimination: the pre-fix build (leak check disabled) prints
+> `case 2 should be rejected but parsed` / `case 3 should be rejected but
+> parsed`; the fixed build prints `accept/reject OK`.  (Process lesson,
+> reinforced for the second time this week: a regression test's calibration
+> claim must be re-verified empirically from the actual logs, not assumed.)
+>
+> **F-4/F-6 — mechanics.**  `fz_read` now rejects `ftell() < 0` before the
+> allocation size depends on it; `mipsolve`'s option loop accepts `--print`
+> in any position instead of trailing-only.
+>
+> **F-5/F-7 — documentation.**  README's library section now states the
+> single-active-solve rule (process-global `psolve_env` in `src/err.c`;
+> concurrent entry points need an external mutex or process isolation; the
+> setjmp-protocol redesign stays on the "Not done" list) and surfaces the
+> AGPL-3.0 license obligation next to the embedding example.
+>
+> Verification: `tools/lp_form_verify.py` (new — contra-bounds class must
+> answer exactly `INFEASIBLE`, duplicate-triplet LPs checked against a
+> scipy/HiGHS reference, wired into `test.sh`) reads **OK=302 WRONG=0** on
+> the fixed binary vs **WRONG=175/302** on the pre-fix one; both repro LPs
+> (`contra.lp` → `INFEASIBLE`, `dup.lp` → `OPTIMAL 2`) and the ASan/UBSan/
+> LSan-built `lpsolve`/`fznsolve` pass the same batteries.  Full `test.sh`
+> exit 0 with the two new sections (`lp_form_verify`, `fz_leak_test`);
+> `cp_opt_verify` 500/0 and the fzn semantics matrix under the ASan binary;
+> MiniZinc benchmark suite re-run on the final binary: **77/77 PASS with
+> zero semantic diffs** (status/objective/verdict/solutions) against the
+> previously committed results — timings only.  Next optimization targets
+> (unchanged, recorded): sound Farkas-certificate checks to replace the
+> per-node exact-rational infeasibility re-solves in the MIP bridge, and CP
+> support for the scheduling globals still declined to MIP.
+
 > **2026-08-15 — branch `arena/cp-engine-correctness`: optimization strength
 > round — CP incumbent-bound propagation, warm-started B&B relaxations, and a
 > fabricated-optimality fix in the public `solver_warm_solve` API.**

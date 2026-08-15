@@ -125,18 +125,36 @@ static Solver *solver_create_internal(const LP *lp)
 
     /* Fill column pointers by a first pass, then fill. Simplest: build in order. */
     long pos = 0;
-    /* original columns */
-    for (j = 0; j < n; j++) {
-        s->colptr[j] = (int)pos;
-        for (k = lp->Acolptr[j]; k < lp->Acolptr[j + 1]; k++) {
-            int r = lp->Arow[k];
-            double a = lp->Aval[k] * mlt[r];     /* apply row scaling */
-            if (a != 0.0) {
+    /* original columns -- canonicalized: duplicate (row,col) entries handed
+       in through the API are merged by summing (GLPK semantics), so the
+       normalized matrix stays consistent between matvecs and column reads
+       (external audit F-2; the text parser does the same merge).  Merged
+       coefficients that cancel to exactly zero are kept: an explicit 0.0 is
+       inert for both products and reads, and dropping it would churn the
+       allocation/size bookkeeping for no correctness benefit. */
+    {
+        int *mk = (int*)xmalloc((size_t)(m ? m : 1) * sizeof(int));
+        double *acc = (double*)xmalloc((size_t)(m ? m : 1) * sizeof(double));
+        int *tlist = (int*)xmalloc((size_t)(m ? m : 1) * sizeof(int));
+        memset(mk, 0, (size_t)(m ? m : 1) * sizeof(int));
+        for (j = 0; j < n; j++) {
+            s->colptr[j] = (int)pos;
+            int nt = 0;
+            for (k = lp->Acolptr[j]; k < lp->Acolptr[j + 1]; k++) {
+                int r = lp->Arow[k];
+                double a = lp->Aval[k] * mlt[r];     /* apply row scaling */
+                if (a == 0.0) continue;
+                if (mk[r] != j + 1) { mk[r] = j + 1; acc[r] = a; tlist[nt++] = r; }
+                else acc[r] += a;
+            }
+            for (int t = 0; t < nt; t++) {
+                int r = tlist[t];
                 s->row[pos] = r;
-                s->val[pos] = a;
+                s->val[pos] = acc[r];
                 pos++;
             }
         }
+        free(mk); free(acc); free(tlist);
     }
     /* slack columns */
     for (i = 0; i < m; i++) {
@@ -1031,6 +1049,16 @@ static int solve_phase(Solver *s)
 static int solver_solve_impl(Solver *s)
 {
     int r = 0;
+    /* Empty box => INFEASIBLE, certified by construction: a variable with
+       l[j] > u[j] admits no assignment at all, so no constraint examination
+       is needed.  Without this up-front verdict a contradictory box (the
+       parser and the API both accept l > u; only generators never emit it)
+       could surface as UNBOUNDED when the entering rules skip the stuck
+       variable and the phase-2 walk rides a ray on a free one -- a status
+       that implies feasibility, i.e. a wrong answer (external audit F-1). */
+    for (int j = 0; j < s->N; j++) {
+        if (s->l[j] > s->u[j]) { s->status_out = 1; return 1; }
+    }
     /* Phase I: needed if any artificial is in the current basis.  Detecting it
        from the basis (not a flag) makes this work both for the initial solve
        and for warm starts after incremental changes. */
@@ -1114,7 +1142,15 @@ static int solver_solve_impl(Solver *s)
     r = solve_phase(s);
     if (r == SOLVE_NUMERICAL) { s->status_out = SOLVE_NUMERICAL; return SOLVE_NUMERICAL; }
     if (r == SOLVE_STOPPED) { s->status_out = SOLVE_STOPPED; return SOLVE_STOPPED; }
-    if (r == 2) { s->status_out = 2; return 2; }
+    if (r == 2) {
+        /* UNBOUNDED asserts a feasible ray -- i.e. it implies feasibility.
+           Run the same primal certificate that gates OPTIMAL before making
+           that claim; a violation means the verdict is numerical noise,
+           which is what SOLVE_NUMERICAL is for (external audit F-1,
+           belt-and-braces next to the up-front empty-box INFEASIBLE). */
+        if (!solver_feasible(s)) { s->status_out = SOLVE_NUMERICAL; return SOLVE_NUMERICAL; }
+        s->status_out = 2; return 2;
+    }
     if (r == -1) { s->status_out = 3; return 3; }   /* iteration limit hit */
 
     /* Solution certificate: if the claimed optimum does not actually satisfy
@@ -1340,6 +1376,11 @@ int solver_warm_solve(Solver *s)
     if (s->rebuild_pending) {
         solver_refresh(s);
         return s->status_out;
+    }
+    /* empty-box INFEASIBLE check (parity with solver_solve_impl; a warm solve
+       may follow solver_set_bounds, which accepts any bound pair) */
+    for (int j = 0; j < s->N; j++) {
+        if (s->l[j] > s->u[j]) { s->status_out = 1; return 1; }
     }
     s->phase = 2;
     s->bland = 0; s->flat = 0; s->last_obj = -LP_INF;
