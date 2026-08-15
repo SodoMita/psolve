@@ -3947,6 +3947,7 @@ void fz_solve(const FZModel*m,FZSolution*sol)
         mip.lp_iter_limit=2000000;
         MIPResult mr;mip_solve(&mip,&mr);
         sol->nodes=mr.nodes; sol->best_bound=mr.best_bound;
+        sol->farkas_certs=mr.farkas_certs; sol->fx_solves=mr.fx_solves;
         /* An optimisation model may only report an objective the search
            actually proved.  mip.stop_at_feasible is off for those, but check
            the proof flag anyway so a future change cannot leak a merely

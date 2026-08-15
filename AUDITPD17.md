@@ -196,9 +196,11 @@ a permanent tool is tracked as recommended future work below.
 ## 7. Remaining risks after fix (carried to `AUDIT.md` "Not done")
 
 1. `setjmp` allocation-error protocol redesign (global state; thread-hostile).
-2. Farkas-certificate fast path for exact re-solves in the MIP bridge
-   (2026-08-15 instrumentation: 121/122 tsp5 exact re-solves are
-   duality-level; this is the wall-time item).
+2. ~~Farkas-certificate fast path for exact re-solves in the MIP bridge~~
+   — **resolved 2026-08-15(5)**: directed-rounding Farkas certificate with
+   engine margin; tsp5 exact re-solves 122 → 0, 2.1× wall, identical
+   verdicts/tree/solutions; discriminating test `tools/farkas_verify.py`.
+   See `AUDIT.md` addendum (5).
 3. Honesty gap on extreme scale-mixed *non-integral* LPs: double phase-1 may
    print bare `INFEASIBLE` on data `fx` declines; an exact-or-UNKNOWN
    promotion path is the principled close.

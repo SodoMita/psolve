@@ -78,6 +78,8 @@ int main(int argc,char**argv)
     if (opt.show_stats) {
         printf("%%%%mzn-stat: intVariables=%d\n", sol.nvars);
         printf("%%%%mzn-stat: nodes=%ld\n", sol.nodes);
+        printf("%%%%mzn-stat: farkasCerts=%ld\n", sol.farkas_certs);
+        printf("%%%%mzn-stat: exactResolves=%ld\n", sol.fx_solves);
         if (m.solve_kind != 0 && sol.status == 0)
             printf("%%%%mzn-stat: objectiveBound=%.15g\n", sol.best_bound);
         printf("%%%%mzn-stat: solveTime=%.3f\n", secs);

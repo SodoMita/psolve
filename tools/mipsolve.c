@@ -100,6 +100,7 @@ int main(int argc, char **argv)
                 printf("x[%d] = %.10g\n", j, res.x[j]);
     } else if (res.status == 1) {
         printf("status: INFEASIBLE\n");
+        printf("nodes: %ld\n", res.nodes);
     } else if (res.status == 2) {
         printf("status: UNBOUNDED\n");
     } else if (res.status == 3) {
@@ -121,6 +122,11 @@ int main(int argc, char **argv)
         if (print)
             for (int j = 0; j < lp.n; j++)
                 printf("x[%d] = %.10g\n", j, res.x[j]);
+    }
+
+    if (print) {
+        printf("farkas_certs: %ld\n", res.farkas_certs);
+        printf("fx_solves: %ld\n", res.fx_solves);
     }
 
     mip_result_free(&res);

@@ -1,5 +1,64 @@
 # psolve — audit & hardening notes
 
+> **2026-08-15 (5) - branch `arena/cp-engine-correctness`: independent
+> verification of the `main` merge, then Phase 6.2 of the ambitious roadmap:
+> the Farkas fast path for infeasibility verdicts in the MIP engine
+> (closes "Not done" item 3).**
+>
+> **Merge verification (the other agent's `add7cdc`/`f098876`/`c34db8c`
+> merges of this branch and `arena/phase4-ports` into `main`).**  All three
+> merges are textually faithful: tree diffs against the respective branch
+> tips are empty except exactly the files each merged side adds, so no
+> hand-resolved-conflict drift.  Empirically re-verified on `main` in a
+> throwaway worktree: full `./test.sh` exit 0 (incl. oom_test 5882
+> injection points, fz_leak_test, the new arena/tlimit/qp-stop entries),
+> lp_form_verify OK=302 WRONG=0, mip_diff WRONG=0 (two seeds).  The `48712f5`
+> zero-malloc arena port (b7f0561) was read for the previously documented
+> rejection reasons: the new design is thread-local with nesting
+> save/restore and ownership-checked frees (pointer-in-buffer test before
+> treating a pointer as arena-owned), which addresses the
+> ownership/alignment/thread-safety grounds the earlier global-arena design
+> was rejected on; arena_test verifies zero libc heap calls under
+> `-Wl,--wrap=free` and clean undersized-arena failure, and fz-arena results
+> are bit-identical to the libc path per its test.  Verdict: main is
+> healthy; the harvest dispositions in ROADMAP_AMBITIOUS.md Appendix B were
+> updated to reflect that this port is now DONE (by the other agent).
+>
+> **Farkas fast path (mip.c + solver.c).**  A relaxation the double solver
+> declares INFEASIBLE previously always paid for the exact-rational fx
+> re-solve (2026-08-15(3) instrumentation: 121 of 122 tsp5 exact re-solves
+> were duality-level infeasibility).  Now the solver marks its certified
+> Phase-I-infeasible state (`farkas_ok`), `solver_farkas_duals` extracts
+> y = B^{-T} c_B as a HINT, and `mip_farkas_certified` independently
+> re-verifies the full Farkas separation min_box(y'A)x > y'b with directed
+> rounding against the ORIGINAL rows and node box (sign-clamped components,
+> corner-minimum over z intervals, engine margin MIP_TOL*(1+|R|)).  The hint
+> is never trusted: a garbage or stale ray can only fail the check and fall
+> through to the exact path, so the change is verdict-neutral by
+> construction.  Rounding-mode regions are allocation-free; btrans's sparse
+> path allocates and is called outside them.
+>
+> Measured effect (verdicts, node counts, and returned solutions identical
+> everywhere): tsp_5 0.455s -> 0.218s (**2.1x**), 96 Farkas certificates,
+> **exactResolves 0**; open_shop_3x3 / jobshop_3x3 flat (their relaxations
+> were already cheap); solutions byte-identical pre/post on tsp_5.
+>
+> Regression lock (project calibration rule): new `tools/farkas_verify.py`
+> (wired into `test.sh` as a hard gate) pins difference-constraint cycles
+> the root FBBT cannot single-row certify (asserts INFEASIBLE at nodes==1
+> with farkas_certs>=1 and fx_solves==0), margin-discipline families
+> (exactly-infeasible sub-tolerance cycles prove INFEASIBLE matching the
+> exact-arbitration reference; exactly-FEASIBLE tight neighbours must never
+> see a certificate), and a 150-instance random family with planted deep
+> infeasibility checked against tolerance-aware brute force.  On the
+> pre-change binary all verdict checks pass but the tool FAILS ("no fast
+> path"), as required for a performance fix to count as discriminating.
+> ASan/UBSan build runs the tool clean (66 checks); mip_diff WRONG=0 at
+> seeds 12345/111/222/333/555; full test.sh exit 0 (oom_test now 5930
+> injection points over 6391 allocations - the new scratch allocations are
+> injector-covered); MiniZinc suite 77/77 PASSED with 0 semantic diffs vs
+> the committed results JSON (timings only).
+
 > **2026-08-15 (4) — branch `arena/phase4-ports`: final merge pass.  Every
 > remaining remote branch is now dispositioned; `main` is the complete
 > tree.**  Remote survey at pass start: `arena/cp-engine-correctness` (16
@@ -753,12 +812,15 @@ specification (see `docs/BRANCH_AUDIT.md` for the full review):
    `tools/mzn_bench.py` falls back to cp-sat for the linear reference).
 2. Redesign the global `setjmp` allocation-error protocol so a recovering,
    multi-threaded library host can own cleanup without process-global state.
-3. Farkas-certificate check for exact re-solves in the MIP bridge — extract
-   the phase-1 dual ray and interval-check it (outward-rounded `yᵀA ≈ 0`,
-   uncertain components taking the safer bound extreme) instead of a full
-   exact-rational re-solve per infeasible-verdict node.  2026-08-15(3)
-   instrumentation: 121 of 122 tsp5 exact re-solves are duality-level
-   infeasibility a row-scan cannot certify; this is where the wall time is.
+3. ~~Farkas-certificate check for exact re-solves in the MIP bridge~~ —
+   **done 2026-08-15(5)** (this round): `solver_farkas_duals` extracts the
+   phase-1 dual ray as a hint and `mip_farkas_certified` interval-checks the
+   full yᵀA separation with directed rounding (uncertain components take the
+   safer bound extreme, engine margin kept), replacing the full
+   exact-rational re-solve per infeasible-verdict node.  tsp_5: 96
+   certificates, exactResolves 0, 0.455s → 0.218s with identical
+   verdicts/tree/solutions; discriminating test `tools/farkas_verify.py` in
+   `test.sh`.  See the (5) addendum above.
 4. Honesty gap on extreme scale-mixed *non-integral* LPs (found this
    round): the double phase-1 may report bare INFEASIBLE on data with
    ~1e-13 coefficients against ~1e25 bounds (repro preserved at

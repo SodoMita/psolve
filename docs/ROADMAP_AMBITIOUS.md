@@ -124,24 +124,15 @@ is safe for a multi-threaded library host.
   binary; no regression on the existing battery (status split identical on
   well-scaled instances).
 
-### 6.2 Farkas-certificate fast path for infeasible relaxations
-- **What:** when the double solver claims a relaxation infeasible, extract
-  the phase-1 dual ray `y` and verify the Farkas conditions
-  (`yᵀA` against per-column safe bound extremes, `yᵀb < 0`) with
-  **directed rounding / interval arithmetic** — uncertain components take the
-  bound extreme that makes certification *harder*. Only a certified ray
-  yields `INFEASIBLE`; otherwise fall back to the exact re-solve.
-- **Why:** closes AUDIT not-done #3. Instrumentation on 2026-08-15 showed
-  **121 of 122** tsp5 exact re-solves decide duality-level infeasibility that
-  a row scan cannot certify — a ~1% of the cost check replaces ~99% of exact
-  re-solves. This is the single largest known wall-time item in the MIP
-  bridge on combinatorial models.
-- **Acceptance:** instrumented counter drop of exact re-solves ≥90% on the
-  tsp5/cumulative suites with **identical verdicts and identical tree**;
-  adversarial near-degenerate rays (engineered to violate margins) still go
-  to the exact path; directed-rounding implementation itself differential-
-  tested against a Fraction reference on the cancellation family from
-  `tools/fbbt_verify.py`.
+### 6.2 Farkas-certificate fast path for infeasible relaxations — **DONE 2026-08-15(5)**
+Implemented as designed (`solver_farkas_duals` hint + `mip_farkas_certified`
+directed-rounding verification against the original rows, `farkas_ok` state
+marker in `Solver`). Acceptance evidence: tsp_5 exact re-solves **122 → 0**
+(96 certificates, 0.455s → 0.218s) with identical verdicts, node counts and
+byte-identical solutions; `tools/farkas_verify.py` discriminating regression
+(fails on pre-change binary) hard-gated in `test.sh`; ASan/UBSan clean;
+full battery + MiniZinc 77/77 with 0 semantic diffs. AUDIT.md addendum
+2026-08-15(5).
 
 ### 6.3 Error-protocol redesign: retire process-global `setjmp`
 - **What:** replace the global allocation-failure longjmp with per-context
@@ -178,16 +169,15 @@ is safe for a multi-threaded library host.
 - **Acceptance:** extended `tools/qp_diff.py` family, pre/post fail counts
   recorded; any fabricated-class bug fixed with discriminating regressions.
 
-### 6.6 Harvest remaining `phase4-interactive-hardening` commits
-- **What:** `48712f5` (thread-local zero-malloc arena) and `a42be76`
-  (ms-precision time limits + QP cooperative stop) are the only unmerged
-  work on any remote branch. Port each **behind verification**: an earlier
-  global-arena design (`6ebf11d`) was rejected for ownership/alignment/
-  thread-safety bugs, so the arena commit must be audited line-by-line
-  against both parents (meta-lesson: hand-resolved merges get line diffs).
-- **Acceptance:** leak/ASan/TSan evidence; per-frame zero-malloc
-  demonstrated by allocation counters; benefits recorded in AUDIT.md with
-  the same rigor as the FBBT port (`18eb475`).
+### 6.6 Harvest remaining `phase4-interactive-hardening` commits — **DONE 2026-08-15(4/5)**
+Ported by the parallel agent's `arena/phase4-ports` branch and merged to
+`main` (`f098876`): `a42be76` ms-precision time limits + QP cooperative stop
+(`4966773`) and the re-entrant thread-local zero-malloc arena (`b7f0561` +
+`df028c2`, designed to the previously documented rejection reasons — no
+process-global arena, ownership-checked frees). Independently verified this
+round: merges textually faithful (empty tree diffs vs branch tips), full
+battery green on `main`, zero-libc-heap proof under `--wrap=free`,
+oom/fz_leak gates pass. See AUDIT.md addenda (4) and (5).
 
 ### 6.7 FlatZinc round-trip & output fuzzing
 - **What:** output-side adversarial tests: re-parse `fznsolve` output with a
@@ -813,7 +803,7 @@ nothing in M3–M6 may land without the Phase-14 CI cell being green first
 | AUDIT item | Disposition |
 |---|---|
 | 2. setjmp protocol redesign | **Phase 6.3** (M1) |
-| 3. Farkas-certificate fast path | **Phase 6.2** (M1), substrate reused by 16.1 |
+| 3. Farkas-certificate fast path | **DONE 2026-08-15(5)** (Phase 6.2): tsp5 exact re-solves 122 → 0, 2.1× wall |
 | 4. Scale-mixed non-integral honesty gap | **Phase 6.1** (M1); exact substrate 9.x makes promotion cheap (M2) |
 | B. Phase-I degenerate-infeasible convergence | **Phase 7.4/7.5** (crash+scaling) with 6.1 as the honesty backstop |
 | CP scheduling globals decline to MIP | **Phase 10.2** (edge finding) — closes `gecode_schedule_unary`/disjunctive gap |
@@ -825,10 +815,10 @@ nothing in M3–M6 may land without the Phase-14 CI cell being green first
 
 | Branch | State | Disposition |
 |---|---|---|
-| `arena/cp-engine-correctness` (HEAD) | active, 16 ahead of main | home of this roadmap |
-| `arena/phase4-interactive-hardening` | +3 vs HEAD | `3573e3a` FBBT **ported** (`18eb475`); `48712f5` + `a42be76` → **6.6** (audit-first port; earlier arena design `6ebf11d` was rejected for ownership/alignment/TSan bugs) |
+| `arena/cp-engine-correctness` (HEAD) | active | home of this roadmap; periodically merged into `main` by the integration pass |
+| `arena/phase4-interactive-hardening` | fully dispositioned | `3573e3a` FBBT **ported** (`18eb475`); `48712f5` + `a42be76` **ported** via `arena/phase4-ports` → merged in `main` (`f098876`), verified 2026-08-15(5) |
 | all other `arena/*`, `feat/*`, `fzn-table-constraint`, `mzfnsh` | fully merged (ahead 0) | none standing; re-survey each window (rule §15.1) |
-| `main` | behind 16 | merge candidate after M1 lands and CI exists |
+| `main` | **current** (contains this branch + phase4 ports) | the integration tree; quarterly review target |
 
 ## Appendix C — Technique → implementation map
 

@@ -106,6 +106,14 @@ typedef struct {
     long flat;             /* iterations without objective improvement */
     double last_obj;
     int needs_phase1;      /* any artificial in the initial basis */
+    int farkas_ok;         /* the last solver_solve(/warm) returned INFEASIBLE
+                              from a certified Phase-I optimum (artsum > tol on
+                              the final, certificate-clean basis).  The basis,
+                              LU/eta factors and the Phase-I objective (cobj)
+                              left behind then describe a genuine Phase-I
+                              optimum, so B^{-T} c_B is a valid Farkas-ray
+                              HINT -- see solver_farkas_duals.  Cleared at the
+                              start of every solve. */
     int negate_obj;        /* original problem was a minimization */
     /* steepest-edge (Goldfarb-Reid) pricing weights */
     double *w;             /* w[j] ~ ||d_j||^2 for nonbasic j */
@@ -146,6 +154,19 @@ int solver_warm_solve(Solver *s);
  * dual must be an M-vector.  The dual of row i gives the marginal change in
  * the objective per unit change in that constraint's right-hand side. */
 void solver_duals(const Solver *s, double *dual);
+
+/* Extract y = B^{-T} c_B at the Phase-I-optimal basis left behind by an
+ * INFEASIBLE verdict (farkas_ok == 1): one component per equality row, in
+ * the scaled-row space of this struct (multiply component i by s->mlt[i] to
+ * obtain the dual of the caller's original row i; mlt is +1/-1 by rhs sign).
+ *
+ * The returned vector is a HINT, never a certificate on its own: the caller
+ * MUST re-verify the Farkas conditions (relation-sign consistency and the
+ * y^T A x > y^T b separation over the variable box) against its own original
+ * data before using it to prune anything.  A wrong or stale hint can only
+ * fail such a check, never fabricate one.  Returns 0 on success, -1 if no
+ * Phase-I-infeasible state is available.  Fills y[0..M). */
+int solver_farkas_duals(Solver *s, double *y);
 
 /* Reduced costs for all original variables (c_j - (dual . A_j)); rc must be
  * an n_orig-vector.  For a free x=x+ - x-, this is the reduced cost of the

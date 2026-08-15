@@ -589,6 +589,19 @@ static void btrans(Solver *s, double *y)
     }
 }
 
+int solver_farkas_duals(Solver *s, double *y)
+{
+    if (!s || !y || !s->farkas_ok || s->M <= 0) return -1;
+    /* Phase-I objective of the basic columns: cobj still holds the Phase-I
+       objective (-1 per artificial, 0 elsewhere) at the return point that set
+       farkas_ok, so y = B^{-T} c_B is the Phase-I-optimal dual vector.  The
+       LU/eta factors belong to the same basis: solve_phase ended on this
+       basis and nothing refactorized after the verdict. */
+    for (int i = 0; i < s->M; i++) y[i] = s->cobj[s->basis[i]];
+    btrans(s, y);
+    return 0;
+}
+
 /* Re-initialize the solver to its starting basis: every original variable
    nonbasic at a bound, and each row served by a slack (if it yields a
    nonnegative value) or a sign-correct artificial.  This is used both at
@@ -1049,6 +1062,10 @@ static int solve_phase(Solver *s)
 static int solver_solve_impl(Solver *s)
 {
     int r = 0;
+    /* The Phase-I-infeasibility marker below is only valid for the solve
+       currently running: clear it on entry so a stale certificate state can
+       never be attributed to a later verdict. */
+    s->farkas_ok = 0;
     /* Empty box => INFEASIBLE, certified by construction: a variable with
        l[j] > u[j] admits no assignment at all, so no constraint examination
        is needed.  Without this up-front verdict a contradictory box (the
@@ -1114,7 +1131,16 @@ static int solver_solve_impl(Solver *s)
                 if (worst > 1e-6 * (1.0 + fabs(artsum))) certified = 0;
             }
             if (certified) {
-                if (artsum > 1e-6) { s->status_out = 1; return 1; }  /* infeasible */
+                if (artsum > 1e-6) {
+                    /* Certified Phase-I INFEASIBLE: keep the Phase-I-optimal
+                       basis and objective in place and mark the state, so the
+                       MIP bridge can pull the dual ray (solver_farkas_duals)
+                       as a HINT for its own directed-rounding Farkas check on
+                       the original model -- replacing most exact-rational
+                       re-solves of infeasibility verdicts. */
+                    s->farkas_ok = 1;
+                    s->status_out = 1; return 1;
+                }
                 break;                                               /* feasible */
             }
             if (attempt++ >= 1) { s->status_out = SOLVE_NUMERICAL; return SOLVE_NUMERICAL; }
@@ -1373,6 +1399,9 @@ static void solver_refresh(Solver *s)
 int solver_warm_solve(Solver *s)
 {
     if(!s)return SOLVE_INVALID;
+    /* same invalidation rule as solver_solve_impl: the marker describes only
+       the verdict currently being produced */
+    s->farkas_ok = 0;
     if (s->rebuild_pending) {
         solver_refresh(s);
         return s->status_out;

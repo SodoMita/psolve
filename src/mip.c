@@ -242,6 +242,96 @@ static int mip_box_conflict(const MIP *mip, const double *lo, const double *hi,
     return 0;
 }
 
+/* ------------------------------------------------------------------ */
+/* Farkas infeasibility certificate over the ORIGINAL rows and node box,
+ * checked with directed rounding in O(m + nnz).  Input `ys` is the raw
+ * Phase-I dual vector the double solver left behind on an INFEASIBLE
+ * verdict (solver_farkas_duals, scaled-row space); `mlt` is the solver's
+ * per-row sign (+1/-1 by rhs sign).  y/zl/zh are caller scratch (m/n/n).
+ *
+ * The solver's vector is a HINT, never trusted on its own: the complete
+ * Farkas conditions are re-verified here against the original MIP data, so
+ * even a garbage or stale ray can only fail this check -- at which point the
+ * caller pays for the exact-rational re-solve exactly as before.  It can
+ * never fabricate a prune.
+ *
+ * Proof shape.  Scale back to original rows: y_i = mlt_i * ys_i.  For every
+ * row-feasible x we need the componentwise implication y_i a_i x <= y_i b_i,
+ * which holds by the row's own constraint iff y_i >= 0 on '<' rows and
+ * y_i <= 0 on '>' rows ('=' rows: any sign, the constraint is an identity).
+ * Components violating their sign are CLAMPED to 0: the row then contributes
+ * the trivial 0 <= 0, which weakens the ray but keeps it sound for any
+ * feasible point.  With z := y^T A it follows that z.x <= y^T b for every
+ * (row-feasible, box-feasible) x, so
+ *
+ *     min_{box} z.x  >  y^T b  (+ engine margin)   ==>   box has no feasible point.
+ *
+ * min z.x over the rectangular box with z_j in the directed-rounding
+ * interval [zl_j, zh_j] is bounded below by the corner minimum
+ * min{zl*l, zl*u, zh*l, zh*u} (all products rounded DOWNWARD), accumulated
+ * downward; y^T b is accumulated UPWARD.  An infinite bound touching any
+ * corner, a NaN/inf anywhere, or a non-finite partial makes the whole check
+ * fail ("cannot say") -- mirroring mip_box_conflict's poison semantics.
+ *
+ * The margin mirrors the engine semantics called out in mip_box_conflict:
+ * row feasibility in this engine is tolerance-based (check_solution accepts
+ * MIP_TOL slack), so a node that is only epsilon-infeasible still hosts
+ * lattice points the engine itself would accept as incumbents; pruning it
+ * would change the OPTIMUM the engine reports.  mar = MIP_TOL*(1+|R|) only
+ * lets certificates fire when no tolerance-slack assignment survives. */
+static int mip_farkas_certified(const MIP *mip, const double *lo, const double *hi,
+                                const double *ys, const int *mlt,
+                                double *y, double *zl, double *zh)
+{
+    const double BIG = 1e29;
+    int n = mip->n, m = mip->m;
+    if (m <= 0) return 0;
+    for (int i = 0; i < m; i++) {
+        double yi = ys[i] * (double)mlt[i];
+        if (!isfinite(yi)) return 0;
+        if (mip->rel[i] == '<' && yi < 0.0) yi = 0.0;
+        else if (mip->rel[i] == '>' && yi > 0.0) yi = 0.0;
+        y[i] = yi;
+    }
+    int rm = fegetround();
+    /* R = y^T b, rounded UP (proven upper bound) */
+    double R = 0.0;
+    fesetround(FE_UPWARD);
+    for (int i = 0; i < m; i++)
+        if (y[i] != 0.0) R += y[i] * mip->b[i];
+    if (!isfinite(R)) { fesetround(rm); return 0; }
+    /* z = y^T A per column, both directions */
+    for (int j = 0; j < n; j++) zl[j] = 0.0;
+    fesetround(FE_DOWNWARD);
+    for (int j = 0; j < n; j++)
+        for (int k = mip->Acolptr[j]; k < mip->Acolptr[j + 1]; k++)
+            zl[j] += y[mip->Arow[k]] * mip->Aval[k];
+    for (int j = 0; j < n; j++) zh[j] = 0.0;
+    fesetround(FE_UPWARD);
+    for (int j = 0; j < n; j++)
+        for (int k = mip->Acolptr[j]; k < mip->Acolptr[j + 1]; k++)
+            zh[j] += y[mip->Arow[k]] * mip->Aval[k];
+    /* L = min_{box} z.x, proven LOWER bound: corner minima, rounded down */
+    fesetround(FE_DOWNWARD);
+    double L = 0.0;
+    for (int j = 0; j < n; j++) {
+        double a = zl[j], c = zh[j];
+        double lj = lo[j], uj = hi[j];
+        if (!isfinite(a) || !isfinite(c) || lj <= -BIG || uj >= BIG) {
+            fesetround(rm); return 0;
+        }
+        double t = a * lj;
+        double t2 = a * uj; if (t2 < t) t = t2;
+        double t3 = c * lj; if (t3 < t) t = t3;
+        double t4 = c * uj; if (t4 < t) t = t4;
+        L += t;
+    }
+    fesetround(rm);
+    if (!isfinite(L) || !isfinite(R)) return 0;
+    double mar = MIP_TOL * (1.0 + fabs(R));
+    return L > R + mar;
+}
+
 /* Persistent simplex state reused across the whole branch-and-bound tree.
  * Successive node relaxations differ ONLY in the variable bounds, which is
  * exactly the supported incremental case (solver_set_bounds +
@@ -257,6 +347,12 @@ typedef struct {
     double *bhi;
     double *cmin;      /* row-activity scratch for mip_box_conflict (m each) */
     double *cmax;
+    double *fy;        /* raw Phase-I dual ray from the solver (m) */
+    double *fyc;       /* sign-clamped ray (m) */
+    double *fzlo;      /* columnwise z = y^T A bounds (n each) */
+    double *fzhi;
+    long    farkas_certs;  /* nodes certified infeasible by the Farkas path */
+    long    fx_solves;     /* relaxations handed to the exact fx solver */
 } MipWarm;
 
 /* build an LP from the MIP with per-node tightened bounds, and solve it;
@@ -321,6 +417,25 @@ static int solve_relaxation(const MIP *mip, const Node *node, MipWarm *ws,
         for (int j = 0; j < n; j++) x[j] = xo[j];
         psolve_free(xo);
     } else if (r == SOLVE_NUMERICAL || r == 1) {
+        int need_exact = 1;
+        if (r == 1 && mip->m > 0 && s->farkas_ok) {
+            /* Farkas fast path: pull the Phase-I dual ray as a hint and prove
+               (or fail to prove) infeasibility against the ORIGINAL rows and
+               node box with directed rounding.  A certified node prunes for
+               O(nnz) instead of paying the exact-rational re-solve; any hint
+               the re-verification rejects (sign-incoherent, numerically
+               poisoned, margin-borderline) falls through to the exact path
+               unchanged, so this cannot alter a verdict.  (2026-08-15(3)
+               instrumentation: 121 of 122 tsp5 exact re-solves were
+               duality-level infeasibility -- precisely this case.) */
+            if (solver_farkas_duals(s, ws->fy) == 0 &&
+                mip_farkas_certified(mip, lo, hi, ws->fy, s->mlt,
+                                     ws->fyc, ws->fzlo, ws->fzhi)) {
+                status = 1;      /* certified infeasible: skip the re-solve */
+                need_exact = 0;
+                ws->farkas_certs++;
+            }
+        }
         /* The double revised-simplex either diverged (SOLVE_NUMERICAL, its
            solution certificate failed) or declared the relaxation INFEASIBLE.
            On the ill-conditioned big-M bases of combinatorial MIPs
@@ -330,8 +445,10 @@ static int solve_relaxation(const MIP *mip, const Node *node, MipWarm *ws,
            rounding.  If the data are integral and the exact solve succeeds we
            trust its verdict; otherwise we keep the double solver's honest
            result. */
+        if (need_exact) {
         FxLP flp; memset(&flp, 0, sizeof(flp));
         if (mip_build_fxlp(mip, lo, hi, &flp) == 0) {
+            ws->fx_solves++;
             FxResult fres; memset(&fres, 0, sizeof(fres));
             int fr = fx_solve(&flp, &fres);
             if (fr == FX_OPTIMAL) {
@@ -344,6 +461,7 @@ static int solve_relaxation(const MIP *mip, const Node *node, MipWarm *ws,
             fx_result_free(&fres);
         }
         fx_free(&flp);
+        }
     }
     for (int j = 0; j < n; j++) { lcur[j] = lo[j]; ucur[j] = hi[j]; }
     return status;   /* solver and box scratch live on in the MipWarm context */
@@ -616,6 +734,10 @@ void mip_solve(const MIP *mip, MIPResult *res)
     ws.bhi = (double*)psolve_malloc((size_t)n * sizeof(double));
     ws.cmin = (double*)psolve_malloc((size_t)(mip->m ? mip->m : 1) * sizeof(double));
     ws.cmax = (double*)psolve_malloc((size_t)(mip->m ? mip->m : 1) * sizeof(double));
+    ws.fy = (double*)psolve_malloc((size_t)(mip->m ? mip->m : 1) * sizeof(double));
+    ws.fyc = (double*)psolve_malloc((size_t)(mip->m ? mip->m : 1) * sizeof(double));
+    ws.fzlo = (double*)psolve_malloc((size_t)n * sizeof(double));
+    ws.fzhi = (double*)psolve_malloc((size_t)n * sizeof(double));
 
     long nodes = 0;
     int status = 1;   /* assume infeasible until a feasible integer found */
@@ -803,6 +925,8 @@ void mip_solve(const MIP *mip, MIPResult *res)
 
     res->nodes = nodes;
     res->best_bound = best_bound;
+    res->farkas_certs = ws.farkas_certs;
+    res->fx_solves = ws.fx_solves;
     /* `obj` is a proven optimum only if nothing cut the search short: no node
        or iteration limit, no cooperative stop, and no stop_at_feasible. */
     res->proven_optimal = (!limit_reached && !stopped_early && have_incumbent);
@@ -827,6 +951,8 @@ void mip_solve(const MIP *mip, MIPResult *res)
     if (ws.s) solver_destroy(ws.s);
     psolve_free(ws.blo); psolve_free(ws.bhi);
     psolve_free(ws.cmin); psolve_free(ws.cmax);
+    psolve_free(ws.fy); psolve_free(ws.fyc);
+    psolve_free(ws.fzlo); psolve_free(ws.fzhi);
     psolve_free(x); psolve_free(lcur); psolve_free(ucur); psolve_free(bestx); psolve_free(xc);
 }
 

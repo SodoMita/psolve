@@ -98,6 +98,11 @@ python3 tools/lp_form_verify.py 150 20260815 | sed 's/.*: //'
 # and additionally checks statuses and the returned point, not just the
 # objective of runs that happened to come back OPTIMAL.
 python3 tools/mip_diff.py 400 12345 | head -2
+# Farkas fast path: Phase-I dual ray re-verified with directed rounding; must
+# certify the pinned cycle relaxations with zero exact re-solves and keep
+# brute-force verdict parity everywhere (discriminating: fails on a
+# pre-change binary because it has no fast path).  Hard gate: rc matters.
+python3 tools/farkas_verify.py 150 20260815 || { echo "farkas_verify: FAIL"; exit 1; }
 python3 tools/mip_verify.py 0 | tail -1
 # Adversarial differential test for the sound FBBT bound tightening: mixes
 # tiny coefficients (1e-13) with large variable magnitudes and all three
