@@ -1,5 +1,6 @@
 #include "fzn.h"
 #include "err.h"
+#include "tlimit.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -55,9 +56,10 @@ int main(int argc,char**argv)
     }
     psolve_try();
     signal(SIGINT, on_sigint);
-    signal(SIGALRM, on_sigint);            /* alarm() fires this for -t limit */
+    signal(SIGALRM, on_sigint);            /* ITIMER_REAL fires this for -t limit */
     psolve_stop_fn = stop_requested;       /* cooperative abort polled by solver */
-    if (opt.time_ms > 0) alarm((unsigned)((opt.time_ms+999)/1000));
+    /* Millisecond precision (alarm() rounded up to whole seconds). */
+    if (tlimit_arm(opt.time_ms) != 0) { psolve_end(); rc = 1; goto done; }
     sol.node_limit = opt.node_limit;       /* wire -n into the MIP node limit */
     sol.all_solutions = opt.all_solutions; /* -a / --all-solutions */
 
@@ -84,6 +86,7 @@ int main(int argc,char**argv)
     if (opt.verbose && sol.status != 0)
         fprintf(stderr, "fznsolve: status=%d nodes=%ld\n", sol.status, sol.nodes);
 done:
+    tlimit_disarm();
     psolve_stop_fn = NULL;
     fz_solution_free(&sol);
     fz_model_free(&m);

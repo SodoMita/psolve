@@ -279,8 +279,9 @@ feature completeness against a huge standard corpus.
 - [x] `solve satisfy` fast path: `stop_at_feasible` returns the first
       integer-feasible solution instead of proving optimality; an LP-rounding
       feasibility heuristic produces incumbents at near-lattice nodes.
-- [x] CLI flags: `-n` (node limit), `-t` (time limit via alarm), `-s` (stats),
-      `-v` (verbose), SIGINT/SIGALRM handlers; `fznsolve` prints objective
+- [x] CLI flags: `-n` (node limit), `-t` (time limit, `ITIMER_REAL` at
+      millisecond precision — see Phase 4), `-s` (stats), `-v` (verbose),
+      SIGINT/SIGALRM handlers; `fznsolve` prints objective
       always and `objectiveBound`/`nodes` in stats.
 - [x] CLI: `-a` / `--all-solutions` for distinct visible finite-domain solutions
       and improving optimization incumbents; continuous satisfaction outputs
@@ -450,13 +451,36 @@ only**, removing all ambiguity.  Examples and generators updated; parser fuzzed
 ---
 
 ## Phase 4 — Hardening for interactive use
-- [ ] `--time-limit` with signal/alarm handler and graceful `UNKNOWN` + best
-      incumbent (no blocking on UI/input threads).
+- [x] **`--time-limit` with signal/alarm handler and graceful stop + best
+      incumbent, at millisecond precision.** Every CLI driver (`lpsolve`,
+      `mipsolve`, `fznsolve`, and now `qpsolve`) arms its budget through the
+      shared `tools/tlimit.h` helper, which uses `ITIMER_REAL` (microsecond
+      resolution) instead of the old `alarm()` (whole-second granularity, which
+      rounded *up*: `-t 1` granted a full second, `-t 1500` granted two).  The
+      QP solver (the UI/layout workhorse) gained cooperative-stop support that
+      it previously lacked: `active_set` and the Phase-I feasibility search now
+      poll `psolve_stop()` and wind down to a new `QP_STOPPED` status, handing
+      back the feasible best incumbent (and *no* incumbent, with `x == NULL`,
+      if a stop lands during the Phase-I search) instead of running to a
+      fabricated OPTIMAL or blocking the frame.  See `tools/qp_stop_test.c`
+      and `tools/tlimit_test.c` for the regressions; a 50 ms budget is verified
+      to fire sub-second.
 - [ ] **Fixed-point end-to-end determinism** (bit-identical across platforms
       for UI/VG/physics; the PGS fixed kernel already guarantees this, extend
       to the rest of the pipeline: integration, collision, rendering).
-- [ ] Memory: optional preallocated arena so per-frame solves do zero `malloc`
-      (critical for 60 fps with no GC pauses).
+- [x] **Re-entrant, thread-local preallocated arena for zero-malloc per-frame
+      solves** (critical for 60 fps with no GC pauses).  `tools/arena_test.c`
+      verifies the QP, LP and exact-`fx` solve paths make **zero** libc heap
+      calls while an arena is active (`--wrap`-counted), give identical answers
+      to a non-arena solve, and are re-entrant (nested `use`/`end` scopes) with
+      sound ownership-checked `realloc`/`free`.  This deliberately supersedes
+      the *unsound* global-arena design previously rejected in the remote-branch
+      audit: the arena is thread-local (no cross-thread corruption, satisfies
+      the "re-entrant, no-global-state" rule), is scoped and nestable, and
+      `psolve_free`/`psolve_realloc` verify ownership before touching a block so
+      a libc pointer is never misread as arena memory.  The PGS kernels were
+      already zero-malloc (caller buffers + alloca); this extends the guarantee
+      to the general LP/QP/MIP/exact solve paths.
 - [ ] Public C API audit: every entry point documented, bounds-checked, and
       returning status codes (no `exit` in library code).
 

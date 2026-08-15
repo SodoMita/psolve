@@ -182,7 +182,7 @@ static FXP(R) *FXP(zalloc)(size_t n)
     if (n == 0) n = 1;
     size_t bytes;
     if (__builtin_mul_overflow(n, sizeof(FXP(R)), &bytes)) return NULL;
-    FXP(R) *a = (FXP(R)*)malloc(bytes);
+    FXP(R) *a = (FXP(R)*)psolve_malloc(bytes);
     if (a) for (size_t i = 0; i < n; i++) { a[i].num = 0; a[i].den = 1; }
     return a;
 }
@@ -314,8 +314,8 @@ static int FXP(solve)(const FxLP *lp, FxResult *res)
     long iters = 0;
 
     FXP(R) *base = FXP(zalloc)((size_t)(n ? n : 1));
-    int *sign = (int*)calloc((size_t)(n ? n : 1), sizeof(int));
-    int *yidx = (int*)malloc((size_t)(n ? n : 1) * sizeof(int));
+    int *sign = (int*)psolve_calloc((size_t)(n ? n : 1), sizeof(int));
+    int *yidx = (int*)psolve_malloc((size_t)(n ? n : 1) * sizeof(int));
     FXP(R) *A = NULL, *b = NULL, *coef = NULL;
     char *rel = NULL;
     int *slackcol = NULL;
@@ -340,7 +340,7 @@ static int FXP(solve)(const FxLP *lp, FxResult *res)
 
     A = FXP(zalloc)((size_t)(M ? (size_t)M * V : 1));
     b = FXP(zalloc)((size_t)(M ? M : 1));
-    rel = (char*)malloc((size_t)(M ? M : 1));
+    rel = (char*)psolve_malloc((size_t)(M ? M : 1));
     if (!A || !b || !rel) { status = FX_ALLOC_FAIL; goto done; }
 
     int row = 0;
@@ -375,7 +375,7 @@ static int FXP(solve)(const FxLP *lp, FxResult *res)
 
     int S = 0;
     for (int r = 0; r < M; r++) if (rel[r] != '=') S++;
-    slackcol = (int*)calloc((size_t)(M ? M : 1), sizeof(int));
+    slackcol = (int*)psolve_calloc((size_t)(M ? M : 1), sizeof(int));
     if (!slackcol) { status = FX_ALLOC_FAIL; goto done; }
     { int cur = V; for (int r = 0; r < M; r++) { if (rel[r] != '=') slackcol[r] = cur++; else slackcol[r] = -1; } }
 
@@ -391,10 +391,10 @@ static int FXP(solve)(const FxLP *lp, FxResult *res)
     int K = V + S + M;
     t.M = M; t.K = K; t.V = V;
     t.T = FXP(zalloc)((size_t)((size_t)(M + 1) * (size_t)(K + 1)));
-    t.basis = (int*)malloc((size_t)(M ? M : 1) * sizeof(int));
-    t.activeVar = (int*)malloc((size_t)(K ? K : 1) * sizeof(int));
-    t.activeRow = (int*)malloc((size_t)(M ? M : 1) * sizeof(int));
-    t.isart = (int*)calloc((size_t)(K ? K : 1), sizeof(int));
+    t.basis = (int*)psolve_malloc((size_t)(M ? M : 1) * sizeof(int));
+    t.activeVar = (int*)psolve_malloc((size_t)(K ? K : 1) * sizeof(int));
+    t.activeRow = (int*)psolve_malloc((size_t)(M ? M : 1) * sizeof(int));
+    t.isart = (int*)psolve_calloc((size_t)(K ? K : 1), sizeof(int));
     if (!t.T || !t.basis || !t.activeVar || !t.activeRow || !t.isart) { status = FX_ALLOC_FAIL; goto done; }
     for (int j = 0; j < K; j++) t.activeVar[j] = 1;
     for (int r = 0; r < M; r++) t.activeRow[r] = 1;
@@ -478,7 +478,7 @@ static int FXP(solve)(const FxLP *lp, FxResult *res)
         if (FXP(ovf)) { status = FX_OVERFLOW; goto done; }
         Fx obj;
         if (FXP(to_fx)(objv, &obj) != 0) { status = FX_OVERFLOW; goto done; }
-        res->x = (Fx*)calloc((size_t)(n ? n : 1), sizeof(Fx));
+        res->x = (Fx*)psolve_calloc((size_t)(n ? n : 1), sizeof(Fx));
         if (!res->x) { status = FX_ALLOC_FAIL; goto done; }
         for (int j = 0; j < n; j++) {
             FXP(R) xv;
@@ -490,7 +490,7 @@ static int FXP(solve)(const FxLP *lp, FxResult *res)
                 xv = FXP(add)(base[j], FXP(mul)(FXP(from_ll)(sign[j]), yv));
             }
             if (FXP(ovf) || FXP(to_fx)(xv, &res->x[j]) != 0) {
-                free(res->x); res->x = NULL;
+                psolve_free(res->x); res->x = NULL;
                 status = FX_OVERFLOW; goto done;
             }
         }
@@ -501,9 +501,9 @@ static int FXP(solve)(const FxLP *lp, FxResult *res)
 done:
     res->iters = iters;
     if (FXP(ovf) && status != FX_ALLOC_FAIL) status = FX_OVERFLOW;
-    free(base); free(sign); free(yidx); free(A); free(b); free(rel);
-    free(slackcol); free(coef);
-    free(t.T); free(t.basis); free(t.activeVar); free(t.activeRow); free(t.isart);
+    psolve_free(base); psolve_free(sign); psolve_free(yidx); psolve_free(A); psolve_free(b); psolve_free(rel);
+    psolve_free(slackcol); psolve_free(coef);
+    psolve_free(t.T); psolve_free(t.basis); psolve_free(t.activeVar); psolve_free(t.activeRow); psolve_free(t.isart);
     res->status = status;
     return status;
 }

@@ -1,4 +1,5 @@
 #include "fx.h"
+#include "err.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -181,14 +182,14 @@ int fx_read(const char*path, FxLP*lp){
     if(fscanf(f,"%d %d",&n,&m)!=2) goto err;
     if(n<=0||m<0||n>1000000||m>1000000){ fprintf(stderr,"invalid dims n=%d m=%d\n",n,m); goto err; }
     lp->n=n; lp->m=m;
-    lp->c=(Fx*)calloc((size_t)n,sizeof(Fx));
-    lp->b=(Fx*)calloc((size_t)(m?m:1),sizeof(Fx));
-    lp->l=(Fx*)calloc((size_t)n,sizeof(Fx));
-    lp->u=(Fx*)calloc((size_t)n,sizeof(Fx));
-    lp->lfinite=(int*)calloc((size_t)n,sizeof(int));
-    lp->ufinite=(int*)calloc((size_t)n,sizeof(int));
-    lp->rel=(char*)malloc((size_t)(m?m:1));
-    lp->A=(Fx*)calloc((size_t)(m?(size_t)m*n:1),sizeof(Fx));
+    lp->c=(Fx*)psolve_calloc((size_t)n,sizeof(Fx));
+    lp->b=(Fx*)psolve_calloc((size_t)(m?m:1),sizeof(Fx));
+    lp->l=(Fx*)psolve_calloc((size_t)n,sizeof(Fx));
+    lp->u=(Fx*)psolve_calloc((size_t)n,sizeof(Fx));
+    lp->lfinite=(int*)psolve_calloc((size_t)n,sizeof(int));
+    lp->ufinite=(int*)psolve_calloc((size_t)n,sizeof(int));
+    lp->rel=(char*)psolve_malloc((size_t)(m?m:1));
+    lp->A=(Fx*)psolve_calloc((size_t)(m?(size_t)m*n:1),sizeof(Fx));
     if(!lp->c||!lp->b||!lp->l||!lp->u||!lp->lfinite||!lp->ufinite||!lp->rel||!lp->A) goto err;
     char tok[80];
     for(int j=0;j<n;j++){ if(fscanf(f,"%79s",tok)!=1||fx_from_str(tok,&lp->c[j])!=0) goto err; }
@@ -235,8 +236,8 @@ err:
 
 void fx_free(FxLP*lp){
     if(!lp) return;
-    free(lp->c);free(lp->b);free(lp->l);free(lp->u);
-    free(lp->lfinite);free(lp->ufinite);free(lp->rel);free(lp->A);
+    psolve_free(lp->c);psolve_free(lp->b);psolve_free(lp->l);psolve_free(lp->u);
+    psolve_free(lp->lfinite);psolve_free(lp->ufinite);psolve_free(lp->rel);psolve_free(lp->A);
     memset(lp,0,sizeof(*lp));
 }
 
@@ -268,7 +269,7 @@ void fx_free(FxLP*lp){
 
 void fx_result_free(FxResult*res){
     if(!res)return;
-    free(res->x); res->x=NULL;
+    psolve_free(res->x); res->x=NULL;
 }
 
 static int fx_lp_valid(const FxLP *lp)

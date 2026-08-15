@@ -1,5 +1,47 @@
 # psolve — audit & hardening notes
 
+> **2026-08-15 (4) — branch `arena/phase4-ports`: final merge pass.  Every
+> remaining remote branch is now dispositioned; `main` is the complete
+> tree.**  Remote survey at pass start: `arena/cp-engine-correctness` (16
+> commits, superset of `feat/finite-domain-cp-engine`,
+> `arena/fzn-set-const-ops`, `feat/flatzinc-complete` — all verified
+> contained, and of latest `main` by construction) plus three leftover
+> `arena/phase4-interactive-hardening` commits; `arena/audit-hardening` and
+> `arena/continue-hardening` unchanged since their documented dispositions
+> (rejections stand; sound parts had been ported earlier).  Merged
+> `arena/cp-engine-correctness` as `add7cdc` after independent
+> re-verification of the merge tree (full `test.sh` exit 0; GLPK sweep
+> 119/119, difftest 0 mismatches; ASan/UBSan fuzz clean).  Then ported the
+> two un-dispositioned phase4 commits onto the new `main`:
+>
+> 1. `a42be76` ms-precision time limits + QP cooperative stop — cherry-picked
+>    cleanly; stop semantics reviewed honest (QP_STOPPED with feasible
+>    incumbent, or NULL x when stopped during Phase-I — never a fabricated
+>    OPTIMAL).  qp_stop_test + tlimit_test + `-t` on all drivers pass.
+> 2. `48712f5` thread-local zero-malloc arena — merged only after re-doing
+>    its allocation-routing invariant on the diverged tree: the CP/engine
+>    merge had reintroduced ~290 raw libc call sites (fz_cp.inc's 65 raw
+>    `free()`s of psolve_malloc'd memory were the headline class), which under
+>    an active arena is a dangling-`free` heap corruption.  Port re-applies
+>    the routing rule to fzn.c/fz_cp.inc/mip.c/solver.c/parser.c; the
+>    grep-enforced post-invariant is *no raw libc allocation call in src/
+>    outside err.c and main.c*.  New `tools/arena_fzn_test.c` extends the
+>    phase4 arena test (which predates the CP engine) to the FlatZinc/CP/MIP
+>    surface: 14 reference models + a direct mip_solve, asserting
+>    --wrap-counted ZERO libc heap calls arena-active, bit-identical
+>    verdicts/objectives/solutions arena-vs-libc, and the
+>    read→solve→free-in-scope + reset/reuse embedding patterns — 91/91
+>    wrapped, ASan/UBSan/LSan clean.  (The one initial FAIL it ever printed
+>    was the test's own knapsack expectation, arithmetic-checked against a
+>    correct solver answer of 34.)  Full branch `test.sh` green incl. the
+>    5882-probe OOM-injection battery.
+>
+> Remaining environment-gated item (unchanged): the MiniZinc differential
+> suite needs a `minizinc` binary, not packaged for Debian — the 77/77
+> real-MiniZinc benchmark was validated on the CP branch's own runs.
+> Designs for the process-global `setjmp` OOM protocol in multi-threaded
+> hosts remain open (the new arena is thread-local and does not worsen it).
+
 > **2026-08-15 (3) — branch `arena/cp-engine-correctness`: fabricated-UNSAT
 > fix in the root FBBT (wrong-answer class), a directed-rounding interval
 > certificate replacing the tolerance prune, and per-node dead-box

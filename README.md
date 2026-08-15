@@ -43,7 +43,7 @@ with an explicit baseline `ARCH`.
 
 ```sh
 ./lpsolve [-t ms|--time-limit ms] <problem.lp> [--print]  # LP (revised simplex, double)
-./qpsolve <qp.qp>                      # convex QP (active-set)
+./qpsolve [-t ms|--time-limit ms] <qp.qp> [--print]  # convex QP (active-set)
 ./mipsolve [-t ms|--time-limit ms] <problem.lp> <nint> <j...> [--print]   # MIP (branch-and-bound)
 ./fznsolve [-a|--all-solutions] [-s] [-v] <problem.fzn>  # FlatZinc reader + solver (Phase 3)
 ./fxsolve <problem.lp> [--print]      # LP (exact rational / fixed-point simplex)
@@ -86,7 +86,14 @@ See `examples/free_vars.lp` for a runnable model.
 
 The QP solver handles: **minimize** ½xᵀQx + cᵀx subject to Ax ≤ b with Q
 symmetric positive semi-definite (convex), reporting the optimum, Lagrange
-multipliers, and status (solved / infeasible).
+multipliers, and status (solved / infeasible).  It supports the same
+cooperative `-t` / `--time-limit` (and Ctrl-C) stop as the LP/MIP drivers:
+the active-set and Phase-I feasibility loops poll `psolve_stop()` and wind
+down to status `QP_STOPPED`, handing back the feasible best incumbent without
+claiming optimality — no blocking on a UI/input thread.  All CLI drivers arm
+their budget through the shared `tools/tlimit.h` helper using `ITIMER_REAL`
+(microsecond resolution) rather than the whole-second-granularity `alarm()`,
+so small per-frame budgets are honored at the requested precision.
 
 The MIP solver (`mipsolve <lp> <nint> <j0 j1 ...>`) solves mixed-integer
 programs by **branch-and-bound** over the revised-simplex LP relaxation: the
@@ -247,6 +254,38 @@ python3 tools/fuzz_inputs.py --iters 200 --seed 1   # fuzz malformed .lp/.qp
 python3 tools/fuzz_fzn.py   --iters 200 --seed 1    # fuzz malformed .fzn
 python3 tools/oom_test.py --full                    # fail every allocation in turn
 ```
+
+## Zero-malloc arena (per-frame solves)
+
+Interactive / real-time callers (UI, physics loops) can run solves with **zero
+libc `malloc` in the hot loop** by supplying a fixed buffer and scoping it as
+the thread's active arena:
+
+```c
+unsigned char buf[1 << 20];
+PSolveArena arena;
+psolve_arena_init(&arena, buf, sizeof(buf));
+
+psolve_arena_use(&arena);      // all psolve_* allocs on this thread -> arena
+solve_lp/qp/mip();             // bump-allocates, zero libc heap calls
+psolve_arena_end();
+
+psolve_arena_reset(&arena);    // reuse the buffer next frame
+```
+
+The arena is **re-entrant and thread-local**: `psolve_arena_use` / `end` nest
+(save/restore the previous arena), and each thread has its own active arena, so
+concurrent frames never corrupt one another.  `psolve_free` / `psolve_realloc`
+are **ownership-checked**: a pointer inside the arena's buffer is a no-op
+free / bump realloc; any other pointer falls back to libc — a libc block is
+never misread as arena memory.  All library allocation routes through the
+`psolve_*` helpers, so while an arena is active the QP, LP, MIP and exact
+(`fxsolve`) solve paths make zero libc heap calls.  An undersized arena reports
+OOM through the `psolve_fail` protocol rather than corrupting memory.  The PGS
+physics kernels were already zero-malloc (caller buffers + alloca).
+
+See `tools/arena_test.c` for the regression (wired into `test.sh`), which
+`--wrap`s the libc heap allocators and asserts zero heap calls under an arena.
 
 ## Incremental solving
 
@@ -431,6 +470,7 @@ src/lu.c        dense LU factorization + forward/back substitution (BTRAN/FTRAN)
 src/splu.c      sparse LU factorization (fill-reducing order + partial pivoting)
                 with hyper-sparse triangular solves
 src/err.c       error-handling protocol (checked allocation, setjmp/longjmp OOM)
+                + re-entrant thread-local zero-malloc arena (PSolveArena)
 src/solver.c    revised-simplex driver, two-phase method, steepest-edge pricing,
                 sparse/dense dispatch, incremental (warm-start) solving,
                 shadow prices + iteration limit
