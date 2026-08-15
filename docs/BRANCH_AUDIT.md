@@ -14,6 +14,18 @@ This pass compared every remote branch against `main` before selecting work for
 | `arena/audit-hardening` | six exclusive commits and three `main` commits missing at final fetch | Reviewed commit by commit; safe/high-value parts were ported and hardened. The branch-and-clip and global arena allocator implementations were rejected as unsound; batch PGS APIs were ported separately. |
 | `arena/continue-hardening` | set semantics / status-honesty fixes + verifiers, plus a division-semantics regression | Reviewed empirically against MiniZinc semantics; sound fixes ported on `arena/fzn-set-status-ports` (now on `main`), one part rejected — see below. |
 
+Follow-up inventory (2026-08-15), completed by `arena/cp-engine-correctness`
+(now fully merged to `main`) and `arena/phase4-ports`:
+
+| Remote branch | State relative to `main` | Result |
+|---|---:|---|
+| `mzfnsh` | fully merged | No action required (MiniZinc shell/examples + benchmark harness). |
+| `feat/finite-domain-cp-engine` | fully contained in `arena/cp-engine-correctness` | Merged via the rollup: Régin all_different CP engine, reif/clause/minmax/element, `-a` enumeration — after audit fixes (heap underflows, silent `llround` rounding, inverted element-offset guard, lattice-step lies) documented in AUDIT.md. |
+| `arena/fzn-set-const-ops` | fully contained in `arena/cp-engine-correctness` | Merged via the rollup (constant/affine-argument wrong-answer fixes; conflicts were cosmetic). |
+| `feat/flatzinc-complete` | fully contained in `arena/cp-engine-correctness` | Merged via the rollup (hybrid CSP/MIP; N-Queens, Sudoku, unbounded products). |
+| `arena/cp-engine-correctness` | merged to `main` (`add7cdc`) | Independently re-verified on the merge tree before merging: full `test.sh` exit 0, GLPK differential sweep 119/119 and difftest 0 mismatches, ASan/UBSan fuzz clean. |
+| `arena/phase4-interactive-hardening` | 3 exclusive commits | All three dispositioned: root FBBT ported+hardened 2026-08-13; ms time limits + thread-local arena merged 2026-08-15 after review/re-routing audit — see "Final disposition" below. |
+
 ### `arena/continue-hardening` review findings
 
 - **REJECTED: `int_div`/`int_mod` floor-division rewrite.**  The branch
@@ -203,6 +215,48 @@ upstream block left it unset on the early-return path).  Independently
 re-validated here: `fbbt_verify` 2400 case-checks across three seeds
 (1/777/999) plus unbounded-gate, infeasible-activity, equality-chain and
 fractional-row hand probes, all agreeing with brute force.
+
+## Final disposition of `arena/phase4-interactive-hardening` (2026-08-15)
+
+All three commits are now on `main` (via `arena/cp-engine-correctness` for the
+FBBT, via `arena/phase4-ports` for the remaining two):
+
+- **`3573e3a` (root FBBT)** — ported 2026-08-13 (`18eb475`) and hardened
+  further (`00f5e1f`: directed-rounding infeasibility certificate replacing
+  the tolerance prune — a fabricated-UNSAT class reachable only at ≥1e10
+  partial cancellation — plus per-node dead-box certificates).  See above.
+- **`a42be76` (millisecond-precision time limits + QP cooperative stop)** —
+  MERGED.  Cherry-picked cleanly onto the post-CP tree (only `tools/
+  mipsolve.c` had drifted).  Reviewed stop semantics before merging: a stop
+  during optimization returns the feasible incumbent as `QP_STOPPED` *without*
+  claiming optimality; a stop during Phase-I returns `res->x == NULL` (no
+  feasible incumbent exists to hand back) — no fabricated verdicts on either
+  path.  Verified: `qp_stop_test` + `tlimit_test` (50 ms budget fires at
+  50.1 ms), `-t` smoke tests on all four drivers, full `test.sh` green.
+- **`48712f5` (re-entrant thread-local zero-malloc arena)** — MERGED after a
+  full re-routing audit of the diverged tree.  The commit mechanically routed
+  all library allocation through the checked `psolve_*` helpers on *its* tree;
+  the CP/engine merge had since reintroduced ~290 raw libc call sites
+  (`src/fz_cp.inc` alone had 65 raw `free()`s of `psolve_malloc`'d memory —
+  benign without an arena, heap corruption under one).  The port therefore
+  re-applied the routing rule to `fzn.c`, `fz_cp.inc`, `mip.c`, `solver.c`,
+  `parser.c` (the commit's `err.c`/`err.h`/`qp.c`/`splu.c`/`fx.c`/
+  `fx_core.inc` hunks applied intact; confirmed zero non-routing deltas) and
+  one miss left by the three-way merge in `solver.c`.  Post-port invariant,
+  grep-enforced: **no raw libc allocation call exists in `src/` outside
+  `err.c` (the router) and `main.c` (a driver)**.  Because `psolve_free` is
+  ownership-checked both ways, raw libc pairs in drivers remain safe; the
+  hazard class (libc `free()` of arena-owned memory) aborts loudly under
+  glibc/ASan, which the new test exploits deliberately.  The phase4
+  `arena_test` predates the CP engine, so `tools/arena_fzn_test.c` extends
+  it: 14 reference FlatZinc models across the CP/table/cumulative/MIP-bridge
+  surface plus a direct `mip_solve`, asserting (a) ZERO libc heap calls while
+  the arena is active (`--wrap`-counted), (b) bit-identical
+  verdicts/objectives/solutions arena vs libc, (c) the read→solve→free
+  inside-one-scope embedding pattern with reset/reuse, under both the wrapped
+  build (91/91 checks) and ASan/UBSan/LSan (no diagnostics).  Full `test.sh`
+  green on the ported tree, including the 5882-probe OOM-injection battery
+  whose failure paths now also unwind through the routed allocation protocol.
 
 ## Additional `main` flaws fixed during the audit
 

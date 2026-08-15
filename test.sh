@@ -71,6 +71,21 @@ gcc -O2 -march=native -DARENA_TEST_WRAP -I src tools/arena_test.c src/qp.c \
     -Wl,--wrap=free -o /tmp/arena_test -lm
 /tmp/arena_test
 
+echo "[5.4/7] Arena over the FlatZinc/CP/MIP bridge (Phase 4 port coverage)..."
+# Same zero-libc-heap guarantee, extended to the CP engine, table/cumulative
+# encodings and the MIP bridge, plus bit-identical arena-vs-libc results.
+gcc -O2 -march=native -DARENA_TEST_WRAP -I src tools/arena_fzn_test.c src/fzn.c \
+    src/mip.c src/fx.c src/err.c src/solver.c src/splu.c src/lu.c src/kernels.c \
+    src/parser.c -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=realloc \
+    -Wl,--wrap=free -o /tmp/arena_fzn_test -lm
+/tmp/arena_fzn_test
+# Missed free-routing is a libc abort in the wrapped build; the sanitizer
+# build turns it into a precise ASan diagnostic.
+gcc -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -I src \
+    tools/arena_fzn_test.c src/fzn.c src/mip.c src/fx.c src/err.c src/solver.c \
+    src/splu.c src/lu.c src/kernels.c src/parser.c -o /tmp/arena_fzn_asan -lm
+/tmp/arena_fzn_asan
+
 echo "[5.5/7] MIP solver (branch-and-bound) vs brute force..."
 gcc -O2 -march=native -I src tools/mip_test.c src/mip.c src/fx.c src/err.c src/solver.c src/splu.c src/lu.c src/kernels.c src/parser.c -o /tmp/mip_test -lm
 /tmp/mip_test

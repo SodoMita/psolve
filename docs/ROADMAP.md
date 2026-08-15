@@ -279,8 +279,9 @@ feature completeness against a huge standard corpus.
 - [x] `solve satisfy` fast path: `stop_at_feasible` returns the first
       integer-feasible solution instead of proving optimality; an LP-rounding
       feasibility heuristic produces incumbents at near-lattice nodes.
-- [x] CLI flags: `-n` (node limit), `-t` (time limit via alarm), `-s` (stats),
-      `-v` (verbose), SIGINT/SIGALRM handlers; `fznsolve` prints objective
+- [x] CLI flags: `-n` (node limit), `-t` (time limit, `ITIMER_REAL` at
+      millisecond precision — see Phase 4), `-s` (stats), `-v` (verbose),
+      SIGINT/SIGALRM handlers; `fznsolve` prints objective
       always and `objectiveBound`/`nodes` in stats.
 - [x] CLI: `-a` / `--all-solutions` for distinct visible finite-domain solutions
       and improving optimization incumbents; continuous satisfaction outputs
