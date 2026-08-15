@@ -23,9 +23,20 @@ It includes the audit's concrete counterexample as a fixed regression:
     true optimum y = 2  (the unsound version reported y = 1).
 
 usage: fbbt_verify.py [N] [seed]
+
+2026-08-15(2) round: the tolerance-padded, round-to-nearest root prune this
+suite guards was found to fabricate UNSAT under catastrophic cancellation
+(products near 1e12 round by ~6e-5, dwarfing the 1e-6*(1+|rhs|) margin;
+fbbt's return value is reported as proven INFEASIBLE with NO LP or exact
+cross-check, so the wrong prune is a wrong final verdict).  The directed-
+rounding rewrite (mip_box_conflict, src/mip.c) is regression-locked below by
+a pinned integral counterexample and a randomized cancellation family whose
+reference is exact dyadic arithmetic (Fractions over the stored doubles) --
+float-tolerance brute force cannot operate at 1e18 coefficient scale.
 """
 
 import itertools, math, os, random, subprocess, sys
+from fractions import Fraction
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 EXE = os.environ.get("PSOLVE_MIPSOLVE", os.path.join(ROOT, "mipsolve"))
@@ -191,6 +202,101 @@ def main():
                     print("FAIL objective: got %r want %r" % (obj, bt[1]))
                     print("   ", (n, m, c, A, b, rel, l, u))
         checked += 1
+
+    # ------------------------------------------------------------------ #
+    # 2026-08-15(2) fabricated-UNSAT regressions (directed-rounding round) #
+    # ------------------------------------------------------------------ #
+
+    # Pinned integral counterexample (the regression of record):
+    #   maximize x0,
+    #   8.658741690308737e17*x0 - 4.4530671550159217e18*x1 <= 2561,
+    #   x0 == 36, x1 == 7, both integer.
+    # Exact activity on the stored doubles (dyadic-exact): 2560 <= 2561 --
+    # feasible; true optimum 36.  The RN activity is 4096, and
+    # 4096 > 2561 + 1e-6*(1+2561), so the pre-fix tolerance prune declared
+    # the model INFEASIBLE before any LP ran; the rigorous certificate does
+    # not fire (its directed-rounded minimum is <= 2560), and the exact
+    # cross-check then recovers OPTIMAL 36.
+    pc = dict(n=2, m=1, c=[1.0, 0.0],
+              A=[[8.658741690308737e+17, -4.4530671550159217e+18]],
+              b=[2561.0], rel=['<'], l=[36.0, 7.0], u=[36.0, 7.0], maximize=True)
+    expect_act = Fraction(pc['A'][0][0]) * 36 + Fraction(pc['A'][0][1]) * 7
+    assert expect_act <= Fraction(2561), "pinned case must be feasible exactly"
+    out = run_one(pc['n'], pc['m'], pc['c'], pc['A'], pc['b'], pc['rel'],
+                  pc['l'], pc['u'], pc['maximize'])
+    status = parse(out)
+    obj = None
+    for ln in out.splitlines():
+        if ln.startswith("objective"):
+            obj = float(ln.split()[-1])
+    ok = (status == "OPTIMAL" and obj == 36.0)
+    print("cancellation pinned case (expect OPTIMAL 36):",
+          "OK" if ok else f"FAIL (status={status} obj={obj})")
+    if not ok:
+        failures += 1
+    checked += 1
+
+    # Randomized cancellation family: two fixed integer variables, one row
+    # whose two huge products nearly cancel to a small exact residual D.
+    # Every instance is feasible (the single box point satisfies the row),
+    # so ANY INFEASIBLE verdict is a fabrication.  Instances are filtered to
+    # the ones whose RN activity crosses the pre-fix tolerance band, so a
+    # pre-fix MIPSOLVE binary provably fails a large share of them (this is
+    # what makes the test discriminating).
+    fam_ok = 0
+    fam_bad = 0
+    fam_target = max(20, ncase // 5)
+    fam = random.Random(seed ^ 0xC4E1)
+    attempts = 0
+    made = 0
+    while made < fam_target and attempts < fam_target * 500:
+        attempts += 1
+        a0i = fam.randint(10**17, 10**18)
+        x0 = fam.randint(2, 40)
+        x1 = fam.randint(2, 40)
+        a1i = -((a0i * x0) // x1)
+        if a1i == 0:
+            continue
+        a0f, a1f = float(a0i), float(a1i)
+        act = Fraction(a0f) * x0 + Fraction(a1f) * x1
+        if act.denominator != 1:
+            continue
+        D = act.numerator
+        if not (1 <= D <= 2_000_000):
+            continue
+        comp = a0f * x0 + a1f * x1               # C-order round-to-nearest
+        if fam.random() < 0.5:
+            rel, rhs = '<', D + 1                # feasible: D <= rhs
+            fires = comp > float(rhs) + 1e-6 * (1.0 + abs(rhs))
+        else:
+            rel, rhs = '>', D - 1                # feasible: D >= rhs
+            fires = comp < float(rhs) - 1e-6 * (1.0 + abs(rhs))
+        if not fires:
+            continue
+        made += 1
+        c0 = fam.randint(-5, 5)
+        obj_exact = float(c0 * x0)               # c = [c0, 0]
+        out = run_one(2, 1, [float(c0), 0.0], [[a0f, a1f]], [float(rhs)],
+                      [rel], [float(x0), float(x1)], [float(x0), float(x1)],
+                      c0 >= 0)
+        status = parse(out)
+        obj = None
+        for ln in out.splitlines():
+            if ln.startswith("objective"):
+                obj = float(ln.split()[-1])
+        # c0 >= 0 -> maximize (obj x0), c0 < 0 -> minimize (obj also c0*x0 at
+        # the single box point either way).
+        exp_obj = float(c0 * x0)
+        if status == "OPTIMAL" and obj is not None and obj == exp_obj:
+            fam_ok += 1
+        else:
+            fam_bad += 1
+            print(f"FAIL cancellation-family: status={status} obj={obj} "
+                  f"expect OPTIMAL {exp_obj}  (a0={a0f!r} a1={a1f!r} "
+                  f"x0={x0} x1={x1} D={D} rel={rel} rhs={rhs})")
+    print(f"cancellation family: OK={fam_ok} FAIL={fam_bad} (of {made} fired instances)")
+    failures += fam_bad
+    checked += made
 
     print("fbbt_verify: checked=%d FAIL=%d (seed=%d)" % (checked, failures, seed))
     return 1 if failures else 0

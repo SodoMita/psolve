@@ -1,5 +1,101 @@
 # psolve — audit & hardening notes
 
+> **2026-08-15 (3) — branch `arena/cp-engine-correctness`: fabricated-UNSAT
+> fix in the root FBBT (wrong-answer class), a directed-rounding interval
+> certificate replacing the tolerance prune, and per-node dead-box
+> certificates in the B&B relaxation driver.**  Remote survey: all branches
+> unchanged since the external-audit round; nothing to port.
+>
+> **Finding (wrong-answer, UNSAT direction).**  `fbbt_tighten`'s root
+> infeasibility prune compared a *round-to-nearest* activity estimate
+> against `rhs + 1e-6·(1+|rhs|)`.  RN accumulation is not a bound: with
+> catastrophic cancellation the products round by up to ~half a ulp of the
+> *partials* (~1e−4-scale at 1e12-magnitude partials), which dwarfs the
+> tolerance, and an overestimated "minimum" then prunes a FEASIBLE model.
+> Reachable only on data with cancellation at ≥1e10-magnitude partials,
+> which is why the existing `fbbt_verify` family (tiny coefficients × large
+> bounds, but small *products*) never crossed the margin.  The prune's
+> caller reports proven INFEASIBLE without running any LP and without the
+> exact-rational cross-check that guards infeasibility verdicts inside the
+> tree — a fabricated final verdict.  Same mechanism, second entrance: the
+> *tightening* step's "one nextafter outward bias" provably under-covers the
+> rest-sum RN error once bounds exceed ~1e15 (a single ulp of
+> underestimate exceeds the absolute 1e-9 slack), collapsing a feasible
+> box into the same fabricated return.  Both entrances closed.
+>
+> **Regression of record** (integral counterexample, found by an exact
+> hunt: Python int/Fraction reference vs IEEE-RN simulation of the C
+> accumulation order): maximize x0 with x0≡36, x1≡7 and
+> `8.658741690308737e17·x0 − 4.4530671550159217e18·x1 ≤ 2561`.  Exact
+> activity over the stored doubles is exactly 2560 ≤ 2561 — feasible,
+> optimum 36 — while the RN activity is 4096 > 2561 + margin.
+> Pre-fix binary: `status: INFEASIBLE`.  Post-fix: `OPTIMAL 36`
+> (the certificate stays silent; the exact cross-check then arbitrates the
+> numerically undecidable double LP).  Pinned plus a 40-instance randomized
+> cancellation family (both relations, exact Fraction references on the
+> stored doubles, filtered to fire the old margin) in `fbbt_verify.py`:
+> **pre-fix binary fails 29/41 of the battery; post-fix passes all**.
+>
+> **Fix architecture — `mip_box_conflict` (src/mip.c).**  One O(nnz)
+> directed-rounding sweep computes a proven lower bound of every row's
+> minimum box activity (FE_DOWNWARD) and a proven upper bound of its
+> maximum (FE_UPWARD) over the *exact double data*.  No accumulation
+> tolerance is needed or sound: unbounded sides poison the accumulator with
+> NaN (row then cannot certify in that direction), overflow only widens
+> toward the non-certifying side, and `isfinite` filters the survivors.
+> Fire conditions carry the engine's tolerance semantics: prune only when
+> the rigorous bound crosses `rhs ± MIP_TOL·(1+|rhs|)`.
+>
+> **Mid-round catch, recorded per the calibration doctrine.**  The first
+> version compared exact-directed bounds to the rhs *with no margin* and
+> passed the pinned/family batteries — but `mip_diff 400 12345` flipped
+> from WRONG=0 to **WRONG=5**, all "INFEASIBLE != OPTIMAL" on
+> tolerance-feasible borderline equality rows (it=236: `2.293·(−3) = −6.879`
+> differs from itself by 8.9e−16 on the stored doubles; exact-strict
+> pruning is *wrong* in a solver whose every layer — LP `TOL_FEAS`, mip
+> `check_solution`, the brute-force references — declares tolerance-based
+> semantics).  A prune must never reject anything the engine would accept;
+> margins were restored (they are constant ulp-free additions, not
+> accumulated terms, so they cannot reintroduce the fabrication).  Post-fix
+> status mix at seed 12345 (INFEASIBLE=149/OPTIMAL=251) equals the pre-fix
+> binary's exactly; WRONG=0 there and at seeds 111/222/333/555.
+>
+> **Tightening rewrite.**  The four bound-candidate cases ('<'/'=' vs '>',
+> a>0 vs a<0) are now computed by accumulation in the direction of the
+> required extremum followed by a subtraction and division each rounded in
+> the provably-safe direction (derivation table in the function comment).
+> Extremum bookkeeping (rest-min for '<'/'=', rest-max for '>') is
+> unchanged from the audit-hardened port; only the rounding discipline is
+> new.  Latch: the lattice snaps and comparison hysteresis can now only
+> widen the result.
+>
+> **Optimization half (this round's recorded target).**  `solve_relaxation`
+> now runs the same certificate on the intersected node box before starting
+> any solve: a provably dead node prunes in O(nnz) without the double LP
+> and, crucially, without the exact-rational re-solve that infeasibility
+> verdicts previously paid for.  It does not mutate the box, touch the
+> warm-start state, or change node accounting, so the tree evolves exactly
+> as before — verified empirically on 11 models (tsp5, assignment,
+> open_shop_3x3, jobshop/flowshop, knapsacks, bin packings): identical
+> verdicts/objectives, lp/fx counters differing by exactly the certified
+> prunes.  Honest performance note: on this combinatorial suite few nodes
+> are *single-row bound-conflict* certifiable (tsp5: 1 of 299 LPs skipped,
+> wall unchanged within noise; knap_lin: 1 of 11) — the instrumented
+> histogram shows the remaining ~122 exact re-solves on tsp5 are
+> duality-level infeasibility, which an interval row scan cannot see.  The
+> cheap sound substeps that remain for that class: extracting the phase-1
+> dual ray and interval-checking a Farkas certificate (recorded next
+> target, unchanged).
+>
+> **Verification:** full `test.sh` exit 0 with the extended `fbbt_verify`
+> (241 checks incl. 40 fired cancellation instances vs scipy-free exact
+> references) and `mip_diff` 400×4 seeds WRONG=0; ASan/UBSan/LSan mipsolve
+> build runs the pinned case, the family and mip_diff clean; MiniZinc
+> benchmark re-run on the final binary: **77/77 with zero semantic diffs**
+> (status/objective/verdict/solutions vs committed results; timings only),
+> docs regenerated.
+>
+
 > **2026-08-15 (2) — branch `arena/cp-engine-correctness`: external-audit
 > round.**  An independent audit of `main`@248eb2f (report supplied by the
 > repository owner) reached a "well-hardened" verdict with one Medium and a
@@ -615,3 +711,19 @@ specification (see `docs/BRANCH_AUDIT.md` for the full review):
    `tools/mzn_bench.py` falls back to cp-sat for the linear reference).
 2. Redesign the global `setjmp` allocation-error protocol so a recovering,
    multi-threaded library host can own cleanup without process-global state.
+3. Farkas-certificate check for exact re-solves in the MIP bridge — extract
+   the phase-1 dual ray and interval-check it (outward-rounded `yᵀA ≈ 0`,
+   uncertain components taking the safer bound extreme) instead of a full
+   exact-rational re-solve per infeasible-verdict node.  2026-08-15(3)
+   instrumentation: 121 of 122 tsp5 exact re-solves are duality-level
+   infeasibility a row-scan cannot certify; this is where the wall time is.
+4. Honesty gap on extreme scale-mixed *non-integral* LPs (found this
+   round): the double phase-1 may report bare INFEASIBLE on data with
+   ~1e-13 coefficients against ~1e25 bounds (repro preserved at
+   /tmp/fbbt_unsat_repro	lp during the session), `fx` declines non-integral
+   data, and the MIP/FZ bridges then keep the shaky verdict instead of an
+   honest UNKNOWN.  `lpsolve` remains the double-precision engine — for
+   certifiable answers on such data `fxsolve` is the right tool — but an
+   exact-or-UNKNOWN promotion path for borderline double verdicts is the
+   principled close.
+

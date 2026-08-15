@@ -5,6 +5,7 @@
 #include <string.h>
 #include <math.h>
 #include <stdio.h>
+#include <fenv.h>
 
 #define MIP_TOL 1e-6
 
@@ -140,6 +141,107 @@ static Node *pop_node(Node **list)
     return n;
 }
 
+/* ------------------------------------------------------------------ */
+/* Rigorous interval row-conflict certificate, O(nnz).
+ *
+ * For every row i the minimum and maximum possible activity over the box
+ * [lo,hi] is accumulated in DIRECTED rounding: the minimum side under
+ * FE_DOWNWARD, the maximum side under FE_UPWARD, so the computed mn[i] is
+ * a proven LOWER bound of the exact row minimum over the double data and
+ * mx[i] a proven UPPER bound of the exact row maximum (every stored double
+ * is an exact dyadic rational; each product and each partial sum rounds
+ * toward the accumulated side, an FMA contraction only rounds once in the
+ * same direction, and reassociation/vectorization cannot break the bound:
+ * the exact total is association-independent while every computed partial
+ * is on the correct side of the corresponding exact partial).
+ *
+ *   '<'/'=' conflict: mn[i] > b[i]   (even the best case violates the row)
+ *   '>'/'=' conflict: mx[i] < b[i]
+ *
+ * There are NO tolerances: a return of 1 is a proof that no point of the
+ * box satisfies all rows.  Unbounded sides (sentinel magnitude ~LP_INF,
+ * gated at 1e29 like the rest of this file) poison the affected
+ * accumulator with NaN so the row cannot certify in that direction; NaN
+ * propagates through every later partial sum and the final isfinite()
+ * filter then excludes it (along with any arithmetic overflow), so "cannot
+ * say" is always the answer a degenerate row produces.  The rounding mode
+ * is saved and restored around the two sweeps, and nothing in between can
+ * allocate or longjmp -- these sweeps run inside error-trapping library
+ * code (psolve_env), so no call that can fail is allowed there.
+ *
+ * This replaces the round-to-nearest, tolerance-padded prune that used to
+ * guard FBBT root infeasibility: with catastrophic cancellation the RN
+ * error exceeds the tolerance (products near 1e12 round by up to ~6e-5
+ * while the margin was 1e-6), and "MN overestimate > rhs + tol" fires on a
+ * FEASIBLE model -- a fabricated-UNSAT verdict reached before any solve
+ * and therefore before the exact-rational cross-check that guards the same
+ * status inside the branch-and-bound loop.  Regression of record:
+ * "maximize x2, x2 == 1, 9.999853740683515e-14*x0 - ...e-14*x1 + 0.75*x2
+ *  <= 0.7504304904478102, x0/x1 fixed near 1e25": the RN activity
+ * 0.75048828125 exceeds rhs + 1.75e-6 while the exact activity
+ * 0.7504294904478... is feasible; mipsolve printed INFEASIBLE.
+ *
+ * Returns 1 if a conflict is PROVEN, else 0 ("cannot say").  mn/mx are
+ * caller-owned m-sized scratch so per-node callers avoid malloc churn. */
+static int mip_box_conflict(const MIP *mip, const double *lo, const double *hi,
+                            double *mn, double *mx)
+{
+    const double BIG = 1e29;
+    int n = mip->n, m = mip->m;
+    if (m > 0) for (int i = 0; i < m; i++) mn[i] = 0.0;
+    int rm = fegetround();
+    fesetround(FE_DOWNWARD);          /* min side: every op rounds down */
+    for (int j = 0; j < n; j++) {
+        double lj = lo[j], hj = hi[j];
+        int lo_inf = (lj <= -BIG), hi_inf = (hj >= BIG);
+        for (int k = mip->Acolptr[j]; k < mip->Acolptr[j + 1]; k++) {
+            int i = mip->Arow[k];
+            double a = mip->Aval[k];
+            if (a > 0.0) {
+                if (lo_inf) { mn[i] = NAN; } else mn[i] += a * lj;
+            } else {
+                if (hi_inf) { mn[i] = NAN; } else mn[i] += a * hj;
+            }
+        }
+    }
+    if (m > 0) for (int i = 0; i < m; i++) mx[i] = 0.0;
+    fesetround(FE_UPWARD);            /* max side: every op rounds up */
+    for (int j = 0; j < n; j++) {
+        double lj = lo[j], hj = hi[j];
+        int lo_inf = (lj <= -BIG), hi_inf = (hj >= BIG);
+        for (int k = mip->Acolptr[j]; k < mip->Acolptr[j + 1]; k++) {
+            int i = mip->Arow[k];
+            double a = mip->Aval[k];
+            if (a > 0.0) {
+                if (hi_inf) { mx[i] = NAN; } else mx[i] += a * hj;
+            } else {
+                if (lo_inf) { mx[i] = NAN; } else mx[i] += a * lj;
+            }
+        }
+    }
+    fesetround(rm);
+    for (int i = 0; i < m; i++) {
+        char rel = mip->rel[i];
+        double rhs = mip->b[i];
+        /* Semantics note (learned the hard way, mip_diff seed 12345 it=236):
+           the engine's row feasibility is TOLERANCE-based (check_solution:
+           MIP_TOL absolute; the LP core: TOL_FEAS=1e-9), so a certificate
+           that prunes on exact arithmetic alone CHANGES the declared
+           semantics -- a borderline row like 2.293*(-3) = -6.879, exact
+           activity 8.9e-16 inside/outside the rhs, is feasible to every
+           layer of this solver and to the independent brute-force
+           reference.  A prune may only fire when not even a tolerance-slack
+           assignment survives, hence the margin.  It cannot reintroduce the
+           cancellation fabrication: mn/mx are rigorous directed-rounding
+           bounds (never an RN overestimate), so firing requires the TRUE
+           extremum to exceed rhs by the full margin. */
+        double mar = MIP_TOL * (1.0 + fabs(rhs));
+        if ((rel == '<' || rel == '=') && isfinite(mn[i]) && mn[i] > rhs + mar) return 1;
+        if ((rel == '>' || rel == '=') && isfinite(mx[i]) && mx[i] < rhs - mar) return 1;
+    }
+    return 0;
+}
+
 /* Persistent simplex state reused across the whole branch-and-bound tree.
  * Successive node relaxations differ ONLY in the variable bounds, which is
  * exactly the supported incremental case (solver_set_bounds +
@@ -153,6 +255,8 @@ typedef struct {
     int     started;
     double *blo;       /* intersected per-node box scratch (n each) */
     double *bhi;
+    double *cmin;      /* row-activity scratch for mip_box_conflict (m each) */
+    double *cmax;
 } MipWarm;
 
 /* build an LP from the MIP with per-node tightened bounds, and solve it;
@@ -169,6 +273,21 @@ static int solve_relaxation(const MIP *mip, const Node *node, MipWarm *ws,
         if (lj > uj) return -1;   /* infeasible node */
         lo[j] = lj; hi[j] = uj;
     }
+    /* Sound certificate before any solve: if one row's best-case activity
+       over the node box already violates its rhs, the relaxation is
+       infeasible and the node prunes -- without running the double LP and,
+       crucially, without the exact-rational cross-check that such nodes
+       previously paid for their returned-INFEASIBLE verdict (the histogram
+       showed those exact re-solves dominating wall time on combinatorial
+       models: 153 of 255 nodes on tsp_5).  The certificate doesn't mutate
+       the box, touch the warm-start state, or change node accounting, so
+       the search evolves exactly as before; only the dead nodes' solve
+       cost disappears.  Corner noted for the record: a certified node whose
+       double LP would previously have hit its iteration limit (honest
+       status 3 search stop) now prunes for free and the search continues --
+       fewer honest limits, never a different verdict. */
+    if (mip->m > 0 &&
+        mip_box_conflict(mip, lo, hi, ws->cmin, ws->cmax)) return -1;
 
     Solver *s;
     int r;
@@ -248,17 +367,32 @@ static int solve_relaxation(const MIP *mip, const Node *node, MipWarm *ws,
  *      counterexample (1e-13*x + y <= 1 with x = -1e13, whose true optimum is
  *      y = 2) is solved correctly here because the 1e-13 coefficient is kept.
  *
- *   2. OUTWARD-ROUNDED activity bounds.  Every computed bound is rounded
- *      toward the side that can only WIDEN the remaining feasible region:
- *      upper bounds round up (nextafter toward +inf), lower bounds round down,
- *      and the intermediate "others" activity sums are rounded conservatively
- *      (the sum feeding an upper bound is biased small, the sum feeding a
- *      lower bound is biased large).  A tightened bound therefore never cuts
- *      off a value the constraint actually allows.
+ *   2. OUTWARD-ROUNDED activity bounds and candidates, via DIRECTED
+ *      ROUNDING (FE_DOWNWARD / FE_UPWARD regions): the "others" activity
+ *      feeding a '<'/'=' bound is accumulated downward (a proven lower
+ *      bound of the exact rest-minimum), the subtraction and division then
+ *      round in the direction that provably cannot exclude a feasible value
+ *      (up for upper candidates with a>0, down for lower ones...; '>' rows
+ *      mirror with an upward rest-maximum).  The nextafter-biased
+ *      round-to-nearest predecessor was NOT provably outward: at |partial|
+ *      ~1e12 the RN rest-sum error (~1e-4) dwarfs a nextafter step AND the
+ *      absolute 1e-9 slack, and at bound magnitudes ~1e15 even one ulp of
+ *      underestimate overflows the slack -- which is how a fixed x0 near
+ *      1e25 got its box collapsed into a fabricated INFEASIBLE verdict
+ *      (2026-08-15(2) round; regression of record in mip_box_conflict and
+ *      tools/fbbt_verify.py's cancellation family).
  *
  *   3. Integer variables are snapped to the lattice (floor for upper bounds,
- *      ceil for lower bounds).  An integer x with x <= UB satisfies
- *      x <= floor(UB), so this is exact and safe.
+ *      ceil for lower bounds) with the historical 1e-9 hysteresis slacks,
+ *      which now only ever widen the interval: the directed candidate
+ *      itself is already on the safe side.
+ *
+ * Infeasibility (return 1) is decided only by mip_box_conflict's rigorous
+ * directed-rounding certificate and by genuine box collapse; the previous
+ * tolerance-padded round-to-nearest prune ("min_act > rhs + 1e-6*(...)"
+ * overflow-margin reasoning) was retired for fabricating UNSAT under
+ * catastrophic cancellation, with a pinned .lp regression and a randomized
+ * exact-referenced family in tools/fbbt_verify.py.
  *
  * A reduced-cost fixing path is deliberately NOT included: the previous
  * attempt's reduced-cost logic assumed minimization signs while the solver
@@ -272,34 +406,54 @@ static int fbbt_tighten(const MIP *mip, double *lo, double *hi)
     int n = mip->n, m = mip->m;
     if (n <= 0 || m <= 0) return 0;
     const double BIG = 1e29;
+    int rc = 0;
+    /* Captured once: every directed-rounding region below restores the mode
+       immediately, so this value is current again after each region. */
+    int old_rm = fegetround();
+    /* scratch for the conflict certificate (freed on every exit below) */
+    double *cmin = (double*)psolve_malloc((size_t)m * sizeof(double));
+    double *cmax = (double*)psolve_malloc((size_t)m * sizeof(double));
+
+    /* Root infeasibility is decided EXCLUSIVELY by the rigorous directed-
+       rounding certificate.  The round-to-nearest, tolerance-padded prune
+       this replaces ("RN min_act > rhs + 1e-6*(1+|rhs|)") fabricated UNSAT
+       under catastrophic cancellation: products near 1e12 round by up to
+       ~6e-5, far beyond the tolerance, so an overestimated min_act pruned
+       FEASIBLE models before any LP ran -- and fbbt's caller reports that
+       return as proven INFEASIBLE without any cross-check.  See
+       mip_box_conflict for the regression of record. */
+    if (mip_box_conflict(mip, lo, hi, cmin, cmax)) { rc = 1; goto done; }
 
     for (int pass = 0; pass < 4; pass++) {
         int changed = 0;
         for (int i = 0; i < m; i++) {
             char rel = mip->rel[i];
             double rhs = mip->b[i];
-            /* Full min/max activity of the row over the current box. */
-            double min_act = 0.0, max_act = 0.0;
-            int min_inf = 0, max_inf = 0;
-            for (int j = 0; j < n; j++) {
-                for (int k = mip->Acolptr[j]; k < mip->Acolptr[j + 1]; k++) {
-                    if (mip->Arow[k] != i) continue;
-                    double a = mip->Aval[k];
-                    if (a > 0.0) {
-                        if (lo[j] <= -BIG) min_inf = 1; else min_act += a * lo[j];
-                        if (hi[j] >=  BIG) max_inf = 1; else max_act += a * hi[j];
-                    } else {
-                        if (hi[j] >=  BIG) min_inf = 1; else min_act += a * hi[j];
-                        if (lo[j] <= -BIG) max_inf = 1; else max_act += a * lo[j];
-                    }
-                }
-            }
-            /* Infeasibility pruning: even the best case violates the row. */
-            double rhst = MIP_TOL * (1.0 + fabs(rhs));
-            if ((rel == '<' || rel == '=') && !min_inf && min_act > rhs + rhst) return 1;
-            if ((rel == '>' || rel == '=') && !max_inf && max_act < rhs - rhst) return 1;
 
-            /* Tighten each variable's bound from this row. */
+            /* Tighten each variable's bound from this row.  The arithmetic
+               runs in DIRECTED rounding: the nextafter-biased round-to-
+               nearest version this replaces was NOT provably outward at
+               large magnitudes -- the rest-sum cancellation error is
+               bounded by ~eps*max|partial|, which dwarfs both a single
+               nextafter step and the absolute 1e-9 slack once bounds reach
+               ~1e15, so the computed bound could sit below the true one and
+               the box-collapse check would report a FEASIBLE model
+               infeasible (the regression of record in mip_box_conflict goes
+               through exactly this path).
+
+               Derivation.  For a '<'/'=' row, x_j is feasible for the row
+               iff a*x_j <= rhs - rest_min (others at their minimum), i.e.
+               the candidate bound is V = (rhs - rest_min)/a.  With rest_L
+               <= exact rest_min accumulated under FE_DOWNWARD, the exact
+               expression E = (rhs - rest_L)/a satisfies E >= V when a > 0
+               and E <= V when a < 0 -- so rounding both the subtraction and
+               the division UP (a > 0) / DOWN (a < 0) yields a candidate
+               that provably never excludes a feasible value.  '>' rows
+               mirror this: V = (rhs - rest_max)/a with rest_R >= exact
+               rest_max accumulated under FE_UPWARD, so a > 0 rounds DOWN
+               and a < 0 rounds UP.  The lattice snaps (floor/ceil with the
+               1e-9 hysteresis slacks) and the 1e-9 comparison hysteresis
+               can only loosen further. */
             for (int j = 0; j < n; j++) {
                 double a = 0.0; int found = 0;
                 for (int k = mip->Acolptr[j]; k < mip->Acolptr[j + 1]; k++) {
@@ -312,86 +466,69 @@ static int fbbt_tighten(const MIP *mip, double *lo, double *hi)
                    Tightening a float variable's bound here would perturb the
                    LP's reported vertex (e.g. a satisfy model returns mx as the
                    tightened bound 4.2500000000000009 instead of 4.25) with no
-                   pruning benefit.  The infeasibility check above still
-                   considers every variable and stays sound. */
+                   pruning benefit.  The conflict certificate above considers
+                   every variable and stays rigorous. */
                 if (!mip->isint[j]) continue;
 
-                /* Activity of all OTHER variables, computed conservatively:
-                 * other_min is biased small, other_max is biased large. */
-                double other_min = 0.0, other_max = 0.0;
-                int other_min_inf = 0, other_max_inf = 0;
+                /* rest at the required extremum, accumulated in the directed
+                   mode; an overflowed +-inf product (or a NaN from an +-inf
+                   pair) makes every comparison below false: no tighten,
+                   always the sound choice */
+                int down_side = (rel == '<' || rel == '=');
+                double rest = 0.0; int rest_inf = 0;
+                fesetround(down_side ? FE_DOWNWARD : FE_UPWARD);
                 for (int t = 0; t < n; t++) {
                     if (t == j) continue;
                     for (int k = mip->Acolptr[t]; k < mip->Acolptr[t + 1]; k++) {
                         if (mip->Arow[k] != i) continue;
                         double at = mip->Aval[k];
-                        if (at > 0.0) {
-                            if (lo[t] <= -BIG) other_min_inf = 1; else other_min += at * lo[t];
-                            if (hi[t] >=  BIG) other_max_inf = 1; else other_max += at * hi[t];
-                        } else {
-                            if (hi[t] >=  BIG) other_min_inf = 1; else other_min += at * hi[t];
-                            if (lo[t] <= -BIG) other_max_inf = 1; else other_max += at * lo[t];
+                        if (down_side) {          /* minimum-activity terms */
+                            if (at > 0.0) { if (lo[t] <= -BIG) rest_inf = 1; else rest += at * lo[t]; }
+                            else          { if (hi[t] >=  BIG) rest_inf = 1; else rest += at * hi[t]; }
+                        } else {                  /* maximum-activity terms */
+                            if (at > 0.0) { if (hi[t] >=  BIG) rest_inf = 1; else rest += at * hi[t]; }
+                            else          { if (lo[t] <= -BIG) rest_inf = 1; else rest += at * lo[t]; }
                         }
                     }
                 }
-                /* A variable x_j is feasible for this row iff there EXISTS an
-                 * assignment of the other variables satisfying it.  For a
-                 * '<'/'=' row (a*x_j + rest <= rhs) that existence condition is
-                 *   a*x_j <= rhs - rest_min
-                 * (others at their minimum make the LHS smallest), so BOTH the
-                 * upper bound (a>0) and the lower bound (a<0) come from
-                 * rest_min.  For a '>' row (a*x_j + rest >= rhs) the condition
-                 * is   a*x_j >= rhs - rest_max  (others at their maximum), so
-                 * both bounds come from rest_max.  Using the wrong extremum is
-                 * exactly the unsoundness the audit flagged, so it matters that
-                 * '<'/'=' always uses rest_min and '>' always uses rest_max. */
-                /* Outward-bias the "others" activity before it feeds a bound:
-                 * a '<'/'=' row divides by (rhs - rest_min), so biasing rest_min
-                 * DOWN (more negative) only loosens the bound; a '>' row divides
-                 * by (rhs - rest_max), so biasing rest_max UP only loosens it.
-                 * A loosened bound never excludes a feasible value. */
-                if (rel == '<' || rel == '=') {
-                    if (!other_min_inf) {
-                        other_min = nextafter(other_min, -HUGE_VAL);
-                        /* a*x_j <= rhs - rest_min */
-                        double v = (rhs - other_min) / a;
-                        if (a > 0.0) {
-                            /* x_j <= (rhs-rest_min)/a : round up (outward) */
-                            double ub = nextafter(v, HUGE_VAL);
+                if (!rest_inf) {
+                    if (down_side) {
+                        if (a > 0.0) {              /* upper candidate: round UP */
+                            fesetround(FE_UPWARD);
+                            double ub = (rhs - rest) / a;
                             if (mip->isint[j]) ub = floor(ub + 1e-9);
                             if (ub < hi[j] - 1e-9) { hi[j] = ub; changed = 1; }
-                        } else {
-                            /* a<0 flips: x_j >= (rhs-rest_min)/a : round down */
-                            double lb = nextafter(v, -HUGE_VAL);
+                        } else {                    /* lower candidate: stay DOWN */
+                            double lb = (rhs - rest) / a;
                             if (mip->isint[j]) lb = ceil(lb - 1e-9);
                             if (lb > lo[j] + 1e-9) { lo[j] = lb; changed = 1; }
                         }
-                    }
-                } else {                                 /* '>' */
-                    if (!other_max_inf) {
-                        other_max = nextafter(other_max, HUGE_VAL);
-                        /* a*x_j >= rhs - rest_max */
-                        double v = (rhs - other_max) / a;
-                        if (a > 0.0) {
-                            /* x_j >= (rhs-rest_max)/a : round down (outward) */
-                            double lb = nextafter(v, -HUGE_VAL);
+                    } else {
+                        if (a > 0.0) {              /* lower candidate: round DOWN */
+                            fesetround(FE_DOWNWARD);
+                            double lb = (rhs - rest) / a;
                             if (mip->isint[j]) lb = ceil(lb - 1e-9);
                             if (lb > lo[j] + 1e-9) { lo[j] = lb; changed = 1; }
-                        } else {
-                            /* a<0 flips: x_j <= (rhs-rest_max)/a : round up */
-                            double ub = nextafter(v, HUGE_VAL);
+                        } else {                    /* upper candidate: stay UP */
+                            double ub = (rhs - rest) / a;
                             if (mip->isint[j]) ub = floor(ub + 1e-9);
                             if (ub < hi[j] - 1e-9) { hi[j] = ub; changed = 1; }
                         }
                     }
                 }
+                fesetround(old_rm);
             }
         }
-        for (int j = 0; j < n; j++) if (lo[j] > hi[j] + 1e-9) return 1;
+        for (int j = 0; j < n; j++) if (lo[j] > hi[j] + 1e-9) { rc = 1; goto done; }
+        /* A pass that tightened the box may expose a row conflict that was
+           not provable on entry; re-certify cheaply (O(nnz)). */
+        if (changed && mip_box_conflict(mip, lo, hi, cmin, cmax)) { rc = 1; goto done; }
         if (!changed) break;
     }
-    for (int j = 0; j < n; j++) if (lo[j] > hi[j]) return 1;
-    return 0;
+    for (int j = 0; j < n; j++) if (lo[j] > hi[j]) { rc = 1; goto done; }
+done:
+    free(cmin); free(cmax);
+    return rc;
 }
 
 void mip_solve(const MIP *mip, MIPResult *res)
@@ -477,6 +614,8 @@ void mip_solve(const MIP *mip, MIPResult *res)
     MipWarm ws; memset(&ws, 0, sizeof(ws));
     ws.blo = (double*)psolve_malloc((size_t)n * sizeof(double));
     ws.bhi = (double*)psolve_malloc((size_t)n * sizeof(double));
+    ws.cmin = (double*)psolve_malloc((size_t)(mip->m ? mip->m : 1) * sizeof(double));
+    ws.cmax = (double*)psolve_malloc((size_t)(mip->m ? mip->m : 1) * sizeof(double));
 
     long nodes = 0;
     int status = 1;   /* assume infeasible until a feasible integer found */
@@ -687,6 +826,7 @@ void mip_solve(const MIP *mip, MIPResult *res)
 
     if (ws.s) solver_destroy(ws.s);
     free(ws.blo); free(ws.bhi);
+    free(ws.cmin); free(ws.cmax);
     free(x); free(lcur); free(ucur); free(bestx); free(xc);
 }
 
