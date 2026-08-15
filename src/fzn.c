@@ -483,21 +483,30 @@ int fz_read(const char*path,FZModel*m)
                 /* FlatZinc set domain: var {1,3,5}: x. */
                 if(ti<nt&&toks[ti].kind==TK_SYM&&strcmp(toks[ti].text,"{")==0){
                     long vmin=1000000000L,vmax=-1000000000L; int nv=0;
-                    long vals[256];
+                    /* count members first, then allocate exactly.  The
+                       previous fixed 256-entry stack buffer kept counting
+                       past its length and the copy loop read that many
+                       entries -- an out-of-bounds stack read feeding
+                       garbage domains downstream (SIGSEGV pin:
+                       var {1..70000-as-set}: x). */
+                    int cap=0; { int tj=ti+1; while(tj<nt&&!(toks[tj].kind==TK_SYM&&strcmp(toks[tj].text,"}")==0)){ if(toks[tj].kind==TK_INT)cap++; tj++; } }
+                    long *vals=(long*)psolve_malloc((size_t)(cap?cap:1)*sizeof(long));
                     ti++;  /* skip '{' */
                     while(ti<nt&&!(toks[ti].kind==TK_SYM&&strcmp(toks[ti].text,"}")==0)){
-                        if(toks[ti].kind==TK_INT){ long v=toks[ti].ival; if(nv<256)vals[nv]=v; if(!nv||v<vmin)vmin=v; if(v>vmax)vmax=v; nv++; }
+                        if(toks[ti].kind==TK_INT){ long v=toks[ti].ival; if(nv<cap)vals[nv]=v; if(!nv||v<vmin)vmin=v; if(v>vmax)vmax=v; nv++; }
                         ti++;
                     }
                     if(ti<nt)ti++;  /* skip '}' */
-                    if(nv>0){
+                    if(nv>0&&nv==cap){
                         if(d->kind==FZ_K_NONE)d->kind=FZ_K_INT;
                         d->has_lo=1;d->has_hi=1;
                         d->lo=(double*)psolve_malloc(sizeof(double));d->hi=(double*)psolve_malloc(sizeof(double));
                         d->lo[0]=(double)vmin; d->hi[0]=(double)vmax;
-                        /* store exact set for SOS1 enforcement in fz_solve */
-                        d->nset=nv; d->setvals=(long*)psolve_malloc((size_t)nv*sizeof(long));
-                        for(int q=0;q<nv;q++)d->setvals[q]=vals[q];
+                        /* store exact set for SOS1 enforcement in fz_solve
+                           (freed in fz_model_free via d->setvals) */
+                        d->nset=nv; d->setvals=vals;
+                    } else {
+                        psolve_free(vals);
                     }
                 }
                 /* FlatZinc shorthand: var 1..10: x or var 0.1..10.5: x.

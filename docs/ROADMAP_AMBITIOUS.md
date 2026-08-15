@@ -241,15 +241,32 @@ round: merges textually faithful (empty tree diffs vs branch tips), full
 battery green on `main`, zero-libc-heap proof under `--wrap=free`,
 oom/fz_leak gates pass. See AUDIT.md addenda (4) and (5).
 
-### 6.7 FlatZinc round-trip & output fuzzing
-- **What:** output-side adversarial tests: re-parse `fznsolve` output with a
-  strict checker (assignments satisfy *every* constraint, objective matches),
-  driven over the fuzz corpus, including `-a` enumeration (no duplicates,
-  completion markers correct) and aliased/mixed-view arrays.
-- **Why:** the bridge's *input* paths are fuzzed; its *output* paths are
-  only spot-tested. An output-layer lie is as dangerous as a solver lie.
-- **Acceptance:** `tools/fzn_output_check.py` (new) green over ≥10k fuzzed
-  models across satisfy/minimize/maximize/`-a`; wired into `test.sh`.
+### 6.7 FlatZinc round-trip & output fuzzing — **DONE 2026-08-16(9)**
+The new output-layer checker caught **one fabricated-SAT class**: the CP
+engine's `cp_set_vals` had replace semantics, letting propagators widen
+declared domains — pin of record `x0≡5, x1∈[-4,-3], int_abs(x1,x0)` printed
+**`x1 = -5`, outside its domain, as SATISFIABLE** (sibling bare case printed
+`x0=0,x1=0` SAT on a truly UNSAT model). Fixed with restrict semantics
+(sort/dedupe + intersect; empty ⇒ infeasible) plus the follow-on threading
+of the now-reachable empty-domain failure return through all 12 propagator
+callsites (its absence was a heap-buffer-overflow, ASan-caught on the
+post-fix binary pre-commit). Also fixed a pre-existing parser OOB stack
+read (`var {>256 ints}: x` → SIGSEGV, pin verified on pre-change binary)
+and the related CP-init path that wrote an intentionally empty domain for
+>CP_MAXVALS set literals instead of declining to the MIP/SOS1 bridge.
+Tool-side lesson documented in AUDIT addendum (9): exact-Fraction checks on
+decimal round-trips of binary doubles are unsound for float rows — the
+checker uses the standard scaled 1e-6 LP feasibility tolerance and reports
+the run-max residual (≤1e-16 over 19.5k models). Acceptance evidence:
+`tools/fzn_output_check.py` hard-gated in `test.sh` (5 pins first: abs
+UNSAT ×2 incl. the x1=-5 of record, abs feasible, 65536/66000-member set
+domains); **pre-change binary**: 4/5 pins fail + `WRONG=34/2000`;
+**post-change**: WRONG=0 at `N=10000 seed 20260815` and `N=4000` each at
+seeds 777/4242 (19.5k models incl. `-a`/aliases/echo checks), ASan/
+UBSan(+LSan) sweep N=1500 clean, full battery + MiniZinc 77/77
+0-semantic-diff. Known limitation logged (perf, not honesty): declined
+>65536-member set domains whose UNSAT-ness needs reasoning grind in MIP
+B&B; presolve suggestion recorded in AUDIT (9).
 
 ### 6.8 Per-module tolerance semantics sheets
 - **What:** one section in `docs/DESIGN.md` per engine: every tolerance,

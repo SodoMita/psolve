@@ -1,5 +1,106 @@
 # psolve — audit & hardening notes
 
+> **2026-08-16 (9) - branch `arena/cp-engine-correctness`: Phase 6.7 of
+> the ambitious roadmap, FlatZinc output-layer round-trip fuzzing.  The
+> new checker caught ONE fabricated-SAT class in the CP engine, one
+> heap-buffer-overflow in the same engine, and one pre-existing parser
+> out-of-bounds stack read (SIGSEGV) - all fixed and locked with
+> discriminating gates.  It also produced one false-alarm class of its
+> own, documented and corrected below.**
+>
+> **The tool (new, `tools/fzn_output_check.py`, hard gate in test.sh).**
+> Structured-model generator + independent oracle that re-parses every
+> emitted byte of `fznsolve` across satisfy / minimize / maximize / `-a`
+> and checks: the marker protocol exactly (`----------` per block,
+> `==========` rules, UNSAT/UNKNOWN placement), every printed assignment
+> against *every* constraint and the declared domains, alias/array-view
+> consistency (including constant alias slots), the `%mzn-stat:`
+> objective echo against the printed point, `-a` enumeration
+> (no duplicates, projection set EQUAL to the brute-forced one for
+> satisfy, strictly improving incumbents ending AT the brute optimum for
+> optimize), and UNSAT-fabrication detection (a printed UNSATISFIABLE on
+> a brute-force-satisfiable model is WRONG).  Float models are checked
+> with a *scaled LP feasibility tolerance* (see the false alarm below);
+> UNSAT/optimum claims on them are cross-checked against HiGHS (scipy)
+> on the benign dyadic data.  Pinned regressions run first and gate the
+> corpus.
+>
+> **Bug 1 (fabrication, CP engine): `cp_set_vals` had REPLACE
+> semantics.** Propagator candidate sets were written as the var's new
+> domain verbatim, so a propagator could WIDEN a declared domain.  Pin
+> of record: `var 5..5: x0; var -4..-3: x1; constraint int_abs(x1,x0);`
+> printed **`x1 = -5` -- a value OUTSIDE its declared domain -- as
+> SATISFIABLE** (the abs propagator with x0 fixed at 5 wrote
+> {+5,-5} over [-4,-3]; leaf printing trusts CP domains); the bare
+> sibling `x0 in 0..1, x1 in -4..-3` printed `x0=0, x1=0` SAT on a truly
+> UNSAT model.  Fix: restrict semantics inside `cp_set_vals` (sort/dedupe
+> candidates, intersect with the current domain; empty intersection
+> returns the infeasibility signal).  All callsites audited: propagation
+> only ever proposes subdomains, so intersecting cannot change any
+> legitimate outcome; the one init callsite intersects against the full
+> int64 range and behaves exactly as before.
+>
+> **Bug 2 (heap-buffer-overflow, exposed by fix 1).** Every one of the
+> 12 propagator callsites checked `cp_set_vals(...) < 0` (capacity
+> failure) but ignored `==1` (empty domain) - harmless under replace
+> semantics because callers pre-guarded empty candidate lists, but
+> restrict semantics made "candidates ∩ domain = ∅" a *new* reachable
+> way to empty a domain.  A `var {3-valued}` var emptied this way left
+> `nvals=0` with propagation continuing, and the next propagator's
+> `cp_dmax` read `vals[v][-1]` (ASan: heap-buffer-overflow,
+> cp_prop_minmax, on a fuzzed 3-var int model).  Fixed by threading the
+> `==1` infeasibility return through all 12 callsites.  Honest
+> accounting: the ignored return is the latent flaw; my own fix 1 made
+> it reachable - the ASan run on the *post-fix* binary caught it
+> pre-commit, exactly what the gate is for.
+>
+> **Bug 3 (pre-existing, parser): `var {>256 ints}: x` out-of-bounds
+> stack read.** fzn.c counted set-domain members without limit but
+> stored into a fixed `long vals[256]`, then copied the *counted* number
+> of entries - past member 256 the copy read beyond the stack buffer
+> into garbage domains (pin: `var {1..70000-as-set}: x` + `x = 54321`
+> SIGSEGV'd - verified on the pre-change binary too).  Fixed by
+> counting first and allocating exactly.  A related latent fault found
+> en route: the CP init path for set literals larger than the CP
+> materialization cap wrote an intentionally EMPTY domain and solved on
+> it (same underflow); it now *declines* to the exact MIP/SOS1 bridge,
+> like every other CP capacity limit.  Both pins added to the tool
+> (65536-member boundary materialized in CP; 66000-member declined to
+> MIP; both instant).
+>
+> **False alarm of the tool itself (documented, fixed).**  The first
+> float-family revision checked float constraints with exact Fraction
+> arithmetic on the printed decimal tokens - unsound: a printed float is
+> a %.*g decimal round-trip of a *binary* double, and LP vertices of
+> dyadic-input models are rationals with non-dyadic denominators (x =
+> -4/3 prints as -1.3333333333333333; its exact Fraction times 3/2 is
+> NOT -2, while in IEEE double arithmetic it evaluates to exactly -2.0).
+> 4/600 models flagged "WRONG" with residuals ~1e-16 while the same
+> expressions evaluated to exactly 0 residual in float64.  The check now
+> uses the standard scaled LP feasibility tolerance (1e-6 · scale) -
+> ~10 orders above round-trip noise, far below any macroscopic lie on
+> these O(1)-scale models - and reports the max scaled residual over the
+> run as a drift indicator (observed ≤ 1e-16 across 19.5k models).
+>
+> **Acceptance evidence.**  Discrimination (pre-change binary, tool
+> exit 1): 4/5 pins fail (the two abs fabrications incl. x1=-5 printed;
+> both big-set pins crash) + corpus `WRONG=34` at N=2000 (all "outside
+> declared domain" int_abs-family escapes).  Post-change: pins pass;
+> `N=10000 seed 20260815`, `N=4000 seed 777`, `N=4000 seed 4242` all
+> WRONG=0 (float max scaled residual ≤ 1e-16); ASan/UBSan(+LSan) build
+> sweep N=1500 WRONG=0 (zero sanitizer events - a nonzero exit is WRONG
+> by construction).  Full `test.sh` battery green incl. MiniZinc
+> differential and 77-instance bench with 0 semantic diffs; verdicts on
+> the int fuzz corpus bit-identical to pre-fix (the fixes changed
+> memory safety and answer *honesty*, never a legitimate answer).
+>
+> **Known limitation surfaced, not fixed (performance, not honesty):**
+> a set domain DECLINED to the MIP bridge (members > 65536) whose
+> UNSAT-ness needs reasoning (e.g. forcing x to a non-member) grinds in
+> branch-and-bound (66000-member SOS1 pin: > 120 s, no wrong output).
+> Candidate fix for a later round: presolve set-domain/equality
+> intersections before the SOS1 encoding.
+
 > **2026-08-15 (8) - branch `arena/cp-engine-correctness`: Phase 6.5 of
 > the ambitious roadmap, the QP numerical audit.  One fabrication-class
 > hole found and closed; no others.**

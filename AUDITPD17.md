@@ -225,3 +225,12 @@ a permanent tool is tracked as recommended future work below.
 7. Future work: commit a permanent canonical-dump differential tool (see the
    scope note in §6) so parse+linearization drift over the whole corpus is a
    one-command check rather than an ad-hoc harness.
+8. Post-audit finding of the same honesty class (Phase 6.7, resolved
+   2026-08-16(9)): output-layer round-trip fuzzing (`tools/fzn_output_check.py`)
+   caught a fabricated-SAT class in the CP engine (`cp_set_vals` replace
+   semantics printing values outside declared domains, e.g. `x1 = -5` for
+   `x1 ∈ [-4,-3]` as SATISFIABLE), a heap-buffer-overflow via an ignored
+   empty-domain failure return, and a pre-existing parser OOB stack read on
+   `var {>256 ints}: x` (SIGSEGV).  All fixed with discriminating pins +
+   corpus gates (pre-change: 4/5 pins fail, WRONG=34/2000; post-change:
+   19.5k models WRONG=0, sanitizer sweep clean).  See `AUDIT.md` addendum (9).

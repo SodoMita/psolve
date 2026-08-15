@@ -251,6 +251,19 @@ python3 tools/extrema_verify.py 300 4242 | sed 's/.*: //'
 echo -n "divmod_verify (trunc-div/mod + pow + sets/among + edge regressions, vs brute force): "
 python3 tools/divmod_verify.py 200 20260808 | sed 's/.*: //'
 
+# FlatZinc OUTPUT-layer round-trip (roadmap 6.7): re-parse every emitted
+# byte; each printed assignment must satisfy every constraint and stay in
+# its declared domain (int: exact Fractions; float: scaled 1e-6 LP
+# feasibility tolerance), marker protocol exact, -a enumeration matches the
+# brute-forced projection set / improving incumbents, UNSAT is
+# cross-checked.  This gate caught the cp_set_vals replace-semantics
+# fabrication (int_abs printed x1=-5, outside its declared domain, as
+# SATISFIABLE) plus a heap-buffer-overflow in the fixed propagator.
+# Discriminating: on the pre-change binary it fails 4 pins and 34/2000
+# fuzzed models; post-change WRONG=0 over 19500 models (10k+4k+4k across 3
+# seeds plus a 1.5k ASan/UBSan/LSan sweep).  Hard gate: rc matters.
+python3 tools/fzn_output_check.py 2000 20260815 8 || { echo "fzn_output_check: FAIL"; exit 1; }
+
 if command -v minizinc >/dev/null 2>&1; then
   echo "[8.5/8] MiniZinc differential (compile .mzn -> fzn -> psolve vs Gecode)..."
   python3 tools/mzn_diff.py | tail -1

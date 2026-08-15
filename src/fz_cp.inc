@@ -55,16 +55,41 @@ static int cp_cmp_i64(const void*a,const void*b){ int64_t x=*(const int64_t*)a,y
 
 static int cp_set_vals(CP*cp,int v,int64_t *vals,int n){
     if(n>CP_MAXVALS) return -1;
+    /* RESTRICT semantics: candidates outside the CURRENT domain are dropped.
+       The previous replace semantics let a propagator WIDEN a declared
+       domain, fabricating SAT on UNSAT models (roadmap 6.7): int_abs(a,c)
+       with c fixed 5 over a in [-4,-3] rewrote a's domain to {5,-5}, and
+       the leaf solution (trusting CP domains) printed x=-5 as SATISFIABLE.
+       Propagators only ever propose candidate subdomains, so intersecting
+       can only drop already-excluded values -- it never changes a
+       legitimate outcome (initial set-literal declarations intersect
+       against [INT64_MIN,INT64_MAX], i.e. behave exactly as before). */
+    /* sort + dedupe candidates in place */
+    qsort(vals,(size_t)n,sizeof(int64_t),cp_cmp_i64);
+    int nd=0; for(int i=0;i<n;i++) if(nd==0||vals[i]!=vals[nd-1]) vals[nd++]=vals[i];
+    /* intersect with the current domain */
+    if(cp->bounded[v]){
+        int w=0;
+        for(int i=0;i<nd;i++){
+            int64_t x=vals[i];
+            int lo=0,hi=cp->nvals[v];          /* membership in current domain */
+            while(lo<hi){ int mid=(lo+hi)>>1; if(cp->vals[v][mid]<x) lo=mid+1; else hi=mid; }
+            if(lo<cp->nvals[v]&&cp->vals[v][lo]==x) vals[w++]=x;
+        }
+        nd=w;
+    } else {
+        int w=0;
+        for(int i=0;i<nd;i++) if(vals[i]>=cp->lo[v]&&vals[i]<=cp->hi[v]) vals[w++]=vals[i];
+        nd=w;
+    }
+    n=nd;
     if(!cp->bounded[v]){ cp->vals[v]=(int64_t*)psolve_malloc((size_t)(n?n:1)*sizeof(int64_t)); cp->cap[v]=n?n:1; cp->bounded[v]=1; }
     else if(cp->cap[v]<n){ cp->vals[v]=(int64_t*)psolve_realloc((void**)&cp->vals[v],(size_t)(n?n:1)*sizeof(int64_t)); cp->cap[v]=n?n:1; }
     for(int i=0;i<n;i++) cp->vals[v][i]=vals[i];
-    /* sort + dedupe so binary search and min/max are correct */
-    qsort(cp->vals[v],(size_t)n,sizeof(int64_t),cp_cmp_i64);
-    int w=0; for(int i=0;i<n;i++) if(w==0||cp->vals[v][i]!=cp->vals[v][w-1]) cp->vals[v][w++]=cp->vals[v][i];
-    cp->nvals[v]=w;
-    cp->lo[v]= w?cp->vals[v][0]:INT64_MAX;
-    cp->hi[v]= w?cp->vals[v][w-1]:INT64_MIN;
-    return w?0:1;
+    cp->nvals[v]=n;
+    cp->lo[v]= n?cp->vals[v][0]:INT64_MAX;
+    cp->hi[v]= n?cp->vals[v][n-1]:INT64_MIN;
+    return n?0:1;
 }
 
 static int cp_intersect(CP*cp,int v,int64_t nlo,int64_t nhi){
@@ -376,14 +401,14 @@ static int cp_restrict_divisors(CP*cp,int v,int64_t*dvbuf,int nd){
         int64_t *nvals=NULL; int nn=0,cap2=0;
         for(int i=0;i<cp->nvals[v];i++){ int64_t val=cp->vals[v][i]; int found=0; for(int k=0;k<nd;k++) if(dvbuf[k]==val){found=1;break;} if(found){ if(nn>=cap2){cap2=cap2?cap2*2:16;nvals=(int64_t*)psolve_realloc((void**)&nvals,(size_t)cap2*sizeof(int64_t));} nvals[nn++]=val; } }
         if(nn==0){ psolve_free(nvals); return 1; }
-        if(cp_set_vals(cp,v,nvals,nn)<0){ psolve_free(nvals); return -1; } psolve_free(nvals);
+        { int svr=cp_set_vals(cp,v,nvals,nn); psolve_free(nvals); if(svr<0) return -1; if(svr) return 1; /* restrict emptied the domain */ }
         return 0;
     } else {
         /* interval/unbounded: restrict to divisor list, respecting current bounds */
         int64_t *nvals=NULL; int nn=0,cap2=0;
         for(int k=0;k<nd;k++){ int64_t val=dvbuf[k]; if(val>=cp->lo[v] && val<=cp->hi[v]){ if(nn>=cap2){cap2=cap2?cap2*2:16;nvals=(int64_t*)psolve_realloc((void**)&nvals,(size_t)cap2*sizeof(int64_t));} nvals[nn++]=val; } }
         if(nn==0){ psolve_free(nvals); return 1; }
-        if(cp_set_vals(cp,v,nvals,nn)<0){ psolve_free(nvals); return -1; } psolve_free(nvals);
+        { int svr=cp_set_vals(cp,v,nvals,nn); psolve_free(nvals); if(svr<0) return -1; if(svr) return 1; /* restrict emptied the domain */ }
         return 0;
     }
 }
@@ -417,7 +442,7 @@ static int cp_prop_times(CP*cp,CPT*a,CPT*b,CPT*c){
                 for(int i=0;i<nn;i++) if(cp_contains(cp,b->v,nvals[i])){ keep=(int64_t*)psolve_realloc((void**)&keep,(size_t)(kn+1)*sizeof(int64_t)); keep[kn++]=nvals[i]; }
                 psolve_free(nvals); nvals=keep; nn=kn;
                 if(nn==0){psolve_free(nvals);return 1;}
-                if(cp_set_vals(cp,b->v,nvals,nn)<0){psolve_free(nvals);return -1;} psolve_free(nvals);
+                { int svr=cp_set_vals(cp,b->v,nvals,nn); psolve_free(nvals); if(svr<0) return -1; if(svr) return 1; /* restrict emptied the domain */ }
             } else if(bV){
                 int64_t clo=cp_dmin(cp,c->v),chi=cp_dmax(cp,c->v);
                 int64_t blo=(int64_t)ceild(clo,av), bhi=(int64_t)floord(chi,av);
@@ -454,7 +479,7 @@ static int cp_prop_times(CP*cp,CPT*a,CPT*b,CPT*c){
             int64_t *keep=NULL;int kn=0;
             for(int i=0;i<ncv;i++) if(cp_contains(cp,a->v,cand[i])){ keep=(int64_t*)psolve_realloc((void**)&keep,(size_t)(kn+1)*sizeof(int64_t)); keep[kn++]=cand[i]; }
             if(kn==0){psolve_free(keep);return 1;}
-            if(cp_set_vals(cp,a->v,keep,kn)<0){psolve_free(keep);return -1;} psolve_free(keep);
+            { int svr=cp_set_vals(cp,a->v,keep,kn); psolve_free(keep); if(svr<0) return -1; if(svr) return 1; /* restrict emptied the domain */ }
             return 0;
         }
     }
@@ -502,26 +527,26 @@ static int cp_prop_divmod(CP*cp,CPT*a,int64_t k,CPT*c,int is_div){
                 int64_t *nvals=NULL; int nn=0,cap2=0;
                 for(int i=0;i<cp->nvals[a->v];i++){ int64_t av2=cp->vals[a->v][i]; if(cp_contains(cp,c->v,av2/k)){ if(nn>=cap2){cap2=cap2?cap2*2:64;nvals=(int64_t*)psolve_realloc((void**)&nvals,(size_t)cap2*sizeof(int64_t));} nvals[nn++]=av2; } }
                 if(nn==0){ psolve_free(nvals); return 1; }
-                if(cp_set_vals(cp,a->v,nvals,nn)<0){ psolve_free(nvals); return -1; } psolve_free(nvals);
+                { int svr=cp_set_vals(cp,a->v,nvals,nn); psolve_free(nvals); if(svr<0) return -1; if(svr) return 1; /* restrict emptied the domain */ }
             }
             if(cp->nvals[c->v]>1){
                 int64_t *nvals=NULL; int nn=0,cap2=0;
                 for(int i=0;i<cp->nvals[a->v];i++){ int64_t av2=cp->vals[a->v][i]; int64_t q=av2/k; if(cp_contains(cp,c->v,q)){ int dup=0; for(int q2=0;q2<nn;q2++) if(nvals[q2]==q){dup=1;break;} if(!dup){ if(nn>=cap2){cap2=cap2?cap2*2:64;nvals=(int64_t*)psolve_realloc((void**)&nvals,(size_t)cap2*sizeof(int64_t));} nvals[nn++]=q; } } }
                 if(nn==0){ psolve_free(nvals); return 1; }
-                if(cp_set_vals(cp,c->v,nvals,nn)<0){ psolve_free(nvals); return -1; } psolve_free(nvals);
+                { int svr=cp_set_vals(cp,c->v,nvals,nn); psolve_free(nvals); if(svr<0) return -1; if(svr) return 1; /* restrict emptied the domain */ }
             }
         } else {
             if(cp->nvals[a->v]>1){
                 int64_t *nvals=NULL; int nn=0,cap2=0;
                 for(int i=0;i<cp->nvals[a->v];i++){ int64_t av2=cp->vals[a->v][i]; if(cp_contains(cp,c->v,av2%k)){ if(nn>=cap2){cap2=cap2?cap2*2:64;nvals=(int64_t*)psolve_realloc((void**)&nvals,(size_t)cap2*sizeof(int64_t));} nvals[nn++]=av2; } }
                 if(nn==0){ psolve_free(nvals); return 1; }
-                if(cp_set_vals(cp,a->v,nvals,nn)<0){ psolve_free(nvals); return -1; } psolve_free(nvals);
+                { int svr=cp_set_vals(cp,a->v,nvals,nn); psolve_free(nvals); if(svr<0) return -1; if(svr) return 1; /* restrict emptied the domain */ }
             }
             if(cp->nvals[c->v]>1){
                 int64_t *nvals=NULL; int nn=0,cap2=0;
                 for(int i=0;i<cp->nvals[a->v];i++){ int64_t av2=cp->vals[a->v][i]; int64_t r=av2%k; if(cp_contains(cp,c->v,r)){ int dup=0; for(int q=0;q<nn;q++) if(nvals[q]==r){dup=1;break;} if(!dup){ if(nn>=cap2){cap2=cap2?cap2*2:64;nvals=(int64_t*)psolve_realloc((void**)&nvals,(size_t)cap2*sizeof(int64_t));} nvals[nn++]=r; } } }
                 if(nn==0){ psolve_free(nvals); return 1; }
-                if(cp_set_vals(cp,c->v,nvals,nn)<0){ psolve_free(nvals); return -1; } psolve_free(nvals);
+                { int svr=cp_set_vals(cp,c->v,nvals,nn); psolve_free(nvals); if(svr<0) return -1; if(svr) return 1; /* restrict emptied the domain */ }
             }
         }
     }
@@ -540,7 +565,7 @@ static int cp_prop_abs(CP*cp,CPT*a,CPT*c){
         int64_t *nvals=NULL; int nn=0;
         if(cv==0){ nvals=(int64_t*)psolve_malloc(sizeof(int64_t)); nvals[nn++]=0; }
         else { nvals=(int64_t*)psolve_malloc(2*sizeof(int64_t)); nvals[nn++]=cv; nvals[nn++]=-cv; }
-        if(cp_set_vals(cp,a->v,nvals,nn)<0){ psolve_free(nvals); return -1; } psolve_free(nvals);
+        { int svr=cp_set_vals(cp,a->v,nvals,nn); psolve_free(nvals); if(svr<0) return -1; if(svr) return 1; /* restrict emptied the domain */ }
         return 0;
     }
     /* bounds */
@@ -595,7 +620,7 @@ static int cp_prop_elem(CP*cp,CPT*idx,CPT*res,CPT*arrt,int narr,int offset){
                     int can = eF ? (ev==rv) : (!e->isc && cp_contains(cp,e->v,rv));
                     if(can){ if(nn>=cap2){cap2=cap2?cap2*2:8;nvals=(int64_t*)psolve_realloc((void**)&nvals,(size_t)cap2*sizeof(int64_t));} nvals[nn++]=iv2; } } }
             if(nn==0){ psolve_free(nvals); return 1; }
-            if(cp_set_vals(cp,idx->v,nvals,nn)<0){ psolve_free(nvals); return -1; } psolve_free(nvals);
+            { int svr=cp_set_vals(cp,idx->v,nvals,nn); psolve_free(nvals); if(svr<0) return -1; if(svr) return 1; /* restrict emptied the domain */ }
         }
     }
     /* index range must be within array */
@@ -615,7 +640,7 @@ static int cp_prop_setin(CP*cp,CPT*x,long long*set,int nset){
         int64_t *nvals=NULL; int nn=0,cap2=0;
         for(int i=0;i<cp->nvals[x->v];i++){ int64_t val=cp->vals[x->v][i]; for(int k=0;k<nset;k++) if(set[k]==val){ if(nn>=cap2){cap2=cap2?cap2*2:8;nvals=(int64_t*)psolve_realloc((void**)&nvals,(size_t)cap2*sizeof(int64_t));} nvals[nn++]=val; break; } }
         if(nn==0){ psolve_free(nvals); return 1; }
-        if(cp_set_vals(cp,x->v,nvals,nn)<0){ psolve_free(nvals); return -1; } psolve_free(nvals);
+        { int svr=cp_set_vals(cp,x->v,nvals,nn); psolve_free(nvals); if(svr<0) return -1; if(svr) return 1; /* restrict emptied the domain */ }
     } else {
         int64_t lo=set[0],hi=set[0]; for(int k=1;k<nset;k++){ if(set[k]<lo)lo=set[k]; if(set[k]>hi)hi=set[k]; }
         if(cp_intersect(cp,x->v,lo,hi)) return 1;
@@ -654,7 +679,7 @@ static int cp_prop_pow(CP*cp,CPT*base,int64_t expo,CPT*c){
             int64_t *nvals=NULL; int nn=0,cap2=0;
             for(int i=0;i<cp->nvals[base->v];i++){ int64_t b2=cp->vals[base->v][i]; __int128 p=1; int povf=0; for(int64_t e=0;e<expo;e++){ p*=(__int128)b2; if(p>INT64_MAX||p<INT64_MIN){ povf=1; break; } } if(!povf && p==cv){ if(nn>=cap2){cap2=cap2?cap2*2:8;nvals=(int64_t*)psolve_realloc((void**)&nvals,(size_t)cap2*sizeof(int64_t));} nvals[nn++]=b2; } }
             if(nn==0){ psolve_free(nvals); return 1; }
-            if(cp_set_vals(cp,base->v,nvals,nn)<0){ psolve_free(nvals); return -1; } psolve_free(nvals);
+            { int svr=cp_set_vals(cp,base->v,nvals,nn); psolve_free(nvals); if(svr<0) return -1; if(svr) return 1; /* restrict emptied the domain */ }
         }
         return 0;
     }
@@ -1596,7 +1621,16 @@ static int fz_cp_try(const FZModel*m,FZSolution*sol){
             if(decl->kind==FZ_K_BOOL){ cp.isbool[v]=1; cp_intersect(&cp,v,0,1); continue; }
             if(decl->nset>0 && decl->n==1){
                 cp.isbool[v]=0;
-                if(cp_set_vals(&cp,v,decl->setvals,decl->nset)<0){ cp_set_vals(&cp,v,decl->setvals,0); }
+                if(cp_set_vals(&cp,v,decl->setvals,decl->nset)<0){
+                    /* set literal larger than the CP materialization cap:
+                       the previous fallback wrote an EMPTY domain and solved
+                       on it (heap underflow in cp_dmin/cp_dmax; SIGSEGV on
+                       var {1..70000-as-set} pins).  Decline to the exact MIP
+                       bridge instead, which represents the domain
+                       symbolically. */
+                    cp_free(&cp); for(int i=0;i<nc;i++){ psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);} psolve_free(cr); psolve_free(referenced); psolve_free(opt.bestx); psolve_free(optcoef);
+                    return 0;
+                }
                 continue;
             }
             if(decl->has_lo){ int64_t lo=(int64_t)llround(decl->lo[0]); if(cp.lo[v]<lo)cp.lo[v]=lo; }
