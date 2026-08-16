@@ -264,6 +264,17 @@ python3 tools/divmod_verify.py 200 20260808 | sed 's/.*: //'
 # seeds plus a 1.5k ASan/UBSan/LSan sweep).  Hard gate: rc matters.
 python3 tools/fzn_output_check.py 2000 20260815 8 || { echo "fzn_output_check: FAIL"; exit 1; }
 
+# orbit_len global (procstates 16-bit automaton, docs/PROCSTATES.md):
+# 8 pins (incl. honest-decline on oversized index tables), the real
+# 65536-state instance re-checked state-by-state against the independent
+# C/Python ground truth (max orbit 44 at start 51641), and a 3-mode fuzz.
+# Discriminating: on the pre-change binary the run at 60 fuzz models
+# reports WRONG=68 (7 pin failures + the real instance + all 60 fuzzed;
+# every orbit model is declined UNKNOWN);
+# post-change pins OK, real instance OK, 300 fuzzed models WRONG=0 plus a
+# 150-model ASan/UBSan/LSan sweep clean.  Hard gate: rc matters.
+python3 tools/procstates_orbit_verify.py 120 20260816 || { echo "procstates_orbit_verify: FAIL"; exit 1; }
+
 if command -v minizinc >/dev/null 2>&1; then
   echo "[8.5/8] MiniZinc differential (compile .mzn -> fzn -> psolve vs Gecode)..."
   python3 tools/mzn_diff.py | tail -1

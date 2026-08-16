@@ -179,6 +179,7 @@ typedef struct {
     CPT   *terms;
     int    nset; long long *setvals;
     CPT   *arr_terms;  /* element array entries (CPT, const or var) */
+    void  *aux;        /* per-kind solver state (CPK_ORBIT: FZOrbit); owned per record */
 } CPCR;
 
 #define CPK_LIN 0
@@ -193,6 +194,7 @@ typedef struct {
 #define CPK_REIF 9     /* r <-> inner linear relation; bool var in terms[0], inner in lvars/lcoef/rhs/rel */
 #define CPK_CLAUSE 10  /* disjunction of literals; pos bools in lvars, neg bools in terms (as terms[].v) */
 #define CPK_MINMAX 11  /* m = min/max(a,b); terms[0]=a,terms[1]=b,terms[2]=m; n set to ismax flag */
+#define CPK_ORBIT 12   /* len = orbit length of `start` in the functional graph setvals[0..nset) */
 
 static int cp_term_from_lin(const Lin*l,CPT*t){
     if(l->n==0 && fabs(l->constant)<=CP_BIG && l->constant==rint(l->constant)){ t->isc=1; t->c=(int64_t)l->constant; t->v=-1; return 0; }
@@ -821,6 +823,144 @@ static int cp_prop_minmax(CP*cp,CPCR*c){
 }
 
 /* ------------------------------------------------------------------ */
+/* orbit_len(next, start, len) -- a psolve global constraint.          */
+/*                                                                    */
+/* next[] is a CONSTANT array over state indices 0..n-1, i.e. the      */
+/* transition function of a finite deterministic automaton viewed as a */
+/* functional graph.  len is the number of DISTINCT states visited by  */
+/* the walk start, next[start], next^2[start], ... up to (not          */
+/* including) the first repeated state -- tail-to-first-reentry plus  */
+/* cycle length (a fixed point has orbit length 1).                    */
+/*                                                                    */
+/* Motivation: declarative formulations of graph orbit questions by    */
+/* bounded unrolling choke stock solvers quickly (the automaton        */
+/* itself may have a data-dependent step cost), and LP/MIP encodings  */
+/* of "first repeat" need order variables over all states.  A native   */
+/* global evaluates orbits by the textbook linear-time algorithm,      */
+/* memoized per solve: depth[] holds PROVEN orbit lengths -- facts     */
+/* independent of the search state, hence shareable across every      */
+/* branch of the DFS without any trail/undo handling.                  */
+/* ------------------------------------------------------------------ */
+#define CP_ORBIT_MAXN (1<<22)
+
+typedef struct {
+    int n;                    /* number of states */
+    const long long *next;    /* n entries; owned by the CPCR's setvals */
+    int *depth;               /* 0 = unknown, else proven orbit length */
+    int *seen;                /* stamp of the walk that visited the state */
+    int *pos;                 /* position within that walk */
+    int *order;               /* walk stack */
+    int  stamp;               /* current walk id */
+} FZOrbit;
+
+static FZOrbit* orbit_alloc(int n){
+    FZOrbit*o=(FZOrbit*)psolve_calloc(1,sizeof(FZOrbit));
+    o->n=n;
+    o->depth=(int*)psolve_calloc((size_t)(n?n:1),sizeof(int));
+    o->seen =(int*)psolve_calloc((size_t)(n?n:1),sizeof(int));
+    o->pos  =(int*)psolve_calloc((size_t)(n?n:1),sizeof(int));
+    o->order=(int*)psolve_calloc((size_t)(n?n:1),sizeof(int));
+    return o;
+}
+static void orbit_free(FZOrbit*o){
+    if(!o) return;
+    psolve_free(o->depth); psolve_free(o->seen);
+    psolve_free(o->pos); psolve_free(o->order); psolve_free(o);
+}
+static void cp_cr_aux_free(CPCR*r){
+    if(r->kind==CPK_ORBIT && r->aux){ orbit_free((FZOrbit*)r->aux); r->aux=NULL; }
+}
+
+/* exact orbit length of state s, with memoization; amortized O(answer). */
+static int orbit_len_one(FZOrbit*o,int s){
+    if(o->depth[s]) return o->depth[s];
+    int k=0, cur=s;
+    o->stamp++;
+    for(;;){
+        if(o->depth[cur]){
+            int r=o->depth[cur];
+            for(int i=k-1;i>=0;i--) o->depth[o->order[i]]=r+(k-i);
+            return o->depth[s];
+        }
+        if(o->seen[cur]==o->stamp){          /* closed the cycle of this walk */
+            int p=o->pos[cur];
+            int cyc=k-p;
+            for(int i=p;i<k;i++) o->depth[o->order[i]]=cyc;
+            for(int i=p-1;i>=0;i--) o->depth[o->order[i]]=o->depth[o->order[i+1]]+1;
+            return o->depth[s];
+        }
+        o->seen[cur]=o->stamp; o->pos[cur]=k; o->order[k]=cur; k++;
+        cur=(int)o->next[cur];
+    }
+}
+
+static int cp_prop_orbit(CP*cp,CPCR*c){
+    FZOrbit*o=(FZOrbit*)c->aux;
+    int n=o->n;
+    if(!c->terms[0].isc){ if(cp_intersect(cp,c->terms[0].v,0,(int64_t)(n-1))) return 1; }
+    if(!c->terms[1].isc){ if(cp_intersect(cp,c->terms[1].v,1,(int64_t)n)) return 1; }
+    int64_t sv=0, lv=0;
+    int sF=cp_term_value(cp,&c->terms[0],&sv);
+    int lF=cp_term_value(cp,&c->terms[1],&lv);
+    if(sF){
+        if(sv<0||sv>=n) return 1;
+        int64_t k=orbit_len_one(o,(int)sv);
+        if(c->terms[1].isc) return (lv==k)?0:1;
+        if(cp_intersect(cp,c->terms[1].v,k,k)) return 1;
+        return 0;
+    }
+    if(lF){
+        /* len determined: keep only start candidates with that exact orbit */
+        if(lv<1||lv>(int64_t)n) return 1;
+        int v=c->terms[0].v;
+        int64_t *keep=NULL; int kn=0;
+        if(cp->bounded[v]){
+            for(int i=0;i<cp->nvals[v];i++){
+                int64_t val=cp->vals[v][i];
+                if(orbit_len_one(o,(int)val)==lv){
+                    keep=(int64_t*)psolve_realloc((void**)&keep,(size_t)(kn+1)*sizeof(int64_t));
+                    keep[kn++]=val;
+                }
+            }
+        } else if((int64_t)n<=CP_MAXVALS){
+            for(int64_t val=0;val<n;val++){
+                if(orbit_len_one(o,(int)val)==lv){
+                    keep=(int64_t*)psolve_realloc((void**)&keep,(size_t)(kn+1)*sizeof(int64_t));
+                    keep[kn++]=val;
+                }
+            }
+        } else {
+            return 0;   /* huge interval domain: leave it to search+verify */
+        }
+        if(kn==0){ psolve_free(keep); return 1; }
+        { int svr=cp_set_vals(cp,v,keep,kn); psolve_free(keep); if(svr<0) return -1; if(svr) return 1; }
+        return 0;
+    }
+    /* neither determined: sound min/max orbit bounds over the start domain
+       (this is the propagation that drives optimization) */
+    {
+        int v=c->terms[0].v;
+        int64_t mn=(int64_t)n, mx=1;
+        if(cp->bounded[v]){
+            if(cp->nvals[v]==0) return 1;
+            for(int i=0;i<cp->nvals[v];i++){
+                int64_t d=orbit_len_one(o,(int)cp->vals[v][i]);
+                if(d<mn) mn=d;
+                if(d>mx) mx=d;
+            }
+        } else {
+            for(int64_t val=0;val<n;val++){
+                int64_t d=orbit_len_one(o,(int)val);
+                if(d<mn) mn=d;
+                if(d>mx) mx=d;
+            }
+        }
+        if(cp_intersect(cp,c->terms[1].v,mn,mx)) return 1;
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /* Parsing FlatZinc constraints into CPCR records                      */
 /* ------------------------------------------------------------------ */
 
@@ -1099,6 +1239,41 @@ static int cp_parse(FZModel*m,CPCR**out_cr,int*out_n,unsigned char*referenced,in
             for(int i=0;i<3;i++) if(!rec.terms[i].isc) referenced[rec.terms[i].v]=1;
             motivating=1;
         }
+        /* ---------- orbit_len(next, start, len) -- psolve global ----------
+           next must be a CONSTANT index array over 0..n-1 (a finite
+           automaton transition function); oversized or out-of-range tables
+           make us decline the whole model (honest UNKNOWN downstream),
+           never a wrong answer. */
+        else if(cp_pred_is(p,"orbit_len")){
+            if(c->nargs<3){ok=0;break;}
+            Lin*arr;int narr; if(parse_array(m,c->args[0],&arr,&narr)!=0){ok=0;break;}
+            Lin l1; if(parse_lin(m,c->args[1],&l1)!=0){free_lins(arr,narr);ok=0;break;}
+            Lin l2; if(parse_lin(m,c->args[2],&l2)!=0){lin_free(&l1);free_lins(arr,narr);ok=0;break;}
+            int bad=0;
+            if(narr<1||narr>CP_ORBIT_MAXN) bad=1;
+            long long *nx=NULL;
+            if(!bad){
+                nx=(long long*)psolve_malloc((size_t)narr*sizeof(long long));
+                for(int i=0;i<narr;i++){
+                    if(arr[i].n!=0||!isfinite(arr[i].constant)||arr[i].constant!=rint(arr[i].constant)
+                       ||fabs(arr[i].constant)>=(double)CP_BIG){ bad=1; break; }
+                    long long vv=(long long)llround(arr[i].constant);
+                    if(vv<0||vv>=narr){ bad=1; break; }
+                    nx[i]=vv;
+                }
+            }
+            free_lins(arr,narr);
+            if(bad){ psolve_free(nx); lin_free(&l1); lin_free(&l2); ok=0; break; }
+            rec.kind=CPK_ORBIT; rec.n=2; rec.setvals=nx; rec.nset=narr;
+            rec.terms=(CPT*)psolve_calloc(2,sizeof(CPT));
+            if(cp_term_from_lin(&l1,&rec.terms[0])!=0) bad=1;
+            if(cp_term_from_lin(&l2,&rec.terms[1])!=0) bad=1;
+            lin_free(&l1);lin_free(&l2);
+            if(bad){ psolve_free(rec.terms); psolve_free(rec.setvals); rec.setvals=NULL; rec.nset=0; ok=0; break; }
+            if(!rec.terms[0].isc) referenced[rec.terms[0].v]=1;
+            if(!rec.terms[1].isc) referenced[rec.terms[1].v]=1;
+            motivating=1;
+        }
         /* ---------- reified relations: r <-> (sum coef*x rel rhs) ---------- */
         else if(cp_pred_is(p,"int_lin_eq_reif")||cp_pred_is(p,"int_lin_ne_reif")||
                 cp_pred_is(p,"int_lin_le_reif")||cp_pred_is(p,"int_lin_lt_reif")||
@@ -1219,8 +1394,8 @@ static int cp_parse(FZModel*m,CPCR**out_cr,int*out_n,unsigned char*referenced,in
         if(nc>=cap){ cap*=2; cr=(CPCR*)psolve_realloc((void**)&cr,(size_t)cap*sizeof(CPCR)); }
         cr[nc++]=rec;
     }
-    if(!ok){ for(int i=0;i<nc;i++){ psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);} psolve_free(cr); return -1; }
-    if(!motivating){ for(int i=0;i<nc;i++){ psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);} psolve_free(cr); return -2; }
+    if(!ok){ for(int i=0;i<nc;i++){ cp_cr_aux_free(&cr[i]); psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);} psolve_free(cr); return -1; }
+    if(!motivating){ for(int i=0;i<nc;i++){ cp_cr_aux_free(&cr[i]); psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);} psolve_free(cr); return -2; }
     *out_cr=cr; *out_n=nc; *has_cp_motivating=motivating;
     return 0;
 }
@@ -1254,6 +1429,7 @@ static int cp_propagate(CP*cp,CPCR*cr,int nc){
                 case CPK_REIF: r=cp_prop_reif(cp,&cr[i]); break;
                 case CPK_CLAUSE: r=cp_prop_clause(cp,&cr[i]); break;
                 case CPK_MINMAX: r=cp_prop_minmax(cp,&cr[i]); break;
+                case CPK_ORBIT: r=cp_prop_orbit(cp,&cr[i]); break;
             }
             if(r==1) return 1;
             if(r==-1) return -1;
@@ -1304,6 +1480,12 @@ static int cp_verify(const CP*cp,CPCR*cr,int nc,const double*outx){
             int64_t a=cp_term_out(&r->terms[0],outx), b=cp_term_out(&r->terms[1],outx), m=cp_term_out(&r->terms[2],outx);
             int64_t res=(r->n? (a>b?a:b) : (a<b?a:b));
             if(res!=m) return 0;
+        }
+        else if(r->kind==CPK_ORBIT){
+            FZOrbit*o=(FZOrbit*)r->aux;
+            int64_t sv=cp_term_out(&r->terms[0],outx), lv=cp_term_out(&r->terms[1],outx);
+            if(sv<0||sv>=o->n) return 0;
+            if(lv!=orbit_len_one(o,(int)sv)) return 0;
         }
     }
     return 1;
@@ -1595,10 +1777,17 @@ static int fz_cp_try(const FZModel*m,FZSolution*sol){
         int combinatorial=0;
         for(int i=0;i<nc;i++) if(cr[i].kind!=CPK_LIN){ combinatorial=1; break; }
         if(!combinatorial){
-            for(int i=0;i<nc;i++){ psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);} psolve_free(cr);
+            for(int i=0;i<nc;i++){ cp_cr_aux_free(&cr[i]); psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);} psolve_free(cr);
             psolve_free(referenced); psolve_free(optcoef); psolve_free(opt.bestx); return 0;
         }
         for(int i=0;i<m->objective.n;i++) referenced[m->objective.idx[i]]=1;
+    }
+
+    /* per-solve solver state for global constraints (facts-only caches that
+       are safe to share across the whole DFS without trailing) */
+    for(int i=0;i<nc;i++) if(cr[i].kind==CPK_ORBIT){
+        cr[i].aux=orbit_alloc(cr[i].nset);
+        ((FZOrbit*)cr[i].aux)->next=cr[i].setvals;
     }
 
     CP cp; memset(&cp,0,sizeof(cp));
@@ -1628,7 +1817,7 @@ static int fz_cp_try(const FZModel*m,FZSolution*sol){
                        var {1..70000-as-set} pins).  Decline to the exact MIP
                        bridge instead, which represents the domain
                        symbolically. */
-                    cp_free(&cp); for(int i=0;i<nc;i++){ psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);} psolve_free(cr); psolve_free(referenced); psolve_free(opt.bestx); psolve_free(optcoef);
+                    cp_free(&cp); for(int i=0;i<nc;i++){ cp_cr_aux_free(&cr[i]); psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);} psolve_free(cr); psolve_free(referenced); psolve_free(opt.bestx); psolve_free(optcoef);
                     return 0;
                 }
                 continue;
@@ -1636,7 +1825,7 @@ static int fz_cp_try(const FZModel*m,FZSolution*sol){
             if(decl->has_lo){ int64_t lo=(int64_t)llround(decl->lo[0]); if(cp.lo[v]<lo)cp.lo[v]=lo; }
             if(decl->has_hi){ int64_t hi=(int64_t)llround(decl->hi[0]); if(cp.hi[v]>hi)cp.hi[v]=hi; }
             if(cp_intersect(&cp,v,cp.lo[v],cp.hi[v])){ /* empty initial domain -> UNSAT */
-                cp_free(&cp); for(int i=0;i<nc;i++){ psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);} psolve_free(cr); psolve_free(referenced); psolve_free(opt.bestx); psolve_free(optcoef);
+                cp_free(&cp); for(int i=0;i<nc;i++){ cp_cr_aux_free(&cr[i]); psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);} psolve_free(cr); psolve_free(referenced); psolve_free(opt.bestx); psolve_free(optcoef);
                 sol->status=1; sol->nvars=nv; sol->nodes=0; return 1;
             }
         }
@@ -1646,8 +1835,8 @@ static int fz_cp_try(const FZModel*m,FZSolution*sol){
        x*x*x*y*y = 100000 with unbounded x,y), bound the whole product chain
        to the divisors of that constant so search is finite and correct. */
     int bd=cp_bound_diophantine(&cp,cr,nc);
-    if(bd==1){ cp_free(&cp); for(int i=0;i<nc;i++){ psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);} psolve_free(cr); psolve_free(referenced); psolve_free(opt.bestx); psolve_free(optcoef); sol->status=1; sol->nvars=nv; return 1; }
-    if(bd==-1){ cp_free(&cp); for(int i=0;i<nc;i++){ psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);} psolve_free(cr); psolve_free(referenced); psolve_free(opt.bestx); psolve_free(optcoef); return 0; }
+    if(bd==1){ cp_free(&cp); for(int i=0;i<nc;i++){ cp_cr_aux_free(&cr[i]); psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);} psolve_free(cr); psolve_free(referenced); psolve_free(opt.bestx); psolve_free(optcoef); sol->status=1; sol->nvars=nv; return 1; }
+    if(bd==-1){ cp_free(&cp); for(int i=0;i<nc;i++){ cp_cr_aux_free(&cr[i]); psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);} psolve_free(cr); psolve_free(referenced); psolve_free(opt.bestx); psolve_free(optcoef); return 0; }
 
     double *outx=sol->x; /* sized nv */
 
@@ -1718,7 +1907,7 @@ static int fz_cp_try(const FZModel*m,FZSolution*sol){
     else { handled=0; } /* fallback: node cap (rr==4) or uncertifiable (rr==-1) */
 
     cp_free(&cp);
-    for(int i=0;i<nc;i++){ psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);} psolve_free(cr);
+    for(int i=0;i<nc;i++){ cp_cr_aux_free(&cr[i]); psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);} psolve_free(cr);
     psolve_free(referenced);
     psolve_free(opt.bestx); psolve_free(optcoef);
     if(!handled) return 0;
