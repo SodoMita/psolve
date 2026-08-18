@@ -59,6 +59,11 @@ typedef struct {
     double *x;          /* solution (n); NULL if a stop during Phase-I left no
                            feasible point to hand back */
     double *mult;       /* Lagrange multipliers for A x <= b (m) */
+    double *ray;        /* certified recession direction (n), only filled
+                           when status == 1 (unbounded); NULL otherwise.
+                           Verifiable against the original data: A d <= 0,
+                           d^T Q d ~ 0, (Q x + c)^T d < 0 (and the point x
+                           above is itself primal feasible) */
     double obj;         /* optimal objective value (or best incumbent on stop) */
     int iterations;     /* active-set iterations */
 } QPResult;

@@ -343,3 +343,36 @@ oversight.
 | ID | site | value | class | why it is not a tolerance |
 |---|---|---|---|---|
 | TOL-SYS-NSEC | main.c:109 | 1e9 | — | nanosecond→second unit conversion for wall-clock reporting; steers no verdict, bound, or branch |
+
+### 8.9 Unified evidence objects (verdict certificates) — `src/cert.c`, `src/cert.h`, wiring in `src/main.c`
+
+The 6.4 certificate layer re-verifies every CLI verdict over the caller's
+ORIGINAL model data before that verdict may print (contract: `src/cert.h`;
+rejection/defer ⇒ the printed class degrades to UNKNOWN/NUMERICAL).  Its
+margins are claim fields carried explicitly on `PsvCert`; the defaults
+below only substitute when a wiring left the field at 0, and every one of
+them merely *re-states* the producing engine's own contract value (the
+engine's site is the normative row).  Class rule: they never ACCEPT a
+verdict alone — the acceptance stands on the certificate's arithmetic
+(directed-rounding Farkas, Lagrangian dual bound, exact snapped
+integrality, KKT residuals) — but they may not be tightened past the
+engine's contract either, or legit engine evidence false-rejects into
+spurious UNKNOWNs (the dual failure mode of this class).
+
+| ID | site | value | class | direction of safety / protects / may-never |
+|---|---|---|---|---|
+| TOL-CERT-INF | cert.h:73 (`PSV_INF`) | 1e29 | S | bound at/above ⇒ "no bound" in claim data; parity with TOL-LP-BIGCAP so boxcert and the cert layer read the same infinity |
+| TOL-CERT-DEFBOX | cert.c:14 default; main.c:181, 216 (LP UNBOUNDED/OPTIMAL lanes) | 1e-6·(1+\|obj\|) | V | primal bound grace when admitting the claimed *point*; mirrors TOL-LP-FINALBOX; may never manufacture acceptance — the point still has to close the bound/descent checks |
+| TOL-CERT-DEFROW | cert.c:15 default; main.c:181, 216 | 1e-5·(1+\|b_i\|) | V | primal row-residual grace; mirrors TOL-LP-FINALROW — same re-check margin the LP core's own final verify uses |
+| TOL-CERT-DEFDJ | cert.c:16 default; main.c:181, 217 | 1e-9·(1+\|rc\| scale) | V | reduced-cost dust window in the dual bound and ray-descent tests; mirrors TOL-LP-DJ (the simplex stops at this scale) — dust reduced costs are charged upward on closed boxes, treated as zero only across open sides; a beyond-window free variable ⇒ DEFER, never a bad bound |
+| TOL-CERT-DEFGAP | cert.c:17 default; main.c:217 | 1e-7·scale | V | dual-gap closure grace for LP-OPTIMAL (B vs the point's objective); strictly looser than DEFDJ so rounding-level bound slack does not false-reject, strictly tighter than any mip_gap so a *suboptimal* point cannot close (the false-optimality injection family hits this line) |
+| TOL-CERT-DEFOBJ | cert.c:18 default; main.c:217 | 1e-9·(1+\|cx\|) | V | claimed-objective vs recomputed cᵀx consistency; protects against a payload obj detached from its point |
+| TOL-CERT-RAYMACRO | cert.c:22 (`PSV_RAY_MACRO`) | 1e-9·(1+\|d\|∞) | V | which components of an LP recession ray must show an open bound side to walk into; sub-macro entries are rounding-level and demand nothing (they cannot carry descent) |
+| TOL-CERT-QPCURV | cert.c:379 | 1e-12·(1+\|Q\|∞)·\|d\|∞² | V | dᵀQd ≈ 0 curvature test mirroring qp.c's own ray-admission scale; a genuinely convex direction rejects UNBOUNDED, rounding-level curvature defers to the descent test |
+
+Direction note (V-class): every cert-lane margin inherits the producing
+engine's direction — i.e. they mirror the engines' own terminal checks
+rather than inventing a new contract.  The two deliberately *strict*
+surfaces are EXACT integrality of MIP incumbents (engine stores them
+snapped; zero width by construction, so 1-ulp corruption is decidable —
+measured 100/100 rejection) and the discrete EXHAUSTION stamps.

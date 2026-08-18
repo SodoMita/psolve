@@ -2,6 +2,7 @@
 #include "solver.h"
 #include "err.h"
 #include "tlimit.h"
+#include "cert.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,6 +29,18 @@ static int parse_positive_ms(const char *text, long *out)
         return -1;
     *out = value;
     return 0;
+}
+
+/* Fill the shared original-model view of a certificate claim from an LP
+   file model.  Payload and margins are set per verdict lane by the caller. */
+static void psv_fill_lp(PsvCert *cl, PsvKind kind, const LP *lp)
+{
+    memset(cl, 0, sizeof(*cl));
+    cl->kind = kind;
+    cl->n = lp->n; cl->m = lp->m;
+    cl->colptr = lp->Acolptr; cl->row = lp->Arow; cl->val = lp->Aval;
+    cl->rel = lp->rel; cl->b = lp->b; cl->lo = lp->l; cl->hi = lp->u;
+    cl->c = lp->c; cl->maximize = lp->maximize;
 }
 
 int main(int argc, char **argv)
@@ -128,11 +141,16 @@ int main(int argc, char **argv)
         double *fr_zh = (double*)malloc((size_t)n * sizeof(double));
         if (fr_y && fr_yc && fr_zl && fr_zh) {
             int certified = 0;
-            if (solver_farkas_duals(s, fr_y) == 0 &&
-                solver_farkas_boxcert(n, m, lp.Acolptr, lp.Arow, lp.Aval,
-                                      lp.rel, lp.b, lp.l, lp.u,
-                                      fr_y, s->mlt, 1e-6, fr_yc, fr_zl, fr_zh))  /* TOLSHEET TOL-LP-FARKAS */
-                certified = 1;
+            if (solver_farkas_duals(s, fr_y) == 0) {
+                /* unified evidence object (roadmap 6.4): the checker
+                   re-verifies the full Farkas separation with directed
+                   rounding against the original data -- the same
+                   solver_farkas_boxcert semantics, one entry point */
+                PsvCert cl; psv_fill_lp(&cl, PSVK_LP_INFEASIBLE, &lp);
+                for (int i = 0; i < m; i++) fr_y[i] *= (double)s->mlt[i];
+                cl.ray = fr_y; cl.dt_gap = 1e-6;  /* TOLSHEET TOL-LP-FARKAS */
+                if (psv_cert_check(&cl) == PSV_OK) certified = 1;
+            }
             if (!certified) {
                 double E = solver_row_exposure(n, m, lp.Acolptr, lp.Arow,
                                                lp.Aval, lp.l, lp.u);
@@ -148,7 +166,29 @@ int main(int argc, char **argv)
     if (r == 1) {
         printf("status: INFEASIBLE\n");
     } else if (r == 2) {
-        printf("status: UNBOUNDED\n");
+        /* UNBOUNDED prints only with a re-verified certificate: a primal
+           feasible point and a recession ray that the psv layer checks
+           against the original rows, box sides and objective direction */
+        double *xu = (double*)malloc((size_t)(lp.n > 0 ? lp.n : 1) * sizeof(double));
+        double *ur = (double*)malloc((size_t)(lp.n > 0 ? lp.n : 1) * sizeof(double));
+        double obju = 0.0;
+        int ok = 0;
+        if (xu && ur) {
+            solver_optimum(s, xu, &obju);
+            if (solver_unbounded_ray(s, ur) == 0) {
+                PsvCert cl; psv_fill_lp(&cl, PSVK_LP_UNBOUNDED, &lp);
+                cl.x = xu; cl.ray = ur; cl.obj = obju;
+                cl.gt_box = 1e-6; cl.gt_row = 1e-5; cl.dt_dj = 1e-9; /* TOLSHEET TOL-CERT-DEFBOX */ /* TOLSHEET TOL-CERT-DEFROW */ /* TOLSHEET TOL-CERT-DEFDJ */
+                ok = (psv_cert_check(&cl) == PSV_OK);
+            }
+        }
+        /* a verdict the certificate layer cannot confirm must not print */
+        if (ok) printf("status: UNBOUNDED\n");
+        else {
+            fprintf(stderr, "psv: lp_unbounded certificate not confirmed\n");
+            printf("status: NUMERICAL_FAILURE\n");
+        }
+        free(xu); free(ur);
     } else if (r == 3) {
         printf("status: ITERATION_LIMIT\n");
     } else if (r == SOLVE_STOPPED) {
@@ -162,6 +202,31 @@ int main(int argc, char **argv)
         double obj;
         if (!xo) { solver_destroy(s); lp_free(&lp); psolve_stop_set(NULL); psolve_frame_pop(&ef); return 1; }
         solver_optimum(s, xo, &obj);
+        /* unified evidence object (roadmap 6.4): OPTIMAL prints only when
+           the certificate layer re-verifies both primal feasibility and a
+           closed bounded-LP Lagrangian dual bound from the engine duals */
+        {
+            double *ylp = (double*)malloc((size_t)(lp.m > 0 ? lp.m : 1) * sizeof(double));
+            int ok = 0;
+            if (ylp) {
+                solver_duals(s, ylp);
+                for (int i = 0; i < lp.m; i++) ylp[i] *= (double)s->mlt[i];
+                PsvCert cl; psv_fill_lp(&cl, PSVK_LP_OPTIMAL, &lp);
+                cl.x = xo; cl.y = ylp; cl.obj = obj;
+                cl.gt_box = 1e-6; cl.gt_row = 1e-5; /* TOLSHEET TOL-CERT-DEFBOX */ /* TOLSHEET TOL-CERT-DEFROW */
+                cl.dt_dj = 1e-9; cl.dt_gap = 1e-7; cl.dt_obj = 1e-9; /* TOLSHEET TOL-CERT-DEFDJ */ /* TOLSHEET TOL-CERT-DEFGAP */ /* TOLSHEET TOL-CERT-DEFOBJ */
+                ok = (psv_cert_check(&cl) == PSV_OK);
+            }
+            free(ylp);
+            if (!ok) {
+                fprintf(stderr, "psv: lp_optimal certificate not confirmed\n");
+                printf("status: NUMERICAL_FAILURE\n");
+                free(xo);
+                solver_destroy(s); lp_free(&lp);
+                tlimit_disarm(); psolve_stop_set(NULL); psolve_frame_pop(&ef);
+                return 0;
+            }
+        }
         printf("status: OPTIMAL\n");
         printf("objective: %.15g\n", obj);
         if (print) {

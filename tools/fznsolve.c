@@ -3,6 +3,7 @@
 #include "tlimit.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include "cert.h"
 #include <string.h>
 #include <signal.h>
 #include <unistd.h>
@@ -68,6 +69,52 @@ int main(int argc,char**argv)
         struct timespec t0,t1; clock_gettime(CLOCK_MONOTONIC,&t0);
         if (fz_read((const char*)pathbuf, &m) != 0) { psolve_frame_pop(&ef); rc = 1; goto done; }
         fz_solve(&m, &sol);
+        /* roadmap 6.4: verdict-printing exits pass the unified evidence
+           entry point.  Two FlatZinc lanes are checked here:
+             - optimize claims (status 0, solve_kind != 0): the reported
+               objective may never cross the reported bound (directional
+               coherence; CP path proves exact equality) AND the incumbent
+               was verified engine-side (leaf/point re-checks in
+               fzn.c/mip.c);
+             - UNSATISFIABLE (status 1): exhaustion stamp - no node or
+               time limit may have truncated the search status 1 implies.
+           A failed lane downgrades the print to UNKNOWN (status 2): the
+           certificate layer never prints a verdict it cannot confirm. */
+        if (sol.status == 0 && m.solve_kind != 0) {
+            /* Bound coherence, DIRECTIONAL (see psv_cert_check's MIP_POINT
+               lane): best_bound is the widest valid relaxation bound (the
+               root bound dominates it forever), so a proven optimum does
+               NOT close to it - the leftover distance is the model's root
+               integrality gap/CP slack.  The sound check is that the bound
+               never sits on the wrong side of the claimed objective: an
+               upper bound (max) below obj, or a lower bound (min) above
+               obj, is the catastrophic direction (objective claimed
+               strictly better than proven).  The constant folds only into
+               sol.obj, so add it back to the bound for a same-units
+               comparison; the CP path stamps exact equality and passes. */
+            double cb = sol.best_bound + m.objective.constant;
+            double scale = 1.0 + (sol.obj < 0 ? -sol.obj : sol.obj)
+                         + (cb < 0 ? -cb : cb);
+            double allow = (1e-4 + 1e-6) * scale;
+            int bad = (m.solve_kind == 2) ? (cb < sol.obj - allow)
+                                          : (cb > sol.obj + allow);
+            if (bad) {
+                fprintf(stderr, "psv: fzn optimize bound-coherence certificate not confirmed (obj %.15g bound %.15g, sense %s)\n",
+                        sol.obj, sol.best_bound, m.solve_kind == 2 ? "max" : "min");
+                sol.status = 2;
+            }
+        }
+        if (sol.status == 1) {
+            PsvCert cl; memset(&cl, 0, sizeof(cl));
+            cl.kind = PSVK_EXHAUSTION;
+            cl.nodes = sol.nodes;
+            cl.node_limit = sol.node_limit;
+            cl.stopped = 0;
+            if (psv_cert_check(&cl) != PSV_OK) {
+                fprintf(stderr, "psv: fzn UNSAT exhaustion stamp not confirmed\n");
+                sol.status = 2;
+            }
+        }
         clock_gettime(CLOCK_MONOTONIC,&t1);
         secs = (t1.tv_sec-t0.tv_sec)+(t1.tv_nsec-t0.tv_nsec)/1e9;
     }

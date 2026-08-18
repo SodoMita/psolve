@@ -149,6 +149,8 @@ static void active_set(const QP *qp, const double *xstart, QPResult *res)
     res->n = n;
     res->x = (double*)xmalloc((size_t)n * sizeof(double));
     res->mult = (double*)xmalloc((size_t)m * sizeof(double));
+    res->ray = (double*)xmalloc((size_t)n * sizeof(double));
+    for (int i = 0; i < n; i++) res->ray[i] = 0.0;
     for (int i = 0; i < m; i++) res->mult[i] = 0.0;
     double *x = res->x;
     memcpy(x, xstart, (size_t)n * sizeof(double));
@@ -297,7 +299,13 @@ static void active_set(const QP *qp, const double *xstart, QPResult *res)
                         (void)anorm;
                         if (ap > 0.0) ray = 0;
                     }
-                    if (ray) { status = 1; break; }   /* certified unbounded */
+                    if (ray) {
+                        status = 1;
+                        /* keep the direction as evidence: the CLI certificate
+                           layer re-verifies it against the original data */
+                        memcpy(res->ray, p, (size_t)n * sizeof(double));
+                        break;
+                    }   /* certified unbounded */
                 }
             }
         }
@@ -559,6 +567,6 @@ void qp_solve(const QP *qp, QPResult *res)
 void qp_result_free(QPResult *res)
 {
     if (!res) return;
-    psolve_free(res->x); psolve_free(res->mult);
+    psolve_free(res->x); psolve_free(res->mult); psolve_free(res->ray);
     memset(res, 0, sizeof(*res));
 }

@@ -120,6 +120,12 @@ typedef struct {
     double *vw;            /* scratch: v = B^{-T} d */
     double *piw;           /* scratch: pi_p = B^{-T} e_p */
     double *duals;         /* dual (shadow-price) vector, B^{-T} c_B, M */
+    /* recession-ray evidence left behind by an UNBOUNDED verdict
+       (unb_valid==1): ray_int[q]=unb_dir, ray_int[basis[i]]=s->v[i] at
+       detection, exactly the same state the honest "is the factorization
+       accurate" dense-retry gate just cleared.  Cleared at solve start. */
+    int unb_valid, unb_var, unb_dir;
+    double *unb_ray;       /* len N */
 } Solver;
 
 /* API */
@@ -154,6 +160,17 @@ int solver_warm_solve(Solver *s);
  * dual must be an M-vector.  The dual of row i gives the marginal change in
  * the objective per unit change in that constraint's right-hand side. */
 void solver_duals(const Solver *s, double *dual);
+
+/* Materialize a certified improving recession ray over the ORIGINAL
+ * variables for a solve that returned UNBOUNDED, using the basis state the
+ * dense-verified detection left behind: D[q] = dir, D[basic_i] = v_i, then
+ * unmapped through the x = x+ - x- split like solver_optimum.  Returns 0 on
+ * success (ray filled, n_orig doubles) and -1 when no UNBOUNDED state is
+ * available.  Like every solver hint the ray is only evidence: the caller
+ * re-verifies point feasibility, row recession, open bound sides and the
+ * objective direction against ITS original data (lpsolve does this through
+ * the psv certificate layer, cert.h). */
+int solver_unbounded_ray(const Solver *s, double *ray);
 
 /* Extract y = B^{-T} c_B at the Phase-I-optimal basis left behind by an
  * INFEASIBLE verdict (farkas_ok == 1): one component per equality row, in

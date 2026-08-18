@@ -1,6 +1,7 @@
 #include "qp.h"
 #include "err.h"
 #include "tlimit.h"
+#include "cert.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -92,11 +93,41 @@ int main(int argc, char **argv)
        "OBJ" + "ITERS"; any other status -> "STATUS <n>".  "--print" adds
        per-variable x[..] lines on top. */
     if (r.status == 0) {
+        /* roadmap 6.4: print an optimum only through the unified evidence
+           entry point - the checker re-verifies primal rows, stationarity
+           residual, multiplier sign/complementarity and the claimed
+           objective against the original model */
+        PsvCert cl; memset(&cl, 0, sizeof(cl));
+        cl.kind = PSVK_QP_OPTIMAL;
+        cl.n = n; cl.m = m; cl.Q = Q; cl.A = A; cl.bq = b; cl.cq = c;
+        cl.x = r.x; cl.mu = r.mult; cl.obj = r.obj;
+        cl.gt_row = 1e-7; cl.dt_dj = 1e-7; cl.dt_obj = 1e-6;
+        if (psv_cert_check(&cl) != PSV_OK) {
+            fprintf(stderr, "psv: qp_optimal certificate not confirmed\n");
+            printf("STATUS %d\n", QP_KKT_FAIL);
+            qp_result_free(&r);
+            free(c); free(Q); free(A); free(b);
+            tlimit_disarm(); psolve_stop_set(NULL); psolve_frame_pop(&ef);
+            return 0;
+        }
         printf("SOLUTION");
         for (int i = 0; i < n; i++) printf(" %.17g", r.x[i]);
         printf("\nOBJ %.17g\nITERS %d\n", r.obj, r.iterations);
         if (print)
             for (int i = 0; i < n; i++) printf("x[%d] = %.17g\n", i, r.x[i]);
+    } else if (r.status == 1) {
+        /* UNBOUNDED claims pass the re-verified ray through the checker */
+        PsvCert cl; memset(&cl, 0, sizeof(cl));
+        cl.kind = PSVK_QP_UNBOUNDED;
+        cl.n = n; cl.m = m; cl.Q = Q; cl.A = A; cl.bq = b; cl.cq = c;
+        cl.x = r.x; cl.ray = r.ray;
+        cl.gt_row = 1e-7; cl.dt_dj = 1e-9;
+        if (psv_cert_check(&cl) == PSV_OK) {
+            printf("STATUS %d\n", r.status);
+        } else {
+            fprintf(stderr, "psv: qp_unbounded certificate not confirmed\n");
+            printf("STATUS %d\n", QP_KKT_FAIL);
+        }
     } else if (r.status == QP_STOPPED) {
         printf("STATUS %d\n", r.status);
         /* best incumbent (feasible) without claiming optimality */

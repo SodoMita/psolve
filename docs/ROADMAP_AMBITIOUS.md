@@ -197,7 +197,43 @@ record:
   state under `-fsanitize=thread` smoke runs; API documented in README;
   all tools migrated.
 
-### 6.4 Unified evidence objects
+### 6.4 Unified evidence objects — **DONE 2026-08-18(12)**
+`src/cert.h`/`src/cert.c`: one `PsvCert` claim type per verdict class
+(LP OPTIMAL/INFEASIBLE/UNBOUNDED, MIP point + proven-optimal stamp,
+QP optimal/unbounded, search-EXHAUSTION) and one `psv_cert_check()`
+entry point; every verdict-printing CLI exit (lpsolve, mipsolve,
+qpsolve, fznsolve optimize/UNSAT lanes) fills the claim over the
+ORIGINAL model data and prints only through it (REJECT/DEFER degrade to
+the honest class).  Engine evidence hooks added: `solver_unbounded_ray`
+(recession ray materialized at the dense-verified `iterate()` exit,
+unmapped through the x⁺/x⁻ split) and `QPResult.ray`.  LP-OPTIMAL is
+certified by a bounded-LP Lagrangian dual bound in the caller's own
+data (sense-normalized duals, sign-clipped = soundly weakened, rounding
+dust charged upward on closed boxes only).  Error-injection hard gate
+`tools/cert_inject` (in `test.sh`, 2 seeds) measures: LEGIT claims
+accepted 100% on all 8 families; LARGE adversarial corruptions rejected
+100%; directed 1-ulp noise rejected 100% on the zero-width
+snapped-integer MIP surface (199/199, 1964/1964 at N=2000) — and
+**reported, not asserted, on tolerance-margined point surfaces** (0%,
+by design: a checker stricter than the engines' own terminal margins
+would false-reject every true claim; the literal "≥99.9% of 1-ulp
+OPTIMAL claims" target is decidable only on zero-width surfaces and is
+met exactly there — AUDIT addendum 12 states this precisely instead of
+claiming it).  Injection adversarialness is decided by independent
+closed-form oracles (never the checker under test), after the harness
+itself caught two of its own unsound families (garbage duals that
+collapse to a *valid* box-corner certificate; rotation-invariant Farkas
+rays).  Three real defects the gate/battery caught during construction
+and pinned: symmetric bound-coherence vs the root integrality gap
+(false-rejected ~38% of proven-optimal MIPs — fixed to directional,
+`examples/knap_gap.lp` pin), |b|-only row grace vs catastrophic
+cancellation (fbbt_verify went 2→31 FAIL then 0 with activity-scaled
+dust bounds), and MIP-UNSAT lane over-strictness on the pinned 5e-7
+margin cycle (sub-margin infeasibility proved by lattice exhaustion,
+not by a Farkas ray).  Full battery rc=0, tolsheet closure green,
+ASan/UBSan/LSan sweep clean, bench 77/77 semantics identical.
+
+### 6.4-origin specification (superseded by the DONE note above)
 - **What:** a small internal `psv_cert_t` per verdict class: OPTIMAL
   (primal point + dual vector), INFEASIBLE (Farkas ray or exact-engine
   stamp), UNBOUNDED (primal point + recession ray), with one

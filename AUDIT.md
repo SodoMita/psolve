@@ -1,5 +1,130 @@
 # psolve — audit & hardening notes
 
+> **2026-08-18 (12) - branch `arena/cp-engine-correctness`: Phase 6.4,
+> unified evidence objects.  One claim type per verdict class, one
+> psv_cert_check() entry point at every CLI verdict exit, an
+> error-injection hard gate - and three real defects the
+> gate/battery caught in the certificate layer's own first drafts.**
+>
+> **What shipped.**  `src/cert.h` defines `PsvCert` (kind + ORIGINAL-data
+> view + evidence payload + explicit margin fields) and one entry point
+> `psv_cert_check()` returning OK / REJECT (evidence contradicts) /
+> DEFER (evidence cannot certify: NaN, missing payload, vacuous bound).
+> `src/cert.c` implements seven kinds against the caller's own data:
+> LP_OPTIMAL (primal point + bounded-LP Lagrangian dual bound built from
+> the engine duals: shadow-price duals are sense-normalized into max form
+> BEFORE sign analysis, sign-invalid components clipped to 0 = sound
+> weakening, reduced-cost dust within the dj window charged UPWARD on
+> closed boxes and treated as zero only across an open side - charging
+> |rc|·1e30 against the infinity sentinel was an early-draft bug that
+> inflated B by 1e14), LP_INFEASIBLE (directed-rounding Farkas box
+> separation, reusing solver_farkas_boxcert), LP_UNBOUNDED (feasible
+> point + recession ray: open bound side on every macro component,
+> sign-consistent row recession, strict descent), MIP_POINT (bounds +
+> rows + EXACT integrality of snapped incumbents + objective consistency
+> + directional bound coherence), QP_OPTIMAL (primal rows, stationarity
+> Qx+c+Aᵀμ, multiplier sign + complementarity, objective consistency),
+> QP_UNBOUNDED (feasible point, strict A d ≤ 0 mirroring qp.c's
+> deliberate no-margin rule, curvature ≈ 0, descent), EXHAUSTION
+> (discrete search-completed stamp: stopped/node-limit/nodes<0 reject -
+> a truncated search can never print UNSAT through this entry point).
+> Engine evidence hooks: `solver_unbounded_ray()` (the recession ray is
+> materialized at the dense-verified `iterate()` unbounded exit and
+> unmapped through the x⁺−x⁻ split; cleared at both solve-entry sites)
+> and `QPResult.ray`.  Wiring: `src/main.c` (all three LP verdict lanes,
+> INFEASIBLE keeping the exact Phase-I/shaky-frontier policy), and
+> `tools/mipsolve.c` / `tools/qpsolve.c` / `tools/fznsolve.c` (MIP point
+> + Farkas-or-exhaustion UNSAT lanes + relaxation-verified UNBOUNDED;
+> QP KKT/recession; fzn optimize bound-coherence + UNSAT exhaustion).
+> On REJECT/DEFER every lane degrades to the honest class
+> (NUMERICAL_FAILURE / UNKNOWN); the checker never prints and never
+> mutates.
+>
+> **The error-injection acceptance (what the numbers mean, stated
+> precisely).**  New hard gate `tools/cert_inject` in test.sh (200
+> instances x 8 families x 2 seeds; extra seeds 4242/99991/31337 and
+> N=2000 also green).  LEGIT (true claims) accepted 100% on every
+> family - a legit rejection is a certificate-layer false-rejection bug.
+> LARGE (out-of-box pushes, objective drifts, integer off-by-one,
+> negated rays, feasible-but-suboptimal false-OPTIMAL claims, row-normal
+> point corruption, flipped statuses) rejected 100% of ADVERSARIAL shots
+> - adversarialness decided by independent closed-form oracles in the
+> harness (long-double box extrema, never the checker under test),
+> because a corrupted payload that still proves the claim accepts
+> CORRECTLY (the harness itself caught two of its own unsound families:
+> garbage duals that clip to the box-sup and remain a valid corner
+> certificate when the optimum saturates the box, and rotation-invariant
+> Farkas rays on symmetric contradiction rows).  1-ulp directed noise:
+> 100% rejected on the zero-width snapped-integer MIP surface
+> (199/199; 1964/1964 at N=2000) - the one surface where ulp corruption
+> is structurally decidable because engine incumbents are stored
+> lattice-snapped and the check is exact `x == rint(x)`.  On the
+> tolerance-margined point surfaces (LP/QP point and dual payloads) the
+> measured rejection is 0% BY DESIGN: the engines' own terminal margins
+> are >= 1e-9-relative, so any checker that rejects 2e-16-relative noise
+> would false-reject every true claim.  The roadmap's literal ">= 99.9%
+> of 1-ulp-perturbed OPTIMAL/UNSAT claims" target is therefore asserted
+> exactly where it is decidable (zero-width surfaces: met at 100%) and
+> reported, not asserted, on continuous surfaces; the 100%-of-large-
+> perturbations clause is unconditional and measured.  (qp_unbounded
+> ulp: ~70% rejected - the strict recession edge catches a majority.)
+>
+> **Three defects the harness/battery caught in this layer's own
+> drafts** (the phase's process point: certificates need verification
+> too): (1) The MIP proven-optimal stamp was first written as a
+> SYMMETRIC window |best_bound - obj| <= gap contract; the injection
+> harness showed 9/20 legit false-rejections.  Root cause: the engine's
+> best_bound is a running extremum over solved node relaxations, so the
+> root LP bound dominates it forever - the residual |bb - obj| of a
+> proven optimum IS the model's root integrality gap, not the stop
+> tolerance.  Fixed to the sound DIRECTIONAL property (an upper bound
+> never sits below a max incumbent; mirror for min), which targets
+> exactly the catastrophic direction (objective strictly better than
+> proven).  Same fix in the fzn optimize gate; `examples/knap_gap.lp`
+> (root relaxation 11.75 vs integer optimum 10) pins it in test.sh.
+> (2) Row/objective graces sized by |b|/|cx| alone false-rejected TRUE
+> points on catastrophic-cancellation data: the fbbt_verify cancellation
+> family (a0·x0 + a1·x1 with |a| ~ 1e18 nearly cancelling to D ~ 3e3)
+> has round-to-nearest activity dust of thousands against a |b|-scale
+> grace of 3e-3 - the battery caught it instantly (fbbt FAIL 2 -> 31 on
+> the first full run).  Fixed with the correct dust form: activity-scaled
+> graces sum_j|a_ij·x_j| / sum_j|c_j·x_j| on every recomputed-dot check
+> (LP/MIP/QP point rows, objective consistency, ray recession).  End
+> state fbbt_verify FAIL=0/241 - better than the pre-change binary (2).
+> (3) The MIP-UNSAT lane first required a fresh LP-relaxation Farkas
+> certificate at dt_gap=1e-6; the pinned 5e-7-strength margin cycle
+> (exactly infeasible over the integer lattice, proved by the engine via
+> lattice exhaustion at nodes=1) has its separation INSIDE the ray
+> margin, so the lane printed NUMERICAL_FAILURE for a model whose UNSAT
+> was legitimately proven (caught by farkas_verify).  The lane order is
+> now: relaxation-Farkas if the relaxation itself is infeasible (with
+> the LP CLI's exact shaky-frontier policy), else the EXHAUSTION stamp
+> (no truncation) - matching the pre-change trust level with the 6.4
+> no-truncation guarantee on top.
+>
+> **Acceptance evidence.**  cert_inject hard gate green (both seeds, in
+> battery); knap_gap CLI pin green; full test.sh rc=0 (including
+> farkas_verify, lp_scale_verify, fbbt_verify FAIL=0, fzn_output_check
+> WRONG=0 @2000, qp/mip/lp differentials); tolsheet closure green
+> (88 ids / 143 sites / 88 rows - new rows in DESIGN.md section 8.9 for
+> every cert-layer margin, each a mirror of the producing engine's own
+> contract value); ASan/UBSan/LSan sweep clean (cert_inject N=40 plus
+> farkas 60 / fzn_output_check 500 / fgraph 60 / orbit_detect 40 /
+> procstates 60 against the instrumented binaries, direct rc checks -
+> the new solver/qp ray allocations are leak-covered); MiniZinc bench
+> 77/77 with benchmark_results.json semantically identical (status /
+> objective / verdicts equal; timing-only churn).  Compile clean under
+> -Wall -Wextra everywhere (the fuzz/ASan direct-gcc build lists in
+> test.sh and tools/fuzz_inputs.py / tools/fuzz_fzn.py gained the new
+> sources).
+>
+> **Interface note for downstream.**  `fznsolve`'s LP bridge now stamps
+> sol.best_bound = LP objective (constant-free units, the MIP path's
+> convention) - an LP proven optimal is its own exact bound - so the
+> objectiveBound stat is truthful on pure-LP models instead of the
+> zero-init default.  Nothing else about printed verdicts changes;
+> downgrade paths only ever move a print to a MORE honest class.
+
 > **2026-08-18 (11) - branch `arena/cp-engine-correctness`: Phase 6.8,
 > per-module tolerance semantics sheets.  Documentation-phase discipline,
 > closed by construction: zero functional code changes, 127 source sites

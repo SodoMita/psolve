@@ -91,6 +91,8 @@ static Solver *solver_create_internal(const LP *lp)
     s->vw = (double*)xmalloc(m * sizeof(double));
     s->piw = (double*)xmalloc(m * sizeof(double));
     s->duals = (double*)xmalloc(m * sizeof(double));
+    s->unb_ray = (double*)xmalloc((size_t)N * sizeof(double));
+    s->unb_valid = 0; s->unb_var = -1; s->unb_dir = 0;
     for (j = 0; j < N; j++) s->w[j] = 1.0;
     s->slackVar = (int*)xmalloc(m * sizeof(int));
     s->artVar = (int*)xmalloc(m * sizeof(int));
@@ -440,6 +442,7 @@ void solver_destroy(Solver *s)
     psolve_free(s->lu); psolve_free(s->piv); psolve_free(s->y); psolve_free(s->d); psolve_free(s->v); psolve_free(s->xb);
     psolve_free(s->slackVar); psolve_free(s->artVar); psolve_free(s->beq); psolve_free(s->borig); psolve_free(s->mlt); psolve_free(s->artSign); psolve_free(s->rel);
     psolve_free(s->w); psolve_free(s->vw); psolve_free(s->piw); psolve_free(s->duals);
+    psolve_free(s->unb_ray);
     psolve_free(s->colptr); psolve_free(s->row); psolve_free(s->val);
     splu_free(&s->splu);
     psolve_free(s->bBp); psolve_free(s->bBi); psolve_free(s->bBx);
@@ -982,6 +985,13 @@ static int iterate(Solver *s)
             recompute_basic(s);
             return 1;   /* continue iterating with the dense basis */
         }
+        /* record the evidence for solver_unbounded_ray: the ratio test just
+           left s->v holding the basic-variable move direction (-dir*d), so
+           the full improving ray is q plus the current basis update */
+        s->unb_valid = 1; s->unb_var = q; s->unb_dir = dir;
+        for (int _j = 0; _j < s->N; _j++) s->unb_ray[_j] = 0.0;
+        s->unb_ray[q] = (double)dir;
+        for (int _i = 0; _i < M; _i++) s->unb_ray[s->basis[_i]] = s->v[_i];
         return 2;
     }
 
@@ -1145,7 +1155,7 @@ static int solver_solve_impl(Solver *s)
     /* The Phase-I-infeasibility marker below is only valid for the solve
        currently running: clear it on entry so a stale certificate state can
        never be attributed to a later verdict. */
-    s->farkas_ok = 0;
+    s->farkas_ok = 0; s->unb_valid = 0;
     /* Empty box => INFEASIBLE, certified by construction: a variable with
        l[j] > u[j] admits no assignment at all, so no constraint examination
        is needed.  Without this up-front verdict a contradictory box (the
@@ -1308,6 +1318,18 @@ int solver_solve(Solver *s)
         r = solver_solve_impl(s);
     }
     return r;
+}
+
+int solver_unbounded_ray(const Solver *s, double *ray)
+{
+    if (!s || !ray || !s->unb_valid || s->unb_var < 0) return -1;
+    for (int j = 0; j < s->n_orig; j++) {
+        int p = s->orig_pos[j], q = s->orig_neg[j];
+        double d = s->unb_ray[p];
+        if (q >= 0) d -= s->unb_ray[q];
+        ray[j] = d;
+    }
+    return 0;
 }
 
 void solver_duals(const Solver *s, double *dual)
@@ -1481,7 +1503,7 @@ int solver_warm_solve(Solver *s)
     if(!s)return SOLVE_INVALID;
     /* same invalidation rule as solver_solve_impl: the marker describes only
        the verdict currently being produced */
-    s->farkas_ok = 0;
+    s->farkas_ok = 0; s->unb_valid = 0;
     if (s->rebuild_pending) {
         solver_refresh(s);
         return s->status_out;

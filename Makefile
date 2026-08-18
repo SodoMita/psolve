@@ -31,7 +31,7 @@ LDFLAGS = -pie -Wl,-z,relro,-z,now -Wl,--as-needed -Wl,-z,noexecstack
 CFLAGS   = -std=gnu11 -Wall -Wextra $(OPT) $(ARCH) $(PERF) $(HARDEN)
 LDLIBS   = -lm
 
-SRC = src/err.c src/kernels.c src/lu.c src/splu.c src/solver.c src/parser.c src/main.c
+SRC = src/err.c src/kernels.c src/lu.c src/splu.c src/solver.c src/parser.c src/cert.c src/main.c
 OBJ = $(SRC:.c=.o)
 QPSRC = src/err.c src/qp.c src/lu.c src/kernels.c
 QPOBJ = $(QPSRC:.c=.o)
@@ -60,14 +60,17 @@ install_mzn:
 lpsolve: $(OBJ)
 	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -o $@ $(OBJ) $(LDFLAGS) $(LDLIBS)
 
-qpsolve: src/err.o src/qp.o src/lu.o src/kernels.o tools/qpsolve.o
+qpsolve: src/err.o src/qp.o src/lu.o src/kernels.o src/cert.o src/solver.o src/splu.o tools/qpsolve.o
 	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -o $@ $^ $(LDFLAGS) $(LDLIBS)
 
-mipsolve: src/err.o src/mip.o src/lu.o src/splu.o src/solver.o src/kernels.o src/parser.o src/fx.o tools/mipsolve.o
+mipsolve: src/err.o src/mip.o src/lu.o src/splu.o src/solver.o src/kernels.o src/parser.o src/fx.o src/cert.o tools/mipsolve.o
 	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -o $@ $^ $(LDFLAGS) $(LDLIBS)
 
 # Real-time 2D-physics kernel: projected Gauss-Seidel boxed-QP
 pgsbench: src/pgs.o tools/pgbench.o
+
+cert_inject: src/err.o src/kernels.o src/lu.o src/splu.o src/solver.o src/parser.o src/cert.o src/mip.o src/qp.o src/fx.o tools/cert_inject.o
+	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -o $@ $^ $(LDFLAGS) $(LDLIBS)
 	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -o $@ $^ $(LDFLAGS) $(LDLIBS)
 
 src/pgs.o: src/pgs.c src/pgs.h
@@ -84,7 +87,7 @@ tools/pgs_vs_lp.o: tools/pgs_vs_lp.c src/pgs.h src/pgs_fixed.h src/qp.h src/solv
 	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -I src -c -o $@ $<
 
 # FlatZinc reader + solver bridge (Phase 3)
-fznsolve: src/fzn.o src/mip.o src/err.o src/solver.o src/splu.o src/lu.o src/kernels.o src/parser.o src/fx.o tools/fznsolve.o
+fznsolve: src/fzn.o src/mip.o src/err.o src/solver.o src/splu.o src/lu.o src/kernels.o src/parser.o src/fx.o src/cert.o tools/fznsolve.o
 	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -o $@ $^ $(LDFLAGS) $(LDLIBS)
 
 src/fzn.o: src/fzn.c src/fzn.h src/solver.h src/err.h src/fz_cp.inc
@@ -161,6 +164,6 @@ src/main.o: src/main.c src/parser.h src/solver.h src/err.h tools/tlimit.h
 	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -I src -I tools -c -o $@ $<
 
 clean:
-	rm -f lpsolve qpsolve mipsolve pgsbench pgfbench pgs_vs_lp fznsolve fxsolve fx_bench src/*.o tools/*.o libpsolve.a libpsolve-lp.a libpsolve-qp.a
+	rm -f lpsolve qpsolve mipsolve pgsbench pgfbench pgs_vs_lp fznsolve fxsolve fx_bench cert_inject src/*.o tools/*.o libpsolve.a libpsolve-lp.a libpsolve-qp.a
 
 .PHONY: all asan clean lib liblp libqp

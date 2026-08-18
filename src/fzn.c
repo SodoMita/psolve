@@ -4004,6 +4004,11 @@ void fz_solve(const FZModel*m,FZSolution*sol)
             double obj;solver_optimum(s,xo,&obj);
             memcpy(sol->x,xo,(size_t)ntot*sizeof(double));
             sol->obj=obj+m->objective.constant;sol->iters=s->iters;sol->status=0;
+            /* an LP proven optimal is its own exact objective bound: stamp
+               it (in the same constant-free units the MIP path's
+               mr.best_bound uses) so the CLI bound-coherence lane and the
+               objectiveBound stat see truthful data, not the zero default */
+            sol->best_bound=obj;
             if(sol->all_solutions){
                 sol->num_solutions++;
                 fz_print_one_solution(m,sol->x,sol->nvars);

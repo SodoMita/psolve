@@ -40,7 +40,7 @@ fi
 echo "[5/7] QP solver vs scipy (analytic + randomized)..."
 gcc -O2 -march=native -I src tools/qp_test.c src/qp.c src/err.c src/lu.c src/kernels.c -o /tmp/qp_test -lm
 /tmp/qp_test
-gcc -O2 -march=native -I src tools/qpsolve.c src/qp.c src/err.c src/lu.c src/kernels.c -o /tmp/qpsolve -lm
+gcc -O2 -march=native -I src tools/qpsolve.c src/qp.c src/err.c src/lu.c src/kernels.c src/splu.c src/solver.c src/cert.c -o /tmp/qpsolve -lm
 ok=0; fail=0
 for s in $(seq 1 40); do
   if python3 tools/qp_gen.py $s 2>/dev/null | grep -q '^OK'; then ok=$((ok+1)); else fail=$((fail+1)); fi
@@ -302,6 +302,39 @@ python3 tools/orbit_detect_verify.py 60 20260818 || { echo "orbit_detect_verify:
 # row is stale.  Adding a tolerance without documenting it (or
 # documentation rotting past a refactor) fails this gate.
 python3 tools/tolsheet_check.py || { echo "tolsheet_check: FAIL"; exit 1; }
+
+# unified evidence objects (roadmap 6.4): every verdict-printing CLI exit
+# (LP OPTIMAL/INFEASIBLE/UNBOUNDED, MIP point + proven-optimal bound
+# stamp, QP optimal/unbounded KKT+recession, fzn optimize/UNSAT lanes)
+# now passes a PsvCert claim through psv_cert_check; REJECT/DEFER degrade
+# the print to the honest class.  cert_inject drives the REAL engines on
+# randomized instances and must (a) accept 100% of TRUE claims - any
+# legit false-rejection is a certificate-layer bug, (b) reject 100% of
+# large corruptions (out-of-box pushes, objective drifts, integer
+# off-by-one, negated/permuted rays, feasible-but-suboptimal false
+# OPTIMAL claims, row-normal point corruption, flipped statuses), (c)
+# reject 100% of directed 1-ulp corruption on the zero-width
+# snapped-integer MIP surface; the tolerance-absorbing LP/QP ulp lanes
+# are reported honestly, not asserted (see AUDIT addendum 12).
+# Discriminating: pre-change binaries cannot build this (cert.h absent);
+# during development the harness caught 9/20 legit mipsolve-class
+# false-rejects (symmetric bound-coherence vs the root integrality gap)
+# and two non-adversarial injection families.  Hard gate: rc matters.
+make cert_inject >/dev/null 2>&1
+./cert_inject 200 20260818 || { echo "cert_inject: FAIL"; exit 1; }
+./cert_inject 200 777 || { echo "cert_inject (seed 777): FAIL"; exit 1; }
+# CLI-lane pin: the MIP certificate's bound-coherence stamp is
+# DIRECTIONAL (an upper bound never sits below a max incumbent; mirror
+# for min), because the engine's best_bound keeps the root-relaxation
+# bound forever - the residual |bb - obj| of a proven optimum IS the
+# model's integrality gap.  This 0-1 knapsack has root relaxation 11.75
+# vs integer optimum 10: a symmetric |bb - obj| window false-rejects it.
+make mipsolve >/dev/null 2>&1
+mip_pin=$(./mipsolve examples/knap_gap.lp 2 0 1 --print)
+echo "$mip_pin" | grep -q "status: OPTIMAL"  || { echo "knap_gap cert pin: FAIL (no OPTIMAL)";  exit 1; }
+echo "$mip_pin" | grep -q "objective: 10"    || { echo "knap_gap cert pin: FAIL (objective)";    exit 1; }
+echo "$mip_pin" | grep -q "x\[1\] = 0"       || { echo "knap_gap cert pin: FAIL (point)";        exit 1; }
+echo "  knap_gap: OPTIMAL 10 through the MIP certificate lane  OK"
 
 if command -v minizinc >/dev/null 2>&1; then
   echo "[8.5/8] MiniZinc differential (compile .mzn -> fzn -> psolve vs Gecode)..."
