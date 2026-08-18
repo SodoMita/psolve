@@ -362,7 +362,20 @@ static int solve_relaxation(const MIP *mip, const Node *node, MipWarm *ws,
         lp.b  = (double*)mip->b;
         lp.l  = lo;
         lp.u  = hi;
-        s = solver_create(&lp);
+        /* Roadmap 7.5 scope pin: the relaxation stays on the RAW data path
+           (scale_mode 0), i.e. exactly the pre-7.5 numerics.  Equilibration
+           ships for the one-shot LP CLI only, where every verdict is
+           re-certified against ORIGINAL data AND a raw-data fallback
+           re-solve exists.  Node LPs here STEER the discrete search
+           (bounds, pruning, incumbent compares), and there is no per-node
+           primal-bound certificate chain, so scaled node answers cannot be
+           arbitrated as strict improvements: the 2026-08-18 extreme-spread
+           A/B (per-entry 1e+-8 mixing) measured 7 lost and 7
+           objective-disagreeing verdicts against 5 rescues.  With 1.0
+           diagonals every funnel arithmetic op is bit-identical, so the
+           whole MIP/fzn-battery behaviour is unchanged.  Lifting the pin
+           needs a per-node certification story (fx/exact territory). */
+        s = solver_create_opts(&lp, 0);
         if (!s) return -1;
         if (mip->lp_iter_limit > 0) s->iteration_limit = mip->lp_iter_limit;
         r = solver_solve(s);

@@ -160,6 +160,20 @@ python3 tools/farkas_verify.py 150 20260815 || { echo "farkas_verify: FAIL"; exi
 # on the pre-change binary it reproduces 6 fabricated INFEASIBLE verdicts.
 # Hard gate: rc matters.
 python3 tools/lp_scale_verify.py 60 20260815 || { echo "lp_scale_verify: FAIL"; exit 1; }
+# Ruiz equilibration + geometric-mean scaling, with --noscale/--scalestat
+# A/B lanes and an evidence-preserving raw-data fallback (roadmap 7.5):
+# default vs raw must print identical verdicts on well-scaled data (scipy
+# oracle cross-check), the conditioning proxy must never get materially
+# worse and must halve the median high-spread ratio, a raw-path OPTIMAL
+# may never be LOST by the default path on extreme entry-mixed data
+# (fallback re-solves on raw data whenever scaled evidence cannot be
+# certified against ORIGINAL data), at least one seeded instance must be
+# RESCUED (raw LU stall -> scaled certified OPTIMAL), and the shipped
+# examples are A/B-identical.  Discriminating: the pre-change binary
+# rejects --noscale/--scalestat, failing the lane probe loudly.  Hard
+# gate: rc matters.
+python3 tools/scale_verify.py 200 20260818 || { echo "scale_verify: FAIL"; exit 1; }
+python3 tools/scale_verify.py 200 777 || { echo "scale_verify (seed 777): FAIL"; exit 1; }
 python3 tools/mip_verify.py 0 | tail -1
 # Adversarial differential test for the sound FBBT bound tightening: mixes
 # tiny coefficients (1e-13) with large variable magnitudes and all three

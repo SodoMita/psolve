@@ -320,6 +320,136 @@ static int lp_var_is_free(double lo, double hi)
     return lo <= -LP_INF && hi >= LP_INF;
 }
 
+/* ------------------------------------------------------------------ */
+/* Roadmap 7.5: Ruiz equilibration + geometric-mean scaling            */
+/*                                                                     */
+/* A pure diagonal preconditioning of the equality form: the engine    */
+/* works on D_r·A·D_c with strictly positive diagonals accumulated at  */
+/* create time; x = D_c·x' and row duals/rays come back scaled by D_r, */
+/* so every caller-visible value stays in ORIGINAL units and every     */
+/* verdict keeps its original-data re-verification path.  The map      */
+/* composes on top of the existing mlt sign rows (mlt is applied to    */
+/* the already-scaled matrix by create_internal, unchanged), and the   */
+/* free-variable split twins share a column scale automatically        */
+/* because their |entries| are identical.                              */
+/*                                                                     */
+/* Every skip rule is a DECLINE-to-scale-less guard, never a verdict   */
+/* input: scaling is optional conditioning, so declining to scale a    */
+/* pathological row/column can only leave the model exactly as the     */
+/* caller handed it in.                                                */
+/* ------------------------------------------------------------------ */
+#define LP_SCALCAP 1e300   /* TOLSHEET TOL-LP-SCALCAP */
+
+/* global max|a_ij| / min|a_ij| over the stored (nonzero) entries - the
+   conditioning-spread proxy reported by the --scalestat CLI lane */
+static double lp_spread_ratio(int n, const int *colptr, const double *val)
+{
+    double mn = 0.0, mx = 0.0; int seen = 0;
+    for (int j = 0; j < n; j++)
+        for (int k = colptr[j]; k < colptr[j + 1]; k++) {
+            double a = fabs(val[k]);
+            if (a == 0.0) continue;
+            if (!seen || a < mn) mn = a;
+            if (!seen || a > mx) mx = a;
+            seen = 1;
+        }
+    return (seen && mn > 0.0) ? mx / mn : 1.0;
+}
+
+/* one Ruiz iteration: geometric-mean row pass then column pass, over a
+   MUTABLE lp; rscale (m) / cscale (n) accumulate the diagonals */
+static void ruiz_iteration(LP *lp, double *rscale, double *cscale)
+{
+    int n = lp->n, m = lp->m;
+    for (int i = 0; i < m; i++) {
+        double mn = 0.0, mx = 0.0; int seen = 0;
+        for (int j = 0; j < n; j++)
+            for (int k = lp->Acolptr[j]; k < lp->Acolptr[j + 1]; k++)
+                if (lp->Arow[k] == i) {
+                    double a = fabs(lp->Aval[k]);
+                    if (a == 0.0) continue;
+                    if (!seen || a < mn) mn = a;
+                    if (!seen || a > mx) mx = a;
+                    seen = 1;
+                }
+        if (!seen) continue;
+        if (mx / mn > LP_SCALCAP) continue;      /* pathology: decline the row */
+        double rho = 1.0 / (sqrt(mn) * sqrt(mx));
+        if (!(rho > 0.0) || !isfinite(rho)) continue;
+        /* anything the row multiply would make non-finite declines it too
+           (b is scaled independently of A's magnitudes, so test it) */
+        if (!isfinite(mx * rho) || !isfinite(lp->b[i] * rho)) continue;
+        for (int j = 0; j < n; j++)
+            for (int k = lp->Acolptr[j]; k < lp->Acolptr[j + 1]; k++)
+                if (lp->Arow[k] == i) lp->Aval[k] *= rho;
+        lp->b[i] *= rho;
+        rscale[i] *= rho;
+    }
+    for (int j = 0; j < n; j++) {
+        double mn = 0.0, mx = 0.0; int seen = 0;
+        for (int k = lp->Acolptr[j]; k < lp->Acolptr[j + 1]; k++) {
+            double a = fabs(lp->Aval[k]);
+            if (a == 0.0) continue;
+            if (!seen || a < mn) mn = a;
+            if (!seen || a > mx) mx = a;
+            seen = 1;
+        }
+        if (!seen) continue;
+        if (mx / mn > LP_SCALCAP) continue;
+        double gam = 1.0 / (sqrt(mn) * sqrt(mx));
+        if (!(gam > 0.0) || !isfinite(gam)) continue;
+        /* bounds at the infinity token are never divided; a finite bound
+           the divide would push ACROSS the token (or non-finite) declines
+           the column - reclassifying a huge finite bound as "infinite"
+           would silently change the model */
+        double lo = lp->l[j], hi = lp->u[j];
+        double slo = (lo <= -LP_INF) ? lo : lo / gam;
+        double shi = (hi >=  LP_INF) ? hi : hi / gam;
+        if (!(lo <= -LP_INF) && (!isfinite(slo) || slo <= -LP_INF)) continue;
+        if (!(hi >=  LP_INF) && (!isfinite(shi) || shi >=  LP_INF)) continue;
+        double sc = lp->c[j] * gam;
+        if (!isfinite(sc) || !isfinite(mx * gam)) continue;
+        for (int k = lp->Acolptr[j]; k < lp->Acolptr[j + 1]; k++)
+            lp->Aval[k] *= gam;
+        lp->c[j] = sc; lp->l[j] = slo; lp->u[j] = shi;
+        cscale[j] *= gam;
+    }
+}
+
+/* Deep-copy an LP into a mutable working image and Ruiz-equilibrate it.
+   The caller's LP is const, hence the copy. */
+static int build_scaled_lp(const LP *src, LP *out,
+                           double **rscale_out, double **cscale_out)
+{
+    int n = src->n, m = src->m;
+    memset(out, 0, sizeof(*out));
+    long nnz = src->Acolptr ? src->Acolptr[n] : 0;
+    out->n = n; out->m = m; out->maximize = src->maximize;
+    out->c = (double*)xmalloc((size_t)(n ? n : 1) * sizeof(double));
+    out->l = (double*)xmalloc((size_t)(n ? n : 1) * sizeof(double));
+    out->u = (double*)xmalloc((size_t)(n ? n : 1) * sizeof(double));
+    out->b = (double*)xmalloc((size_t)(m ? m : 1) * sizeof(double));
+    out->rel = (char*)xmalloc((size_t)(m ? m : 1));
+    out->Acolptr = (int*)xmalloc((size_t)(n + 1) * sizeof(int));
+    out->Arow = (int*)xmalloc((size_t)(nnz ? nnz : 1) * sizeof(int));
+    out->Aval = (double*)xmalloc((size_t)(nnz ? nnz : 1) * sizeof(double));
+    *rscale_out = (double*)xmalloc((size_t)(m ? m : 1) * sizeof(double));
+    *cscale_out = (double*)xmalloc((size_t)(n ? n : 1) * sizeof(double));
+    memcpy(out->c, src->c, (size_t)n * sizeof(double));
+    memcpy(out->l, src->l, (size_t)n * sizeof(double));
+    memcpy(out->u, src->u, (size_t)n * sizeof(double));
+    if (m > 0) { memcpy(out->b, src->b, (size_t)m * sizeof(double));
+                 memcpy(out->rel, src->rel, (size_t)m); }
+    memcpy(out->Acolptr, src->Acolptr, (size_t)(n + 1) * sizeof(int));
+    if (nnz > 0) { memcpy(out->Arow, src->Arow, (size_t)nnz * sizeof(int));
+                   memcpy(out->Aval, src->Aval, (size_t)nnz * sizeof(double)); }
+    for (int i = 0; i < m; i++) (*rscale_out)[i] = 1.0;
+    for (int j = 0; j < n; j++) (*cscale_out)[j] = 1.0;
+    for (int it = 0; it < 4; it++)
+        ruiz_iteration(out, *rscale_out, *cscale_out);
+    return 0;
+}
+
 static void free_normalized_lp(LP *lp)
 {
     psolve_free(lp->c); psolve_free(lp->l); psolve_free(lp->u);
@@ -327,12 +457,19 @@ static void free_normalized_lp(LP *lp)
     memset(lp, 0, sizeof(*lp));
 }
 
+/* the scaled working image additionally owns its b/rel */
+static void free_scaled_lp(LP *lp)
+{
+    psolve_free(lp->b); psolve_free(lp->rel);
+    free_normalized_lp(lp);
+}
+
 /* Public construction path.  Revised simplex needs every nonbasic variable
  * to sit at a bound, so normalize a caller-visible free variable x into
  * x+ - x-, x+,x- >= 0.  This is an exact linear transformation: the positive
  * column is A_j, the negative column is -A_j, and their costs are c_j/-c_j.
  * The mapping is retained for solution, sensitivity, and incremental APIs. */
-Solver *solver_create(const LP *lp)
+Solver *solver_create_opts(const LP *lp, int scale_mode)
 {
     if (!lp || lp->n <= 0 || lp->m < 0 || lp->n > 1000000 || lp->m > 1000000 ||
         !lp->c || !lp->l || !lp->u || !lp->Acolptr ||
@@ -367,8 +504,18 @@ Solver *solver_create(const LP *lp)
     }
 
     Solver *s = NULL;
-    if (nfree == 0) {
+    double *rscale_w = NULL, *cscale_w = NULL;
+    double ratio_pre = 1.0, ratio_post = 1.0;
+    if (nfree == 0 && !scale_mode) {
         s = solver_create_internal(lp);
+    } else if (nfree == 0) {
+        /* equilibration, no splits: deep-copy then precondition */
+        LP scaled;
+        ratio_pre = lp_spread_ratio(lp->n, lp->Acolptr, lp->Aval);
+        build_scaled_lp(lp, &scaled, &rscale_w, &cscale_w);
+        ratio_post = lp_spread_ratio(scaled.n, scaled.Acolptr, scaled.Aval);
+        s = solver_create_internal(&scaled);
+        free_scaled_lp(&scaled);
     } else {
         LP norm; memset(&norm, 0, sizeof(norm));
         norm.n = ncore; norm.m = lp->m; norm.maximize = lp->maximize;
@@ -412,10 +559,20 @@ Solver *solver_create(const LP *lp)
             }
         }
         norm.Acolptr[ncore] = (int)pos;
-        s = solver_create_internal(&norm);
+        if (scale_mode) {
+            LP scaled;
+            ratio_pre = lp_spread_ratio(norm.n, norm.Acolptr, norm.Aval);
+            build_scaled_lp(&norm, &scaled, &rscale_w, &cscale_w);
+            ratio_post = lp_spread_ratio(scaled.n, scaled.Acolptr, scaled.Aval);
+            s = solver_create_internal(&scaled);
+            free_scaled_lp(&scaled);
+        } else {
+            s = solver_create_internal(&norm);
+        }
         free_normalized_lp(&norm);
     }
-    if (!s) { psolve_free(orig_pos); psolve_free(orig_neg); return NULL; }
+    if (!s) { psolve_free(orig_pos); psolve_free(orig_neg);
+              psolve_free(rscale_w); psolve_free(cscale_w); return NULL; }
 
     s->n_orig = n;
     s->n_core = ncore;
@@ -428,7 +585,27 @@ Solver *solver_create(const LP *lp)
     memcpy(s->orig_l, lp->l, (size_t)n * sizeof(double));
     memcpy(s->orig_u, lp->u, (size_t)n * sizeof(double));
     s->rebuild_pending = 0;
+    /* scale state: the funnels multiply unconditionally, so mode-off needs
+       allocated identity diagonals rather than NULLs */
+    if (!rscale_w) {
+        rscale_w = (double*)xmalloc((size_t)(lp->m ? lp->m : 1) * sizeof(double));
+        for (int i = 0; i < lp->m; i++) rscale_w[i] = 1.0;
+        cscale_w = (double*)xmalloc((size_t)(ncore ? ncore : 1) * sizeof(double));
+        for (int j = 0; j < ncore; j++) cscale_w[j] = 1.0;
+        ratio_pre = lp_spread_ratio(lp->n, lp->Acolptr, lp->Aval);
+        ratio_post = ratio_pre;
+    }
+    s->scale_mode = scale_mode ? 1 : 0;
+    s->rscale = rscale_w;
+    s->cscale = cscale_w;
+    s->stat_ratio_pre = ratio_pre;
+    s->stat_ratio_post = ratio_post;
     return s;
+}
+
+Solver *solver_create(const LP *lp)
+{
+    return solver_create_opts(lp, 1);
 }
 
 void solver_destroy(Solver *s)
@@ -443,6 +620,7 @@ void solver_destroy(Solver *s)
     psolve_free(s->slackVar); psolve_free(s->artVar); psolve_free(s->beq); psolve_free(s->borig); psolve_free(s->mlt); psolve_free(s->artSign); psolve_free(s->rel);
     psolve_free(s->w); psolve_free(s->vw); psolve_free(s->piw); psolve_free(s->duals);
     psolve_free(s->unb_ray);
+    psolve_free(s->rscale); psolve_free(s->cscale);
     psolve_free(s->colptr); psolve_free(s->row); psolve_free(s->val);
     splu_free(&s->splu);
     psolve_free(s->bBp); psolve_free(s->bBi); psolve_free(s->bBx);
@@ -603,6 +781,10 @@ int solver_farkas_duals(Solver *s, double *y)
        basis and nothing refactorized after the verdict. */
     for (int i = 0; i < s->M; i++) y[i] = s->cobj[s->basis[i]];
     btrans(s, y);
+    /* absorb the equilibration diagonal into the documented output space:
+       callers multiply by mlt and get the ORIGINAL-row ray, scaling or no
+       scaling (1.0 diagonals when off; roadmap 7.5) */
+    for (int i = 0; i < s->M; i++) y[i] *= s->rscale[i];
     return 0;
 }
 
@@ -1325,8 +1507,8 @@ int solver_unbounded_ray(const Solver *s, double *ray)
     if (!s || !ray || !s->unb_valid || s->unb_var < 0) return -1;
     for (int j = 0; j < s->n_orig; j++) {
         int p = s->orig_pos[j], q = s->orig_neg[j];
-        double d = s->unb_ray[p];
-        if (q >= 0) d -= s->unb_ray[q];
+        double d = s->unb_ray[p] * s->cscale[p];
+        if (q >= 0) d -= s->unb_ray[q] * s->cscale[q];
         ray[j] = d;
     }
     return 0;
@@ -1339,7 +1521,7 @@ void solver_duals(const Solver *s, double *dual)
        problem was a minimization so the reported shadow prices have the sign
        consistent with the original objective. */
     double sign = s->negate_obj ? -1.0 : 1.0;
-    for (int i = 0; i < s->M; i++) dual[i] = sign * s->duals[i];
+    for (int i = 0; i < s->M; i++) dual[i] = sign * s->rscale[i] * s->duals[i];
 }
 
 void solver_reduced_costs(const Solver *s, double *rc)
@@ -1355,6 +1537,10 @@ void solver_reduced_costs(const Solver *s, double *rc)
         rc[j] = s->cobj[p] - k_dsdot_sparse(s->duals,
                               s->row + s->colptr[p], s->val + s->colptr[p],
                               (long)(s->colptr[p+1] - s->colptr[p]), ytol);
+        /* internal row i is mlt_i*rscale_i*(orig row i) and the core cost is
+           gamma_j*c_j, so the core reduced cost is gamma_j times the
+           original-direction one; scale back out (7.5) */
+        rc[j] /= s->cscale[p];
     }
 }
 
@@ -1363,7 +1549,7 @@ void solver_optimum(const Solver *s, double *x_orig, double *obj)
     if(!s||!x_orig||!obj)return;
     for (int j = 0; j < s->n_orig; j++) {
         int p = s->orig_pos[j], q = s->orig_neg[j];
-        x_orig[j] = s->x[p] - (q >= 0 ? s->x[q] : 0.0);
+        x_orig[j] = s->x[p] * s->cscale[p] - (q >= 0 ? s->x[q] * s->cscale[q] : 0.0);
     }
     *obj = s->negate_obj ? -s->objval : s->objval;
 }
@@ -1376,8 +1562,8 @@ void solver_set_objective(Solver *s, const double *c, int maximize)
         int p = s->orig_pos[j], q = s->orig_neg[j];
         double cj = maximize ? c[j] : -c[j];
         s->orig_c[j] = c[j];
-        s->c0[p] = cj;
-        if (q >= 0) s->c0[q] = -cj;
+        s->c0[p] = cj * s->cscale[p];
+        if (q >= 0) s->c0[q] = -cj * s->cscale[q];
     }
     memcpy(s->cobj, s->c0, (size_t)s->N * sizeof(double));
     /* slacks/artificials keep zero objective (already 0 after Phase II) */
@@ -1402,7 +1588,15 @@ void solver_set_bounds(Solver *s, const double *l, const double *u)
     }
     for (int j = 0; j < s->n_orig; j++) {
         int p = s->orig_pos[j];
-        if (s->orig_neg[j] < 0) { s->l[p] = l[j]; s->u[p] = u[j]; }
+        if (s->orig_neg[j] < 0) {
+            double gam = s->cscale[p];
+            /* cscale[p] > 0 always; the infinity-token sides keep the token
+               (a finite huge bound mapped across it would clamp to the
+               token, and the original-data verification lanes then enforce
+               the true bound - certification stands, never a wrong print) */
+            s->l[p] = (l[j] <= -LP_INF) ? -LP_INF : l[j] / gam;
+            s->u[p] = (u[j] >=  LP_INF) ?  LP_INF : u[j] / gam;
+        }
     }
 }
 
@@ -1435,7 +1629,7 @@ static int solver_export_lp(const Solver *s, const double *new_a,
         lp->c[j] = s->orig_c[j];
         lp->l[j] = s->orig_l[j]; lp->u[j] = s->orig_u[j];
     }
-    for (int i = 0; i < m; i++) { lp->b[i] = s->borig[i]; lp->rel[i] = s->rel[i]; }
+    for (int i = 0; i < m; i++) { lp->b[i] = s->borig[i] / s->rscale[i]; lp->rel[i] = s->rel[i]; }
     if (add) { lp->b[m] = new_rhs; lp->rel[m] = new_rel; }
 
     long nnz = 0;
@@ -1460,7 +1654,9 @@ static int solver_export_lp(const Solver *s, const double *new_a,
         for (int k = s->colptr[p]; k < s->colptr[p+1]; k++) {
             int row = s->row[k];
             if (row < 0 || row >= m) { free_exported_lp(lp); return -1; }
-            double v = s->val[k] / s->mlt[row];  /* undo equality row scaling */
+            /* undo equality row sign AND equilibration diagonals (7.5):
+               stored = mlt * rscale_row * cscale_col * original */
+            double v = s->val[k] / (s->mlt[row] * s->rscale[row] * s->cscale[p]);
             if (v != 0.0) { lp->Arow[pos] = row; lp->Aval[pos] = v; pos++; }
         }
         if (add && new_a[j] != 0.0) { lp->Arow[pos] = m; lp->Aval[pos] = new_a[j]; pos++; }
@@ -1479,7 +1675,7 @@ static void solver_refresh(Solver *s)
         s->status_out = SOLVE_NUMERICAL;
         return;
     }
-    Solver *fresh = solver_create(&lp);
+    Solver *fresh = solver_create_opts(&lp, s->scale_mode);
     if (!fresh) {
         free_exported_lp(&lp);
         s->status_out = SOLVE_NUMERICAL;
@@ -1549,7 +1745,7 @@ int solver_add_row(Solver *s, const double *a, double rhs, char rel)
 
     LP lp;
     if (solver_export_lp(s, a, rhs, rel, &lp) != 0) return -1;
-    Solver *fresh = solver_create(&lp);
+    Solver *fresh = solver_create_opts(&lp, s->scale_mode);
     if (!fresh) { free_exported_lp(&lp); return -1; }
     fresh->iteration_limit = s->iteration_limit;
     fresh->reinvert_interval = s->reinvert_interval;

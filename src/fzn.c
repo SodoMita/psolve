@@ -3969,7 +3969,13 @@ void fz_solve(const FZModel*m,FZSolution*sol)
         else sol->status=2;
         mip_result_free(&mr);
     } else {
-        Solver*s=solver_create(&lp);
+        /* Roadmap 7.5 scope pin: RAW data path (pre-7.5 numerics).  This
+           one-shot lane re-verifies verdicts against ORIGINAL data but has
+           no raw-data fallback re-solve like the LP CLI, so equilibration
+           here could move a verdict to the honest class with no recovery;
+           it stays raw until that fallback story exists.  1.0 diagonals
+           keep every funnel op bit-identical. */
+        Solver*s=solver_create_opts(&lp,0);
         int rr=solver_solve(s);
         /* Same infeasibility-verdict gate as the LP CLI and the MIP bridge:
            a phase-1 UNSAT on extreme scale-mixed float data that no

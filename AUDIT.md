@@ -1,5 +1,135 @@
 # psolve — audit & hardening notes
 
+> **2026-08-18 (13) - branch `arena/cp-engine-correctness`: Phase 7.5,
+> Ruiz equilibration + geometric-mean scaling for the LP engine (v2
+> item), with A/B CLI lanes and an evidence-preserving raw-data
+> fallback.  Scale can add certified answers, never take one away.**
+>
+> **What shipped.**  `solver_create_opts(lp, scale_mode)` (new public
+> API; `solver_create()` = scaled default, `0` = the raw pre-7.5 path).
+> At create time the engine deep-copies the normalized LP and applies 4
+> Ruiz iterations — each a geometric-mean row pass (factor
+> 1/(sqrt(min|a|)·sqrt(max|a|)) per row, rhs included) then the same per
+> column (bounds and costs mapped consistently) — accumulating strictly
+> positive diagonals `rscale`/`cscale`.  The engine then runs entirely on
+> `D_r·A·D_c` and every public funnel composes the diagonals back, so
+> caller-visible values stay in ORIGINAL units: `solver_optimum` and
+> `solver_unbounded_ray` multiply by `cscale` (split twins share the
+> original column's factor exactly, their |entries| being identical),
+> `solver_duals` and `solver_farkas_duals` multiply by `rscale` (the
+> documented mlt-multiply caller contract is UNCHANGED), reduced costs
+> divide by γ (the core reduced cost is γ times the original one),
+> `solver_set_objective` maps `c→γc`, `solver_set_bounds` maps `l,u→l/γ,u/γ`
+> with infinity-token sides never divided, `solver_export_lp` unwraps
+> `mlt·rscale·cscale` on entries and `rscale` on the rhs, and
+> `solver_refresh`/`solver_add_row` re-equilibrate their rebuilt images.
+> With scaling off the diagonals are allocated as literal 1.0, so every
+> funnel multiplication/division is an exact IEEE no-op: the raw path is
+> bit-identical to the pre-change engine (verified by the MIP A/B below).
+> Decline rules (`LP_SCALCAP=1e300` intra-line spread cap, non-finite
+> factor × entry/rhs products, a finite bound the divide would push
+> ACROSS the infinity token, non-finite mapped costs) SKIP that row or
+> column — scaling is optional conditioning; declining can only leave
+> the model exactly as handed in.  All guards are class-D (never verdict
+> inputs); new tolsheet row TOL-LP-SCALCAP documents them, gate green
+> (89 ids).
+>
+> **The CLI contract (lpsolve).**  New flags `--noscale` (raw path) and
+> `--scalestat` (stderr: mode, pre/post max|a|/min|a| spread proxy,
+> iters).  The verdict chain runs inside a two-attempt fallback loop:
+> equilibration is conditioning, never a verdict input, so when the
+> scaled run's outcome cannot be certified against ORIGINAL data — any
+> 6.4 psv lane rejection (OPTIMAL/UNBOUNDED/Farkas-shaky) or an engine
+> SOLVE_NUMERICAL — attempt 1 destroys the solver, re-creates it on the
+> raw path with the dense factorization forced, re-solves and
+> re-evaluates the ENTIRE chain, printing only what certifies.  The
+> retry never fires after an explicit stop (budget binding) or when
+> `--noscale` was already given, and every engagement is announced on
+> stderr (`psv: scaled evidence not certified, re-solving on raw data`),
+> preceded by the specific cert-lane note.  Consequence: a raw-path
+> OPTIMAL can never be LOST to scaling; a raw-path NUMERICAL that
+> scaling rescues (the LU stall goes away on the equilibrated image and
+> the psv lane certifies the answer against original data) is a pure
+> gain.
+>
+> **Scope decision: MIP/fzn pinned RAW.**  Scaling was validated for
+> one-shot LP verdicts where every print re-verifies against original
+> data AND the fallback re-solve exists.  Node LPs in the MIP bridge
+> STEER discrete decisions and have no per-node primal-bound certificate
+> chain, so scaled node answers cannot be arbitrated as improvements.
+> Measured before pinning (per-entry log-uniform 1e±8 MIP family, N=150,
+> new-vs-old mipsolve): 12 status flips, 7 LOST certified-OPTIMAL
+> verdicts, 7 co-OPTIMAL objective disagreements >1e-6 rel, honest-class
+> count 6→10 — against 5 rescues.  That exposure is not acceptable as
+> silent behaviour change, so `src/mip.c` (relaxation), `src/fzn.c`
+> (pure-LP lane) and the mipsolve relaxation arbitrator call
+> `solver_create_opts(..., 0)`.  Post-pin A/B (E=4 and E=8, N=150 each):
+> ZERO flips, ZERO disagreements, NUM counts 6/6 — the pin restores
+> bit-identical bridge numerics, exactly as designed.  Lifting the pins
+> needs per-node certification (fx/exact territory; see Appendix A item
+> B sibling note).
+>
+> **Measurements (regeneration: /tmp probe generators are seeded in
+> tools/scale_verify.py; engine: this commit's lpsolve).**
+> Conditioning proxy (median post/pre spread, max|a|/min|a| over stored
+> entries): well-scaled family 44.7 → 13.0; entry-mixed 1e±4 family
+> 1.02e8 → 1.42e6 (72×); 1e±12 family 1.9e23 → 8.8e18.  Gate medians on
+> high-spread instances: 0.0098 (E=4), 3.9e-6 (E=12); the proxy NEVER
+> got materially worse (0/466 instances across both gate seeds).
+> Verdict movement (census raw→default): well-scaled N=150: 150
+> OPTIMAL→OPTIMAL, zero fallbacks; 1e±4 N=150: 150 OPTIMAL→OPTIMAL, 0
+> fallbacks; 1e±12 N=80: 12 OPT→OPT, 6 NUM→OPT (rescues), 62 NUM→NUM,
+> 0 losses, 68 fallbacks (the scaled psv attempt rarely certifies at
+> 1e±12; the fallback keeps parity).  Rescue contract, pinned instance
+> (tools/scale_verify.py gen_mixed stream, spread 6.0e8): pre-change and
+> `--noscale` both print NUMERICAL_FAILURE (honest LU stall); default
+> prints OPTIMAL 10560305.7817494 = scipy/HiGHS 10560305.781749407.
+> Rescue rate measured ~0.4% of the 1e±4 family and ~7% of the 1e±12
+> family (gate asserts ≥1 across its seeded streams; E=4-only existence
+> is seed-luck, hence the combined assert — recorded here so nobody
+> "fixes" a spurious gate failure by weakening it).
+> Iteration movement (honesty bar — report exactly what moved): on the
+> co-OPTIMAL probe families the scaled image takes slightly MORE simplex
+> iterations (well-scaled 1868→1919 total, median 12→12.5; 1e±4
+> 1698→1756, median 11→11).  Equilibration changes vertex paths; on
+> these tiny models there is no iteration win to claim — the function of
+> 7.5 is certified-answer RECOVERY on extreme data, and on well-scaled
+> data it costs ~3% pivots.  Also recorded: the 6.4 LP-OPTIMAL dual-dust
+> lane occasionally fails to certify the scaled run's evidence when γ
+> spans ~1e±9+ (its original-units rounding exceeds the dt margins);
+> that is precisely what the fallback arbitrates — observed 1–2
+> engagements per 200 at 1e±4 and dominating at 1e±12, with zero
+> resulting verdict losses.
+>
+> **Test pinning.**  `tools/scale_verify.py` (200 models × 2 seeds in
+> `test.sh`, hard gate): (0) A/B-lane probe — FAILS LOUDLY on the
+> pre-change binary, which rejects `--noscale`/`--scalestat` as unknown
+> options (discrimination proven against the aa9bcda build); (1)
+> well-scaled parity N=200, statuses identical and co-OPT objectives
+> ≤1e-7 rel, scipy oracle cross-check (200/200); (2) conditioning
+> asserts on entry-mixed families (never-materially-worse + median
+> halving); (3) no-loss contract on 1e±4/1e±12 (raw OPTIMAL ⇒ default
+> OPTIMAL ≤1e-6 rel; rescued objectives scipy-confirmed); (4) rescue
+> existence across the seeded streams; (5) the six shipped examples
+> A/B-identical.  Both seeds green; per-seed tables in the gate output.
+> Battery: full `test.sh` green (MiniZinc differential OK=33 FAIL=0,
+> benchmark 77/77 semantically identical — status/objective/solutions/
+> verdict/nodes all equal, only timing churn; lp_scale_verify unchanged:
+> fabricated=0, rescued=60; cert_inject 100/100/100 on both seeds).
+> ASan/UBSan/LSan sweep on the instrumented build: examples × 4 flag
+> combos, the pinned rescue instance, two live fallback instances,
+> scale_verify N=40, cert_inject N=40, mipsolve knap_gap, fznsolve ×3,
+> fxsolve prodplan — zero reports, leak checking on (covers the new
+> rscale/cscale ownership and the fallback's destroy/recreate path).
+> One battery pin needed a documented touch: `tools/arena_test.c`'s LP
+> baseline oracle asserted the double engine hits prodplan's true 26
+> EXACTLY; with the scaled default the reconstructed objective is
+> 26.000000000000004 (1 ulp — funnel rounding on an already-certified
+> answer, inside every margin).  The oracle now allows 8·DBL_EPSILON·26
+> with a comment; the arena-vs-libc BIT-IDENTITY pin it feeds is
+> unchanged and still exact, and the fx (exact rational) oracle was not
+> touched.
+
 > **2026-08-18 (12) - branch `arena/cp-engine-correctness`: Phase 6.4,
 > unified evidence objects.  One claim type per verdict class, one
 > psv_cert_check() entry point at every CLI verdict exit, an

@@ -126,10 +126,32 @@ typedef struct {
        accurate" dense-retry gate just cleared.  Cleared at solve start. */
     int unb_valid, unb_var, unb_dir;
     double *unb_ray;       /* len N */
+    /* Ruiz equilibration (roadmap 7.5): when scale_mode!=0 the engine
+       works on D_r·A·D_c with positive diagonals accumulated at create
+       time; every public input/output funnel (optimum/duals/rays,
+       set_bounds/set_objective, export/rebuild) composes them back, so
+       callers always see ORIGINAL units.  rscale[i] scales row i (rhs
+       included), cscale[j] scales core column j (split twins share the
+       original column's factor, so indexing by core column is exact);
+       all 1.0 when scaling is off. */
+    int scale_mode;
+    double *rscale;        /* len M */
+    double *cscale;        /* len n_core */
+    /* measured once at create for the --scalestat lane: pre/post-scale
+       max/min |a_ij| ratio over the data columns (0s/empty = 1) */
+    double stat_ratio_pre, stat_ratio_post;
 } Solver;
 
 /* API */
 Solver *solver_create(const LP *lp);
+/* Same as solver_create but with the equilibration-mode choice explicit:
+   scale_mode 0 = raw data path (the pre-7.5 behaviour, kept for A/B and
+   debugging), 1 = Ruiz equilibration (default).  Equilibration is a pure
+   diagonal preconditioning of the equality form: D_r·(A·D_c) with
+   positive diagonals; x = D_c·x' and the row duals/rays scale by D_r on
+   the way out, so every caller-visible value stays in ORIGINAL units and
+   every verdict keeps its original-data re-verification path. */
+Solver *solver_create_opts(const LP *lp, int scale_mode);
 void solver_destroy(Solver *s);
 /* returns status_out: 0 solved (objval set), 1 infeasible, 2 unbounded */
 int solver_solve(Solver *s);

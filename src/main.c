@@ -49,9 +49,14 @@ int main(int argc, char **argv)
     const char * volatile path = NULL;
     volatile int print = 0;
     volatile long time_ms = 0;
+    volatile int scale_mode = 1, scalestat = 0;
     for (int a = 1; a < argc; a++) {
         if (strcmp(argv[a], "--print") == 0) {
             print = 1;
+        } else if (strcmp(argv[a], "--noscale") == 0) {
+            scale_mode = 0;   /* roadmap 7.5 A/B escape hatch: raw data path */
+        } else if (strcmp(argv[a], "--scalestat") == 0) {
+            scalestat = 1;    /* report the pre/post equilibration spread */
         } else if (strcmp(argv[a], "-t") == 0 || strcmp(argv[a], "--time-limit") == 0) {
             long parsed_ms;
             if (++a == argc || parse_positive_ms(argv[a], &parsed_ms) != 0) {
@@ -71,7 +76,7 @@ int main(int argc, char **argv)
         }
     }
     if (!path) {
-        fprintf(stderr, "usage: %s [-t ms|--time-limit ms] <problem.lp> [--print]\n", argv[0]);
+        fprintf(stderr, "usage: %s [-t ms|--time-limit ms] [--noscale] [--scalestat] <problem.lp> [--print]\n", argv[0]);
         return 1;
     }
 
@@ -100,7 +105,7 @@ int main(int argc, char **argv)
     memset(&lp, 0, sizeof(LP));
     if (lp_read((const char *)path, &lp) != 0) { psolve_stop_set(NULL); psolve_frame_pop(&ef); return 1; }
 
-    Solver *s = solver_create(&lp);
+    Solver *s = solver_create_opts(&lp, scale_mode);
     if (!s) { lp_free(&lp); psolve_stop_set(NULL); psolve_frame_pop(&ef); return 1; }
 
     struct timespec t0, t1;
@@ -112,7 +117,7 @@ int main(int argc, char **argv)
        explicit user stop: doing so would violate the requested time budget. */
     if (r == 0 && !solver_feasible(s) && !psolve_stop()) {
         solver_destroy(s);
-        s = solver_create(&lp);
+        s = solver_create_opts(&lp, scale_mode);
         if (!s) { lp_free(&lp); psolve_stop_set(NULL); psolve_frame_pop(&ef); return 1; }
         s->sparse_disabled = 1;  /* force dense from the start */
         s->use_sparse = 0;
@@ -120,121 +125,175 @@ int main(int argc, char **argv)
     }
     clock_gettime(CLOCK_MONOTONIC, &t1);
     double secs = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;  /* TOLSHEET TOL-SYS-NSEC */
+    if (scalestat)
+        fprintf(stderr, "scalestat: mode=%d ratio_pre=%.6g ratio_post=%.6g iters=%ld\n",
+                s->scale_mode, s->stat_ratio_pre, s->stat_ratio_post, s->iters);
 
-    if (r == 1 && s->farkas_ok) {
-        /* The phase-1 infeasibility verdict needs an independent proof before
-           it may be printed bare: extract the dual ray and re-verify the full
-           Farkas separation against the original rows and box with directed
-           rounding.  If that fails (dirty ray, poisoned arithmetic, margins)
-           AND the model is extreme scale-mixed -- products feeding the
-           phase-1 residuals round by more than half its absolute 1e-6
-           artificial-sum tolerance -- the double verdict cannot distinguish
-           infeasibility from rounding noise (AUDIT not-done #4; an exactly-
-           feasible model printed INFEASIBLE is a fabrication, and no consumer
-           verifier rechecks the UNSAT direction).  Downgrade to the honest
-           numerical-failure class.  An empty-box verdict (farkas_ok == 0) is
-           exact by construction and stays INFEASIBLE. */
-        int n = lp.n, m = lp.m;
-        double *fr_y  = (double*)malloc((size_t)(m ? m : 1) * sizeof(double));
-        double *fr_yc = (double*)malloc((size_t)(m ? m : 1) * sizeof(double));
-        double *fr_zl = (double*)malloc((size_t)n * sizeof(double));
-        double *fr_zh = (double*)malloc((size_t)n * sizeof(double));
-        if (fr_y && fr_yc && fr_zl && fr_zh) {
-            int certified = 0;
-            if (solver_farkas_duals(s, fr_y) == 0) {
-                /* unified evidence object (roadmap 6.4): the checker
-                   re-verifies the full Farkas separation with directed
-                   rounding against the original data -- the same
-                   solver_farkas_boxcert semantics, one entry point */
-                PsvCert cl; psv_fill_lp(&cl, PSVK_LP_INFEASIBLE, &lp);
-                for (int i = 0; i < m; i++) fr_y[i] *= (double)s->mlt[i];
-                cl.ray = fr_y; cl.dt_gap = 1e-6;  /* TOLSHEET TOL-LP-FARKAS */
-                if (psv_cert_check(&cl) == PSV_OK) certified = 1;
+    /* roadmap 7.5 unscaled fallback (evidence-preserving, never silent):
+       equilibration is conditioning, never a verdict input - so if the
+       scaled run's outcome cannot be certified against the ORIGINAL data
+       (a psv lane below rejects, or the engine itself surfaced
+       SOLVE_NUMERICAL) the model is re-solved once on the raw data path
+       and the whole verdict chain re-evaluated.  The printed answer is
+       therefore always the best CERTIFIED one available, and scaling can
+       only add answers, never take one away.  The retry is skipped after
+       an explicit stop - the requested budget is binding - and is never
+       attempted when the caller already asked for --noscale. */
+    int printed = 0;
+    int degraded;
+    for (int attempt = 0; attempt < 2 && !printed; attempt++) {
+        degraded = 0;
+        /* A raw-data retry can only help when THIS attempt ran the scaled
+           path and no explicit stop is pending (the budget is binding);
+           on the final attempt -- or with --noscale -- printing the
+           honest class is all there is. */
+        int can_retry = (attempt == 0 && scale_mode && !psolve_stop());
+        if (attempt == 1) {
+            fprintf(stderr, "psv: scaled evidence not certified, re-solving on raw data (--noscale path)\n");
+            solver_destroy(s);
+            s = solver_create_opts(&lp, 0);
+            if (!s) { lp_free(&lp); psolve_stop_set(NULL); psolve_frame_pop(&ef); return 1; }
+            s->sparse_disabled = 1;  /* retry robustly: attempt 0 already failed */
+            s->use_sparse = 0;
+            r = solver_solve(s);
+            if (r == 0 && !solver_feasible(s) && !psolve_stop()) {
+                solver_destroy(s);
+                s = solver_create_opts(&lp, 0);
+                if (!s) { lp_free(&lp); psolve_stop_set(NULL); psolve_frame_pop(&ef); return 1; }
+                s->sparse_disabled = 1;
+                s->use_sparse = 0;
+                r = solver_solve(s);
             }
-            if (!certified) {
-                double E = solver_row_exposure(n, m, lp.Acolptr, lp.Arow,
-                                               lp.Aval, lp.l, lp.u);
-                if (E * DBL_EPSILON >= 5e-7) r = SOLVE_NUMERICAL;  /* TOLSHEET TOL-LP-SHAKY */
-            }
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            secs = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;  /* TOLSHEET TOL-SYS-NSEC */
+            if (scalestat)
+                fprintf(stderr, "scalestat: mode=%d ratio_pre=%.6g ratio_post=%.6g iters=%ld\n",
+                        s->scale_mode, s->stat_ratio_pre, s->stat_ratio_post, s->iters);
         }
-        free(fr_y); free(fr_yc); free(fr_zl); free(fr_zh);
-    }
 
-    printf("iterations: %ld\n", s->iters);
-    printf("time: %.6f s\n", secs);
-
-    if (r == 1) {
-        printf("status: INFEASIBLE\n");
-    } else if (r == 2) {
-        /* UNBOUNDED prints only with a re-verified certificate: a primal
-           feasible point and a recession ray that the psv layer checks
-           against the original rows, box sides and objective direction */
-        double *xu = (double*)malloc((size_t)(lp.n > 0 ? lp.n : 1) * sizeof(double));
-        double *ur = (double*)malloc((size_t)(lp.n > 0 ? lp.n : 1) * sizeof(double));
-        double obju = 0.0;
-        int ok = 0;
-        if (xu && ur) {
-            solver_optimum(s, xu, &obju);
-            if (solver_unbounded_ray(s, ur) == 0) {
-                PsvCert cl; psv_fill_lp(&cl, PSVK_LP_UNBOUNDED, &lp);
-                cl.x = xu; cl.ray = ur; cl.obj = obju;
-                cl.gt_box = 1e-6; cl.gt_row = 1e-5; cl.dt_dj = 1e-9; /* TOLSHEET TOL-CERT-DEFBOX */ /* TOLSHEET TOL-CERT-DEFROW */ /* TOLSHEET TOL-CERT-DEFDJ */
-                ok = (psv_cert_check(&cl) == PSV_OK);
+        if (r == 1 && s->farkas_ok) {
+            /* The phase-1 infeasibility verdict needs an independent proof before
+               it may be printed bare: extract the dual ray and re-verify the full
+               Farkas separation against the original rows and box with directed
+               rounding.  If that fails (dirty ray, poisoned arithmetic, margins)
+               AND the model is extreme scale-mixed -- products feeding the
+               phase-1 residuals round by more than half its absolute 1e-6
+               artificial-sum tolerance -- the double verdict cannot distinguish
+               infeasibility from rounding noise (AUDIT not-done #4; an exactly-
+               feasible model printed INFEASIBLE is a fabrication, and no consumer
+               verifier rechecks the UNSAT direction).  Downgrade to the honest
+               numerical-failure class.  An empty-box verdict (farkas_ok == 0) is
+               exact by construction and stays INFEASIBLE. */
+            int n = lp.n, m = lp.m;
+            double *fr_y  = (double*)malloc((size_t)(m ? m : 1) * sizeof(double));
+            double *fr_yc = (double*)malloc((size_t)(m ? m : 1) * sizeof(double));
+            double *fr_zl = (double*)malloc((size_t)n * sizeof(double));
+            double *fr_zh = (double*)malloc((size_t)n * sizeof(double));
+            if (fr_y && fr_yc && fr_zl && fr_zh) {
+                int certified = 0;
+                if (solver_farkas_duals(s, fr_y) == 0) {
+                    /* unified evidence object (roadmap 6.4): the checker
+                       re-verifies the full Farkas separation with directed
+                       rounding against the original data -- the same
+                       solver_farkas_boxcert semantics, one entry point */
+                    PsvCert cl; psv_fill_lp(&cl, PSVK_LP_INFEASIBLE, &lp);
+                    for (int i = 0; i < m; i++) fr_y[i] *= (double)s->mlt[i];
+                    cl.ray = fr_y; cl.dt_gap = 1e-6;  /* TOLSHEET TOL-LP-FARKAS */
+                    if (psv_cert_check(&cl) == PSV_OK) certified = 1;
+                }
+                if (!certified) {
+                    double E = solver_row_exposure(n, m, lp.Acolptr, lp.Arow,
+                                                   lp.Aval, lp.l, lp.u);
+                    if (E * DBL_EPSILON >= 5e-7) {  /* TOLSHEET TOL-LP-SHAKY */
+                        if (can_retry) degraded = 1;  /* the raw-data retry may still certify */
+                        else r = SOLVE_NUMERICAL;
+                    }
+                }
             }
+            free(fr_y); free(fr_yc); free(fr_zl); free(fr_zh);
         }
-        /* a verdict the certificate layer cannot confirm must not print */
-        if (ok) printf("status: UNBOUNDED\n");
-        else {
-            fprintf(stderr, "psv: lp_unbounded certificate not confirmed\n");
-            printf("status: NUMERICAL_FAILURE\n");
-        }
-        free(xu); free(ur);
-    } else if (r == 3) {
-        printf("status: ITERATION_LIMIT\n");
-    } else if (r == SOLVE_STOPPED) {
-        printf("status: STOPPED\n");
-    } else if (r == SOLVE_NUMERICAL) {
-        printf("status: NUMERICAL_FAILURE\n");
-    } else if (r == SOLVE_INVALID) {
-        printf("status: INVALID_MODEL\n");
-    } else {
-        double *xo = (double*)malloc((size_t)(lp.n > 0 ? lp.n : 1) * sizeof(double));
-        double obj;
-        if (!xo) { solver_destroy(s); lp_free(&lp); psolve_stop_set(NULL); psolve_frame_pop(&ef); return 1; }
-        solver_optimum(s, xo, &obj);
-        /* unified evidence object (roadmap 6.4): OPTIMAL prints only when
-           the certificate layer re-verifies both primal feasibility and a
-           closed bounded-LP Lagrangian dual bound from the engine duals */
-        {
-            double *ylp = (double*)malloc((size_t)(lp.m > 0 ? lp.m : 1) * sizeof(double));
+        if (degraded) continue;   /* nothing printable from the scaled run */
+
+        printf("iterations: %ld\n", s->iters);
+        printf("time: %.6f s\n", secs);
+
+        if (r == 1) {
+            printf("status: INFEASIBLE\n");
+        } else if (r == 2) {
+            /* UNBOUNDED prints only with a re-verified certificate: a primal
+               feasible point and a recession ray that the psv layer checks
+               against the original rows, box sides and objective direction */
+            double *xu = (double*)malloc((size_t)(lp.n > 0 ? lp.n : 1) * sizeof(double));
+            double *ur = (double*)malloc((size_t)(lp.n > 0 ? lp.n : 1) * sizeof(double));
+            double obju = 0.0;
             int ok = 0;
-            if (ylp) {
-                solver_duals(s, ylp);
-                for (int i = 0; i < lp.m; i++) ylp[i] *= (double)s->mlt[i];
-                PsvCert cl; psv_fill_lp(&cl, PSVK_LP_OPTIMAL, &lp);
-                cl.x = xo; cl.y = ylp; cl.obj = obj;
-                cl.gt_box = 1e-6; cl.gt_row = 1e-5; /* TOLSHEET TOL-CERT-DEFBOX */ /* TOLSHEET TOL-CERT-DEFROW */
-                cl.dt_dj = 1e-9; cl.dt_gap = 1e-7; cl.dt_obj = 1e-9; /* TOLSHEET TOL-CERT-DEFDJ */ /* TOLSHEET TOL-CERT-DEFGAP */ /* TOLSHEET TOL-CERT-DEFOBJ */
-                ok = (psv_cert_check(&cl) == PSV_OK);
+            if (xu && ur) {
+                solver_optimum(s, xu, &obju);
+                if (solver_unbounded_ray(s, ur) == 0) {
+                    PsvCert cl; psv_fill_lp(&cl, PSVK_LP_UNBOUNDED, &lp);
+                    cl.x = xu; cl.ray = ur; cl.obj = obju;
+                    cl.gt_box = 1e-6; cl.gt_row = 1e-5; cl.dt_dj = 1e-9; /* TOLSHEET TOL-CERT-DEFBOX */ /* TOLSHEET TOL-CERT-DEFROW */ /* TOLSHEET TOL-CERT-DEFDJ */
+                    ok = (psv_cert_check(&cl) == PSV_OK);
+                }
             }
-            free(ylp);
-            if (!ok) {
-                fprintf(stderr, "psv: lp_optimal certificate not confirmed\n");
-                printf("status: NUMERICAL_FAILURE\n");
-                free(xo);
-                solver_destroy(s); lp_free(&lp);
-                tlimit_disarm(); psolve_stop_set(NULL); psolve_frame_pop(&ef);
-                return 0;
+            /* a verdict the certificate layer cannot confirm must not print */
+            if (ok) printf("status: UNBOUNDED\n");
+            else {
+                fprintf(stderr, "psv: lp_unbounded certificate not confirmed\n");
+                if (can_retry) degraded = 1;
+                else printf("status: NUMERICAL_FAILURE\n");
+            }
+            free(xu); free(ur);
+        } else if (r == 3) {
+            printf("status: ITERATION_LIMIT\n");
+        } else if (r == SOLVE_STOPPED) {
+            printf("status: STOPPED\n");
+        } else if (r == SOLVE_NUMERICAL) {
+            /* engine-surfaced numerics: the raw-data retry may still certify */
+            if (can_retry) degraded = 1;
+            else printf("status: NUMERICAL_FAILURE\n");
+        } else if (r == SOLVE_INVALID) {
+            printf("status: INVALID_MODEL\n");
+        } else {
+            double *xo = (double*)malloc((size_t)(lp.n > 0 ? lp.n : 1) * sizeof(double));
+            double obj;
+            if (!xo) { solver_destroy(s); lp_free(&lp); psolve_stop_set(NULL); psolve_frame_pop(&ef); return 1; }
+            solver_optimum(s, xo, &obj);
+            /* unified evidence object (roadmap 6.4): OPTIMAL prints only when
+               the certificate layer re-verifies both primal feasibility and a
+               closed bounded-LP Lagrangian dual bound from the engine duals */
+            {
+                double *ylp = (double*)malloc((size_t)(lp.m > 0 ? lp.m : 1) * sizeof(double));
+                int ok = 0;
+                if (ylp) {
+                    solver_duals(s, ylp);
+                    for (int i = 0; i < lp.m; i++) ylp[i] *= (double)s->mlt[i];
+                    PsvCert cl; psv_fill_lp(&cl, PSVK_LP_OPTIMAL, &lp);
+                    cl.x = xo; cl.y = ylp; cl.obj = obj;
+                    cl.gt_box = 1e-6; cl.gt_row = 1e-5; /* TOLSHEET TOL-CERT-DEFBOX */ /* TOLSHEET TOL-CERT-DEFROW */
+                    cl.dt_dj = 1e-9; cl.dt_gap = 1e-7; cl.dt_obj = 1e-9; /* TOLSHEET TOL-CERT-DEFDJ */ /* TOLSHEET TOL-CERT-DEFGAP */ /* TOLSHEET TOL-CERT-DEFOBJ */
+                    ok = (psv_cert_check(&cl) == PSV_OK);
+                }
+                free(ylp);
+                if (!ok) {
+                    fprintf(stderr, "psv: lp_optimal certificate not confirmed\n");
+                    free(xo);
+                    if (can_retry) { degraded = 1; continue; }
+                    printf("status: NUMERICAL_FAILURE\n");
+                } else {
+                    printf("status: OPTIMAL\n");
+                    printf("objective: %.15g\n", obj);
+                    if (print) {
+                        for (int j = 0; j < lp.n; j++)
+                            printf("x[%d] = %.17g\n", j, xo[j]);
+                    }
+                    free(xo);
+                }
             }
         }
-        printf("status: OPTIMAL\n");
-        printf("objective: %.15g\n", obj);
-        if (print) {
-            for (int j = 0; j < lp.n; j++)
-                printf("x[%d] = %.17g\n", j, xo[j]);
-        }
-        free(xo);
-    }
+
+        if (!degraded) printed = 1;
+    }   /* fallback attempt loop */
 
     solver_destroy(s);
     lp_free(&lp);

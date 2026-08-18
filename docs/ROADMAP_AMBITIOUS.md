@@ -404,7 +404,44 @@ plan for it.
 - **Acceptance:** Phase-I pivot count down ≥30% on equality-heavy families;
   the fz bridge passes its known-good bases through the new API.
 
-### 7.5 Scaling (Ruiz equilibration + geometric mean, Curtis–Reid option)
+### 7.5 Scaling (Ruiz equilibration + geometric mean, Curtis–Reid option) — **DONE 2026-08-18(13)**
+`solver_create_opts(lp, scale_mode)` / `solver_create` (= scaled default):
+4 Ruiz iterations (geometric-mean row pass then column pass) at create
+time accumulate strictly positive diagonals `D_r`/`D_c`; the engine works
+on `D_r·A·D_c` and every public funnel composes the diagonals back
+(optimum/ray ×D_c, row duals/Farkas rays ×D_r, reduced costs ÷γ,
+set_objective ×γ, set_bounds ÷γ with infinity-token sides never divided,
+export/rebuild unwrap all three factors), so callers always see ORIGINAL
+units and every verdict keeps its original-data psv re-verification.
+Decline-to-scale-less guards (`LP_SCALCAP=1e300` spread cap, non-finite
+factor products, finite-bound→token reclassification refusal) are class-D
+honest-decline, never verdict inputs.  The LP CLI gains `--noscale` (raw
+path) and `--scalestat` (pre/post spread proxy) plus an
+evidence-preserving raw-data FALLBACK: when a scaled run's evidence
+cannot be certified against the original data (any psv lane reject or an
+engine SOLVE_NUMERICAL) it re-solves once raw and re-evaluates the whole
+verdict chain, so scaling can add certified answers, never take one away.
+The MIP bridge, fzn pure-LP lane and mipsolve's relaxation arbitrator are
+pinned to the RAW path (1.0 diagonals ⇒ bit-identical pre-7.5 numerics;
+measured pre-pin MIP answer movement at per-entry 1e±8 spread — 7 lost /
+7 objective-disagreeing vs 5 rescues in 150 — showed scaled node answers
+cannot be arbitrated as strict improvements without a per-node primal
+certificate story).
+- **Acceptance, measured:** conditioning proxy — median post/pre spread
+  0.0098 at 1e±4 entry-mixing and 3.9e-6 at 1e±12, worsened on 0/466
+  gate instances; honest-failure rescues (the "before it becomes an exact
+  re-solve" knob): raw/pre-change LU-stall NUMERICAL → scaled certified
+  OPTIMAL at ~0.4% of the 1e±4 family and ~7% of the 1e±12 family,
+  objectives scipy-confirmed (pinned instance: spread 6e8 model, raw
+  NUMERICAL, scaled 10560305.7817494 == HiGHS); verdict changes — zero on
+  well-scaled data (400/400 scipy cross-checked parity across two gate
+  seeds), examples A/B-identical, MIP/fzn surfaces bit-identical by pin.
+  Hard gate `tools/scale_verify.py` (in `test.sh`, 2 seeds);
+  discriminating: pre-change binary fails the `--noscale`/`--scalestat`
+  lane probe loudly.  AUDIT addendum (13) carries the full tables,
+  including the honest iteration-movement delta (+2.7–3.4% iterations on
+  the small probe families — equilibration changes vertex paths; the win
+  is certified-answer recovery, not iteration count).
 - **Why:** cheap, and directly attacks the big-M conditioning debt
   (AUDIT finding A lineage) *before* it becomes an exact re-solve.
 - **Acceptance:** conditioning proxy (max/min pivot growth) improved on the
@@ -961,7 +998,7 @@ nothing in M3–M6 may land without the Phase-14 CI cell being green first
 | 2. setjmp protocol redesign | **Phase 6.3** (M1) |
 | 3. Farkas-certificate fast path | **DONE 2026-08-15(5)** (Phase 6.2): tsp5 exact re-solves 122 → 0, 2.1× wall |
 | 4. Scale-mixed non-integral honesty gap | **DONE — Phase 6.1, 2026-08-15(6)** (rescue + exposure-gate promotion; `tools/lp_scale_verify.py`); exact substrate 9.x would make promotion *cheap* (M2) |
-| B. Phase-I degenerate-infeasible convergence | **Phase 7.4/7.5** (crash+scaling) with 6.1 as the honesty backstop |
+| B. Phase-I degenerate-infeasible convergence | **Phase 7.4/7.5** — the 7.5 scaling half **landed 2026-08-18(13)** (rescue contract + CLI fallback); 7.4 crash bases remain, 6.1 stays the honesty backstop |
 | CP scheduling globals decline to MIP | **Phase 10.2** (edge finding) — closes `gecode_schedule_unary`/disjunctive gap |
 | `-f` free search no-op | **Phase 11.3** |
 | Phase-2 VG/UI kernels (unstarted) | **Track 17.x by host pull** — kernels own no frame budget until a consumer exists; physics (12) stays priority |

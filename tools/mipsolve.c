@@ -35,7 +35,9 @@ static void psv_fill_lp(PsvCert *cl, PsvKind kind, const LP *lp)
 static int lp_relax_verdict(const LP *lp, int *cert_ok, PsvKind want)
 {
     *cert_ok = 0;
-    Solver *s = solver_create(lp);
+    /* 7.5 scope pin: raw data path, consistent with the MIP bridge whose
+       verdicts this arbitration feeds (see src/mip.c solve_relaxation) */
+    Solver *s = solver_create_opts(lp, 0);
     if (!s) return -1;
     int r = solver_solve(s);
     if (r == 1 && want == PSVK_LP_INFEASIBLE) {
