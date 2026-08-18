@@ -9,13 +9,13 @@
 #include <limits.h>
 #include <fenv.h>
 
-#define TOL_FEAS 1e-9
-#define TOL_PIV  1e-12
+#define TOL_FEAS 1e-9  /* TOLSHEET TOL-LP-FEAS */
+#define TOL_PIV  1e-12  /* TOLSHEET TOL-LP-PIV */
 /* Dual (reduced-cost) tolerance.  A reduced cost at rounding level is *not* an
    improving direction: pivoting on one produces a meaningless search direction
    that can end in a bogus "unbounded" ray or in cycling.  Only a reduced cost
    that clears this tolerance counts as improving. */
-#define TOL_DJ   1e-9
+#define TOL_DJ   1e-9  /* TOLSHEET TOL-LP-DJ */
 
 static void *xmalloc(size_t n) {
     return psolve_malloc(n);   /* signals PSOLVE_ERR_OOM instead of exit() */
@@ -52,7 +52,7 @@ static Solver *solver_create_internal(const LP *lp)
     memset(s, 0, sizeof(Solver));
     s->N = N; s->n_orig = n; s->n_core = n; s->M = m;
     s->reinvert_interval = 100;
-    s->hyper_tol = 0.0;
+    s->hyper_tol = 0.0;  /* TOLSHEET TOL-LP-HYPERDEF */
     s->use_sparse = 0;      /* decided per-basis in refactorize */
     /* Global decision: sparse LU only pays off on genuinely sparse problems.
        On dense problems its fill-in makes it both slower and less stable than
@@ -63,7 +63,7 @@ static Solver *solver_create_internal(const LP *lp)
     }
     s->sparse_ok = 0;
     memset(&s->splu, 0, sizeof(s->splu));
-    s->splu.pivot_tol = 1e-13;
+    s->splu.pivot_tol = 1e-13;  /* TOLSHEET TOL-LP-SPLUPIV */
 
     s->l = (double*)xmalloc(N * sizeof(double));
     s->u = (double*)xmalloc(N * sizeof(double));
@@ -284,7 +284,7 @@ static void build_initial_basis(Solver *s)
             /* slack coeff = mlt_i * (rel=='<' ? +1 : -1) */
             double scoef = (double)s->mlt[i] * (s->rel[i] == '<' ? 1.0 : -1.0);
             double v = resid / scoef;
-            if (v >= -1e-12) {   /* slack value nonneg => feasible start */
+            if (v >= -1e-12) {   /* slack value nonneg => feasible start */  /* TOLSHEET TOL-LP-STARTSLACK */
                 chosen = sv;
                 s->x[sv] = (v > 0.0) ? v : 0.0;
             }
@@ -484,7 +484,7 @@ static void refactorize(Solver *s)
         }
         splu_free(&s->splu);
         memset(&s->splu, 0, sizeof(s->splu));
-        s->splu.pivot_tol = 1e-13;
+        s->splu.pivot_tol = 1e-13;  /* TOLSHEET TOL-LP-SPLUPIV */
         s->sparse_ok = (splu_factor(&s->splu, s->bBp, s->bBi, s->bBx, M) == 0);
         s->eta_count = 0;
         if (!s->sparse_ok) {
@@ -609,7 +609,7 @@ int solver_farkas_boxcert(int n, int m, const int *colptr, const int *row,
                           const int *mlt, double tol,
                           double *y, double *zl, double *zh)
 {
-    const double BIG = 1e29;
+    const double BIG = 1e29;  /* TOLSHEET TOL-LP-BIGCAP */
     if (m <= 0 || n <= 0 || !colptr || !rel || !b || !lo || !hi || !ys ||
         !mlt || !y || !zl || !zh) return 0;
     for (int i = 0; i < m; i++) {
@@ -654,7 +654,7 @@ int solver_farkas_boxcert(int n, int m, const int *colptr, const int *row,
     }
     fesetround(rm);
     if (!isfinite(L) || !isfinite(R)) return 0;
-    double mar = tol * (1.0 + fabs(R));
+    double mar = tol * (1.0 + fabs(R));  /* TOLSHEET TOL-LP-FARKAS */
     return L > R + mar;
 }
 
@@ -662,7 +662,7 @@ double solver_row_exposure(int n, int m, const int *colptr, const int *row,
                            const double *val,
                            const double *lo, const double *hi)
 {
-    const double BIGCAP = 1e29;
+    const double BIGCAP = 1e29;  /* TOLSHEET TOL-LP-BIGCAP */
     if (!colptr || !row || !val || !lo || !hi || m < 0 || n <= 0) return 0.0;
     double worst = 0.0;
     /* accumulate per-column contributions into a reusable row buffer */
@@ -728,7 +728,7 @@ static void solver_reset_to_initial(Solver *s)
             if (sv >= 0) {
                 double scoef = (double)mlt[i] * (s->rel[i] == '<' ? 1.0 : -1.0);
                 double v = resid / scoef;
-                if (v >= -1e-12) {   /* slack value nonneg => feasible start */
+                if (v >= -1e-12) {   /* slack value nonneg => feasible start */  /* TOLSHEET TOL-LP-STARTSLACK */
                     chosen = sv;
                     s->x[sv] = (v > 0.0) ? v : 0.0;
                 }
@@ -779,7 +779,7 @@ static void solver_reset_to_initial(Solver *s)
     s->iters = 0;
     s->status_out = 0;
     s->objval = 0.0;
-    s->hyper_tol = 0.0;
+    s->hyper_tol = 0.0;  /* TOLSHEET TOL-LP-HYPERDEF */
 
     /* initial refactorization (honors s->sparse_disabled / use_sparse) */
     refactorize(s);
@@ -833,10 +833,10 @@ static int pick_entering(const Solver *s)
         double score;   /* improving reduced cost normalized by sqrt(weight) */
         if (st == LP_NBL) {
             if (rc <= TOL_DJ) continue;
-            score = rc / sqrt(s->w[j] < 1e-30 ? 1e-30 : s->w[j]);
+            score = rc / sqrt(s->w[j] < 1e-30 ? 1e-30 : s->w[j]);  /* TOLSHEET TOL-LP-WGUARD */
         } else { /* NBU */
             if (rc >= -TOL_DJ) continue;
-            score = (-rc) / sqrt(s->w[j] < 1e-30 ? 1e-30 : s->w[j]);
+            score = (-rc) / sqrt(s->w[j] < 1e-30 ? 1e-30 : s->w[j]);  /* TOLSHEET TOL-LP-WGUARD */
         }
         if (score > best) { best = score; q = j; }
     }
@@ -887,7 +887,7 @@ static int ratio_test(const Solver *s, int q, int dir, const double *d,
 
     /* Harris pass 2: among candidates within relax of min, pick largest |v| */
     if (blockIsBasic) {
-        double relax = 1e-9 * (1.0 + fabs(theta));
+        double relax = 1e-9 * (1.0 + fabs(theta));  /* TOLSHEET TOL-LP-RELAX */
         double bestv = 0.0; int bestslot = -1;
         for (int i = 0; i < M; i++) {
             int bv = s->basis[i];
@@ -925,7 +925,7 @@ static void update_steepest_edge(Solver *s, int q, int p)
     double wq = 0.0;
     for (int i = 0; i < M; i++) wq += s->d[i] * s->d[i];
     double aq = s->d[p];
-    if (fabs(aq) < 1e-300) aq = (aq < 0) ? -1e-300 : 1e-300;
+    if (fabs(aq) < 1e-300) aq = (aq < 0) ? -1e-300 : 1e-300;  /* TOLSHEET TOL-LP-AQGUARD */
     /* v = B^{-T} d */
     memcpy(s->vw, s->d, (size_t)M * sizeof(double));
     btrans(s, s->vw);
@@ -943,8 +943,8 @@ static void update_steepest_edge(Solver *s, int q, int p)
         double ajv   = k_dsdot_sparse(s->vw,   s->row + s->colptr[j], s->val + s->colptr[j], nnz, 0.0);
         double t = alpha / aq;
         double nj = s->w[j] - 2.0 * t * ajv + t * t * wq;
-        if (nj < 1e-30) nj = 1e-30;
-        if (nj > 1e18) nj = 1e18;
+        if (nj < 1e-30) nj = 1e-30;  /* TOLSHEET TOL-LP-WGUARD */
+        if (nj > 1e18) nj = 1e18;  /* TOLSHEET TOL-LP-WCAP */
         s->w[j] = nj;
     }
     /* the variable leaving the basis (slot p) becomes nonbasic */
@@ -1000,7 +1000,7 @@ static int iterate(Solver *s)
         double obj = 0.0;
         for (int _j = 0; _j < s->N; _j++)
             if (s->status[_j] != LP_REMOVED) obj += s->cobj[_j] * s->x[_j];
-        if (obj > s->last_obj + 1e-9 * (1.0 + fabs(s->last_obj))) s->flat = 0;
+        if (obj > s->last_obj + 1e-9 * (1.0 + fabs(s->last_obj))) s->flat = 0;  /* TOLSHEET TOL-LP-FLAT */
         else s->flat++;
         s->last_obj = obj;
         if (s->flat > 500) s->bland = 1;
@@ -1077,7 +1077,7 @@ static void remove_basic_artificials(Solver *s)
            let the artificial absorb infeasibility and report a solution that
            violates the row (e.g. -3x0=0 solved as x0=20).  Only replace an
            artificial that is basic at a nonzero value. */
-        if (fabs(s->x[bv]) <= 1e-9) {
+        if (fabs(s->x[bv]) <= 1e-9) {  /* TOLSHEET TOL-LP-ARTPIN */
             s->l[bv] = 0.0; s->u[bv] = 0.0;   /* pin the redundant artificial at 0 */
             continue;
         }
@@ -1208,10 +1208,10 @@ static int solver_solve_impl(Solver *s)
                     int av = s->artVar[i];
                     if (s->status[av] == LP_BASIC) artsum += s->x[av];
                 }
-                if (worst > 1e-6 * (1.0 + fabs(artsum))) certified = 0;
+                if (worst > 1e-6 * (1.0 + fabs(artsum))) certified = 0;  /* TOLSHEET TOL-LP-P1CERT */
             }
             if (certified) {
-                if (artsum > 1e-6) {
+                if (artsum > 1e-6) {  /* TOLSHEET TOL-LP-P1SUM */
                     /* Certified Phase-I INFEASIBLE: keep the Phase-I-optimal
                        basis and objective in place and mark the state, so the
                        MIP bridge can pull the dual ray (solver_farkas_duals)
@@ -1544,7 +1544,7 @@ int solver_feasible(const Solver *s)
 {
     if(!s)return 0;
     int N = s->N, M = s->M;
-    const double tol = 1e-6 * (1.0 + fabs(s->objval));
+    const double tol = 1e-6 * (1.0 + fabs(s->objval));  /* TOLSHEET TOL-LP-FINALBOX */
     for (int j = 0; j < N; j++) {
         if (s->status[j] == LP_REMOVED) continue;
         if (s->x[j] < s->l[j] - tol || s->x[j] > s->u[j] + tol) return 0;
@@ -1559,7 +1559,7 @@ int solver_feasible(const Solver *s)
     }
     int ok = 1;
     for (int i = 0; i < M; i++)
-        if (fabs(res[i] - s->beq[i]) > 1e-5 * (1.0 + fabs(s->beq[i]))) { ok = 0; break; }
+        if (fabs(res[i] - s->beq[i]) > 1e-5 * (1.0 + fabs(s->beq[i]))) { ok = 0; break; }  /* TOLSHEET TOL-LP-FINALROW */
     psolve_free(res);
     return ok;
 }

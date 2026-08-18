@@ -268,17 +268,27 @@ UBSan(+LSan) sweep N=1500 clean, full battery + MiniZinc 77/77
 >65536-member set domains whose UNSAT-ness needs reasoning grind in MIP
 B&B; presolve suggestion recorded in AUDIT (9).
 
-### 6.8 Per-module tolerance semantics sheets
-- **What:** one section in `docs/DESIGN.md` per engine: every tolerance,
-  its direction of safety, what it protects, and what it may never justify
-  (e.g. a margin may never turn feasibility pruning into UNSAT without the
-  directed-rounding certificate).
-- **Why:** the 2026-08-15 `mip_diff` flip (seed 12345 WRONG=5) was caused by
-  an exact prune that ignored the engine margin — a *semantics* bug wearing
-  a numerics costume.
-- **Acceptance:** sheets exist and are cited by the code comments at each
-  tolerance site; `grep` proves every literal tolerance in `src/` has a
-  documented entry.
+### 6.8 Per-module tolerance semantics sheets — **DONE 2026-08-18(11)**
+- **What (shipped):** `docs/DESIGN.md` §8 — one subsection per engine (LP
+  core, MIP, QP, PGS float+fixed, FlatZinc front-end, CP, exact-fx, plus a
+  §8.8 for no-decision-power constants swept by the closure).  80 rows
+  covering all 127 tolerance-literal sites in `src/`, each with class
+  (verdict-adjacent V / convergence C / honest-decline D / recognition R /
+  sentinel-stability S / exact E), direction of safety, what it protects,
+  and what it may never justify.  Header rule: a V-class tolerance never
+  decides a verdict alone — it feeds a certificate that stands without it
+  (directed rounding, exact-rational re-check, printed bound), or the
+  status degrades to SOLVE_NUMERICAL.
+- **Acceptance mechanised:** every site carries a `/* TOLSHEET <ID> */`
+  comment; new hard gate `tools/tolsheet_check.py` (in `test.sh`) enforces
+  closure both directions through a real C comment/string state machine —
+  every code-line literal tagged, every tag documented, every row live.
+  Undocumented new tolerances and stale rows both fail the battery.
+- **Survey honesty:** the machine closure caught sites the manual sweep
+  missed (fx representability guards, fznsolve's own 5e-7 exposure
+  frontier, QP divergence cap, splu growth watchdog, sentinel families) —
+  they are documented as found-by-machine in AUDIT (11).  Full battery
+  rc=0, 77/77 bench 0 semantic diffs; comment-only source changes.
 
 ### 6.9 Functional-graph family + presolve structure recovery — **DONE 2026-08-18(10)**
 Generalizes the procstates-specific `orbit_len` global (docs/PROCSTATES.md)

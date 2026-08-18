@@ -8,7 +8,7 @@
 #define LP_NBU    2   /* nonbasic at upper bound */
 #define LP_REMOVED 3
 
-#define LP_INF 1e30
+#define LP_INF 1e30  /* TOLSHEET TOL-LP-INF */
 #define SOLVE_STOPPED 4   /* cooperative abort requested (time limit / Ctrl-C) */
 #define SOLVE_NUMERICAL 5 /* factorization/certificate failure */
 #define SOLVE_INVALID 6   /* NULL or structurally invalid public-API input */

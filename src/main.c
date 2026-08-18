@@ -106,7 +106,7 @@ int main(int argc, char **argv)
         r = solver_solve(s);
     }
     clock_gettime(CLOCK_MONOTONIC, &t1);
-    double secs = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+    double secs = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;  /* TOLSHEET TOL-SYS-NSEC */
 
     if (r == 1 && s->farkas_ok) {
         /* The phase-1 infeasibility verdict needs an independent proof before
@@ -131,12 +131,12 @@ int main(int argc, char **argv)
             if (solver_farkas_duals(s, fr_y) == 0 &&
                 solver_farkas_boxcert(n, m, lp.Acolptr, lp.Arow, lp.Aval,
                                       lp.rel, lp.b, lp.l, lp.u,
-                                      fr_y, s->mlt, 1e-6, fr_yc, fr_zl, fr_zh))
+                                      fr_y, s->mlt, 1e-6, fr_yc, fr_zl, fr_zh))  /* TOLSHEET TOL-LP-FARKAS */
                 certified = 1;
             if (!certified) {
                 double E = solver_row_exposure(n, m, lp.Acolptr, lp.Arow,
                                                lp.Aval, lp.l, lp.u);
-                if (E * DBL_EPSILON >= 5e-7) r = SOLVE_NUMERICAL;
+                if (E * DBL_EPSILON >= 5e-7) r = SOLVE_NUMERICAL;  /* TOLSHEET TOL-LP-SHAKY */
             }
         }
         free(fr_y); free(fr_yc); free(fr_zl); free(fr_zh);

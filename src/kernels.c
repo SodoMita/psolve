@@ -83,7 +83,7 @@ double k_dsdot_sparse(const double *restrict y,
         int row = col[k];
         double yv = y[row];
         /* hyper-sparsity: skip multiply when y[row] is (near) zero */
-        if (yv >= ytol || yv <= -ytol)
+        if (yv >= ytol || yv <= -ytol)  /* TOLSHEET TOL-KRN-YTOL */
             r += yv * val[k];
     }
     return r;

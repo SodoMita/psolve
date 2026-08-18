@@ -116,7 +116,7 @@ static Expr parse_primary(const char*s,size_t*pos,FZModel*m,int*err)
             while(isspace((unsigned char)s[*pos]))(*pos)++;
             if(s[*pos]!=']'){expr_free2(&ix);*err=1;return e;}
             (*pos)++;
-            if(ix.is_array||ix.n!=1||ix.els[0].n!=0||fabs(ix.els[0].constant-round(ix.els[0].constant))>1e-12){
+            if(ix.is_array||ix.n!=1||ix.els[0].n!=0||fabs(ix.els[0].constant-round(ix.els[0].constant))>1e-12){  /* TOLSHEET TOL-FZN-INTCONST */
                 expr_free2(&ix);*err=1;return e;
             }
             long ival=(long)llround(ix.els[0].constant);expr_free2(&ix);
@@ -326,7 +326,7 @@ static int tok_int_value(FZModel*m,const Token*t,long*out)
         FZDecl*d=find_decl(m,t->text);
         if(d&&!d->is_var&&!d->is_array&&d->par){
             double v=d->par[0];
-            if(fabs(v-round(v))<=1e-12){*out=(long)llround(v);return 0;}
+            if(fabs(v-round(v))<=1e-12){*out=(long)llround(v);return 0;}  /* TOLSHEET TOL-FZN-ALIAS */
         }
     }
     return -1;
@@ -569,7 +569,7 @@ int fz_read(const char*path,FZModel*m)
                         for(int q=0;q<narr;q++){
                             if(arr[q].n==0){
                                 d->alias_idx[q]=-1;d->alias_const[q]=arr[q].constant;contiguous=0;
-                            } else if(arr[q].n==1&&fabs(arr[q].coef[0]-1.0)<=1e-12&&fabs(arr[q].constant)<=1e-12){
+                            } else if(arr[q].n==1&&fabs(arr[q].coef[0]-1.0)<=1e-12&&fabs(arr[q].constant)<=1e-12){  /* TOLSHEET TOL-FZN-ALIAS */
                                 d->alias_idx[q]=arr[q].idx[0];
                                 if(q==0)first=d->alias_idx[q];
                                 else if(d->alias_idx[q]!=first+q)contiguous=0;
@@ -587,7 +587,7 @@ int fz_read(const char*path,FZModel*m)
                         d->n=1;
                         Lin l;memset(&l,0,sizeof(l));
                         if(parse_lin(m,rhs,&l)!=0 ||
-                           !(l.n==0 || (l.n==1&&fabs(l.coef[0]-1.0)<=1e-12&&fabs(l.constant)<=1e-12))){
+                           !(l.n==0 || (l.n==1&&fabs(l.coef[0]-1.0)<=1e-12&&fabs(l.constant)<=1e-12))){  /* TOLSHEET TOL-FZN-ALIAS */
                             lin_free(&l);psolve_free(rhs);free_toks(toks,nt);psolve_free(src);fz_model_free(m);return -1;
                         }
                         d->is_alias=1;d->alias_idx=(int*)psolve_calloc(1,sizeof(int));d->alias_const=(double*)psolve_calloc(1,sizeof(double));
@@ -654,8 +654,8 @@ typedef struct { int nvars;int varcap;double*lo,*hi;int*haslo,*hashi;unsigned ch
 /* The LP core needs a finite starting box.  This is only a bridge sentinel,
    never a mathematical FlatZinc bound; optimization results that rely on it
    are reported as UNKNOWN rather than a fictitious optimum at +/-1e9. */
-#define FZ_BIG_BOUND 1e9
-#define FZ_BIG_HIT_TOL 1e-5
+#define FZ_BIG_BOUND 1e9  /* TOLSHEET TOL-FZN-BIGBOUND */
+#define FZ_BIG_HIT_TOL 1e-5  /* TOLSHEET TOL-FZN-BIGHIT */
 static int b_newvar_kind(Builder*b, double lo, double hi, int is_int){
     if(b->nvars>=b->varcap){
         int nc=b->varcap?b->varcap*2:16;
@@ -701,7 +701,7 @@ static int lin_bounds(const Builder*b,const Lin*l,double*lo,double*hi)
 
 static int lin_unit_var(const Lin*l,int*out)
 {
-    if(l->n!=1||fabs(l->coef[0]-1.0)>1e-12||fabs(l->constant)>1e-12)return -1;
+    if(l->n!=1||fabs(l->coef[0]-1.0)>1e-12||fabs(l->constant)>1e-12)return -1;  /* TOLSHEET TOL-FZN-ALIAS */
     *out=l->idx[0];return 0;
 }
 
@@ -743,12 +743,12 @@ static int lin_materialize(Builder*b,const Lin*l,int is_float)
    exists and the caller must decline (the handler then reports UNKNOWN
    instead of fabricating). */
 static int int_lattice_steps(const Lin*d,double*P,double*N){
-    if(!isfinite(d->constant)||fabs(d->constant)>1e15) return 0;
+    if(!isfinite(d->constant)||fabs(d->constant)>1e15) return 0;  /* TOLSHEET TOL-FZN-LATTICECAP */
     double f=d->constant-floor(d->constant);
-    if(f>1.0-1e-9) f=0.0; else if(f<1e-9) f=0.0;
+    if(f>1.0-1e-9) f=0.0; else if(f<1e-9) f=0.0;  /* TOLSHEET TOL-FZN-LATTICE */
     for(int i=0;i<d->n;i++){
         double cf=d->coef[i];
-        if(!isfinite(cf)||cf!=rint(cf)||fabs(cf)>1e15) return 0;
+        if(!isfinite(cf)||cf!=rint(cf)||fabs(cf)>1e15) return 0;  /* TOLSHEET TOL-FZN-LATTICECAP */
     }
     if(f>0.0){ *P=f; *N=f-1.0; } else { *P=1.0; *N=-1.0; }
     return 1;
@@ -775,7 +775,7 @@ static int add_int_ne(Builder*b,const Lin*d)
 static int add_int_reif(Builder*b,const Lin*d,int r,int which)
 {
     double L,U,P,N;
-    if(r<0||r>=b->nvars||b->lo[r]<-1e-9||b->hi[r]>1.0+1e-9||lin_bounds(b,d,&L,&U)!=0)return -1;
+    if(r<0||r>=b->nvars||b->lo[r]<-1e-9||b->hi[r]>1.0+1e-9||lin_bounds(b,d,&L,&U)!=0)return -1;  /* TOLSHEET TOL-FZN-BOOLBOX */
     if(int_lattice_steps(d,&P,&N)!=1)return 1; /* irregular lattice: decline honestly */
     if(which==0){
         /* r=1 => d=0; r=0 selects d>=P or d<=N.  On a fractional lattice d=0
@@ -826,7 +826,7 @@ static int add_int_reif(Builder*b,const Lin*d,int r,int which)
 static int add_int_imp(Builder*b,const Lin*d,int r,int which)
 {
     double L,U,P,N;
-    if(r<0||r>=b->nvars||b->lo[r]<-1e-9||b->hi[r]>1.0+1e-9||lin_bounds(b,d,&L,&U)!=0)return -1;
+    if(r<0||r>=b->nvars||b->lo[r]<-1e-9||b->hi[r]>1.0+1e-9||lin_bounds(b,d,&L,&U)!=0)return -1;  /* TOLSHEET TOL-FZN-BOOLBOX */
     if(int_lattice_steps(d,&P,&N)!=1)return 1; /* irregular lattice: decline honestly */
     if(which==0){ /* r => d == 0 (fractional lattice: identically false -> r=0) */
         if(P<1.0){ Lin pin;memset(&pin,0,sizeof(pin));lin_term(&pin,r,1.0);b_put(b,'<',0.0,&pin);lin_free(&pin);return 0; }
@@ -893,7 +893,7 @@ static int objective_uses_synthetic_bound(const FZModel*m,const Builder*b,const 
        sentinel means the claimed optimum is not certifiable. */
     for(int k=0;k<m->objective.n;k++){
         int v=m->objective.idx[k];
-        if(v<0||v>=norig||fabs(m->objective.coef[k])<=1e-14)continue;
+        if(v<0||v>=norig||fabs(m->objective.coef[k])<=1e-14)continue;  /* TOLSHEET TOL-FZN-OBJZERO */
         if((!b->haslo[v]&&x[v]<=-FZ_BIG_BOUND+FZ_BIG_HIT_TOL)||
            (!b->hashi[v]&&x[v]>= FZ_BIG_BOUND-FZ_BIG_HIT_TOL))return 1;
     }
@@ -1159,7 +1159,7 @@ static int csp_try_alldiff(const FZModel *m, double *out){
                 if(arr[i].n==0){
                     long v=(long)llround(arr[i].constant);
                     fixed[nfixed++]=v;
-                } else if(arr[i].n==1 && fabs(arr[i].coef[0]-1.0)<1e-12 && fabs(arr[i].constant)<1e-12){
+                } else if(arr[i].n==1 && fabs(arr[i].coef[0]-1.0)<1e-12 && fabs(arr[i].constant)<1e-12){  /* TOLSHEET TOL-FZN-ALIAS */
                     vars[nvars_ad++]=arr[i].idx[0];
                 } else { ok=0; break; }
             }
@@ -1222,7 +1222,7 @@ static int csp_try_alldiff(const FZModel *m, double *out){
                 if(varArr[i].n!=1){ ok=0; break; }
                 vars2[i]=varArr[i].idx[0];
                 coefs2[i]=(long)llround(coefArr[i].constant);
-                if(fabs(coefArr[i].constant - coefs2[i])>1e-9) ok=0;
+                if(fabs(coefArr[i].constant - coefs2[i])>1e-9) ok=0;  /* TOLSHEET TOL-FZN-TBLCOEF */
             }
             long rhsval=(long)llround(rhs.constant);
             char rel='=';
@@ -1863,11 +1863,11 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
         if(parse_lin(m,c->args[2],&l3)!=0){lin_free(&l1);lin_free(&l2);return -1;}
         int handled=0;
         if(l2.n==0 && isfinite(l2.constant) && l2.constant==rint(l2.constant) &&
-           l2.constant!=0.0 && fabs(l2.constant)<=0x1p53){
+           l2.constant!=0.0 && fabs(l2.constant)<=0x1p53){  /* TOLSHEET TOL-FZN-POWCAP */
             double K=l2.constant, R=fabs(K)-1.0;
             int is_div=(strcmp(p,"int_div")==0);
             if(l1.n==0 && isfinite(l1.constant) &&
-               l1.constant==rint(l1.constant) && fabs(l1.constant)<=0x1p53){
+               l1.constant==rint(l1.constant) && fabs(l1.constant)<=0x1p53){  /* TOLSHEET TOL-FZN-POWCAP */
                 /* These values are exact integers in double, and their ratio
                    is far inside int64, so C's truncation-toward-zero semantics
                    exactly match MiniZinc's div/mod semantics. */
@@ -1930,7 +1930,7 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
                    coefficient, so claiming exact int_pow support would solve a
                    nearby model.  Return UNKNOWN instead. */
                 if(!isfinite(base)||base!=rint(base)||!isfinite(val)||
-                   fabs(val)>0x1p53||val!=rint(val)){
+                   fabs(val)>0x1p53||val!=rint(val)){  /* TOLSHEET TOL-FZN-POWCAP */
                     lin_free(&l1);lin_free(&l2);lin_free(&l3);return 1;
                 }
                 Lin eq;memset(&eq,0,sizeof(eq)); lin_into(&eq,&l3,1.0); eq.constant-=val;
@@ -1938,10 +1938,10 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
                 lin_free(&l1);lin_free(&l2);lin_free(&l3); return 0;
             } else if(l1.n==1 && b->haslo[l1.idx[0]] && b->hashi[l1.idx[0]]){
                 int xv = l1.idx[0];
-                if(fabs(b->lo[xv] - b->hi[xv]) <= 1e-9){
+                if(fabs(b->lo[xv] - b->hi[xv]) <= 1e-9){  /* TOLSHEET TOL-FZN-FIXED */
                     double base=b->lo[xv],val=pow(base,(double)exp);
                     if(!isfinite(base)||base!=rint(base)||!isfinite(val)||
-                       fabs(val)>0x1p53||val!=rint(val)){
+                       fabs(val)>0x1p53||val!=rint(val)){  /* TOLSHEET TOL-FZN-POWCAP */
                         lin_free(&l1);lin_free(&l2);lin_free(&l3);return 1;
                     }
                     Lin eq;memset(&eq,0,sizeof(eq)); lin_into(&eq,&l3,1.0); eq.constant-=val;
@@ -1960,7 +1960,7 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
                     Lin sum;memset(&sum,0,sizeof(sum)); lin_into(&sum,&l3,1.0);
                     for(int k=0;k<nvals;k++){
                         double pval=pow((double)(vlo+k),(double)exp);
-                        if(!isfinite(pval)||fabs(pval)>0x1p53||pval!=rint(pval)){
+                        if(!isfinite(pval)||fabs(pval)>0x1p53||pval!=rint(pval)){  /* TOLSHEET TOL-FZN-POWCAP */
                             lin_free(&sum);psolve_free(zs);lin_free(&l1);lin_free(&l2);lin_free(&l3);return 1;
                         }
                         lin_term(&sum,zs[k],-pval);
@@ -1983,7 +1983,7 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
         if(parse_lin(m,c->args[0],&l1)!=0)return -1;
         if(parse_lin(m,c->args[1],&l2)!=0){lin_free(&l1);return -1;}
         if(parse_lin(m,c->args[2],&l3)!=0){lin_free(&l1);lin_free(&l2);return -1;}
-        if(l2.n!=0||fabs(l2.constant)<1e-15){lin_free(&l1);lin_free(&l2);lin_free(&l3);return 1;}
+        if(l2.n!=0||fabs(l2.constant)<1e-15){lin_free(&l1);lin_free(&l2);lin_free(&l3);return 1;}  /* TOLSHEET TOL-FZN-DIVGUARD */
         Lin dd;memset(&dd,0,sizeof(dd));lin_into(&dd,&l3,1.0);lin_into(&dd,&l1,-1.0/l2.constant);
         b_put(b,'=',0.0,&dd);lin_free(&dd);
         lin_free(&l1);lin_free(&l2);lin_free(&l3);return 0;
@@ -2098,7 +2098,7 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
                    decidable at compile time).  Beyond 2^53 the double from
                    parse_lin may have lost precision, so stay honest. */
                 double xv=xl.constant;
-                if(!isfinite(xv)||fabs(xv)>0x1p53){psolve_free(vals);lin_free(&xl);return 1;}
+                if(!isfinite(xv)||fabs(xv)>0x1p53){psolve_free(vals);lin_free(&xl);return 1;}  /* TOLSHEET TOL-FZN-POWCAP */
                 int member=(xv==rint(xv));
                 if(member){
                     long v=(long)rint(xv);
@@ -2212,7 +2212,7 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
         Lin*arr;int narr;
         if(parse_array(m,c->args[0],&arr,&narr)!=0)return -1;
         if(narr<=1){free_lins(arr,narr);return 0;}
-        double dlo=1e18, dhi=-1e18;
+        double dlo=1e18, dhi=-1e18;  /* TOLSHEET TOL-FZN-BOUNDINIT */
         for(int i=0;i<narr;i++){
             double lo_i, hi_i;
             if(lin_bounds(b, &arr[i], &lo_i, &hi_i)!=0){free_lins(arr,narr);return 1;}
@@ -2413,7 +2413,7 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
            unbounded number of binary selector variables. */
         if(nrows>1024||nt>65536){free_lins(xs,nx);free_lins(tuples,nt);return 1;}
         for(int k=0;k<nt;k++){
-            if(tuples[k].n!=0||fabs(tuples[k].constant-round(tuples[k].constant))>1e-12){
+            if(tuples[k].n!=0||fabs(tuples[k].constant-round(tuples[k].constant))>1e-12){  /* TOLSHEET TOL-FZN-INTCONST */
                 free_lins(xs,nx);free_lins(tuples,nt);return 1;
             }
         }
@@ -2445,7 +2445,7 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
         if(strcmp(p,"gecode_circuit")==0){
             if(c->nargs<2)return -1;
             if(parse_lin(m,c->args[0],&ol)!=0)return -1;
-            if(ol.n!=0||fabs(ol.constant-round(ol.constant))>1e-12||
+            if(ol.n!=0||fabs(ol.constant-round(ol.constant))>1e-12||  /* TOLSHEET TOL-FZN-INTCONST */
                ol.constant<(double)INT_MIN||ol.constant>(double)INT_MAX){lin_free(&ol);return 1;}
             offset=(int)llround(ol.constant);xarg=c->args[1];lin_free(&ol);
         } else {
@@ -2521,7 +2521,7 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
         else which=5;
         int rr;
         if(rb.n==0){
-            if(fabs(rb.constant)>1e-12&&fabs(rb.constant-1.0)>1e-12)rr=1;
+            if(fabs(rb.constant)>1e-12&&fabs(rb.constant-1.0)>1e-12)rr=1;  /* TOLSHEET TOL-FZN-CONSTBOOL */
             else if(is_imp){
                 if(rb.constant>=0.5) rr=add_int_relation_constant(b,&d,which,1);
                 else rr=0; /* 0 => relation is vacuously true */
@@ -2590,7 +2590,7 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
         else which=5;
         int rr;
         if(rb.n==0){
-            if(fabs(rb.constant)>1e-12&&fabs(rb.constant-1.0)>1e-12)rr=1;
+            if(fabs(rb.constant)>1e-12&&fabs(rb.constant-1.0)>1e-12)rr=1;  /* TOLSHEET TOL-FZN-CONSTBOOL */
             else if(is_imp){
                 if(rb.constant>=0.5) rr=add_int_relation_constant(b,&lin,which,1);
                 else rr=0;
@@ -2687,7 +2687,7 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
                 /* par element: fold its membership exactly (previously the
                    whole constraint reported UNHANDLED) */
                 double cv=arr[i].constant;
-                if(!isfinite(cv)||cv!=rint(cv)||fabs(cv)>0x1p53){psolve_free(bs);psolve_free(vals);free_lins(arr,narr);lin_free(&nl);return 1;}
+                if(!isfinite(cv)||cv!=rint(cv)||fabs(cv)>0x1p53){psolve_free(bs);psolve_free(vals);free_lins(arr,narr);lin_free(&nl);return 1;}  /* TOLSHEET TOL-FZN-POWCAP */
                 long v=(long)rint(cv);
                 int lolo=0,hihi=nvals-1,found=0;
                 while(lolo<=hihi){int mid=(lolo+hihi)>>1; if(vals[mid]==v){found=1;break;} if(vals[mid]<v)lolo=mid+1; else hihi=mid-1;}
@@ -2749,7 +2749,7 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
                 psolve_free(M);psolve_free(vals);free_lins(arr,narr);return 1;   /* unbounded -> UNKNOWN */
             }
             double lo=b->lo[v], hi=b->hi[v];
-            double colmin=1e18, colmax=-1e18;
+            double colmin=1e18, colmax=-1e18;  /* TOLSHEET TOL-FZN-BOUNDINIT */
             for(int j=0;j<rows;j++){ double t=(double)vals[j*arity+i]; if(t<colmin)colmin=t; if(t>colmax)colmax=t; }
             double m = fmax(colmax-lo, hi-colmin);
             M[i]= (m<1.0)?1.0:m;
@@ -2788,12 +2788,12 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
         if(ns!=nd||ns!=nr){lin_free(&bl);free_lins(sarr,ns);free_lins(darr,nd);free_lins(rarr,nr);return -1;}
         int n=ns;
         if(n==0){lin_free(&bl);free_lins(sarr,ns);free_lins(darr,nd);free_lins(rarr,nr);return 0;}
-        if(bl.n!=0||bl.constant<0.0||fabs(bl.constant-rint(bl.constant))>1e-9){
+        if(bl.n!=0||bl.constant<0.0||fabs(bl.constant-rint(bl.constant))>1e-9){  /* TOLSHEET TOL-FZN-CUMUL */
             lin_free(&bl);free_lins(sarr,ns);free_lins(darr,nd);free_lins(rarr,nr);return 1;
         }
         double B=bl.constant;
 
-        double minStart=1e18,maxEnd=-1e18;
+        double minStart=1e18,maxEnd=-1e18;  /* TOLSHEET TOL-FZN-BOUNDINIT */
         long *lo=(long*)psolve_malloc((size_t)n*sizeof(long));
         long *hi=(long*)psolve_malloc((size_t)n*sizeof(long));
         double *dval=(double*)psolve_malloc((size_t)n*sizeof(double));
@@ -2807,7 +2807,7 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
             }
             double d=darr[i].constant,r=rarr[i].constant;
             dval[i]=d; rval[i]=r;
-            if(d<0.0||r<0.0||fabs(d-rint(d))>1e-9||fabs(r-rint(r))>1e-9){
+            if(d<0.0||r<0.0||fabs(d-rint(d))>1e-9||fabs(r-rint(r))>1e-9){  /* TOLSHEET TOL-FZN-CUMUL */
                 psolve_free(lo);psolve_free(hi);psolve_free(dval);psolve_free(rval);
                 lin_free(&bl);free_lins(sarr,ns);free_lins(darr,nd);free_lins(rarr,nr);return 1;
             }
@@ -3355,7 +3355,7 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
         Lin*arr;int narr;
         if(parse_array(m,c->args[0],&arr,&narr)!=0)return -1;
         if(narr<=1){free_lins(arr,narr);return 0;}
-        double dlo=1e18, dhi=-1e18;
+        double dlo=1e18, dhi=-1e18;  /* TOLSHEET TOL-FZN-BOUNDINIT */
         for(int i=0;i<narr;i++){
             double lo_i, hi_i;
             if(lin_bounds(b, &arr[i], &lo_i, &hi_i)!=0){free_lins(arr,narr);return 1;}
@@ -3416,7 +3416,7 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
             Lin eq; memset(&eq, 0, sizeof(eq)); lin_into(&eq, &nl, 1.0); b_put(b, '=', 0.0, &eq); lin_free(&eq);
             lin_free(&nl); free_lins(arr,narr); return 0;
         }
-        double dlo=1e18, dhi=-1e18;
+        double dlo=1e18, dhi=-1e18;  /* TOLSHEET TOL-FZN-BOUNDINIT */
         for(int i=0;i<narr;i++){
             double lo_i, hi_i;
             if(lin_bounds(b, &arr[i], &lo_i, &hi_i)!=0){lin_free(&nl);free_lins(arr,narr);return 1;}
@@ -3948,7 +3948,7 @@ void fz_solve(const FZModel*m,FZSolution*sol)
         MIP mip;memset(&mip,0,sizeof(mip));
         mip.n=ntot;mip.m=b.nrows;mip.c=lp.c;mip.Acolptr=lp.Acolptr;mip.Arow=lp.Arow;mip.Aval=lp.Aval;
         mip.rel=lp.rel;mip.b=lp.b;mip.l=lp.l;mip.u=lp.u;mip.maximize=lp.maximize;
-        mip.isint=isint;mip.mip_gap=1e-4;
+        mip.isint=isint;mip.mip_gap=1e-4;  /* TOLSHEET TOL-FZN-MIPGAP */
         mip.stop_at_feasible = (m->solve_kind==0);   /* satisfy: first feasible is enough */
         mip.all_solutions = sol->all_solutions;
         mip.on_solution = fz_solution_cb;
@@ -3987,13 +3987,13 @@ void fz_solve(const FZModel*m,FZSolution*sol)
                 int cert=0;
                 if(solver_farkas_duals(s,fy)==0 &&
                    solver_farkas_boxcert(lp.n,lp.m,lp.Acolptr,lp.Arow,lp.Aval,
-                                         lp.rel,lp.b,lp.l,lp.u,fy,s->mlt,1e-6,
+                                         lp.rel,lp.b,lp.l,lp.u,fy,s->mlt,1e-6,  /* TOLSHEET TOL-FZN-FARKAS */
                                          fyc,fzl,fzh))
                     cert=1;
                 if(!cert){
                     double E=solver_row_exposure(lp.n,lp.m,lp.Acolptr,lp.Arow,
                                                  lp.Aval,lp.l,lp.u);
-                    if(E*DBL_EPSILON>=5e-7)shaky_unsat=1;
+                    if(E*DBL_EPSILON>=5e-7)shaky_unsat=1;  /* TOLSHEET TOL-FZN-SHAKY */
                 }
             }
             psolve_free(fy);psolve_free(fyc);psolve_free(fzl);psolve_free(fzh);

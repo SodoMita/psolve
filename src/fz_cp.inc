@@ -219,8 +219,8 @@ static int fg_kind(int k){ return k==CPK_ORBIT||k==CPK_ORBITTR||k==CPK_ORBITCL||
 
 static int cp_term_from_lin(const Lin*l,CPT*t){
     if(l->n==0 && fabs(l->constant)<=CP_BIG && l->constant==rint(l->constant)){ t->isc=1; t->c=(int64_t)l->constant; t->v=-1; return 0; }
-    if(l->n==1 && fabs(l->coef[0]-1.0)<1e-9 && fabs(l->constant)<1e-9){ t->isc=0; t->v=l->idx[0]; t->c=0; return 0; }
-    if(l->n==1 && fabs(l->coef[0]+1.0)<1e-9 && fabs(l->constant)<1e-9){ t->isc=0; t->v=l->idx[0]; t->c=1; return -2; }
+    if(l->n==1 && fabs(l->coef[0]-1.0)<1e-9 && fabs(l->constant)<1e-9){ t->isc=0; t->v=l->idx[0]; t->c=0; return 0; }  /* TOLSHEET TOL-CP-UNIT */
+    if(l->n==1 && fabs(l->coef[0]+1.0)<1e-9 && fabs(l->constant)<1e-9){ t->isc=0; t->v=l->idx[0]; t->c=1; return -2; }  /* TOLSHEET TOL-CP-UNIT */
     return -1;
 }
 static int cp_term_value(const CP*cp,const CPT*t,int64_t*out){

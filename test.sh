@@ -296,6 +296,13 @@ python3 tools/fgraph_verify.py 120 20260818 || { echo "fgraph_verify: FAIL"; exi
 # decline UNKNOWN or time out); post-change WRONG=0 at 100.  Hard gate.
 python3 tools/orbit_detect_verify.py 60 20260818 || { echo "orbit_detect_verify: FAIL"; exit 1; }
 
+# tolerance semantics sheets (docs/DESIGN.md section 8, roadmap 6.8):
+# grep-provable closure - every tolerance-class literal in src/ carries a
+# TOLSHEET tag, every tag resolves to a documented sheet row, and no sheet
+# row is stale.  Adding a tolerance without documenting it (or
+# documentation rotting past a refactor) fails this gate.
+python3 tools/tolsheet_check.py || { echo "tolsheet_check: FAIL"; exit 1; }
+
 if command -v minizinc >/dev/null 2>&1; then
   echo "[8.5/8] MiniZinc differential (compile .mzn -> fzn -> psolve vs Gecode)..."
   python3 tools/mzn_diff.py | tail -1

@@ -8,7 +8,7 @@
 #include <fenv.h>
 #include <float.h>
 
-#define MIP_TOL 1e-6
+#define MIP_TOL 1e-6  /* TOLSHEET TOL-MIP-INT */
 
 /* Build an exact-rational FxLP from the double MIP data plus per-node bounds.
  * Used to retry a relaxation with the exact solver when the double revised
@@ -41,9 +41,9 @@ static int mip_build_fxlp(const MIP *mip, const double *lo, const double *hi, Fx
     for(int i = 0; i < m; i++) if(fx_from_double(mip->b[i], &flp->b[i]) != 0) goto fail;
     for(int i = 0; i < m; i++) flp->rel[i] = mip->rel[i];
     for(int j = 0; j < n; j++){
-        if(lo[j] <= -1e29){ flp->lfinite[j] = 0; flp->l[j].num = -FX_INF_SENT; }
+        if(lo[j] <= -1e29){ flp->lfinite[j] = 0; flp->l[j].num = -FX_INF_SENT; }  /* TOLSHEET TOL-MIP-BIGCAP */
         else { if(fx_from_double(lo[j], &flp->l[j]) != 0) goto fail; flp->lfinite[j] = 1; }
-        if(hi[j] >= 1e29){ flp->ufinite[j] = 0; flp->u[j].num = FX_INF_SENT; }
+        if(hi[j] >= 1e29){ flp->ufinite[j] = 0; flp->u[j].num = FX_INF_SENT; }  /* TOLSHEET TOL-MIP-BIGCAP */
         else { if(fx_from_double(hi[j], &flp->u[j]) != 0) goto fail; flp->ufinite[j] = 1; }
         if(!flp->lfinite[j] && !flp->ufinite[j]) goto fail;   /* free var unsupported */
     }
@@ -127,8 +127,8 @@ static void push_node(Node **list, Node *node, int maximize)
     Node *cur = *list, *prev = NULL;
     int before;
     while (cur) {
-        before = maximize ? (node->bound > cur->bound + 1e-9)
-                          : (node->bound < cur->bound - 1e-9);
+        before = maximize ? (node->bound > cur->bound + 1e-9)  /* TOLSHEET TOL-MIP-PROGRESS */
+                          : (node->bound < cur->bound - 1e-9);  /* TOLSHEET TOL-MIP-PROGRESS */
         if (before) break;
         prev = cur; cur = cur->next;
     }
@@ -188,7 +188,7 @@ static Node *pop_node(Node **list)
 static int mip_box_conflict(const MIP *mip, const double *lo, const double *hi,
                             double *mn, double *mx)
 {
-    const double BIG = 1e29;
+    const double BIG = 1e29;  /* TOLSHEET TOL-MIP-BIGCAP */
     int n = mip->n, m = mip->m;
     if (m > 0) for (int i = 0; i < m; i++) mn[i] = 0.0;
     int rm = fegetround();
@@ -237,7 +237,7 @@ static int mip_box_conflict(const MIP *mip, const double *lo, const double *hi,
            cancellation fabrication: mn/mx are rigorous directed-rounding
            bounds (never an RN overestimate), so firing requires the TRUE
            extremum to exceed rhs by the full margin. */
-        double mar = MIP_TOL * (1.0 + fabs(rhs));
+        double mar = MIP_TOL * (1.0 + fabs(rhs));  /* TOLSHEET TOL-MIP-FARKAS */
         if ((rel == '<' || rel == '=') && isfinite(mn[i]) && mn[i] > rhs + mar) return 1;
         if ((rel == '>' || rel == '=') && isfinite(mx[i]) && mx[i] < rhs - mar) return 1;
     }
@@ -292,7 +292,7 @@ static int mip_farkas_certified(const MIP *mip, const double *lo, const double *
        is the engine's MIP_TOL. */
     return solver_farkas_boxcert(mip->n, mip->m, mip->Acolptr, mip->Arow,
                                  mip->Aval, mip->rel, mip->b, lo, hi,
-                                 ys, mlt, MIP_TOL, y, zl, zh);
+                                 ys, mlt, MIP_TOL, y, zl, zh);  /* TOLSHEET TOL-MIP-FARKAS */
 }
 
 /* Persistent simplex state reused across the whole branch-and-bound tree.
@@ -439,7 +439,7 @@ static int solve_relaxation(const MIP *mip, const Node *node, MipWarm *ws,
                whenever the exposure is comfortably below the frontier. */
             double E = solver_row_exposure(n, mip->m, mip->Acolptr, mip->Arow,
                                            mip->Aval, lo, hi);
-            if (E * DBL_EPSILON >= 5e-7) status = SOLVE_NUMERICAL;
+            if (E * DBL_EPSILON >= 5e-7) status = SOLVE_NUMERICAL;  /* TOLSHEET TOL-MIP-SHAKY */
         }
         }
     }
@@ -503,7 +503,7 @@ static int fbbt_tighten(const MIP *mip, double *lo, double *hi)
 {
     int n = mip->n, m = mip->m;
     if (n <= 0 || m <= 0) return 0;
-    const double BIG = 1e29;
+    const double BIG = 1e29;  /* TOLSHEET TOL-MIP-BIGCAP */
     int rc = 0;
     /* Captured once: every directed-rounding region below restores the mode
        immediately, so this value is current again after each region. */
@@ -550,7 +550,7 @@ static int fbbt_tighten(const MIP *mip, double *lo, double *hi)
                mirror this: V = (rhs - rest_max)/a with rest_R >= exact
                rest_max accumulated under FE_UPWARD, so a > 0 rounds DOWN
                and a < 0 rounds UP.  The lattice snaps (floor/ceil with the
-               1e-9 hysteresis slacks) and the 1e-9 comparison hysteresis
+               1e-9 hysteresis slacks) and the 1e-9 comparison hysteresis  [TOLSHEET TOL-MIP-FBBT]
                can only loosen further. */
             for (int j = 0; j < n; j++) {
                 double a = 0.0; int found = 0;
@@ -594,30 +594,30 @@ static int fbbt_tighten(const MIP *mip, double *lo, double *hi)
                         if (a > 0.0) {              /* upper candidate: round UP */
                             fesetround(FE_UPWARD);
                             double ub = (rhs - rest) / a;
-                            if (mip->isint[j]) ub = floor(ub + 1e-9);
-                            if (ub < hi[j] - 1e-9) { hi[j] = ub; changed = 1; }
+                            if (mip->isint[j]) ub = floor(ub + 1e-9);  /* TOLSHEET TOL-MIP-PROPRND */
+                            if (ub < hi[j] - 1e-9) { hi[j] = ub; changed = 1; }  /* TOLSHEET TOL-MIP-PROPRND */
                         } else {                    /* lower candidate: stay DOWN */
                             double lb = (rhs - rest) / a;
-                            if (mip->isint[j]) lb = ceil(lb - 1e-9);
-                            if (lb > lo[j] + 1e-9) { lo[j] = lb; changed = 1; }
+                            if (mip->isint[j]) lb = ceil(lb - 1e-9);  /* TOLSHEET TOL-MIP-PROPRND */
+                            if (lb > lo[j] + 1e-9) { lo[j] = lb; changed = 1; }  /* TOLSHEET TOL-MIP-PROPRND */
                         }
                     } else {
                         if (a > 0.0) {              /* lower candidate: round DOWN */
                             fesetround(FE_DOWNWARD);
                             double lb = (rhs - rest) / a;
-                            if (mip->isint[j]) lb = ceil(lb - 1e-9);
-                            if (lb > lo[j] + 1e-9) { lo[j] = lb; changed = 1; }
+                            if (mip->isint[j]) lb = ceil(lb - 1e-9);  /* TOLSHEET TOL-MIP-PROPRND */
+                            if (lb > lo[j] + 1e-9) { lo[j] = lb; changed = 1; }  /* TOLSHEET TOL-MIP-PROPRND */
                         } else {                    /* upper candidate: stay UP */
                             double ub = (rhs - rest) / a;
-                            if (mip->isint[j]) ub = floor(ub + 1e-9);
-                            if (ub < hi[j] - 1e-9) { hi[j] = ub; changed = 1; }
+                            if (mip->isint[j]) ub = floor(ub + 1e-9);  /* TOLSHEET TOL-MIP-PROPRND */
+                            if (ub < hi[j] - 1e-9) { hi[j] = ub; changed = 1; }  /* TOLSHEET TOL-MIP-PROPRND */
                         }
                     }
                 }
                 fesetround(old_rm);
             }
         }
-        for (int j = 0; j < n; j++) if (lo[j] > hi[j] + 1e-9) { rc = 1; goto done; }
+        for (int j = 0; j < n; j++) if (lo[j] > hi[j] + 1e-9) { rc = 1; goto done; }  /* TOLSHEET TOL-MIP-CROSS */
         /* A pass that tightened the box may expose a row conflict that was
            not provable on entry; re-certify cheaply (O(nnz)). */
         if (changed && mip_box_conflict(mip, lo, hi, cmin, cmax)) { rc = 1; goto done; }
@@ -649,7 +649,7 @@ void mip_solve(const MIP *mip, MIPResult *res)
         if(!isfinite(mip->b[i])||
            (mip->rel[i]!='<'&&mip->rel[i]!='>'&&mip->rel[i]!='='))return;
     int n = mip->n;
-    double gap = mip->mip_gap > 0 ? mip->mip_gap : 1e-4;
+    double gap = mip->mip_gap > 0 ? mip->mip_gap : 1e-4;  /* TOLSHEET TOL-MIP-GAP */
     long node_limit = mip->node_limit > 0 ? mip->node_limit : 100000;
 
     memset(res, 0, sizeof(*res));
@@ -661,10 +661,10 @@ void mip_solve(const MIP *mip, MIPResult *res)
     double *bestx = (double*)psolve_malloc((size_t)n * sizeof(double));
     double *xc = (double*)psolve_malloc((size_t)n * sizeof(double));
 
-    double incumbent = mip->maximize ? -1e30 : 1e30;
+    double incumbent = mip->maximize ? -1e30 : 1e30;  /* TOLSHEET TOL-MIP-INFBOUND */
     int have_incumbent = 0;
-    double best_bound = mip->maximize ? -1e30 : 1e30;
-    res->best_bound = mip->maximize ? 1e30 : -1e30;
+    double best_bound = mip->maximize ? -1e30 : 1e30;  /* TOLSHEET TOL-MIP-INFBOUND */
+    res->best_bound = mip->maximize ? 1e30 : -1e30;  /* TOLSHEET TOL-MIP-INFBOUND */
     Node *stack = NULL;
     double *lo0 = (double*)psolve_malloc((size_t)n * sizeof(double));
     double *hi0 = (double*)psolve_malloc((size_t)n * sizeof(double));

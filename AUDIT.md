@@ -1,5 +1,61 @@
 # psolve — audit & hardening notes
 
+> **2026-08-18 (11) - branch `arena/cp-engine-correctness`: Phase 6.8,
+> per-module tolerance semantics sheets.  Documentation-phase discipline,
+> closed by construction: zero functional code changes, 127 source sites
+> tagged, both directions machine-checked.**
+>
+> **What shipped.**  docs/DESIGN.md section 8 now inventories EVERY
+> tolerance-class literal in src/ (decimal exponent floats, 0x1pN
+> hex-floats, DBL_EPSILON): 80 IDs across LP core / MIP / QP / PGS /
+> FlatZinc front-end / CP engine / exact-fx, each with class (V verdict-
+> adjacent, C convergence, D honest-decline guard, R flattener-exact
+> recognition, S sentinel/stability, E exact), direction of safety, what
+> it protects, and what it may never justify.  The header rule, learned
+> from the 2026-08-15 mip_diff flip that motivated 6.8: a V-class
+> tolerance may never decide a verdict alone - it feeds a certificate that
+> stands without it (directed rounding, exact-rational re-check, printed
+> bound), or the status degrades to the honest numerical-failure class.
+>
+> **The grep-provable acceptance, mechanised.**  New hard gate
+> tools/tolsheet_check.py (wired into test.sh): scans every src/ code line
+> through a real C comment/string state machine - a literal inside prose
+> or a printf string cannot steer a verdict and is exempt - and requires
+> (1) every hit carries a /* TOLSHEET <ID> */ tag on the same line,
+> (2) every tag resolves to a DESIGN.md section-8 row, (3) every row is
+> carried by at least one source line (no stale rows after refactors).
+> Adding an undocumented tolerance literal fails the battery; so does
+> deleting or renaming a documented site.
+>
+> **What the inventory actually found (honesty of the survey itself).**
+> The first manual sweep MISSED sites; the machine closure caught them,
+> and they are documented, not excused: fx.c had two representability
+> guards (±0x1p63 range, 9e17 decimal cap - the exact module has guards,
+> no margins; section 8.7 says so precisely), fznsolve's own exposure
+> frontier (fzn.c:3996, 5e-7, the TOL-LP-SHAKY sibling), QP's divergence
+> cap (1e14 => QP_ITERATION_LIMIT), splu's norm-growth watchdog (1e10),
+> solver's steepest-edge weight cap (1e18), the MIP/fznsolve/LP sentinel
+> families (1e29/1e30/1e9), and one no-decision-power unit constant
+> (ns->s) filed under section 8.8 so the closure stays total rather than
+> carved out.
+>
+> **Two process notes (both caught pre-commit by the toolchain, not by
+> luck).**  (1) Tags on comment-continuation lines must not use /* */
+> syntax - the first pass broke the build (nested comment); those two
+> sites (mip.c FBBT comment, pgs_fixed.c saturation-policy comment) carry
+> bracket tags instead, which the checker detects on raw lines.  (2) Every
+> tag site was applied with a content anchor assertion (file, line,
+> expected substring) so a drifted line number fails loudly instead of
+> tagging the wrong line.
+>
+> **Acceptance evidence.**  tools/tolsheet_check.py: OK (80 ids, 127
+> tagged sites, 80 documented rows).  Full test.sh rc=0 including the new
+> gate; compile clean under -Wall -Wextra; 77-instance MiniZinc bench 0
+> semantic diffs (status/objective/solutions/verdict identical; only
+> time_psolve_ms/time_ref_ms/compile_time_ms churn).  No ASan sweep this
+> phase - no functional code changed (comments + docs + one read-only
+> checker tool), which the battery's build+run path confirms.
+
 > **2026-08-18 (10) - branch `arena/cp-engine-correctness`: Phase 6.9,
 > functional-graph constraint family + presolve structure-recovery
 > detector.  One honesty regression introduced by the work itself and
