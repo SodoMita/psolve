@@ -137,6 +137,32 @@ some stock solver succeeds; it quantifies that the natural declarative
 encodings grind, while a solver with a native orbit global terminates with
 a *certified* optimum immediately.
 
+### 5.1 Addendum 2026-08-18: the stock encoding now solves — via auto-detection
+
+Phase 6.9 (`docs/FUNCTIONAL_GRAPH.md`) generalized the task-specific global
+into a constraint family plus a **presolve structure-recovery detector**.
+The detector recognizes the exact "H-step walk + prefix-distinct count"
+lattice the MiniZinc flattener emits for the stock
+`procstates_orbit_stock.mzn` encoding (element chain over one constant
+table, CSE-shared reified pair disequalities, `array_bool_and` prefix
+bools, `dst_1`-folded objective sum) and rewrites it — semantics preserved
+exactly — into one `orbit_len_capped(next, H, start, len)` record on the
+same shared digest the dedicated model uses.
+
+Measured on the same box: the **stock flattened model** (n=65536, H=64,
+the one in the §5 table) is now auto-detected (one
+`presolve: orbit_chain rewrite: table_n=65536 chain_H=64` trace line) and
+solved to the **proven optimum 44 in 1.76–1.89 s at 103 MB peak RSS** —
+versus Gecode's 600 s UNKNOWN and the Chuffed/CP-SAT OOM kills in the §5
+table.  No model change was needed; the gain comes entirely from
+recognizing the structure after flattening.  Four memory cliffs had to be
+fixed for this to finish (count-then-allocate propagator keep-lists,
+dead-var domain skip, search-var-only branching, mutation-counter
+fixpoint); each is measured and documented in `docs/FUNCTIONAL_GRAPH.md`
+§4, and the one honesty regression the first cut introduced (unconstrained
+*output* vars printing as fabricated 0s — caught by the phase-6.7 output
+gate) is documented there in §5.
+
 ## 6. Verification
 
 `tools/procstates_orbit_verify.py` (hard gate in `test.sh`) checks

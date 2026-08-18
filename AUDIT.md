@@ -1,5 +1,110 @@
 # psolve — audit & hardening notes
 
+> **2026-08-18 (10) - branch `arena/cp-engine-correctness`: Phase 6.9,
+> functional-graph constraint family + presolve structure-recovery
+> detector.  One honesty regression introduced by the work itself and
+> caught by the phase-6.7 output gate before commit; four measured
+> memory cliffs fixed; one latent nv==0 dispatch gap closed.  Full
+> reference: docs/FUNCTIONAL_GRAPH.md.**
+>
+> **What shipped.** Five new FlatZinc predicates on one shared
+> per-table functional-graph digest (`orbit_transient`,
+> `orbit_cycle_len`, `orbit_on_cycle`, `orbit_len_capped`, plus
+> `array_bool_and` which stock models need and psolve previously
+> declined), digest content-dedupe with single-owner borrow semantics,
+> and a presolve detector that recovers the MiniZinc
+> "H-step walk + prefix-distinct count" lattice exactly (guards: every
+> record consumed, no intermediate referenced/output-pinned/
+> objective-pinned, `referenced[]` fully recomputed from surviving
+> records - airtight by construction) and rewrites it to one
+> `orbit_len_capped` record.  On ANY mismatch the model is untouched -
+> detection never narrows semantics, it only changes how fast the
+> (identical) answer is found.
+>
+> **Regression introduced and caught pre-commit (honest accounting).**
+> The first cut of "branch over referenced vars only" fabricated
+> answers: an unconstrained *output* var was never branched, stayed
+> unfixed, and printed as `0` - which can lie OUTSIDE its declared
+> domain (the exact fabrication class phase 6.7 built its gate for),
+> and `-a` enumeration collapsed the cartesian factor of free output
+> vars.  `tools/fzn_output_check.py` flagged `WRONG=59/2000` on the
+> first battery run.  Fix: branch predicate `searchme = referenced OR
+> output-pinned`; searchable-but-unfixed at a leaf is an honest
+> decline.  Rewrite-exposed chain intermediates are neither (the
+> detector refuses output-pinned intermediates), so the memory win
+> (cliff 3 below) is preserved exactly where needed.  Post-fix:
+> `WRONG=0/2000`, and the stock 65536-state rewrite still finishes
+> (1.76 s / 103 MB).
+>
+> **Four measured memory cliffs fixed (each found by profiling, in
+> order):** (1) realloc-per-entry keep lists in the new propagators -
+> quadratic churn, 1.3 GB RSS at n=16384, now two-pass
+> count-then-allocate + identical-set no-op guards; (2) initial domains
+> materialized for every declared interval incl. dead intermediates -
+> 803,479 values on the H=24/n=16384 probe, now search vars only
+> (empty-declared-domain UNSAT contract preserved); (3) branching over
+> unreferenced vars - ~800k nodes x MB-scale `cp_copy`, linear 600 MB/s
+> RSS growth, now search vars only; (4) `cp_total` fixpoint summed
+> total domain sizes per pass per node - replaced by a `mutations`
+> counter bumped by domain mutators ONLY on actual change.
+>
+> **Mutation-counter convergence (proof obligation audited).**  The
+> fixpoint must terminate when and only when propagation stabilised.
+> Audit: every domain write goes through `cp_set_vals` (restrict-
+> intersect stage runs FIRST; same-content => no bump, verified),
+> `cp_intersect` (bounded path: no-change check before bump; unbounded
+> path: bump iff lo/hi moved or materialization changed),
+> `cp_remove_val` and `cp_assign` (change-only).  An UNDER-bump would
+> exit propagation early and could print an unfiltered leaf - but leaf
+> `cp_verify` re-checks every record on the emitted point, so even a
+> missed propagation cannot fabricate; an OVER-bump only costs
+> fixpoint passes (monotone domain shrinkage bounds the loop).
+> Direction of safety confirmed: worst case is wasted work, never a
+> wrong answer.
+>
+> **nv==0 dispatch change (behaviour widened, honesty kept).**
+> All-constant satisfy models (`nv==0`) now REACH the CP engine (was
+> silently skipped by an `if(nv>0)` gate in src/fzn.c): legality per
+> the FlatZinc spec, needed by detector lattice probes
+> (`opt.bestx` allocated `(nv?nv:1)`; optimize still requires nv>0).
+> This changes UNKNOWN -> SAT/UNSAT answers for all-constant models;
+> each new answer is verified by `cp_verify` like any other leaf.
+>
+> **One more detector-side bug the mutation suite caught:** at H=2 the
+> sum row `-len + d2 = -1` has one plus AND one minus coefficient, so
+> telling the len var by "the unique +1" picked `d2` and the lattice
+> correctly (but silently) refused to fire on that polarity.  The two
+> dstsum shapes are now told apart by the rhs sign, which cannot
+> coincide (they require contradictory rhs).  Caught by
+> `tools/orbit_detect_verify.py` mode-0/9 positives (i9/i60), which
+> exist precisely because polarity is randomized per case.
+>
+> **Logged, not fixed (perf risk, not honesty):** older propagators in
+> `src/fz_cp.inc` (the int_lin family ~lines 412-688) still use the
+> realloc-per-entry keep-list pattern measured as cliff (1).  They were
+> not hot in any profile this session (their candidate lists are small
+> in practice); replacing them is a mechanical future item if a profile
+> ever indicts them.
+>
+> **Acceptance evidence.**  Discrimination on the pre-change binary
+> (both new gates fail there, per project rule):
+> `tools/fgraph_verify.py` pins_bad=5, real_bad=7, WRONG=112 at 60
+> fuzzed; post-change pins_bad=0 real_bad=0 WRONG=0 at 200.
+> `tools/orbit_detect_verify.py` WRONG=16/40 (positives UNKNOWN or
+> timed out; pre binary also lacks `array_bool_and`); post-change
+> WRONG=0/100.  `tools/procstates_orbit_verify.py` WRONG=0/120 (rerun
+> after the engine predicate change).  Full `test.sh` rc=0 incl.
+> `fzn_output_check` WRONG=0/2000, MiniZinc differential OK=33,
+> 77-instance bench 0 semantic diffs (2 search-node telemetry changes
+> recorded: bool_and_sat 1->2, subcircuit_demo 13->6).  ASan/UBSan/LSan
+> sweep: the three new gates at 60/40/60 plus output-check 500, plus
+> the stock 65536-state rewrite and the lattice template direct -
+> rc=0, zero sanitizer reports.  Auto-detection headline: the stock
+> procstates encoding (n=65536, H=64) is recovered and PROVEN optimal
+> (44, objective=objectiveBound) in 1.76-1.89 s / 103 MB, vs Gecode
+> 600 s UNKNOWN, Chuffed OOM at load, CP-SAT OOM mid-search
+> (docs/PROCSTATES.md SS5 baselines, same box).
+
 > **2026-08-16 (9) - branch `arena/cp-engine-correctness`: Phase 6.7 of
 > the ambitious roadmap, FlatZinc output-layer round-trip fuzzing.  The
 > new checker caught ONE fabricated-SAT class in the CP engine, one

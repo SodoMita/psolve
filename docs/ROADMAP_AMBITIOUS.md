@@ -280,6 +280,37 @@ B&B; presolve suggestion recorded in AUDIT (9).
   tolerance site; `grep` proves every literal tolerance in `src/` has a
   documented entry.
 
+### 6.9 Functional-graph family + presolve structure recovery — **DONE 2026-08-18(10)**
+Generalizes the procstates-specific `orbit_len` global (docs/PROCSTATES.md)
+into a reusable toolset plus auto-detection, answering: "how does a
+task-specific orbit trick become a general-purpose set of tools, or an
+automatic solving-path choice?"  Shipped (full spec in
+docs/FUNCTIONAL_GRAPH.md): (a) a shared functional-graph digest pool
+(content-deduped, single-owner) with façades `orbit_transient`,
+`orbit_cycle_len`, `orbit_on_cycle`, `orbit_len_capped` and the previously
+unparsed `array_bool_and`; (b) a presolve detector that recovers the
+MiniZinc "H-step walk + prefix-distinct count" lattice exactly — every
+consumed record verified, every intermediate proven dead (no surviving
+reference, not output-pinned, not objective-pinned), `referenced[]`
+recomputed airtight — and rewrites it to one `orbit_len_capped` record.
+Hard rule: detection never narrows semantics; on any mismatch the model is
+untouched and the generic engine answers.  Four memory cliffs fixed en
+route (measured, in order): realloc-per-entry keep lists (1.3 GB at
+n=16384 → two-pass count-then-allocate), dead-var domain materialization
+(803k dead values), dead-var branching (~800k nodes × MB-scale copies →
+branch over `searchme = referenced ∪ output` — the referenced-only first
+cut fabricated 0-valued prints for unconstrained OUTPUT vars, WRONG=59
+flagged by the phase-6.7 output gate, fixed before commit), and the
+O(Σ|dom|)-per-pass `cp_total` fixpoint (→ change-only mutation counter).
+Plus nv==0 satisfy models now reach CP (was a silent skip).  Headline:
+the **stock flattened procstates encoding** (n=65536, H=64) is auto-detected
+and PROVEN optimal (44) in 1.76–1.89 s / 103 MB — vs Gecode 600 s UNKNOWN,
+Chuffed/CP-SAT OOM (§6.9 docs; PROCSTATES §5 baselines).  Acceptance
+evidence: two new discriminating hard gates (`fgraph_verify`: pre
+pins_bad=5/WRONG=112@60 → post WRONG=0@200; `orbit_detect_verify`: pre
+WRONG=16/40 → post WRONG=0@100), procstates gate WRONG=0@120 rerun,
+full battery rc=0, 77/77 bench 0 semantic diffs, ASan/UBSan/LSan clean.
+
 **Phase 6 exit criteria:** AUDIT.md "Not done" list is empty or each item
 has a written permanent disposition; full battery + sanitizer matrix green;
 no fabricated-verdict family known.

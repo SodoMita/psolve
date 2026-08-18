@@ -3817,7 +3817,7 @@ void fz_solve(const FZModel*m,FZSolution*sol)
        pruning over finite domains, with the exhaustive search constituting
        the optimality proof (node cap or unbounded structure -> honest
        fallback to the MIP bridge, never an unproven "optimum"). */
-    if(nv>0){
+    if(nv>=0){
         if(fz_cp_try(m,sol)) return;
     }
     /* A compiler can propagate every decision variable to a literal (for

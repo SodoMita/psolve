@@ -275,6 +275,27 @@ python3 tools/fzn_output_check.py 2000 20260815 8 || { echo "fzn_output_check: F
 # 150-model ASan/UBSan/LSan sweep clean.  Hard gate: rc matters.
 python3 tools/procstates_orbit_verify.py 120 20260816 || { echo "procstates_orbit_verify: FAIL"; exit 1; }
 
+# functional-graph constraint family (orbit_len / orbit_transient /
+# orbit_cycle_len / orbit_on_cycle / orbit_len_capped / array_bool_and,
+# docs/FUNCTIONAL_GRAPH.md): pins incl. honest declines, real-instance
+# spot checks, and a 4-mode fuzz against an independent Python oracle
+# (identity orbit = transient + cycle_len checked inside the models).
+# Discriminating: on the pre-change binary it reports pins_bad=5,
+# real_bad=7, WRONG=112 at 60 fuzzed models; post-change WRONG=0 at 200
+# plus an ASan/UBSan/LSan sweep.  Hard gate: rc matters.
+python3 tools/fgraph_verify.py 120 20260818 || { echo "fgraph_verify: FAIL"; exit 1; }
+
+# presolve orbit-chain detector (docs/FUNCTIONAL_GRAPH.md): positive
+# mutation suite (maximize / minimize / two-chain / satisfy -a projection)
+# where the exact rewrite must fire and the answer must match a Python
+# evaluation of the emitted model, plus negatives (extra pin on an
+# intermediate, missing AND pair, mutated reif/sum rhs, mixed tables,
+# broken chain, output-pinned or objective intermediates) where it must
+# stay silent and the generic engine must still answer correctly.
+# Discriminating: on the pre-change binary WRONG=16 at 40 cases (positives
+# decline UNKNOWN or time out); post-change WRONG=0 at 100.  Hard gate.
+python3 tools/orbit_detect_verify.py 60 20260818 || { echo "orbit_detect_verify: FAIL"; exit 1; }
+
 if command -v minizinc >/dev/null 2>&1; then
   echo "[8.5/8] MiniZinc differential (compile .mzn -> fzn -> psolve vs Gecode)..."
   python3 tools/mzn_diff.py | tail -1
