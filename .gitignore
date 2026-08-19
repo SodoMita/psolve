@@ -18,3 +18,4 @@ fxsolve
 fx_bench
 gmon.out
 cert_inject
+presolve_selftest

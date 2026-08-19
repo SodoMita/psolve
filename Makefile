@@ -31,7 +31,7 @@ LDFLAGS = -pie -Wl,-z,relro,-z,now -Wl,--as-needed -Wl,-z,noexecstack
 CFLAGS   = -std=gnu11 -Wall -Wextra $(OPT) $(ARCH) $(PERF) $(HARDEN)
 LDLIBS   = -lm
 
-SRC = src/err.c src/kernels.c src/lu.c src/splu.c src/solver.c src/parser.c src/cert.c src/main.c
+SRC = src/err.c src/kernels.c src/lu.c src/splu.c src/solver.c src/parser.c src/cert.c src/presolve.c src/main.c
 OBJ = $(SRC:.c=.o)
 QPSRC = src/err.c src/qp.c src/lu.c src/kernels.c
 QPOBJ = $(QPSRC:.c=.o)
@@ -71,6 +71,9 @@ pgsbench: src/pgs.o tools/pgbench.o
 
 cert_inject: src/err.o src/kernels.o src/lu.o src/splu.o src/solver.o src/parser.o src/cert.o src/mip.o src/qp.o src/fx.o tools/cert_inject.o
 	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -o $@ $^ $(LDFLAGS) $(LDLIBS)
+
+# Roadmap 7.1 presolve records unit harness (apply -> restore checks)
+presolve_selftest: src/err.o src/kernels.o src/lu.o src/splu.o src/solver.o src/parser.o src/presolve.o tools/presolve_selftest.o
 	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -o $@ $^ $(LDFLAGS) $(LDLIBS)
 
 src/pgs.o: src/pgs.c src/pgs.h
@@ -160,7 +163,7 @@ asan: clean
 # src/main.o is the LP CLI: it shares the millisecond-precision time-limit
 # helper (tools/tlimit.h) with the other CLI drivers, so give it that include
 # path too.
-src/main.o: src/main.c src/parser.h src/solver.h src/err.h tools/tlimit.h
+src/main.o: src/main.c src/parser.h src/solver.h src/err.h src/presolve.h src/cert.h tools/tlimit.h
 	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -I src -I tools -c -o $@ $<
 
 clean:

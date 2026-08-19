@@ -45,7 +45,7 @@ with an explicit baseline `ARCH`.
 ## Usage
 
 ```sh
-./lpsolve [-t ms|--time-limit ms] [--noscale] [--scalestat] <problem.lp> [--print]  # LP (revised simplex, double)
+./lpsolve [-t ms|--time-limit ms] [--nopresolve] [--prestat] [--noscale] [--scalestat] <problem.lp> [--print]  # LP (revised simplex, double)
 ./qpsolve [-t ms|--time-limit ms] <qp.qp> [--print]  # convex QP (active-set)
 ./mipsolve [-t ms|--time-limit ms] <problem.lp> <nint> <j...> [--print]   # MIP (branch-and-bound)
 ./fznsolve [-a|--all-solutions] [-s] [-v] <problem.fzn>  # FlatZinc reader + solver (Phase 3)
@@ -61,13 +61,24 @@ solution as optimal. For FlatZinc, `-a` enumerates distinct visible finite-domai
 solutions (or improving optimization incumbents). Continuous satisfaction
 outputs cannot be exhaustively enumerated and return `UNKNOWN` under `-a`.
 
-The LP CLI Ruiz-equilibrates its working image by default (geometric-mean
-diagonal preconditioning; all reported values stay in original units and every
-verdict is still re-certified against the original data). `--noscale` selects
-the raw data path, `--scalestat` reports the pre/post conditioning-spread proxy
-on stderr, and when a scaled run's evidence cannot be certified the CLI
-automatically re-solves once on the raw data path — scaling can add certified
-answers, never take one away.
+The LP CLI presolves by default (fixed columns, empty rows/columns,
+singleton-row implied bounds, redundant rows, doubleton-equality
+substitution — each fired reduction leaves a record) and postsolves the
+engine evidence back to the original model before it is certified.
+`--nopresolve` selects the untouched-data path, `--prestat` reports the
+reduction accounting on stderr. Presolve proves some models outright
+(exact infeasibility rays, bounds-propagation optima, read-time
+unboundedness notes print with `iterations: 0`); whenever a postsolved
+certificate cannot be re-proven against original data, the CLI degrades
+to solving without presolve — presolve can decline or degrade, never
+guess. On top of that, the CLI Ruiz-equilibrates its working image by
+default (geometric-mean diagonal preconditioning; all reported values
+stay in original units and every verdict is still re-certified against
+the original data). `--noscale` selects the raw data path, `--scalestat`
+reports the pre/post conditioning-spread proxy on stderr, and when a
+scaled run's evidence cannot be certified the CLI automatically re-solves
+once on the raw data path — scaling can add certified answers, never
+take one away.
 
 ### MiniZinc Integration & `mzfnsh`
 

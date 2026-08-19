@@ -1,5 +1,161 @@
 # psolve — audit & hardening notes
 
+> **2026-08-19 (14) - branch `arena/cp-engine-correctness`: Phase 7.1,
+> presolve + postsolve for the LP CLI (v2's highest-ROI item), plus a
+> bundled cert-layer fix: free-variable columns no longer veto Farkas
+> box-certificates whose window on them is provably zero.  Presolve may
+> decline or degrade, never guess; every printed verdict is re-proven
+> against ORIGINAL data by the same 6.4 psv lanes as before.**
+>
+> **What shipped.**  `src/presolve.{h,c}` (~830 lines) with
+> `lp_presolve()` and the replay maps
+> `lp_presolve_postsolve_{x,duals,ray}()`, `lp_presolve_farkas_ray()`,
+> `lp_presolve_unbounded_note()`.  Reductions run to a pass-capped
+> fixpoint on the caller-visible LP (before the engine's free-variable
+> split, mlt sign rows and 7.5 equilibration): fixed columns; empty
+> rows (consistent: dropped with dual 0; inconsistent: EXACT infeasible
+> with an explicit one-row Farkas ray hint); empty columns at read
+> (fixed at the cost-sign bound; cost walking an open side emits a
+> certified-UNBOUNDED note); singleton rows (implied bound folded into
+> the box with directed-rounding outward folds; singleton-vs-ORIGINAL-box
+> conflicts are exact one-row rays, singleton-vs-singleton conflicts
+> exact two-row rays); redundant rows (directed-rounding activity
+> limits, dropped with dual 0; activity conflicts are exact one-row
+> rays); doubleton-equality substitution (fill capped at 3x nnz growth,
+> pivot = larger |a|).  Every fired reduction pushes a record
+> (`PreRec`), its pivot-column snapshot capped by a byte/record budget;
+> crossing any budget, sentinel, or unsupported shape declines the
+> whole run (rc -1) and the CLI walks the untouched original.
+>
+> **Postsolve & the dual replay invariant.**  Records replay in REVERSE
+> firing order; dual replay reconstructs row duals from the firing-time
+> snapshot `y_i = (c_j - Sum y_r a_rj)/a_ij` over rows then-ACTIVE.
+> An unknown reference (elimination-order cycle) makes the map return
+> -1 - a caller-level fallback event, not a verdict.  A complementarity
+> guard (new tolsheet row TOL-LP-PRETIGHT, class D - caught during
+> development when free_vars.lp's certificate failed: the raw rc-formula
+> alone can assign a nonzero dual to a SLACK singleton row, inflating
+> the psv dual bound) forces y_i = 0 on any inequality singleton row
+> whose implied side is not tight at the postsolved point.
+> All exact-ray paths are gated by `row_touched`: a row whose
+> b/coefficients were mutated by an earlier fold can no longer source a
+> ray (the mutation destroyed the "ray over original rows" reading), so
+> presolve aborts instead of handing the psv lane a doomed artifact -
+> found in development on a folded chain whose "ray" was correctly
+> REJECTED by psv_cert_check (the system worked; the gate makes the
+> decline explicit and cheap).
+>
+> **CLI lanes.**  Default `lpsolve` now runs presolve first; the
+> config ladder `(presolve,scale) -> (0,scale) -> (0,0)` with dedup
+> handles every uncertified outcome (same machinery 7.5 introduced for
+> scaling).  New flags `--nopresolve` (pre-7.1 path) and `--prestat`
+> (reduction accounting on stderr).  New verdict lanes with
+> `iterations: 0` (no engine run): presolve rc==1 exact-infeasible rays
+> (routed through `psv_cert_check(PSVK_LP_INFEASIBLE)` like any ray),
+> and the full-elimination branch (`model->n == 0`): direct OPTIMAL /
+> UNBOUNDED-via-note claims whose x/duals/ray come purely from record
+> replay.  A presolved-model engine-INFEASIBLE (r==1) ALWAYS degrades
+> in v1 - no ray back-propagation - even when the engine's own raw-data
+> retry would have a ray; documented in presolve.h.  Objective prints
+> are always recomputed `Sum c_j x_j` on the original postsolved point
+> (objconst never feeds the print), so the printed number is the
+> original-data number.
+>
+> **Bundled cert-layer fix (same commit): boxcert exact-zero windows.**
+> `solver_farkas_boxcert` (one implementation, used by every LP/MIP/fzn
+> Farkas lane) computed `L = min_box(y^T A)x` corner-by-corner and
+> DECLINED the whole certificate when ANY column had a box side at the
+> +-1e30 "infinity" sentinel (TOL-LP-BIGCAP 1e29) - even when that
+> column's directed-rounding `y^T A` window is provably `[0,0]`
+> (`zl >= 0 && zh <= 0`; zl/zh bracket the exact sum under
+> FE_DOWNWARD/FE_UPWARD, so the exact sum IS 0 and the column's box
+> product is exactly 0 for ANY box, open sides included).  Consequence:
+> EVERY infeasibility certificate on a model with a free variable -
+> including the engine's own extracted rays - degraded to
+> NUMERICAL_FAILURE.  The fix skips such columns (their contribution is
+> provably 0) before the BIG test; soundness is unchanged (the skip can
+> only fire when the true sum is exactly 0), and on finite-box columns
+> the old corner-min accepted the same 0 contribution already, so
+> finite-box behavior is bit-identical (MIP/fzn lanes: variables are
+> bounded, BIG never fires - smokes bit-identical pre/post).
+>
+> **Regression-locked measurements.**
+>
+>   * Planted per-reduction corpus (12 cases, now hard-gated): each
+>     exact-ray family (singleton-vs-box, empty-row, activity, FREE-var
+>     pair conflict) prints INFEASIBLE with `iterations: 0`; the
+>     touched-row chain declines presolve and still prints the correct
+>     raw-engine INFEASIBLE; the doubleton bound chain full-eliminates
+>     and direct-claims OPTIMAL 3 (iters 0); empty-column and doubleton
+>     ray-transfer print UNBOUNDED; fixed/singleton-fold/redundant
+>     optimal families print 2/7/5 exactly; the planted fallback case
+>     (doubleton fires, reduced model engine-infeasible) shows the psv
+>     degrade notes AND the identical raw verdict.  Pre-change binary on
+>     the same 12: identical verdicts everywhere EXCEPT the two cases
+>     the boxcert fix converts from NUMERICAL_FAILURE to certified
+>     INFEASIBLE (free-var pair conflict; joint y-range conflict) -
+>     recorded as an intentional verdict-quality improvement.
+>   * A/B parity (default vs --nopresolve), records the acceptance
+>     mapping: 40k random LPs (20k well-scaled + 20k entry-mixed 1e+-4,
+>     seed 42) + 10k (seed 777): **0 verdict flips, 0 lost raw answers**;
+>     combined-evidence fallbacks 364 + 90 (each lands the identical raw
+>     verdict); co-OPTIMAL objective prints bit-identical on
+>     98.6%/99.1% (identical whenever no reduction fires); the remainder
+>     measure <= 1.4e-10 rel (engine tolerance replay noise through big
+>     coefficients - the gate pins 1e-12 well-scaled / 1e-9 entry-mixed).
+>   * scipy/HiGHS oracle, honestly calibrated: 39 952 + 9 990 co-OPTIMAL
+>     cross-checks.  On well-scaled data the 1e-6 oracle held 20 000/20 000.
+>     On 1e+-4 entry-mixed data HiGHS is NOT an authoritative objective
+>     oracle: measured engine-vs-HiGHS gaps up to 1.8e-4 rel while the
+>     PRE-CHANGE binary prints byte-identical values on every
+>     scipy-flagged instance (all 7 flagged across the dev runs
+>     verified: t756, t2997, t4902, t8459, t12679, t18122, t18259 of
+>     `tools/presolve_verify.py 20000 42`; instances regenerate
+>     deterministically from the seeded generator).  The parity-flagged
+>     instances (default-vs-raw delta <= 1.4e-10, presolve fired) are a
+>     disjoint set by construction.  The gate therefore uses a
+>     gross-error-only 3e-4 bar on
+>     that family (a replayed side flip or dropped row errs at O(1)).
+>   * Records unit-verified: tools/presolve_selftest.c, 17 apply->restore
+>     invariant checks (primal replay satisfies ORIGINAL rows+box and
+>     hits the known optimum; dual replay exactly stationary on
+>     eliminated pivot columns with the complementary reduced-cost sign
+>     on surviving columns; complementarity guard slack/tight; stats).
+>   * Size reduction, measured not promised: the random families are
+>     decline-dominated (3 330/40 000 models reduce; conditional mean
+>     shrink rows 16.5% / cols 5.2% / nnz 10.5%; shipped examples: 2 of
+>     6 reduce - one eliminates 100% of rows - the others carry no
+>     removable structure and decline).  The roadmap's 30-60% target is
+>     NOT reproduced on this corpus (it lacks the structure the target
+>     assumed); what is verified is that presolve is safe at ANY
+>     reduction rate, which is the property that matters here.
+>   * Hard gates: `tools/presolve_verify.py 400 20260819` and
+>     `presolve_selftest` in test.sh; both discriminating - the
+>     pre-change binary rejects --nopresolve/--prestat ("unknown
+>     option") so the gate exits 1 loudly (verified), and the selftest
+>     target does not exist on the pre-change tree.  scale_verify.py's
+>     raw lane now means `--nopresolve --noscale` (true pre-7.x path;
+>     2 seeds green).  tolsheet gate green (90 ids).
+>   * ASan/UBSan/LSan (detect_leaks=1): all 6 examples x 3 flag combos,
+>     12 planted cases, presolve_verify N=40 + scale_verify N=40 +
+>     cert_inject N=40 (both seeds) on instrumented binaries, mip/fzn/fx
+>     smokes - clean; found and fixed ONE leak in the NEW selftest
+>     harness itself (missing lp_free(&red) in section 1), none in the
+>     module or CLI.
+>   * MIP/branch-and-bound, fzn, fx, qp paths: unchanged behavior -
+>     presolve is LP-CLI-only, 7.5 pins those bridges to the raw engine,
+>     and the boxcert skip is provably inert on bounded columns (mipsolve
+>     knap_gap pin OPTIMAL 10, fzn smoke UNSATISFIABLE: byte-identical
+>     pre/post).
+>   * Battery: full `test.sh` exit 0 on the final tree on 2026-08-19
+>     (incl. farkas_verify 150, lp_scale_verify 60, scale_verify 200 x 2
+>     seeds, presolve_verify 400 + selftest, cert_inject 200 x 2 seeds,
+>     mzn_diff OK=33, fx_verify OK=300, oom_test 6119 injections), and
+>     the MiniZinc benchmark regenerated: 77/77 models semantically
+>     identical (status/objective/solutions/verdict; timing-only churn)
+>     - one tooling fix surfaced by the battery itself: fuzz_inputs.py's
+>     manual ASan source list missed src/presolve.c.
+>
 > **2026-08-18 (13) - branch `arena/cp-engine-correctness`: Phase 7.5,
 > Ruiz equilibration + geometric-mean scaling for the LP engine (v2
 > item), with A/B CLI lanes and an evidence-preserving raw-data

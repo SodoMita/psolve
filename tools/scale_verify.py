@@ -5,14 +5,18 @@ The LP CLI now equilibrates the working image by default (strictly
 positive diagonal preconditioning Dr·A·Dc; every funnel composes the
 diagonals back so caller-visible values stay in ORIGINAL units and every
 verdict is still re-certified against ORIGINAL data by the psv lanes).
-Two CLI escape hatches make the change observable and reversible:
---noscale (raw data path, the pre-7.5 behaviour) and --scalestat (pre/post
-conditioning-spread proxy on stderr).
+CLI escape hatches make the change observable and reversible:
+--noscale (no equilibration) and --scalestat (pre/post
+conditioning-spread proxy on stderr).  With roadmap 7.1 (presolve) the
+truly-raw data path is --nopresolve --noscale: presolve is on by default,
+so this tool's raw lanes pass both flags to mean 'pre-7.x behaviour' (RAW
+below).
 
 Contracts enforced here:
 
-  1. A/B parity on well-scaled data: default vs --noscale print the SAME
-     status on every instance; co-OPTIMAL objectives agree <= 1e-7 rel.
+  1. A/B parity on well-scaled data: default vs raw (--nopresolve
+     --noscale) print the SAME status on every instance; co-OPTIMAL
+     objectives agree <= 1e-7 rel.
      (And scipy/HiGHS agrees when importable.)
   2. Conditioning effect on entry-mixed data (per-entry magnitudes over
      1e+-E): the scalestat proxy must not get worse (post <= pre on >=90%
@@ -28,12 +32,12 @@ Contracts enforced here:
      the default scaled path certifies OPTIMAL (scipy-confirmed when
      importable).  Measured at development: ~0.4% of the E=4 family.
   5. Example-file A/B identity: the six shipped examples print identical
-     status+objective under default and --noscale.
+     status+objective under default and raw (--nopresolve --noscale).
 
 Discrimination (project calibration rule): the pre-change binary rejects
---noscale/--scalestat as unknown options, so the A/B-lane probe fails
-loudly on it; the family asserts then cannot be satisfied by any binary
-without the 7.5 lanes.
+--noscale/--scalestat/--nopresolve as unknown options, so the A/B-lane
+probe fails loudly on it; the family asserts then cannot be satisfied by
+any binary without the 7.5/7.1 lanes.
 
 Usage: tools/scale_verify.py [N] [seed]
 Env:   LPSOLVE overrides the binary under test.
@@ -117,6 +121,9 @@ def gen_mixed(rnd, E):
     return n, m, c, A, b, rel, l, u, rnd.random() < 0.5
 
 
+RAW = ("--nopresolve", "--noscale")  # the pre-7.x data path (7.1: presolve off)
+
+
 def run(path, extra=()):
     p = subprocess.run([LPSOLVE, *extra, path],
                        capture_output=True, text=True, timeout=60)
@@ -184,12 +191,13 @@ def main():
     # ---- 0. discrimination probe: the A/B lanes must exist -------------
     probe_path = os.path.join(TMP, "probe.lp")
     write_lp(probe_path, *gen_modest(random.Random(f"{seed}:probe")))
-    st, _, err, rc = run(probe_path, ("--noscale",))
+    st, _, err, rc = run(probe_path, RAW)
     st2, _, err2, rc2 = run(probe_path, ("--scalestat",))
     if rc != 0 or "unknown option" in err or rc2 != 0 or \
             "scalestat:" not in err2:
-        print("scale_verify: FAIL - binary lacks the 7.5 A/B lanes "
-              "(--noscale/--scalestat rejected); tool cannot discriminate")
+        print("scale_verify: FAIL - binary lacks the 7.5/7.1 A/B lanes "
+              "(--nopresolve/--noscale/--scalestat rejected); "
+              "tool cannot discriminate")
         sys.exit(1)
     if st != st2:
         fails.append(f"lane probe: --noscale {st} vs --scalestat {st2}")
@@ -202,7 +210,7 @@ def main():
         path = os.path.join(TMP, "modest.lp")
         write_lp(path, *gen_modest(rnd))
         sd, od, _, _ = run(path)
-        sr, orr, _, _ = run(path, ("--noscale",))
+        sr, orr, _, _ = run(path, RAW)
         if sd != sr or (sd == "OPTIMAL" and sr == "OPTIMAL" and
                         rel_diff(od, orr) > 1e-7):
             bad += 1
@@ -228,7 +236,7 @@ def main():
             path = os.path.join(TMP, f"mixed{E}.lp")
             write_lp(path, *gen_mixed(rnd, E))
             sd, od, ed, _ = run(path)
-            sr, orr, _, _ = run(path, ("--noscale",))
+            sr, orr, _, _ = run(path, RAW)
             if sr == "OPTIMAL" and sd != "OPTIMAL":
                 lost += 1
                 fails.append(f"no-loss E={E} t={t}: raw OPTIMAL {orr}, "
@@ -281,7 +289,7 @@ def main():
             continue
         p = os.path.join(exdir, name)
         sd, od, _, _ = run(p)
-        sr, orr, _, _ = run(p, ("--noscale",))
+        sr, orr, _, _ = run(p, RAW)
         if sd != sr or (od or 0) != (orr or 0):
             if sd == "OPTIMAL" and sr == "OPTIMAL" and \
                     rel_diff(od, orr) <= 1e-9:

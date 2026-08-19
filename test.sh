@@ -174,6 +174,21 @@ python3 tools/lp_scale_verify.py 60 20260815 || { echo "lp_scale_verify: FAIL"; 
 # gate: rc matters.
 python3 tools/scale_verify.py 200 20260818 || { echo "scale_verify: FAIL"; exit 1; }
 python3 tools/scale_verify.py 200 777 || { echo "scale_verify (seed 777): FAIL"; exit 1; }
+# Roadmap 7.1 presolve + postsolve hard gate: planted per-reduction
+# verdict cases (each exact-ray family must certify with iterations: 0,
+# the touched-row family must decline presolve and still answer, the
+# fallback family must degrade with a psv note yet never change the
+# answer), default vs --nopresolve parity + bit-identical objective
+# lines + scipy oracle on the random families, and example-file A/B
+# identity.  Discriminating: the pre-change binary rejects
+# --nopresolve/--prestat, failing the lane probe loudly.  Hard gate.
+python3 tools/presolve_verify.py 400 20260819 || { echo "presolve_verify: FAIL"; exit 1; }
+# 7.1 record-level unit harness (apply -> restore bookkeeping: primal
+# replayfeasibility, pivot-column dual stationarity, complementarity guard,
+# stats accounting; does not exist on the pre-change tree, so it is
+# structurally discriminating).
+make presolve_selftest >/dev/null 2>&1
+./presolve_selftest >/dev/null || { echo "presolve_selftest: FAIL"; exit 1; }
 python3 tools/mip_verify.py 0 | tail -1
 # Adversarial differential test for the sound FBBT bound tightening: mixes
 # tiny coefficients (1e-13) with large variable magnitudes and all three

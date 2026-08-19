@@ -371,17 +371,72 @@ where simplex is weak. Techniques and literature pointers are already
 surveyed in `SOLVER_OPTIMIZATIONS.md` §2; this phase is the implementation
 plan for it.
 
-### 7.1 Presolve + postsolve *(highest ROI in the phase)*
-- Singleton rows/columns, doubleton substitution, activity-bound row
-  elimination/redundancy removal, bound tightening on coefficients,
-  dominated/duplicate column and row detection, fixed-variable elimination.
-- **Design constraint:** every reduction must record a reversible
-  *postsolve stack* so primal/dual certificates transfer back exactly
-  (PaPILO-style reduction records, minimal from-scratch subset).
-- **Acceptance:** 30–60% size reduction on the sparse differential corpus
-  with **bit-identical objectives** post-postsolve; presolve off/on A/B
-  shows no verdict change over ≥20k random LPs; reduction records are
-  themselves unit-verified (apply → restore → identical problem).
+### 7.1 Presolve + postsolve *(highest ROI in the phase)* — **DONE 2026-08-19(14)**
+`lp_presolve()` / `lp_presolve_postsolve_{x,duals,ray}()` (src/presolve.{h,c})
+run on the caller-visible LP before the engine's free-variable split, mlt
+sign rows and 7.5 equilibration: fixed columns, empty rows (consistent:
+dropped, dual 0; inconsistent: exact infeasibility with an explicit
+one-row Farkas ray), empty columns at read (fixed at the cost-sign bound;
+cost walking an open side = certified-UNBOUNDED note), singleton-row
+implied-bound box folds (directed-rounding outward; singleton-vs-box and
+singleton-pair conflicts = exact one-/two-row rays), redundant rows
+(directed-rounding activity limits) and doubleton-equality substitution
+(fill-capped `PRE_NNZ_GROWTH`, pivot = larger |a|).  Every fired reduction
+pushes a record; postsolve replays records in REVERSE firing order, duals
+via firing-time pivot-column snapshots (`y_i = (c_j − Σ y_r a_rj)/a_ij`,
+unknown-reference cycle ⇒ the map declines), with a complementarity guard
+(TOL-LP-PRETIGHT) keeping slack singleton rows at dual 0.  Exact-ray
+paths are gated by `row_touched`: any row b/coeff-mutated by an earlier
+fold aborts presolve rather than risk a doom ray — decline or degrade,
+never guess.  The CLI climbs `(presolve,scale) → (0,scale) → (0,0)` on
+any uncertified evidence; `model->n == 0` (full elimination) takes a
+direct-claim branch with `iterations: 0`; presolve rc==1 rays go through
+the same `psv_cert_check(PSVK_LP_INFEASIBLE)` lane; a presolved-model
+engine-INFEASIBLE never prints without re-solving raw (no ray
+back-propagation in v1, documented).  Objective prints are always
+recomputed `Σ c_j·x_j` on ORIGINAL postsolved data.
+
+- **Bundled cert-layer fix (same commit):** `solver_farkas_boxcert` now
+  skips columns whose directed-rounding `yᵀA` window is provably `[0,0]`
+  (`zl ≥ 0 ∧ zh ≤ 0` forces the exact sum to 0 ⇒ box product contribution
+  exactly 0 for ANY box) *before* the TOL-LP-BIGCAP decline — previously
+  ANY free-variable column vetoed the whole certificate, so every
+  infeasibility Farkas ray on a free-variable model (engine's own rays
+  included) degraded to NUMERICAL_FAILURE.  Soundness unchanged (zl/zh
+  bracket the exact sum under FE_DOWNWARD/FE_UPWARD); measured effect on
+  the planted corpus: 2 pre-change NUMERICAL_FAILUREs now certify
+  INFEASIBLE (free-var pair conflict; y-range-joint conflict), all
+  farkas/lp_scale/scale/cert_inject gates stay green on both seeds.
+- **Acceptance, measured:** presolve off/on A/B over **40 000 random LPs**
+  (20k well-scaled + 20k entry-mixed 1e±4, seed 42, plus 5k+5k seed 777)
+  — **zero verdict flips, zero lost raw answers**, combined-evidence
+  fallbacks 364/20k·2 (each lands the identical raw verdict; the ladder
+  may only decline, never change an answer); co-OPTIMAL objective prints
+  bit-identical on 98.6%/99.1% of the corpus (identical whenever no
+  reduction fires), remainder ≤1.4e-10 rel — inside engine tolerance,
+  far under the 1e-9 psv re-proof — gate pins 1e-12 (well-scaled) /
+  1e-9 (entry-mixed); 39 952 co-OPTIMAL scipy/HiGHS cross-checks inside
+  the calibrated bars (modest 1e-6 hard 20/20k-clean; entry-mixed
+  gross-error 3e-4 — HiGHS is not an authoritative objective oracle on
+  1e±4 data, measured max engine-vs-HiGHS gap 1.8e-4 with the
+  pre-change binary printing IDENTICAL values on every flagged instance).
+  Planted per-reduction verdict cases (11): every exact-ray family
+  certifies with `iterations: 0`, the touched-row family declines and
+  still answers, the fallback family degrades with a psv note yet never
+  changes the answer.  Records unit-verified by
+  `tools/presolve_selftest.c` (17 apply→restore invariant checks: primal
+  replay exactness, exact pivot-column dual stationarity,
+  complementarity guard, stats accounting).  Size reduction on the
+  shipped corpus: honest measurement — the random families are
+  decline-dominated (3 330/40 000 models reduce; conditional shrink
+  rows 16.5% / cols 5.2% / nnz 10.5%; the structured planted chains
+  eliminate 100% of rows), so the 30–60% target is *not* reproduced on
+  this corpus (it lacks the removable structure the target assumed);
+  what is verified end-to-end is the certified-decline discipline that
+  makes presolve safe regardless of reduction rate.  CLI: `--nopresolve`
+  / `--prestat`.  Hard gates in `test.sh`: `tools/presolve_verify.py
+  400 20260819` (fails loudly on the pre-change binary — unknown option)
+  and the selftest binary (absent on the pre-change tree).
 
 ### 7.2 Dual simplex (bounded-variable, dual steepest edge)
 - **Why:** MIP re-optimization after bound changes/cuts is dual-simplex

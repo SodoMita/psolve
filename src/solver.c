@@ -827,8 +827,22 @@ int solver_farkas_boxcert(int n, int m, const int *colptr, const int *row,
     double L = 0.0;
     for (int j = 0; j < n; j++) {
         double a = zl[j], c = zh[j];
+        if (!isfinite(a) || !isfinite(c)) {
+            fesetround(rm); return 0;
+        }
+        if (a >= 0.0 && c <= 0.0) {
+            /* Provably-zero column window: zl/zh bracket the exact sum by
+               directed rounding, so z_j == 0 and the box product z_j x_j is
+               exactly 0 for ANY box, open sides included.  Skipping is
+               sound: L's bound is unchanged and no ±inf sentinel is read.
+               (Without this skip, any free-variable column — box sides at
+               the ±1e30 sentinel — would veto the whole certificate even
+               when its y^T A column cancels to an exact zero, e.g. the
+               presolve pair-conflict ray on a free x.) */
+            continue;
+        }
         double lj = lo[j], uj = hi[j];
-        if (!isfinite(a) || !isfinite(c) || lj <= -BIG || uj >= BIG) {
+        if (lj <= -BIG || uj >= BIG) {
             fesetround(rm); return 0;
         }
         double t = a * lj;
