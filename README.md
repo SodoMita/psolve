@@ -21,6 +21,16 @@ See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the original long-term plan
 [`docs/ROADMAP_AMBITIOUS.md`](docs/ROADMAP_AMBITIOUS.md) for the living 2026 →
 2028 development programme (correctness closure, LP/MIP/CP engine v2, exact
 arithmetic at scale, proof-carrying verdicts).
+[`docs/CURV_PS_PLAN.md`](docs/CURV_PS_PLAN.md) is the consumer-facing plan for
+the first interactive host that drives the LP/QP cores per frame
+([`SodoMita/curv-ps`](https://github.com/SodoMita/curv-ps), Curv `solve { }`
+blocks on WebAssembly): measured capacity curve, the QP verdict issues it hits,
+and the P0/P1 API changes (warm start through the wasm bridge, certified
+Phase-I, equalities + bounds + sparse input in the QP).  Reproduce it with
+`make ui-probe` (`tools/ui_qp_probe.c`). The QP's Phase-I runs on the LP core, so
+the QP library now needs `src/solver.c`/`src/splu.c` at link time; `tools/psolve_web.c`
+is the psolve-owned wasm/FFI bridge (`make bridge-test` checks it without a wasm
+toolchain, `make wasm` builds the module).
 
 It reads a simple text LP format, solves it, and prints the optimum.  The QP
 solver (`qpsolve`) solves convex QPs (minimize ½xᵀQx + cᵀx s.t. Ax ≤ b).  It
@@ -488,6 +498,11 @@ src/main.c      LP CLI
 tools/fxsolve.c fixed-point LP CLI
 tools/fx_bench.c double-vs-fixed LP benchmark
 tools/qpsolve.c QP CLI
+tools/ui_qp_probe.c UI-layout QP probe: verdict robustness + frame-budget capacity
+tools/psolve_web.{c,h}  wasm/FFI bridge: x0 warm start, max_resid, certified
+                        infeasibility (psw_qp_proven/psw_qp_farkas), ms budget
+tools/wasm_build.sh     builds psolve.wasm with emcc or wasi-sdk (--check = native)
+tools/psw_test.c        the bridge's contract as an executable test (make bridge-test)
 tools/mipsolve.c MIP CLI
 tools/          generators, differential tester, unit tests, benchmarks, fuzzer
 examples/       sample LP files

@@ -33,7 +33,7 @@ LDLIBS   = -lm
 
 SRC = src/err.c src/kernels.c src/lu.c src/splu.c src/solver.c src/parser.c src/main.c
 OBJ = $(SRC:.c=.o)
-QPSRC = src/err.c src/qp.c src/lu.c src/kernels.c
+QPSRC = src/err.c src/qp.c src/lu.c src/splu.c src/solver.c src/kernels.c
 QPOBJ = $(QPSRC:.c=.o)
 
 # Library (for embedding in other projects, e.g. SmazkaVG).
@@ -44,7 +44,7 @@ LIB_SRC = src/err.c src/kernels.c src/lu.c src/splu.c src/solver.c src/parser.c 
 LIB_OBJ = $(LIB_SRC:.c=.o)
 LP_LIB_SRC = src/err.c src/kernels.c src/lu.c src/splu.c src/solver.c src/parser.c
 LP_LIB_OBJ = $(LP_LIB_SRC:.c=.o)
-QP_LIB_SRC = src/err.c src/qp.c src/lu.c src/kernels.c src/pgs.c src/pgs_fixed.c
+QP_LIB_SRC = src/err.c src/qp.c src/lu.c src/splu.c src/solver.c src/kernels.c src/pgs.c src/pgs_fixed.c
 QP_LIB_OBJ = $(QP_LIB_SRC:.c=.o)
 
 all: lpsolve qpsolve mipsolve pgsbench pgfbench fznsolve fxsolve
@@ -60,7 +60,7 @@ install_mzn:
 lpsolve: $(OBJ)
 	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -o $@ $(OBJ) $(LDFLAGS) $(LDLIBS)
 
-qpsolve: src/err.o src/qp.o src/lu.o src/kernels.o tools/qpsolve.o
+qpsolve: src/err.o src/qp.o src/lu.o src/splu.o src/solver.o src/kernels.o tools/qpsolve.o
 	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -o $@ $^ $(LDFLAGS) $(LDLIBS)
 
 mipsolve: src/err.o src/mip.o src/lu.o src/splu.o src/solver.o src/kernels.o src/parser.o src/fx.o tools/mipsolve.o
@@ -126,6 +126,28 @@ fx_bench: tools/fx_bench.o src/err.o src/kernels.o src/lu.o src/splu.o src/solve
 tools/fx_bench.o: tools/fx_bench.c src/solver.h src/parser.h src/fx.h
 	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -I src -c -o $@ $<
 
+# UI-layout problem-class probe (the shape a constraint-layout front end such as
+# curv-ps feeds the QP core).  Report tool: exits 0 unless --strict, so it can
+# be run before the issues it documents are fixed.  See docs/CURV_PS_PLAN.md.
+ui_qp_probe: src/err.o src/qp.o src/lu.o src/splu.o src/solver.o src/kernels.o tools/ui_qp_probe.o
+	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -o $@ $^ $(LDFLAGS) $(LDLIBS)
+
+ui-probe: ui_qp_probe
+	./ui_qp_probe --fast
+
+# The wasm/FFI bridge is built and checked through its own script so a consumer
+# gets the same command that CI gets.  `bridge-test` needs no wasm toolchain: it
+# compiles the bridge plus tools/psw_test.c against the host libc, which is how the
+# ABI and its semantics are actually verified.
+bridge-test:
+	./tools/wasm_build.sh --check
+
+wasm:
+	./tools/wasm_build.sh
+
+tools/ui_qp_probe.o: tools/ui_qp_probe.c src/qp.h src/err.h
+	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -I src -I tools -c -o $@ $<
+
 # Library targets ------------------------------------------------------
 # Static archives of the solver cores (no main()).  Headers to use from a
 # consuming project: src/solver.h (LP), src/qp.h (QP), src/mip.h (MIP),
@@ -161,6 +183,7 @@ src/main.o: src/main.c src/parser.h src/solver.h src/err.h tools/tlimit.h
 	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -I src -I tools -c -o $@ $<
 
 clean:
-	rm -f lpsolve qpsolve mipsolve pgsbench pgfbench pgs_vs_lp fznsolve fxsolve fx_bench src/*.o tools/*.o libpsolve.a libpsolve-lp.a libpsolve-qp.a
+	rm -f lpsolve qpsolve mipsolve pgsbench pgfbench pgs_vs_lp fznsolve fxsolve fx_bench ui_qp_probe src/*.o tools/*.o libpsolve.a libpsolve-lp.a libpsolve-qp.a
+	rm -rf build
 
-.PHONY: all asan clean lib liblp libqp
+.PHONY: all asan clean lib liblp libqp ui-probe bridge-test wasm

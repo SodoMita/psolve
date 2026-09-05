@@ -1,5 +1,6 @@
 #include "qp.h"
 #include "lu.h"
+#include "solver.h"
 #include "err.h"
 #include <stdlib.h>
 #include <string.h>
@@ -40,6 +41,54 @@ static double row_resid(const QP *qp, int i, const double *x)
     double s = -qp->b[i];
     for (int j = 0; j < qp->n; j++) s += Ai[j] * x[j];
     return s;
+}
+
+/* Size of the terms that must cancel in row i at x: 1 + |b_i| + |a_i|^T |x|.
+ * Every feasibility/activity tolerance in this file is relative to this, not to
+ * an absolute constant: the same code has to answer for a UI layout measured in
+ * pixels (1e0..1e3, curv-ps) and for geometry measured in nanometres, and an
+ * absolute 1e-8 decides "feasible" by the unit of measure in the latter case and
+ * never decides it in the former. */
+static double row_scale(const QP *qp, int i, const double *x)
+{
+    double s = fabs(qp->b[i]);
+    const double *Ai = qp->A + (size_t)i * qp->n;
+    for (int j = 0; j < qp->n; j++) s += fabs(Ai[j]) * fabs(x[j]);
+    return 1.0 + s;
+}
+
+/* 1 when row i is violated at x beyond the relative tolerance. */
+static int row_violated(const QP *qp, int i, const double *x)
+{
+    /* 1e-11 * row_scale is ~100x the rounding noise of a_i^T x and, at the
+       pixel scale a UI layout uses, lands on the 1e-8 this file historically
+       used.  Looser than that and a materially infeasible "warm start" is
+       accepted; the active set then stalls on the violated rows (measured: an
+       8-chip model at scale 1e3 went OPTIMAL-in-16-iters -> ITER_LIMIT-in-8100
+       when 1e-9 was tried), which trades a wrong verdict for a useless one. */
+    return row_resid(qp, i, x) > 1e-11 * row_scale(qp, i, x);
+}
+
+int qp_start_feasible(const QP *qp, const double *x)
+{
+    if (!qp || !x) return 0;
+    for (int i = 0; i < qp->m; i++)
+        if (row_violated(qp, i, x)) return 0;
+    return 1;
+}
+
+/* Phase-I hand-over test: "feasible well enough to hand the active set a
+ * start".  Looser than qp_start_feasible on purpose -- the simplex answers at
+ * its own pivot tolerance (1e-9, src/solver.c TOL_FEAS), which is coarser than
+ * the rounding floor a *caller's* cached warm start has to clear, and the
+ * active set carries its own primal verification that rejects a bad start with
+ * KKT_FAIL rather than a wrong OPTIMAL.  One tolerance for both decisions made
+ * the LP route throw away starts it had legitimately found. */
+static int phase1_point_ok(const QP *qp, const double *x)
+{
+    for (int i = 0; i < qp->m; i++)
+        if (row_resid(qp, i, x) > 1e-8 * row_scale(qp, i, x)) return 0;
+    return 1;
 }
 
 /* Build & factor KKT, solve [Q A^T; A 0][p;mu]=[-g;0]. Returns 0 ok, -1 singular. */
@@ -343,22 +392,313 @@ static void active_set(const QP *qp, const double *xstart, QPResult *res)
     psolve_free(W); psolve_free(orth); psolve_free(tmp); psolve_free(g); psolve_free(p); psolve_free(mu); psolve_free(xnew);
 }
 
+/* Verify a candidate Farkas certificate of infeasibility for Ax <= b:
+ *     lambda >= 0,   A^T lambda ~ 0,   b^T lambda < 0.
+ * (Theorem of alternatives: any x with Ax <= b would give
+ *  0 <= x^T A^T lambda = lambda^T A x <= lambda^T b < 0, a contradiction.)
+ *
+ * `dual` is the LP's per-row multiplier vector.  Its per-row sign is an
+ * internal convention of the simplex driver -- rows are rescaled so their right
+ * side is nonnegative, and prices are negated for a maximisation -- so rather
+ * than couple this file to that, every cheap candidate combination is tried and
+ * the arithmetic on the CALLER's data decides.  A candidate that does not verify
+ * is never reported: losing the proof only downgrades the verdict to "no
+ * feasible start found", which is what the "trust but verify" rule at the top of
+ * this file is for, and it means a future change of convention in the LP core
+ * costs a rescue rather than producing a wrong answer.
+ * Tolerances are relative to the magnitudes of the products they compare, so
+ * they carry no unit of measure.  Returns 1 with the normalised lambda (max
+ * |lambda_i| = 1, so rows with lambda_i > 0 name a conflicting subset) in `out`. */
+static int farkas_verify(const QP *qp, const double *dual, double *out)
+{
+    const int n = qp->n, m = qp->m;
+    for (int combo = 0; combo < 4; combo++) {
+        int flip  = combo & 1;            /* negate all                     */
+        int byrow = (combo >> 1) & 1;     /* negate rows whose b_i is < 0   */
+        double lam_max = 0.0, lmin = 1e300;
+        for (int i = 0; i < m; i++) {
+            double v = dual[i];
+            if (byrow && qp->b[i] < 0.0) v = -v;
+            if (flip) v = -v;
+            out[i] = v;
+            lam_max = fmax(lam_max, fabs(v));
+            if (v < lmin) lmin = v;
+        }
+        if (!(lam_max > 0.0)) continue;
+        if (lmin < -1e-12 * lam_max) continue;              /* requires lambda >= 0 */
+        for (int i = 0; i < m; i++) out[i] /= lam_max;      /* scale-free checks below */
+        double colmax = 0.0;
+        for (int j = 0; j < n; j++) {
+            double sv = 0.0, mag = 0.0;
+            for (int i = 0; i < m; i++) {
+                double a = qp->A[(size_t)i*n + j];
+                sv  += a * out[i];
+                mag += fabs(a) * out[i];
+            }
+            colmax = fmax(colmax, fabs(sv) / (1.0 + mag));  /* A^T lambda ~ 0 */
+        }
+        if (colmax > 1e-7) continue;
+        double bt = 0.0, bmag = 0.0;
+        for (int i = 0; i < m; i++) { bt += out[i]*qp->b[i]; bmag += out[i]*fabs(qp->b[i]); }
+        if (bt < -1e-9 * (1.0 + bmag)) return 1;            /* b^T lambda < 0  */
+    }
+    return 0;
+}
+
+/* Phase-I through the LP core:
+ *      minimize    sum_i s_i
+ *      subject to  A x - s <= b,  s >= 0,  x free.
+ * Feasible iff the optimum is 0 (any x is feasible for the LP itself by taking
+ * s large, so the LP never has to answer "infeasible"), and bounded below, so
+ * only `OPTIMAL` carries information.  Two answers come out of it:
+ *   - a point x with the least total row violation: if it clears
+ *     qp_start_feasible(), it is a start for the active set (from x0 the search
+ *     happens in the residual space of x0, i.e. for the shift d = x - x0, so a
+ *     drag frame's near-feasible point costs a couple of pivots);
+ *   - with a positive optimum, the row multipliers give a Farkas certificate
+ *     (see farkas_verify) turning "no feasible start" into a proof.
+ * Returns 1 (x written, feasible start), 2 (infeasible, proven; lambda in
+ * `farkas`), 0 (no verdict: give the caller's fallback a chance), 3 on stop. */
+static int lp_phase1_once(const QP *qp, const double *x0, double *x, double *farkas,
+                          double boxmul)
+{
+    int n = qp->n, m = qp->m;
+    if (m <= 0) return 0;
+    long nnz = m;                         /* one entry per slack column */
+    for (int i = 0; i < m; i++)
+        for (int j = 0; j < n; j++) if (qp->A[(size_t)i*n+j]) nnz++;
+    int nL = n + m;
+    int *colptr = (int*)psolve_malloc(sizeof(int) * (size_t)(nL + 1));
+    int *rowi   = (int*)psolve_malloc(sizeof(int) * (size_t)nnz);
+    double *val = (double*)psolve_malloc(sizeof(double) * (size_t)nnz);
+    double *cL  = (double*)psolve_calloc((size_t)nL, sizeof(double));
+    double *lL  = (double*)psolve_malloc(sizeof(double) * (size_t)nL);
+    double *uL  = (double*)psolve_malloc(sizeof(double) * (size_t)nL);
+    double *bL  = (double*)psolve_malloc(sizeof(double) * (size_t)m);
+    double *xL  = (double*)psolve_malloc(sizeof(double) * (size_t)nL);
+    double *dual= (double*)psolve_malloc(sizeof(double) * (size_t)m);
+    char *rel   = (char*)psolve_malloc((size_t)m);
+    if (!colptr || !rowi || !val || !cL || !lL || !uL || !bL || !xL || !dual || !rel) {
+        psolve_free(colptr); psolve_free(rowi); psolve_free(val); psolve_free(cL);
+        psolve_free(lL); psolve_free(uL); psolve_free(bL); psolve_free(xL);
+        psolve_free(dual); psolve_free(rel);
+        return 0;                          /* allocation failed: no verdict */
+    }
+    long p = 0;
+    for (int j = 0; j < n; j++) {          /* x columns: A^T column j */
+        colptr[j] = (int)p;
+        for (int i = 0; i < m; i++) {
+            double a = qp->A[(size_t)i*n + j];
+            if (a) { rowi[p] = i; val[p] = a; p++; }
+        }
+    }
+    for (int i = 0; i < m; i++) {          /* slack column i: -1 in row i */
+        colptr[n+i] = (int)p; rowi[p] = i; val[p] = -1.0; p++;
+    }
+    colptr[nL] = (int)p;
+    /* maximize -sum s == minimize sum s */
+    for (int i = 0; i < m; i++) cL[n+i] = -1.0;
+    /* The QP's variables are free, but handing the simplex ±LP_INF (1e30)
+     * bounds on them is what makes this Phase-I LP fail: the x = x+ - x- split
+     * of a free column then carries magnitudes ~1e30 whose difference is O(1),
+     * and the resulting cancellation breaks solver_feasible()'s certificate
+     * (measured on the UI-layout family: 1e30 bounds -> NUMERICAL_FAILURE on
+     * 11 of 16 models, a data-derived box -> all 16 solved).  The box is a
+     * search bound only, never a claim about the model: a start it produces is
+     * verified against the caller's rows (phase1_point_ok), and infeasibility is
+     * only ever reported from the verified Farkas certificate, which is stated
+     * for A x <= b alone.  So a too-tight box can cost a rescue, not a verdict. */
+    double bmax = 0.0;
+    for (int i = 0; i < m; i++) bmax = fmax(bmax, fabs(qp->b[i]));
+    double box = boxmul * (1.0 + bmax);
+    double *bx = (double*)psolve_malloc(sizeof(double) * (size_t)n);
+    for (int j = 0; j < n; j++) {
+        double aj = 0.0;
+        for (int i = 0; i < m; i++) aj = fmax(aj, fabs(qp->A[(size_t)i*n + j]));
+        double u = (aj > 1e-300) ? box / aj : box;
+        if (!(u > 1.0)) u = 1.0;
+        if (u > 1e100) u = 1e100;
+        if (bx) bx[j] = u;
+        lL[j] = -u; uL[j] = u;
+    }
+    for (int i = 0; i < m; i++) { lL[n+i] = 0.0; uL[n+i] = LP_INF; }     /* s >= 0 */
+    /* right-hand side: with a warm start the search runs in the shift space
+       d = x - x0, so a drag frame's near-feasible point costs a couple of
+       pivots instead of a full feasibility solve */
+    for (int i = 0; i < m; i++) {
+        double ax0 = 0.0;
+        if (x0) {
+            const double *Ai = qp->A + (size_t)i*n;
+            for (int j = 0; j < n; j++) ax0 += Ai[j] * x0[j];
+        }
+        bL[i] = qp->b[i] - ax0;
+    }
+    for (int i = 0; i < m; i++) rel[i] = '<';
+
+    LP lp; memset(&lp, 0, sizeof lp);
+    lp.n = nL; lp.m = m; lp.c = cL; lp.Acolptr = colptr; lp.Arow = rowi;
+    lp.Aval = val; lp.rel = rel; lp.b = bL; lp.l = lL; lp.u = uL; lp.maximize = 1;
+    Solver *s = solver_create(&lp);
+    int got = 0;
+    if (!s) { psolve_free(colptr); psolve_free(rowi); psolve_free(val); psolve_free(cL);
+              psolve_free(lL); psolve_free(uL); psolve_free(bL); psolve_free(xL);
+              psolve_free(dual); psolve_free(rel); return 0; }
+    int st = solver_solve(s);
+    if (st == SOLVE_STOPPED) got = 3;
+    if (st == 0) {
+        double obj = 0.0;
+        solver_optimum(s, xL, &obj);
+        for (int j = 0; j < n; j++) x[j] = (x0 ? x0[j] : 0.0) + xL[j];
+        if (phase1_point_ok(qp, x)) got = 1;
+        else if (farkas && bx) {
+            /* The duals certify infeasibility of the BOXED system.  They are a
+             * certificate for the caller's Ax <= b only if the box played no
+             * part at this vertex (complementary slackness: a variable strictly
+             * inside its bounds has zero box multiplier, so A^T y = 0 holds for
+             * the unboxed LP too).  Checked with a wide margin, then verified
+             * numerically anyway -- a certificate that does not check out is
+             * never reported. */
+            int box_touch = 0;
+            for (int j = 0; j < n; j++)
+                if (fabs(xL[j]) > 0.25 * bx[j]) { box_touch = 1; break; }
+            if (!box_touch) {
+            solver_duals(s, dual);
+            if (farkas_verify(qp, dual, farkas)) {
+                got = 2;
+            }
+            }
+        }
+    }
+    solver_destroy(s);
+    psolve_free(colptr); psolve_free(rowi); psolve_free(val); psolve_free(cL);
+    psolve_free(lL); psolve_free(uL); psolve_free(bL); psolve_free(xL);
+    psolve_free(dual); psolve_free(rel); psolve_free(bx);
+    return got;
+}
+
+/* A second route to the certificate: solve the Farkas alternative itself.
+ *
+ * The boxed Phase-I LP above asks the simplex for a point and reads the
+ * infeasibility verdict off the *duals* of that problem; when the simplex
+ * cannot certify its own answer (SOLVE_NUMERICAL -- typically the badly scaled
+ * free-variables-plus-slacks basis) the certificate is lost even though the
+ * conflict is obvious.  So ask for the certificate directly:
+ *
+ *     minimise    b^T lambda
+ *     subject to  A^T lambda = 0,   sum_i lambda_i >= 1,   0 <= lambda <= 1
+ *
+ * which is Farkas' alternative for {x : Ax <= b}.  Its optimum is < 0 exactly
+ * when the row system is infeasible, and the argmin IS the certificate.  Every
+ * variable is bounded in [0,1] and the only structural entries come from A, so
+ * this LP is as well scaled as the model itself -- no box ladder, no free
+ * columns, nothing for the 1e30 business to go wrong in.  The candidate is
+ * still verified against the caller's data (non-negativity is already forced by
+ * the bounds, but A^T lambda ~ 0 and b^T lambda < 0 are checked), so a
+ * misbehaving simplex costs the proof rather than creating a false one. */
+static int lp_farkas(const QP *qp, double *farkas)
+{
+    const int n = qp->n, m = qp->m, nL = m, rows = n + 1;
+    if (m <= 0 || n <= 0 || !farkas) return 0;
+    int nnz = 0;
+    for (int i = 0; i < m; i++)
+        for (int j = 0; j < n; j++) if (qp->A[(size_t)i*n + j] != 0.0) nnz++;
+    nnz += nL;                                     /* the >= row touches each lambda */
+    int *colptr = (int*)psolve_malloc(sizeof(int) * (size_t)(nL + 1));
+    int *rowi   = (int*)psolve_malloc(sizeof(int) * (size_t)nnz);
+    double *val = (double*)psolve_malloc(sizeof(double) * (size_t)nnz);
+    double *cL  = (double*)psolve_malloc(sizeof(double) * (size_t)nL);
+    double *lL  = (double*)psolve_malloc(sizeof(double) * (size_t)nL);
+    double *uL  = (double*)psolve_malloc(sizeof(double) * (size_t)nL);
+    double *bL  = (double*)psolve_malloc(sizeof(double) * (size_t)rows);
+    double *xL  = (double*)psolve_malloc(sizeof(double) * (size_t)nL);
+    char *rel   = (char*)psolve_malloc((size_t)rows);
+    if (!colptr || !rowi || !val || !cL || !lL || !uL || !bL || !xL || !rel) {
+        psolve_free(colptr); psolve_free(rowi); psolve_free(val); psolve_free(cL);
+        psolve_free(lL); psolve_free(uL); psolve_free(bL); psolve_free(xL); psolve_free(rel);
+        return 0;
+    }
+    int pos = 0;
+    for (int j = 0; j < nL; j++) {
+        colptr[j] = pos;
+        for (int k = 0; k < n; k++) {
+            double a = qp->A[(size_t)j*n + k];
+            if (a != 0.0) { rowi[pos] = k; val[pos] = a; pos++; }
+        }
+        rowi[pos] = n; val[pos] = 1.0; pos++;        /* sum_i lambda_i >= 1 */
+        cL[j] = -qp->b[j];                           /* max -b^T lambda = min b^T lambda */
+        lL[j] = 0.0; uL[j] = 1.0;
+    }
+    colptr[nL] = pos;
+    for (int k = 0; k < n; k++) { bL[k] = 0.0; rel[k] = '='; }
+    bL[n] = 1.0; rel[n] = '>';
+    LP lp; memset(&lp, 0, sizeof lp);
+    lp.n = nL; lp.m = rows;
+    lp.Acolptr = colptr; lp.Arow = rowi; lp.Aval = val;
+    lp.c = cL; lp.l = lL; lp.u = uL; lp.b = bL; lp.rel = rel;
+    lp.maximize = 1;
+    Solver *s = solver_create(&lp);
+    int got = 0;
+    if (s) {
+        int st = solver_solve(s);
+        if (st == 0) {
+            double obj = 0.0;
+            solver_optimum(s, xL, &obj);             /* obj = -b^T lambda */
+            if (obj > 0.0) {                         /* a witness exists */
+                double *cand = (double*)psolve_malloc(sizeof(double) * (size_t)m);
+                if (cand) {
+                    for (int i = 0; i < m; i++) cand[i] = xL[i];
+                    if (farkas_verify(qp, cand, farkas)) got = 1;
+                    psolve_free(cand);
+                }
+            }
+        }
+        solver_destroy(s);
+    }
+    psolve_free(colptr); psolve_free(rowi); psolve_free(val); psolve_free(cL);
+    psolve_free(lL); psolve_free(uL); psolve_free(bL); psolve_free(xL); psolve_free(rel);
+    return got;
+}
+
+/* lp_phase1_once() is a coin flip on the box width: the box exists to keep the
+ * QP's free variables away from the 1e30 bounds that wreck the simplex's final
+ * certificate, but a box that is too wide or too narrow leaves the rows badly
+ * scaled inside the basis and the LP answers NUMERICAL_FAILURE.  On the
+ * UI-layout family (models constructed feasible, or constructed infeasible) a
+ * single scale rescued 5 of 16 hard cases; this ladder rescues all 16.  Nothing
+ * here can produce a wrong verdict: every start is re-checked against the
+ * caller's rows and every proof against the caller's Farkas system, and a box
+ * that clips the search only ever yields "no verdict" -- status -1 as before. */
+static int lp_phase1(const QP *qp, const double *x0, double *x, double *farkas)
+{
+    static const double boxmul[4] = { 1e9, 1e6, 1e3, 1e12 };
+    for (int k = 0; k < 4; k++) {
+        if (psolve_stop()) return 3;      /* a budget must bound the ladder too */
+        int r = lp_phase1_once(qp, x0, x, farkas, boxmul[k]);
+        if (r) return r;
+    }
+    return 0;
+}
+
 /* Find a feasible point for A x <= b, or accept a provided one.
- * Phase-I QP:  minimize 1/2||x||^2 + 1/2||s||^2 + sum s
- *   s.t.  a_i x - s_i <= b_i,  s_i >= 0.
+ *
+ * First the caller's x0 (relative tolerance, so a warm start that drifted by
+ * rounding still counts as feasible).  Then the LP core as Phase-I (see
+ * lp_phase1) -- O(nnz)-per-pivot, and the only route that can PROVE the row
+ * system empty.  Then the dense auxiliary QP as a fallback, kept because it
+ * handles what the simplex can not (and it is what this solver did before the
+ * LP route existed):
+ *   minimize 1/2||x||^2 + 1/2||s||^2 + sum s
+ *     s.t.  a_i x - s_i <= b_i,  s_i >= 0.
  * Strictly convex so the active-set converges; the linear term on s drives
  * s -> 0 whenever a feasible x exists.
  * Returns 1 on success (writes x), 0 if no feasible point was certified, and 2
  * if the search was cooperatively stopped (time limit / Ctrl-C). */
-static int find_feasible(const QP *qp, const double *x0, double *x)
+static int find_feasible(const QP *qp, const double *x0, double *x, QPResult *res)
 {
     int n = qp->n, m = qp->m;
     const double *base = x0 ? x0 : x;
     memcpy(x, base, (size_t)n * sizeof(double));
-    int feas = 1;
-    for (int i = 0; i < m; i++)
-        if (row_resid(qp, i, x) > 1e-8) { feas = 0; break; }
-    if (feas) return 1;
+    if (qp_start_feasible(qp, x)) return 1;
 
     int N = n + m;
     double eps = 1e-6;
@@ -380,6 +720,7 @@ static int find_feasible(const QP *qp, const double *x0, double *x)
         b1[m+i] = 0.0;
     }
     QP q1; q1.n = N; q1.m = m1; q1.Q = Q1; q1.c = c1; q1.A = A1; q1.b = b1;
+    memcpy(x, base, (size_t)n * sizeof(double));   /* lp_phase1 may have written x */
     double *z0 = (double*)psolve_calloc((size_t)N, sizeof(double));
     for (int i = 0; i < m; i++) z0[n+i] = (qp->b[i] < 0) ? -qp->b[i] : 0.0;
     q1.x0 = z0;
@@ -409,6 +750,33 @@ static int find_feasible(const QP *qp, const double *x0, double *x)
 
     qp_result_free(&r1);
     psolve_free(Q1); psolve_free(c1); psolve_free(A1); psolve_free(b1); psolve_free(z0);
+
+    /* The dense search could not produce a start.  Ask the LP core, which
+     * answers two things the dense search can not: a start found by a simplex
+     * pivot sequence on the least-violation LP (min sum s, s >= 0) -- and, more
+     * importantly, whether "no start" is a FACT.  Ordering matters: the dense
+     * search is tried first because its strictly convex objective returns a
+     * well-centred point, which is the start the active set likes; handing it a
+     * simplex vertex instead measurably stalls on degenerate working sets. */
+    if (!ok) {
+        double *lam = (double*)psolve_malloc(sizeof(double) * (size_t)(m > 0 ? m : 1));
+        if (!lam) return 0;
+        for (int i = 0; i < m; i++) lam[i] = 0.0;
+        double *xl = (double*)psolve_malloc(sizeof(double) * (size_t)n);
+        int pr = xl ? lp_phase1(qp, x0, xl, lam) : 0;
+        if (pr == 1) {
+            memcpy(x, xl, (size_t)n * sizeof(double)); ok = 1;
+        } else if (pr == 2) {                      /* verified Farkas certificate */
+            res->infeasible_proven = 1;
+            res->farkas = lam;  lam = NULL;        /* ownership -> QPResult */
+        } else if (pr == 3) { ok = 2; }            /* stopped: no verdict, but not a give-up */
+        else if (pr == 0 && !psolve_stop() && lp_farkas(qp, lam)) {  /* certificate-only route */
+            res->infeasible_proven = 1;
+            res->farkas = lam;  lam = NULL;
+        }
+        psolve_free(xl);
+        psolve_free(lam);
+    }
     return ok;
 }
 
@@ -457,8 +825,12 @@ void qp_solve(const QP *qp, QPResult *res)
     }
     double *x = (double*)xmalloc((size_t)qp->n * sizeof(double));
     memset(x, 0, (size_t)qp->n * sizeof(double));
-    int fr = find_feasible(qp, qp->x0, x);
-    if (fr == 0) { psolve_free(x); return; }   /* status stays -1: no feasible start */
+    int fr = find_feasible(qp, qp->x0, x, res);
+    if (fr == 0) {                             /* status stays -1: no feasible start */
+        psolve_free(x);
+        return;                                /* res->infeasible_proven says whether
+                                                  that is a proof or a give-up */
+    }
     if (fr == 2) {
         /* Cooperatively stopped while searching for a feasible point, so there
            is no feasible incumbent to hand back.  Report QP_STOPPED with an
@@ -473,11 +845,17 @@ void qp_solve(const QP *qp, QPResult *res)
     }
     active_set(qp, x, res);
     psolve_free(x);
+    if (res->x) {                              /* report how feasible the answer is,
+                                                  in the caller's own units */
+        double mr = 0.0;
+        for (int i = 0; i < qp->m; i++) mr = fmax(mr, row_resid(qp, i, res->x));
+        res->max_resid = mr > 0.0 ? mr : 0.0;
+    }
 }
 
 void qp_result_free(QPResult *res)
 {
     if (!res) return;
-    psolve_free(res->x); psolve_free(res->mult);
+    psolve_free(res->x); psolve_free(res->mult); psolve_free(res->farkas);
     memset(res, 0, sizeof(*res));
 }

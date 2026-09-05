@@ -38,9 +38,9 @@ else
 fi
 
 echo "[5/7] QP solver vs scipy (analytic + randomized)..."
-gcc -O2 -march=native -I src tools/qp_test.c src/qp.c src/err.c src/lu.c src/kernels.c -o /tmp/qp_test -lm
+gcc -O2 -march=native -I src tools/qp_test.c src/qp.c src/err.c src/lu.c src/splu.c src/solver.c src/kernels.c -o /tmp/qp_test -lm
 /tmp/qp_test
-gcc -O2 -march=native -I src tools/qpsolve.c src/qp.c src/err.c src/lu.c src/kernels.c -o /tmp/qpsolve -lm
+gcc -O2 -march=native -I src tools/qpsolve.c src/qp.c src/err.c src/lu.c src/splu.c src/solver.c src/kernels.c -o /tmp/qpsolve -lm
 ok=0; fail=0
 for s in $(seq 1 40); do
   if python3 tools/qp_gen.py $s 2>/dev/null | grep -q '^OK'; then ok=$((ok+1)); else fail=$((fail+1)); fi
@@ -51,10 +51,44 @@ echo "  QP vs scipy: OK=$ok FAIL=$fail"
 # the KKT conditions (necessary AND sufficient for a convex QP) plus an exact
 # recession-direction test, so it catches infeasible/unbounded/non-stationary
 # points that an objective comparison against SLSQP cannot.
-python3 tools/qp_diff.py 200 4242 | head -2
+if python3 -c 'import numpy, scipy' 2>/dev/null; then
+  out=$(python3 tools/qp_diff.py 200 4242 2>&1)
+  echo "$out" | head -2
+  # A differential test whose verdict is only printed is a diff test that can
+  # regress in silence, and a missing scipy is not a solver failure: gate on the
+  # first explicitly and skip on the second.
+  case "$out" in
+    *"checked="*"WRONG=0"*) : ;;
+    *"checked="*) echo "qp_diff: WRONG answers (see above)"; exit 1 ;;
+    *) echo "qp_diff: no summary line produced"; exit 1 ;;
+  esac
+else
+  echo "  QP differential SKIPPED (numpy/scipy not installed)"
+fi
+
+echo "[5.1/7] QP Phase-I on the degenerate UI-layout class + the host-facing bridge..."
+# Two gates for the Phase-I rework (docs/CURV_PS_PLAN.md P0.1):
+#  [1] a model that is feasible by construction must be solved OPTIMAL in all
+#      three ways a layout front end can encode the same constraints -- before
+#      the rework, the encodings disagreed and N>=16 claimed INFEASIBLE;
+#  [5] a model that is infeasible by construction must return status -1 WITH a
+#      Farkas certificate, which the tool re-verifies from the model's own data
+#      (A^T lambda ~ 0, b^T lambda < 0, lambda >= 0) and whose positive weights
+#      must name a minimal conflicting subset.
+# Both run --strict so a regression fails this script rather than only printing.
+gcc -O2 -march=native -I src -I tools tools/ui_qp_probe.c src/qp.c src/err.c src/lu.c src/splu.c src/solver.c src/kernels.c -o /tmp/ui_qp_probe -lm
+/tmp/ui_qp_probe --strict --only 1 --nmax 24
+/tmp/ui_qp_probe --strict --only 5
+# The bridge is where a consumer re-derives psolve's semantics, so its contract is
+# tested here rather than assumed: warm start accepted and scale-free, -1 kept apart
+# from a proof, per-call budget returning an incumbent, arena path, status names.
+# Compiled natively against the same sources tools/wasm_build.sh puts in the module.
+gcc -O2 -march=native -I src -I tools tools/psw_test.c tools/psolve_web.c \
+     src/qp.c src/err.c src/lu.c src/splu.c src/solver.c src/kernels.c -o /tmp/psw_test -lm
+/tmp/psw_test
 
 echo "[5.2/7] QP cooperative stop + millisecond-precision time limits (Phase 4)..."
-gcc -O2 -march=native -I src tools/qp_stop_test.c src/qp.c src/err.c src/lu.c src/kernels.c -o /tmp/qp_stop_test -lm
+gcc -O2 -march=native -I src tools/qp_stop_test.c src/qp.c src/err.c src/lu.c src/splu.c src/solver.c src/kernels.c -o /tmp/qp_stop_test -lm
 /tmp/qp_stop_test
 # Verifies the CLI -t/--time-limit budget is ITIMER_REAL (microsecond
 # resolution), not alarm() (whole-second, rounds up): a 50ms budget must fire
