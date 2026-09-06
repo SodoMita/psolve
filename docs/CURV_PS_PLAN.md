@@ -281,13 +281,17 @@ has anything resembling the wasm bridge — `tools/psolve_web.[ch]`,
 ahead/behind numbers here are from an unshallowed clone: the sandbox clone is
 shallow, and a truncated history makes every branch look ~100 commits ahead of
 `main`.  Verify with `git rev-list --count origin/main..BR`, not by counting log
-lines.)  This branch is 2 commits of QP/bridge work on top of
-`main`, deliberately **not** rebased onto their line, so it stays reviewable
-against `main`.  What merging takes is mechanical, and it has been measured
-rather than predicted: their tree was checked out in a worktree, this branch's
-`36e7680` cherry-picked with `-n`, and every gate run on the merged result.
+lines.)
 
-* **6 conflict hunks in 5 files** (`src/qp.c` doc comment + tolerance-tag lines,
+**Status: merged.**  Their 13 commits are now in this branch (merge commit
+`527127b`), so a single merge of this branch into `main` lands both lines; the
+branch is 17 commits ahead of `main`, 0 behind.  The merge was rehearsed first
+(their tree in a worktree, this branch's QP commit cherry-picked `-n`, every gate
+run on the result) and only then performed, because a conflict this deep in a
+numerical core should be resolved against measurements rather than against the
+diff.
+
+* **6 conflict hunks in 6 files** (`src/qp.c` doc comment + tolerance-tag lines,
   `src/qp.h` two doc paragraphs, `Makefile` the `qpsolve` target and `clean`,
   `test.sh` where the `qp_diff` gate block is appended, `tools/fuzz_inputs.py`
   link list).  Both sides' edits survive in every case; nothing semantic collides.
@@ -296,42 +300,47 @@ rather than predicted: their tree was checked out in a worktree, this branch's
   them in the merge); `src/qp.c`'s new dependency on the LP core is already
   satisfied on their line.
 * **Their Phase 6.3 replaced the global `psolve_stop_fn` with
-  `psolve_stop_set(fn)`** (per-thread, no getter).  Any tool that saved and
-  restored the global has to own its slot instead: `psolve_stop_set(my_hook)` on
-  entry, `psolve_stop_set(NULL)` on exit.  Two files here need that one-line
-  change (`tools/psolve_web.c`, `tools/ui_qp_probe.c`); after it the bridge test
-  is 42 checks, 0 failures on the merged tree.
-* **Their `tools/tolsheet_check.py` gate rejects this patch as-authored**: every
-  code line in `src/*.{c,h}` carrying a float-exponent literal must be tagged
+  `psolve_stop_set(fn)`** (per-thread, write-only).  A tool that saved and
+  restored the global can no longer do that: it owns the slot while it needs the
+  hook and clears it with `psolve_stop_set(NULL)`.  Applied to the two files here
+  that armed it (`tools/psolve_web.c`, `tools/ui_qp_probe.c`); the bridge contract
+  test is 42 checks, 0 failures on the merged tree.  Worth knowing that this loses
+  something: a bridge budget now *replaces* a host callback for its duration rather
+  than chaining onto the host's, so a host that wants both must combine the two
+  conditions in its own callback and not call `psw_set_time_budget_ms`.  curv-ps's
+  Rust shim would face the same one-line change if it ever arms its own hook.
+* **Their `tools/tolsheet_check.py` gate rejected this patch as-authored; it now
+  passes.**  Every code line in `src/*.{c,h}` carrying a float-exponent literal must
+  be tagged
   `/* TOLSHEET TOL-… */`, and every tag must have a row in `docs/DESIGN.md` §8
-  (and vice versa — no stale rows).  The tags are done on this branch (15 sites
-  in `src/qp.c`); the rows below are paste-ready for their §8.3 sheet.  Values
-  are as measured, and the classes are theirs: `C` steers convergence, `S` is a
-  scaling/division guard, `V` gates a verdict or a certificate.
+  (and vice versa — no stale rows).  Landed: 15 tagged sites in `src/qp.c`, 11
+  new rows in their §8.3, gate reports `OK (101 ids, 171 tagged sites, 101
+  documented rows)`.  Three things that gate taught, all worth keeping in mind for
+  anyone adding tolerances here:
 
-  | ID | site | value | class | direction of safety / protects / may never |
-  |---|---|---|---|---|
-  | TOL-QP-WARMFEAS | qp.c:69 | 1e-11·(1+\|b_i\|+Σ\|a_ij\|\|x_j\|) | V | accepts the caller's x0 as a start; loose enough to keep usable warm starts, tight enough that the active set never starts infeasible (its own primal gate is the backstop) |
-  | TOL-QP-P1HANDOVER | qp.c:90 | 1e-8·row_scale | V | "feasible enough to hand to the active set" for a point the LP produced; deliberately looser than WARMFEAS (different arithmetic), never looser than the terminal primal re-check |
-  | TOL-QP-BOX | qp.c:513 | boxmul·(1+max\|b\|) | C | bounds the free variables the Phase-I LP needs; exists only in an auxiliary problem, so it may never be quoted as a bound of the caller's |
-  | TOL-QP-BOXLADDER | qp.c:673 | {1e9, 1e6, 1e3, 1e12} | C | box scales tried in turn; any single scale is a coin flip on ill-conditioned rows (12/16 vs 16/16 on the sweep), so no entry is canonical |
-  | TOL-QP-BOXDIV | qp.c:518 | 1e-300 | S | row-coefficient guard turning the slack box into a variable bound; protects division only — enlarging it shrinks the box |
-  | TOL-QP-BOXCAP | qp.c:520 | 1e100 | S | keeps a derived bound representable; measured: a 1e18 box is worse than 1e12, and ±DBL_MAX on free x must never be used (it makes the LP report infeasible) |
-  | TOL-QP-BOXIDLE | qp.c:563 | 0.25 | V | "box untouched, so the boxed optimum says something about the unboxed system" test; errs toward refusing the claim |
-  | TOL-QP-FARKASINIT | qp.c:418 | 1e300 | S | sentinel for the max/min scan, never a tolerance |
-  | TOL-QP-FARKASSIGN | qp.c:428 | −1e-12·max\|λ\| | V | λ ≥ 0 acceptance; may never be loosened past zero — a certificate with a negative λ proves nothing |
-  | TOL-QP-FARKASCOL | qp.c:440 | 1e-7 | V | ‖Aᵀλ‖∞ ≈ 0, recomputed from the caller's own A |
-  | TOL-QP-FARKASB | qp.c:443 | −1e-9·(1+Σλ\|b\|) | V | bᵀλ < 0, same source; with the two rows above it is the entire `INFEASIBLE` claim, so `qpsolve` may print it only when all three hold |
-  | TOL-QP-P1RIDGE | qp.c:712 | 1e-6 | C | ridge making the dense auxiliary QP strictly convex/bounded; must stay far below the slack objective's scale or it moves the optimum and P1VERIFY rejects the point |
-  | TOL-QP-P1SUM | qp.c:745 | 1e-7 (absolute) | V | total slack of the candidate; absolute because the auxiliary problem has its own units — P1VERIFY is what ties it to the caller's |
-  | TOL-QP-P1VERIFY | qp.c:752 | 1e-7·(1+\|b_i\|) | V | re-check of the candidate against the caller's rows, in the caller's scale; the reason P1SUM may stay absolute |
-  | TOL-QP-P1DENSE | qp.c:802 | n+m ≤ 600 | C | size gate on the dense search (policy threshold, not arithmetic): below it the centred start wins, above it one iteration exceeds a frame budget (11.4 s vs 20 ms measured) |
+  * **Adopt their id when the rule is the same rule.**  My ridge / slack-sum /
+    candidate-recheck / hand-over tags became `TOL-QP-PERTURB`, `TOL-QP-PH1SUM`,
+    `TOL-QP-PRIMAL`, `TOL-QP-FEASROW` rather than new `TOL-QP-P1*` names — the
+    sheet already described those decisions, and a second name for one rule is
+    how a semantics sheet starts lying.  `FEASROW`'s row was updated in place
+    (`1e-8` absolute → `1e-8·row_scale`) because this patch changed the rule, not
+    just its address.
+  * **The gate checks id closure, not line numbers.**  My insertions moved ~30 of
+    their cited `qp.c:NNN` sites; nothing failed.  The site column was regenerated
+    from the tags in the file, and that regeneration is worth making part of the
+    gate — a cited line is the only thing connecting a row to code review.
+  * Prose is exempt: a comment that discusses `1e-9` is not a tolerance site
+    (their checker blanks comments before matching), so a tag in a comment
+    sentence counts as *documentation* only.
+
+  (`docs/DESIGN.md` §8.3 is the authoritative sheet for all 15 rows; no copy here.
 
 * **Overlap to resolve in favour of theirs, not by keeping both**: their
   `solver_farkas_duals()` and `solver_farkas_boxcert()` do, inside the LP core,
   what this patch's `farkas_verify()` guesses from the outside (a four-way
-  sign/search over the duals) and what `TOL-QP-BOXIDLE` refuses.  On a merged
-  line the LP-side helpers should feed the QP certificate, and `src/cert.h`
+  sign/search over the duals) and what `TOL-QP-BOXIDLE` refuses.  Now that the
+  lines are merged, the LP-side helpers should feed the QP certificate, and
+  `src/cert.h`
   should gain `PSVK_QP_INFEASIBLE` carrying `QPResult.farkas` — their kinds list
   has `QP_OPTIMAL`/`QP_UNBOUNDED` but no infeasible QP certificate, which is
   exactly the hole P0.1 filled.
@@ -347,6 +356,14 @@ rather than predicted: their tree was checked out in a worktree, this branch's
   Phase 7.5 Ruiz equilibration and this Phase-I neither rescue nor break each
   other: the ill-scaled sweep comes out with an identical verdict mix from both
   trees (12 ok / 6 NO_START / 6 KKT_FAIL / 4 ITER_LIMIT over 30 points).
+* **Left as follow-up work on the merged tree** (deliberately not folded into the
+  merge commit, so the merge stays reviewable as conflict resolution): give
+  `src/cert.h` a `PSVK_QP_INFEASIBLE` kind and route `QPResult.farkas` through
+  `psv_cert_check()` at the `qpsolve` verdict exit, so the QP's infeasibility claim
+  is re-verified at the same choke point as the LP's and the MIP's (today the
+  certificate is verified inside `qp.c` and then trusted by the caller); and make
+  `src/cert.h`'s docs mention that a QP infeasibility proof needs neither `ray` nor
+  `duals`.
 * **This patch is not redundant on their line.** Their `tools/qpsolve.c` no
   longer *labels* an unconstrained start "infeasible" (it prints `STATUS -1`,
   which is honest), but nothing in their tree proves a QP infeasibility or
@@ -356,7 +373,7 @@ rather than predicted: their tree was checked out in a worktree, this branch's
 
 ## 2. P0 — three changes that buy the most for the least risk
 
-### P0.1  `INFEASIBLE` must mean *proven* infeasible (kill the dense Phase-I QP)  — implemented, see §1.9
+### P0.1  `INFEASIBLE` must mean *proven* infeasible (gate the dense Phase-I QP; claim infeasibility only from a certificate)  — implemented, see §1.9 and §1.10
 
 * **Problem.** A feasible model returns `INFEASIBLE` (above). In the browser
   that is not a warning: `src/curv/interp.ts:975` does
