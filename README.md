@@ -118,7 +118,11 @@ See `examples/free_vars.lp` for a runnable model.
 
 The QP solver handles: **minimize** ½xᵀQx + cᵀx subject to Ax ≤ b with Q
 symmetric positive semi-definite (convex), reporting the optimum, Lagrange
-multipliers, and status (solved / infeasible).  It supports the same
+multipliers, and status (solved / infeasible).  The library API (`src/qp.h`)
+also accepts native equalities `Aeq x = beq` and variable bounds `l ≤ x ≤ u`
+(`QP.me/Aeq/beq/l/u`; `QPResult.mult_eq/mult_l/mult_u`), and
+`qp_solve_sparse` / `QPSparse` accept A in CSC plus Q as diagonal + sparse
+rank-1 terms for hosts that do not want to marshal dense Q.  It supports the same
 cooperative `-t` / `--time-limit` (and Ctrl-C) stop as the LP/MIP drivers:
 the active-set and Phase-I feasibility loops poll `psolve_stop()` and wind
 down to status `QP_STOPPED`, handing back the feasible best incumbent without
@@ -427,7 +431,8 @@ The LP API (`src/solver.h`) takes a sparse-CSC matrix with per-variable bounds
 and `<`/`>`/`=` rows, supports warm starts (`solver_warm_solve`) and
 sensitivity analysis (`solver_duals`, `solver_reduced_costs`).  The QP API
 (`src/qp.h`) solves convex `min ½xᵀQx + cᵀx s.t. Ax ≤ b` with a Phase-I
-feasibility search (variable bounds are expressed as rows).  This is the
+feasibility search, and takes native equalities/bounds as first-class fields
+(variable bounds no longer have to be expressed as rows).  This is the
 integration point used by [SmazkaVG](https://github.com/SodoMita/SmazkaVG).
 
 **Threading note.**  Concurrent solves from multiple threads **are

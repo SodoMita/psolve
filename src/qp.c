@@ -57,23 +57,121 @@ static double row_scale(const QP *qp, int i, const double *x)
     return 1.0 + s;
 }
 
-/* 1 when row i is violated at x beyond the relative tolerance. */
-static int row_violated(const QP *qp, int i, const double *x)
+/* ------------------------------------------------------- P1.1 native equalities/bounds
+ * A `QP` can carry three kinds of constraint beside A x <= b:
+ *   - me equalities Aeq x = beq (permanent working-set members),
+ *   - per-variable lower bounds l <= x,
+ *   - per-variable upper bounds x <= u.
+ * Bounds are represented as the corresponding inequality rows only when they
+ * enter the KKT working set; they cost no rows in the caller's `m` and no rows
+ * in the marshalled A/b.  LP_INF (src/solver.h) is used as the infinite sentinel,
+ * so the semantics are the same as the LP core's own bound handling.
+ */
+
+/* A working-set member: an original inequality, an equality, a lower-bound row
+ * (-x_j <= -l_j) or an upper-bound row (x_j <= u_j). */
+typedef enum { QP_C_INEQ = 0, QP_C_EQ = 1, QP_C_LOWER = 2, QP_C_UPPER = 3 } QP_ConsKind;
+typedef struct { QP_ConsKind kind; int idx; } QP_Cons;
+
+static double qp_lb(const QP *qp, int j)
 {
-    /* 1e-11 * row_scale is ~100x the rounding noise of a_i^T x and, at the
-       pixel scale a UI layout uses, lands on the 1e-8 this file historically
-       used.  Looser than that and a materially infeasible "warm start" is
-       accepted; the active set then stalls on the violated rows (measured: an
-       8-chip model at scale 1e3 went OPTIMAL-in-16-iters -> ITER_LIMIT-in-8100
-       when 1e-9 was tried), which trades a wrong verdict for a useless one. */
-    return row_resid(qp, i, x) > 1e-11 * row_scale(qp, i, x);   /* TOLSHEET TOL-QP-WARMFEAS */
+    double v = qp->l ? qp->l[j] : -LP_INF;
+    return (!isfinite(v) || v < -LP_INF/2) ? -LP_INF : v;
+}
+static double qp_ub(const QP *qp, int j)
+{
+    double v = qp->u ? qp->u[j] : LP_INF;
+    return (!isfinite(v) || v > LP_INF/2) ? LP_INF : v;
+}
+static int qp_bound_is_finite(double v) { return v > -LP_INF/2 && v < LP_INF/2; }
+
+static double eq_resid(const QP *qp, int i, const double *x)
+{
+    const double *Ai = qp->Aeq + (size_t)i * qp->n;
+    double s = -qp->beq[i];
+    for (int j = 0; j < qp->n; j++) s += Ai[j] * x[j];
+    return s;
+}
+static double eq_scale(const QP *qp, int i, const double *x)
+{
+    double s = fabs(qp->beq[i]);
+    const double *Ai = qp->Aeq + (size_t)i * qp->n;
+    for (int j = 0; j < qp->n; j++) s += fabs(Ai[j]) * fabs(x[j]);
+    return 1.0 + s;
+}
+
+/* Residual of a working-set member in the `a^T x - b` convention used by the
+ * active set: <= 0 is feasible (equal rows are required to be ~0). */
+static double cons_resid(const QP *qp, const QP_Cons *c, const double *x)
+{
+    switch (c->kind) {
+    case QP_C_INEQ:  return row_resid(qp, c->idx, x);
+    case QP_C_EQ:    return eq_resid(qp, c->idx, x);
+    case QP_C_LOWER: return -x[c->idx] + qp_lb(qp, c->idx);
+    case QP_C_UPPER: return x[c->idx] - qp_ub(qp, c->idx);
+    }
+    return 0.0;
+}
+static double cons_scale(const QP *qp, const QP_Cons *c, const double *x)
+{
+    switch (c->kind) {
+    case QP_C_INEQ:  return row_scale(qp, c->idx, x);
+    case QP_C_EQ:    return eq_scale(qp, c->idx, x);
+    case QP_C_LOWER: return 1.0 + fabs(qp_lb(qp, c->idx)) + fabs(x[c->idx]);
+    case QP_C_UPPER: return 1.0 + fabs(qp_ub(qp, c->idx)) + fabs(x[c->idx]);
+    }
+    return 1.0;
+}
+/* Write the working-set row into out[n]. */
+static void cons_row(const QP *qp, const QP_Cons *c, double *out)
+{
+    int j;
+    switch (c->kind) {
+    case QP_C_INEQ: {
+        const double *Ai = qp->A + (size_t)c->idx * qp->n;
+        for (j = 0; j < qp->n; j++) out[j] = Ai[j];
+        break;
+    }
+    case QP_C_EQ: {
+        const double *Ai = qp->Aeq + (size_t)c->idx * qp->n;
+        for (j = 0; j < qp->n; j++) out[j] = Ai[j];
+        break;
+    }
+    case QP_C_LOWER:
+        for (j = 0; j < qp->n; j++) out[j] = 0.0;
+        out[c->idx] = -1.0;
+        break;
+    case QP_C_UPPER:
+        for (j = 0; j < qp->n; j++) out[j] = 0.0;
+        out[c->idx] = 1.0;
+        break;
+    }
+}
+
+/* 1 when a constraint row is violated at x beyond the warm-start tolerance. */
+static int cons_violated(const QP *qp, const QP_Cons *c, const double *x)
+{
+    double r = cons_resid(qp, c, x);
+    if (c->kind == QP_C_EQ) return fabs(r) > 1e-11 * cons_scale(qp, c, x);
+    return r > 1e-11 * cons_scale(qp, c, x);   /* TOLSHEET TOL-QP-WARMFEAS */
 }
 
 int qp_start_feasible(const QP *qp, const double *x)
 {
     if (!qp || !x) return 0;
-    for (int i = 0; i < qp->m; i++)
-        if (row_violated(qp, i, x)) return 0;
+    int i, j;
+    for (i = 0; i < qp->m; i++) {
+        QP_Cons c; c.kind = QP_C_INEQ; c.idx = i;
+        if (cons_violated(qp, &c, x)) return 0;
+    }
+    for (i = 0; i < qp->me; i++) {
+        QP_Cons c; c.kind = QP_C_EQ; c.idx = i;
+        if (cons_violated(qp, &c, x)) return 0;
+    }
+    for (j = 0; j < qp->n; j++) {
+        if (qp->l && qp_bound_is_finite(qp_lb(qp, j)) && x[j] < qp_lb(qp, j) - 1e-11 * (1.0 + fabs(qp_lb(qp, j)) + fabs(x[j]))) return 0;
+        if (qp->u && qp_bound_is_finite(qp_ub(qp, j)) && x[j] > qp_ub(qp, j) + 1e-11 * (1.0 + fabs(qp_ub(qp, j)) + fabs(x[j]))) return 0;
+    }
     return 1;
 }
 
@@ -86,13 +184,20 @@ int qp_start_feasible(const QP *qp, const double *x)
  * the LP route throw away starts it had legitimately found. */
 static int phase1_point_ok(const QP *qp, const double *x)
 {
-    for (int i = 0; i < qp->m; i++)
+    int i, j;
+    for (i = 0; i < qp->m; i++)
         if (row_resid(qp, i, x) > 1e-8 * row_scale(qp, i, x)) return 0;   /* TOLSHEET TOL-QP-FEASROW */
+    for (i = 0; i < qp->me; i++)
+        if (fabs(eq_resid(qp, i, x)) > 1e-8 * eq_scale(qp, i, x)) return 0;
+    for (j = 0; j < qp->n; j++) {
+        if (qp->l && qp_bound_is_finite(qp_lb(qp, j)) && x[j] < qp_lb(qp, j) - 1e-8 * (1.0 + fabs(qp_lb(qp, j)) + fabs(x[j]))) return 0;
+        if (qp->u && qp_bound_is_finite(qp_ub(qp, j)) && x[j] > qp_ub(qp, j) + 1e-8 * (1.0 + fabs(qp_ub(qp, j)) + fabs(x[j]))) return 0;
+    }
     return 1;
 }
 
 /* Build & factor KKT, solve [Q A^T; A 0][p;mu]=[-g;0]. Returns 0 ok, -1 singular. */
-static int solve_kkt(const QP *qp, const int *W, int k,
+static int solve_kkt(const QP *qp, const QP_Cons *C, int k,
                      const double *g, double *p, double *mu)
 {
     int n = qp->n;
@@ -107,13 +212,14 @@ static int solve_kkt(const QP *qp, const int *W, int k,
     double *rhs  = blk + 2 * (size_t)N * N;
     double *rhs0 = rhs + N;
     int *piv = (int*)xmalloc((size_t)N * sizeof(int));
+    double *row = (double*)xmalloc((size_t)n * sizeof(double));
     for (int j = 0; j < n; j++)
         for (int i = 0; i < n; i++) K[j*N + i] = qp->Q[j*n + i];
     for (int c = 0; c < k; c++) {
-        const double *Arow = qp->A + (size_t)W[c] * n;
+        cons_row(qp, &C[c], row);
         for (int i = 0; i < n; i++) {
-            K[(n+c)*N + i] = Arow[i];
-            K[i*N + (n+c)] = Arow[i];
+            K[(n+c)*N + i] = row[i];
+            K[i*N + (n+c)] = row[i];
         }
     }
     for (int i = 0; i < n; i++) rhs[i] = -g[i];
@@ -160,24 +266,23 @@ static int solve_kkt(const QP *qp, const int *W, int k,
             r = lu_factor(K, N, piv);
         }
     }
-    if (!good) { psolve_free(blk); psolve_free(piv); return -1; }
+    if (!good) { psolve_free(blk); psolve_free(piv); psolve_free(row); return -1; }
     for (int i = 0; i < n; i++) p[i] = rhs[i];
     for (int c = 0; c < k; c++) mu[c] = rhs[n+c];
 
-    psolve_free(blk); psolve_free(piv);
+    psolve_free(blk); psolve_free(piv); psolve_free(row);
     return 0;
 }
 
 /* Build an orthonormal basis of the working-set rows (for rank management).
- * orth is n*k, column j = orthonormal basis vector for W[j]. */
-static void build_orth(const QP *qp, const int *W, int k, double *orth)
+ * orth is n*k, column j = orthonormal basis vector for C[j]. */
+static void build_orth(const QP *qp, const QP_Cons *C, int k, double *orth)
 {
     int n = qp->n;
     double tol = 1e-9;  /* TOLSHEET TOL-QP-NRMDIV */
     for (int c = 0; c < k; c++) {
-        const double *Arow = qp->A + (size_t)W[c] * n;
         double *v = orth + (size_t)c * n;
-        for (int i = 0; i < n; i++) v[i] = Arow[i];
+        cons_row(qp, &C[c], v);
         for (int d = 0; d < c; d++) {
             const double *u = orth + (size_t)d * n;
             double dp = 0; for (int i = 0; i < n; i++) dp += u[i]*v[i];
@@ -189,46 +294,92 @@ static void build_orth(const QP *qp, const int *W, int k, double *orth)
     }
 }
 
+/* Add c to the working set if it is rank-independent of the members already in
+ * C[0..k).  Returns 1 on success (C[k] written, orth rebuilt), 0 on a dependent
+ * row (which the active set is allowed to omit: it is implied by the others). */
+static int add_cons(QP_Cons *C, int *k, double *orth, double *tmp,
+                    const QP *qp, QP_Cons c, double tolrank)
+{
+    cons_row(qp, &c, tmp);
+    for (int d = 0; d < *k; d++) {
+        const double *u = orth + (size_t)d * qp->n;
+        double dp = 0; for (int i = 0; i < qp->n; i++) dp += u[i]*tmp[i];
+        for (int i = 0; i < qp->n; i++) tmp[i] -= dp * u[i];
+    }
+    double nrm = 0; for (int i = 0; i < qp->n; i++) nrm += tmp[i]*tmp[i];
+    nrm = sqrt(nrm);
+    if (nrm <= tolrank) return 0;
+    C[*k] = c; (*k)++;
+    build_orth(qp, C, *k, orth);
+    return 1;
+}
+
 /* Active-set core.  Requires xstart feasible.  Writes solution to res->x.
- * The working set W is kept row-independent (rank-managed) so the KKT system
- * is never singular; linearly dependent active constraints are skipped. */
+ * The working set C is kept row-independent (rank-managed) so the KKT system
+ * is never singular; linearly dependent active constraints are skipped.
+ * P1.1: equality rows are inserted first and are never dropped; variable bounds
+ * enter the working set only when they are active, so they cost no rows in m. */
+static int cons_in_set(const QP_Cons *C, int k, QP_Cons c)
+{
+    for (int i = 0; i < k; i++)
+        if (C[i].kind == c.kind && C[i].idx == c.idx) return 1;
+    return 0;
+}
+
 static void active_set(const QP *qp, const double *xstart, QPResult *res)
 {
-    int n = qp->n, m = qp->m;
+    int n = qp->n, m = qp->m, me = qp->me;
+    int maxc = m + me + 2 * n;
     res->n = n;
     res->x = (double*)xmalloc((size_t)n * sizeof(double));
     res->mult = (double*)xmalloc((size_t)m * sizeof(double));
     res->ray = (double*)xmalloc((size_t)n * sizeof(double));
+    if (me > 0) res->mult_eq = (double*)xmalloc((size_t)me * sizeof(double));
+    if (qp->l)  res->mult_l  = (double*)xmalloc((size_t)n * sizeof(double));
+    if (qp->u)  res->mult_u  = (double*)xmalloc((size_t)n * sizeof(double));
     for (int i = 0; i < n; i++) res->ray[i] = 0.0;
     for (int i = 0; i < m; i++) res->mult[i] = 0.0;
+    if (me > 0) for (int i = 0; i < me; i++) res->mult_eq[i] = 0.0;
+    if (qp->l)  for (int i = 0; i < n; i++) res->mult_l[i] = 0.0;
+    if (qp->u)  for (int i = 0; i < n; i++) res->mult_u[i] = 0.0;
     double *x = res->x;
     memcpy(x, xstart, (size_t)n * sizeof(double));
 
-    int *W = (int*)xmalloc((size_t)m * sizeof(int));
+    QP_Cons *C = (QP_Cons*)xmalloc((size_t)maxc * sizeof(QP_Cons));
     double *orth = (double*)xmalloc((size_t)n * n * sizeof(double));
     double *tmp = (double*)xmalloc((size_t)n * sizeof(double));
     double tolrank = 1e-9;  /* TOLSHEET TOL-QP-RANK */
     int k = 0;
-    build_orth(qp, W, 0, orth);
-    for (int i = 0; i < m; i++) {
+    build_orth(qp, C, 0, orth);
+
+    /* Equality rows are permanent: add every rank-independent one up-front. */
+    for (int i = 0; i < me; i++) {
+        QP_Cons c; c.kind = QP_C_EQ; c.idx = i;
+        add_cons(C, &k, orth, tmp, qp, c, tolrank);
+    }
+    int neq0 = k;                       /* C[0..neq0) are never dropped */
+    for (int i = 0; i < m; i++)
         if (row_resid(qp, i, x) > -1e-7) {  /* TOLSHEET TOL-QP-ACTIVE */
-            const double *Arow = qp->A + (size_t)i * n;
-            for (int j = 0; j < n; j++) tmp[j] = Arow[j];
-            for (int d = 0; d < k; d++) {
-                const double *u = orth + (size_t)d * n;
-                double dp = 0; for (int j = 0; j < n; j++) dp += u[j]*tmp[j];
-                for (int j = 0; j < n; j++) tmp[j] -= dp * u[j];
-            }
-            double nrm = 0; for (int j = 0; j < n; j++) nrm += tmp[j]*tmp[j];
-            if (sqrt(nrm) > tolrank) { W[k] = i; k++; build_orth(qp, W, k, orth); }
+            QP_Cons c; c.kind = QP_C_INEQ; c.idx = i;
+            add_cons(C, &k, orth, tmp, qp, c, tolrank);
+        }
+    for (int j = 0; j < n; j++) {
+        QP_Cons c;
+        if (qp->l && qp_bound_is_finite(qp_lb(qp, j))) {
+            c.kind = QP_C_LOWER; c.idx = j;
+            if (cons_resid(qp, &c, x) > -1e-7) add_cons(C, &k, orth, tmp, qp, c, tolrank);
+        }
+        if (qp->u && qp_bound_is_finite(qp_ub(qp, j))) {
+            c.kind = QP_C_UPPER; c.idx = j;
+            if (cons_resid(qp, &c, x) > -1e-7) add_cons(C, &k, orth, tmp, qp, c, tolrank);
         }
     }
 
     double *g = (double*)xmalloc((size_t)n * sizeof(double));
     double *p = (double*)xmalloc((size_t)n * sizeof(double));
-    double *mu = (double*)xmalloc((size_t)m * sizeof(double));
+    double *mu = (double*)xmalloc((size_t)maxc * sizeof(double));
     double *xnew = (double*)xmalloc((size_t)n * sizeof(double));
-    int maxit = 4000 + 100 * (n + m);
+    int maxit = 4000 + 100 * (n + m + me);
     int it = 0;
     int status = -1;   /* default: not solved */
 
@@ -239,8 +390,9 @@ static void active_set(const QP *qp, const double *xstart, QPResult *res)
            do NOT claim optimality. */
         if (psolve_stop()) { status = QP_STOPPED; break; }
         eval_grad(qp, x, g);
-        if (solve_kkt(qp, W, k, g, p, mu) != 0) {
-            if (k > 0) { k--; build_orth(qp, W, k, orth); continue; }
+        if (solve_kkt(qp, C, k, g, p, mu) != 0) {
+            /* Drop a non-equality member rather than the permanent equalities. */
+            if (k > neq0) { k--; build_orth(qp, C, k, orth); continue; }
             status = QP_KKT_FAIL; break;
         }
         double pnorm = 0.0;
@@ -257,23 +409,26 @@ static void active_set(const QP *qp, const double *xstart, QPResult *res)
         }
         if (pnorm < 1e-9 * scale) {  /* TOLSHEET TOL-QP-MU */
             int drop = -1; double minmu = 0.0;
-            for (int c = 0; c < k; c++)
+            for (int c = neq0; c < k; c++)
                 if (mu[c] < minmu - 1e-9 * scale) { minmu = mu[c]; drop = c; }  /* TOLSHEET TOL-QP-MU */
             if (drop < 0) {
                 /* candidate optimum: verify the KKT stationarity residual
                    before certifying success, so a bad KKT solve cannot be
                    reported as optimal. */
+                double *crow = (double*)xmalloc((size_t)n * sizeof(double));
                 double kkt = 0.0, gmax = 0.0, tmax = 0.0;
                 for (int j = 0; j < n; j++) {
                     double rj = g[j];
                     gmax = fmax(gmax, fabs(g[j]));
                     for (int c = 0; c < k; c++) {
-                        double t = qp->A[(size_t)W[c]*n + j] * mu[c];
+                        cons_row(qp, &C[c], crow);
+                        double t = crow[j] * mu[c];
                         rj += t;
                         tmax = fmax(tmax, fabs(t));
                     }
                     kkt = fmax(kkt, fabs(rj));
                 }
+                psolve_free(crow);
                 /* Scale the stationarity tolerance by the size of the terms
                    being cancelled, NOT by the objective value.  The old
                    1e-6*(1+|obj|) grew with a diverging iterate: on an
@@ -285,8 +440,8 @@ static void active_set(const QP *qp, const double *xstart, QPResult *res)
                    to a constraint that is actually active at x. */
                 int comp_ok = 1;
                 for (int c = 0; c < k; c++) {
-                    double rr = row_resid(qp, W[c], x);
-                    if (fabs(rr) > 1e-7 * (1.0 + fabs(qp->b[W[c]]))) { comp_ok = 0; break; }  /* TOLSHEET TOL-QP-COMP */
+                    double rr = cons_resid(qp, &C[c], x);
+                    if (fabs(rr) > 1e-7 * cons_scale(qp, &C[c], x)) { comp_ok = 0; break; }  /* TOLSHEET TOL-QP-COMP */
                 }
                 if (!comp_ok) { status = QP_KKT_FAIL; break; }
                 /* Stationarity alone is not a solution: the point must also be
@@ -300,12 +455,25 @@ static void active_set(const QP *qp, const double *xstart, QPResult *res)
                     double rr = row_resid(qp, i, x);
                     if (rr > 1e-7 * (1.0 + fabs(qp->b[i]))) { infeas = 1; break; }  /* TOLSHEET TOL-QP-PRIMAL */
                 }
+                for (int i = 0; i < me && !infeas; i++)
+                    if (fabs(eq_resid(qp, i, x)) > 1e-7 * eq_scale(qp, i, x)) infeas = 1;
+                for (int j = 0; j < n && !infeas; j++) {
+                    if (qp->l && qp_bound_is_finite(qp_lb(qp, j)) &&
+                        x[j] < qp_lb(qp, j) - 1e-7 * (1.0 + fabs(qp_lb(qp, j)) + fabs(x[j]))) infeas = 1;
+                    if (qp->u && qp_bound_is_finite(qp_ub(qp, j)) &&
+                        x[j] > qp_ub(qp, j) + 1e-7 * (1.0 + fabs(qp_ub(qp, j)) + fabs(x[j]))) infeas = 1;
+                }
                 if (infeas) { status = QP_KKT_FAIL; break; }
-                for (int c = 0; c < k; c++) res->mult[W[c]] = mu[c];
+                for (int c = 0; c < k; c++) {
+                    if (C[c].kind == QP_C_INEQ) res->mult[C[c].idx] = mu[c];
+                    else if (C[c].kind == QP_C_EQ) res->mult_eq[C[c].idx] = mu[c];
+                    else if (C[c].kind == QP_C_LOWER) res->mult_l[C[c].idx] = mu[c];
+                    else if (C[c].kind == QP_C_UPPER) res->mult_u[C[c].idx] = mu[c];
+                }
                 status = 0; break;
             }
-            W[drop] = W[k-1]; k--;
-            build_orth(qp, W, k, orth);
+            C[drop] = C[k-1]; k--;
+            build_orth(qp, C, k, orth);
             continue;
         }
         /* Unboundedness certificate.  For a convex QP the objective is
@@ -335,18 +503,19 @@ static void active_set(const QP *qp, const double *xstart, QPResult *res)
                     int ray = 1;
                     for (int i = 0; i < m && ray; i++) {
                         const double *Ai = qp->A + (size_t)i * n;
-                        double ap = 0.0, anorm = 0.0;
-                        for (int j = 0; j < n; j++) {
-                            ap += Ai[j] * p[j];
-                            anorm = fmax(anorm, fabs(Ai[j]));
-                        }
-                        /* No tolerance here on purpose: a row with even a
-                           rounding-level positive slope does eventually block
-                           the ray, so claiming UNBOUNDED would be a wrong
-                           answer.  Failing the test just falls back to the
-                           iteration limit, which is never wrong. */
-                        (void)anorm;
+                        double ap = 0.0;
+                        for (int j = 0; j < n; j++) ap += Ai[j] * p[j];
                         if (ap > 0.0) ray = 0;
+                    }
+                    for (int i = 0; i < me && ray; i++) {
+                        double ap = 0.0;
+                        const double *Ai = qp->Aeq + (size_t)i * n;
+                        for (int j = 0; j < n; j++) ap += Ai[j] * p[j];
+                        if (fabs(ap) > 1e-9 * (1.0 + pinf)) ray = 0;
+                    }
+                    for (int j = 0; j < n && ray; j++) {
+                        if (qp->l && qp_bound_is_finite(qp_lb(qp, j)) && p[j] < 0.0) ray = 0;
+                        if (qp->u && qp_bound_is_finite(qp_ub(qp, j)) && p[j] > 0.0) ray = 0;
                     }
                     if (ray) {
                         status = 1;
@@ -359,11 +528,11 @@ static void active_set(const QP *qp, const double *xstart, QPResult *res)
             }
         }
 
-        double alpha = 1.0; int block = -1;
+        double alpha = 1.0; QP_Cons block; block.kind = QP_C_INEQ; block.idx = -1;
+        int has_block = 0;
         for (int i = 0; i < m; i++) {
-            int inW = 0;
-            for (int c = 0; c < k; c++) if (W[c] == i) { inW = 1; break; }
-            if (inW) continue;
+            QP_Cons c; c.kind = QP_C_INEQ; c.idx = i;
+            if (cons_in_set(C, k, c)) continue;
             const double *Ai = qp->A + (size_t)i * n;
             double ap = 0.0;
             for (int j = 0; j < n; j++) ap += Ai[j] * p[j];
@@ -376,28 +545,35 @@ static void active_set(const QP *qp, const double *xstart, QPResult *res)
                    standard degenerate-step handling: the constraint enters the
                    working set and the next KKT solve moves along it. */
                 if (r < 0.0) r = 0.0;
-                if (r < alpha - 1e-10) { alpha = r; block = i; }  /* TOLSHEET TOL-QP-STEP */
+                if (r < alpha - 1e-10) { alpha = r; block = c; has_block = 1; }  /* TOLSHEET TOL-QP-STEP */
+            }
+        }
+        for (int j = 0; j < n; j++) {
+            if (qp->l && qp_bound_is_finite(qp_lb(qp, j)) && p[j] < -1e-12) {
+                QP_Cons c; c.kind = QP_C_LOWER; c.idx = j;
+                if (cons_in_set(C, k, c)) continue;
+                double r = (qp_lb(qp, j) - x[j]) / p[j];
+                if (r < 0.0) r = 0.0;
+                if (r < alpha - 1e-10) { alpha = r; block = c; has_block = 1; }
+            }
+            if (qp->u && qp_bound_is_finite(qp_ub(qp, j)) && p[j] > 1e-12) {
+                QP_Cons c; c.kind = QP_C_UPPER; c.idx = j;
+                if (cons_in_set(C, k, c)) continue;
+                double r = (qp_ub(qp, j) - x[j]) / p[j];
+                if (r < 0.0) r = 0.0;
+                if (r < alpha - 1e-10) { alpha = r; block = c; has_block = 1; }
             }
         }
         for (int i = 0; i < n; i++) xnew[i] = x[i] + alpha * p[i];
         memcpy(x, xnew, (size_t)n * sizeof(double));
-        if (alpha < 1.0 - 1e-10 && block >= 0) {  /* TOLSHEET TOL-QP-STEP */
-            const double *Arow = qp->A + (size_t)block * n;
-            for (int j = 0; j < n; j++) tmp[j] = Arow[j];
-            for (int d = 0; d < k; d++) {
-                const double *u = orth + (size_t)d * n;
-                double dp = 0; for (int j = 0; j < n; j++) dp += u[j]*tmp[j];
-                for (int j = 0; j < n; j++) tmp[j] -= dp * u[j];
-            }
-            double nrm = 0; for (int j = 0; j < n; j++) nrm += tmp[j]*tmp[j];
-            if (sqrt(nrm) > tolrank) { W[k] = block; k++; build_orth(qp, W, k, orth); }
-        }
+        if (alpha < 1.0 - 1e-10 && has_block)
+            add_cons(C, &k, orth, tmp, qp, block, tolrank);
     }
     if (status == -1) status = QP_ITERATION_LIMIT;   /* loop exhausted without KKT cert */
     res->iterations = it;
     res->obj = eval_obj(qp, x);
     res->status = status;
-    psolve_free(W); psolve_free(orth); psolve_free(tmp); psolve_free(g); psolve_free(p); psolve_free(mu); psolve_free(xnew);
+    psolve_free(C); psolve_free(orth); psolve_free(tmp); psolve_free(g); psolve_free(p); psolve_free(mu); psolve_free(xnew);
 }
 
 /* Verify a candidate Farkas certificate of infeasibility for Ax <= b:
@@ -735,10 +911,11 @@ static int dense_phase1(const QP *qp, const double *base, double *x)
         A1[(m+i)*N + (n+i)] = -1.0;
         b1[m+i] = 0.0;
     }
-    QP q1; q1.n = N; q1.m = m1; q1.Q = Q1; q1.c = c1; q1.A = A1; q1.b = b1;
     memcpy(x, base, (size_t)n * sizeof(double));   /* search from the given point */
     double *z0 = (double*)psolve_calloc((size_t)N, sizeof(double));
     for (int i = 0; i < m; i++) z0[n+i] = (qp->b[i] < 0) ? -qp->b[i] : 0.0;
+    QP q1; memset(&q1, 0, sizeof(q1));
+    q1.n = N; q1.m = m1; q1.Q = Q1; q1.c = c1; q1.A = A1; q1.b = b1;
     q1.x0 = z0;
     QPResult r1; memset(&r1, 0, sizeof(r1));
     active_set(&q1, z0, &r1);
@@ -864,10 +1041,13 @@ void qp_solve(const QP *qp, QPResult *res)
     memset(res, 0, sizeof(*res));
     res->status = QP_INVALID;
     if (!qp || qp->n <= 0 || qp->m < 0 || qp->n > 8192 || qp->m > 1000000 ||
-        !qp->Q || !qp->c || (qp->m > 0 && (!qp->A || !qp->b))) return;
+        qp->me < 0 || qp->me > 1000000 ||
+        !qp->Q || !qp->c || (qp->m > 0 && (!qp->A || !qp->b)) ||
+        (qp->me > 0 && (!qp->Aeq || !qp->beq))) return;
     int n = qp->n;
     if ((size_t)n > (size_t)-1 / (size_t)n ||
-        (qp->m > 0 && (size_t)n > (size_t)-1 / (size_t)qp->m)) return;
+        (qp->m > 0 && (size_t)n > (size_t)-1 / (size_t)qp->m) ||
+        (qp->me > 0 && (size_t)n > (size_t)-1 / (size_t)qp->me)) return;
     for (int j = 0; j < n; j++)
         if (!isfinite(qp->c[j]) || (qp->x0 && !isfinite(qp->x0[j]))) return;
     for (size_t k = 0; k < (size_t)n * n; k++) if (!isfinite(qp->Q[k])) return;
@@ -875,6 +1055,16 @@ void qp_solve(const QP *qp, QPResult *res)
         if (!isfinite(qp->b[i])) return;
         for (int j = 0; j < n; j++) if (!isfinite(qp->A[(size_t)i*n+j])) return;
     }
+    for (int i = 0; i < qp->me; i++) {
+        if (!isfinite(qp->beq[i])) return;
+        for (int j = 0; j < n; j++) if (!isfinite(qp->Aeq[(size_t)i*n+j])) return;
+    }
+    if (qp->l)
+        for (int j = 0; j < n; j++)
+            if (!isfinite(qp->l[j]) && qp->l[j] != -INFINITY && qp->l[j] != INFINITY) return;
+    if (qp->u)
+        for (int j = 0; j < n; j++)
+            if (!isfinite(qp->u[j]) && qp->u[j] != -INFINITY && qp->u[j] != INFINITY) return;
     res->status = -1;
     /* Convexity gate.  Symmetry first (the factorization assumes it), then a
        FULL symmetric ~Cholesky scan: the old 1x1/2x2 principal-minor screen
@@ -982,39 +1172,191 @@ void qp_solve(const QP *qp, QPResult *res)
             return;
         }
     }
-    double *x = (double*)xmalloc((size_t)qp->n * sizeof(double));
-    memset(x, 0, (size_t)qp->n * sizeof(double));
-    int fr = find_feasible(qp, qp->x0, x, res);
-    if (fr == 0) {                             /* status stays -1: no feasible start */
-        psolve_free(x);
-        return;                                /* res->infeasible_proven says whether
+    /* Phase-I search and the main active set.  With native equalities or
+     * variable bounds (P1.1) the feasibility search runs on an expanded row
+     * system (equalities as two inequalities, bounds as one row each) that
+     * describes the SAME feasible set; the main active set then enforces the
+     * equalities permanently and bounds at zero row cost.  The expanded Farkas
+     * certificate is discarded (it is over the expansion, whose rows are a
+     * different object than the caller's rows), so an equalities/bounds model
+     * never reports a proof that the certificate layer could not re-verify. */
+    int has_bounds = 0;
+    if (qp->l || qp->u) {
+        for (int j = 0; j < n; j++) {
+            if (qp->l && qp_bound_is_finite(qp_lb(qp, j))) { has_bounds = 1; break; }
+            if (qp->u && qp_bound_is_finite(qp_ub(qp, j))) { has_bounds = 1; break; }
+        }
+    }
+    double *x = (double*)xmalloc((size_t)n * sizeof(double));
+    memset(x, 0, (size_t)n * sizeof(double));
+    int fr;
+    if (qp->me > 0 || has_bounds) {
+        int maxr = qp->m + 2 * qp->me + 2 * n;
+        double *Af = (double*)psolve_calloc((size_t)maxr * n, sizeof(double));
+        double *bf = (double*)psolve_calloc((size_t)maxr, sizeof(double));
+        int r = 0;
+        for (int i = 0; i < qp->m; i++) {
+            for (int j = 0; j < n; j++) Af[(size_t)r*n + j] = qp->A[(size_t)i*n + j];
+            bf[r++] = qp->b[i];
+        }
+        for (int i = 0; i < qp->me; i++) {
+            for (int j = 0; j < n; j++) {
+                double a = qp->Aeq[(size_t)i*n + j];
+                Af[(size_t)r*n + j] = a; Af[(size_t)(r+1)*n + j] = -a;
+            }
+            bf[r++] = qp->beq[i];
+            bf[r++] = -qp->beq[i];
+        }
+        for (int j = 0; j < n; j++) {
+            if (qp->l && qp_bound_is_finite(qp_lb(qp, j))) {
+                Af[(size_t)r*n + j] = -1.0; bf[r++] = -qp_lb(qp, j);
+            }
+            if (qp->u && qp_bound_is_finite(qp_ub(qp, j))) {
+                Af[(size_t)r*n + j] = 1.0; bf[r++] = qp_ub(qp, j);
+            }
+        }
+        QP fp; memset(&fp, 0, sizeof(fp));
+        fp.n = n; fp.m = r; fp.Q = qp->Q; fp.c = qp->c;
+        fp.A = Af; fp.b = bf; fp.x0 = qp->x0; fp.phase1_order = qp->phase1_order;
+        QPResult rf; memset(&rf, 0, sizeof(rf));
+        fr = find_feasible(&fp, qp->x0, x, &rf);
+        if (fr == 0) {
+            res->status = -1;
+            res->infeasible_proven = rf.infeasible_proven;
+            qp_result_free(&rf);
+            psolve_free(Af); psolve_free(bf); psolve_free(x);
+            return;
+        }
+        if (fr == 2) {
+            res->status = QP_STOPPED;
+            res->n = n; res->x = NULL; res->obj = 0.0; res->iterations = 0;
+            qp_result_free(&rf);
+            psolve_free(Af); psolve_free(bf); psolve_free(x);
+            return;
+        }
+        qp_result_free(&rf);
+        psolve_free(Af); psolve_free(bf);
+        active_set(qp, x, res);
+    } else {
+        fr = find_feasible(qp, qp->x0, x, res);
+        if (fr == 0) {                         /* status stays -1: no feasible start */
+            psolve_free(x);
+            return;                            /* res->infeasible_proven says whether
                                                   that is a proof or a give-up */
+        }
+        if (fr == 2) {
+            /* Cooperatively stopped while searching for a feasible point, so there
+               is no feasible incumbent to hand back.  Report QP_STOPPED with an
+               empty solution rather than a possibly-infeasible iterate. */
+            res->status = QP_STOPPED;
+            res->n = n; res->x = NULL; res->obj = 0.0; res->iterations = 0;
+            psolve_free(x);
+            return;
+        }
+        active_set(qp, x, res);
     }
-    if (fr == 2) {
-        /* Cooperatively stopped while searching for a feasible point, so there
-           is no feasible incumbent to hand back.  Report QP_STOPPED with an
-           empty solution rather than a possibly-infeasible iterate. */
-        res->status = QP_STOPPED;
-        res->n = qp->n;
-        res->x = NULL;
-        res->obj = 0.0;
-        res->iterations = 0;
-        psolve_free(x);
-        return;
-    }
-    active_set(qp, x, res);
     psolve_free(x);
     if (res->x) {                              /* report how feasible the answer is,
                                                   in the caller's own units */
         double mr = 0.0;
         for (int i = 0; i < qp->m; i++) mr = fmax(mr, row_resid(qp, i, res->x));
+        for (int i = 0; i < qp->me; i++) mr = fmax(mr, fabs(eq_resid(qp, i, res->x)));
+        for (int j = 0; j < n; j++) {
+            if (qp->l && qp_bound_is_finite(qp_lb(qp, j)))
+                mr = fmax(mr, qp_lb(qp, j) - res->x[j]);
+            if (qp->u && qp_bound_is_finite(qp_ub(qp, j)))
+                mr = fmax(mr, res->x[j] - qp_ub(qp, j));
+        }
         res->max_resid = mr > 0.0 ? mr : 0.0;
     }
+}
+
+void qp_solve_sparse(const QPSparse *s, QPResult *res)
+{
+    if (!res) return;
+    memset(res, 0, sizeof(*res));
+    res->status = QP_INVALID;
+    if (!s || s->n <= 0 || s->m < 0 || s->n > 8192 || s->m > 1000000 ||
+        s->me < 0 || s->me > 1000000 || !s->c ||
+        (s->m > 0 && (!s->Acolptr || !s->Arow || !s->Aval || !s->b)) ||
+        (s->me > 0 && (!s->Aeq || !s->beq)) ||
+        (s->nq < 0) ||
+        (s->nq > 0 && (!s->q_w || !s->q_rk_colptr || !s->q_rk_rowi || !s->q_rk_val))) {
+        return;
+    }
+    int n = s->n, m = s->m, me = s->me;
+    if ((size_t)n > (size_t)-1 / (size_t)n) return;
+    if (m > 0 && (size_t)m > (size_t)-1 / (size_t)n) return;
+    if (me > 0 && (size_t)me > (size_t)-1 / (size_t)n) return;
+    if (s->m > 0) {
+        for (int j = 0; j < n; j++) {
+            if (s->Acolptr[j] < 0 || s->Acolptr[j+1] < s->Acolptr[j]) return;
+        }
+    }
+    long long rk_total = -1;
+    if (s->nq > 0) {
+        for (int k = 0; k < s->nq; k++) {
+            long long lo = s->q_rk_colptr[k], hi = s->q_rk_colptr[k+1];
+            if (lo < 0 || hi < lo || (size_t)hi > (size_t)-1 / sizeof(double)) return;
+        }
+        rk_total = s->q_rk_colptr[s->nq];
+        if (rk_total < 0) return;
+        (void)rk_total;
+    }
+    size_t qn = (size_t)n * n;
+    double *Q = (double*)psolve_calloc(qn, sizeof(double));
+    double *A = m > 0 ? (double*)psolve_calloc((size_t)m * n, sizeof(double)) : NULL;
+    double *Aeq = me > 0 ? (double*)psolve_calloc((size_t)me * n, sizeof(double)) : NULL;
+    if (!Q || (m > 0 && !A) || (me > 0 && !Aeq)) {
+        psolve_free(Q); psolve_free(A); psolve_free(Aeq);
+        return;
+    }
+    if (s->q_diag)
+        for (int j = 0; j < n; j++) Q[(size_t)j*n + j] = s->q_diag[j];
+    for (int k = 0; k < s->nq; k++) {
+        int lo = s->q_rk_colptr[k];
+        int hi = s->q_rk_colptr[k+1];
+        double w = s->q_w[k];
+        for (int a = lo; a < hi; a++) {
+            int i = s->q_rk_rowi[a];
+            double vi = s->q_rk_val[a];
+            if (i < 0 || i >= n) { psolve_free(Q); psolve_free(A); psolve_free(Aeq); return; }
+            for (int b = a; b < hi; b++) {          /* each unordered pair once */
+                int j = s->q_rk_rowi[b];
+                double vj = s->q_rk_val[b];
+                if (j < 0 || j >= n) { psolve_free(Q); psolve_free(A); psolve_free(Aeq); return; }
+                if (i == j) Q[(size_t)i*n + i] += w * vi * vj;
+                else {
+                    Q[(size_t)i*n + j] += w * vi * vj;
+                    Q[(size_t)j*n + i] += w * vi * vj;
+                }
+            }
+        }
+    }
+    if (m > 0)
+        for (int j = 0; j < n; j++)
+            for (int p = s->Acolptr[j]; p < s->Acolptr[j+1]; p++) {
+                int i = s->Arow[p];
+                if (i < 0 || i >= m) { psolve_free(Q); psolve_free(A); psolve_free(Aeq); return; }
+                A[(size_t)i*n + j] = s->Aval[p];
+            }
+    if (me > 0)
+        for (int i = 0; i < me; i++)
+            for (int j = 0; j < n; j++) Aeq[(size_t)i*n + j] = s->Aeq[(size_t)i*n + j];
+
+    QP qp; memset(&qp, 0, sizeof(qp));
+    qp.n = n; qp.m = m; qp.me = me; qp.Q = Q; qp.c = s->c;
+    qp.A = A; qp.b = s->b; qp.Aeq = Aeq; qp.beq = s->beq;
+    qp.l = s->l; qp.u = s->u; qp.x0 = s->x0;
+    qp.phase1_order = (s->phase1_order == QP_PHASE1_LP_FIRST) ? QP_PHASE1_LP_FIRST : QP_PHASE1_DENSE_FIRST;
+    qp_solve(&qp, res);
+    psolve_free(Q); psolve_free(A); psolve_free(Aeq);
 }
 
 void qp_result_free(QPResult *res)
 {
     if (!res) return;
     psolve_free(res->x); psolve_free(res->mult); psolve_free(res->ray); psolve_free(res->farkas);
+    psolve_free(res->mult_eq); psolve_free(res->mult_l); psolve_free(res->mult_u);
     memset(res, 0, sizeof(*res));
 }

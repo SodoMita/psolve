@@ -40,6 +40,13 @@ fi
 echo "[5/7] QP solver vs scipy (analytic + randomized)..."
 gcc -O2 -march=native -I src tools/qp_test.c src/qp.c src/err.c src/lu.c src/splu.c src/solver.c src/kernels.c -o /tmp/qp_test -lm
 /tmp/qp_test
+# P1.1: native equalities + variable bounds must agree with the same model as
+# equality/inequality rows, and the native working set must actually enforce them.
+gcc -O2 -march=native -I src tools/qp_eq_bound_test.c src/qp.c src/err.c src/lu.c src/splu.c src/solver.c src/kernels.c -o /tmp/qp_eq_bound_test -lm
+/tmp/qp_eq_bound_test
+# P1.2: sparse CSC A + diagonal/rank-1 Q must match the dense QP judgement.
+gcc -O2 -march=native -I src tools/qp_sparse_test.c src/qp.c src/err.c src/lu.c src/splu.c src/solver.c src/kernels.c -o /tmp/qp_sparse_test -lm
+/tmp/qp_sparse_test
 gcc -O2 -march=native -I src tools/qpsolve.c src/qp.c src/err.c src/lu.c src/kernels.c src/splu.c src/solver.c src/cert.c -o /tmp/qpsolve -lm
 ok=0; fail=0
 for s in $(seq 1 40); do
@@ -79,6 +86,7 @@ echo "[5.1/7] QP Phase-I on the degenerate UI-layout class + the host-facing bri
 gcc -O2 -march=native -I src -I tools tools/ui_qp_probe.c src/qp.c src/err.c src/lu.c src/splu.c src/solver.c src/kernels.c -o /tmp/ui_qp_probe -lm
 /tmp/ui_qp_probe --strict --only 1 --nmax 24
 /tmp/ui_qp_probe --strict --only 5
+/tmp/ui_qp_probe --strict --only 6 --nmax 12
 # The bridge is where a consumer re-derives psolve's semantics, so its contract is
 # tested here rather than assumed: warm start accepted and scale-free, -1 kept apart
 # from a proof, per-call budget returning an incumbent, arena path, status names.

@@ -5,6 +5,8 @@
  *
  *   minimize    1/2 x^T Q x + c^T x
  *   subject to        A x  <=  b
+ *                     Aeq x == beq   (optional; P1.1)
+ *                     l <= x <= u    (optional; P1.1)
  *
  * Q must be symmetric positive semi-definite (convex).  The active-set method
  * is the natural quadratic generalization of the simplex method: it maintains
@@ -58,6 +60,14 @@ typedef struct {
     const double *A;    /* m*n, row-major: A[i*n+j] */
     const double *b;    /* m */
     const double *x0;   /* optional feasible start (NULL => use x=0) */
+    int me;             /* number of equality constraints Aeq x = beq */
+    const double *Aeq;  /* me*n, row-major: Aeq[i*n+j] (NULL if me == 0) */
+    const double *beq;  /* me */
+    const double *l;    /* n lower bounds, or NULL (entries kept for the
+                         * callers that allocate l but want a partial bound:
+                         * a value <= -LP_INF/2 is treated as no lower bound) */
+    const double *u;    /* n upper bounds, or NULL (a value >= LP_INF/2 is
+                         * treated as no upper bound) */
     int phase1_order;     /* which Phase-I search runs first: 0 or
                            * QP_PHASE1_DENSE_FIRST (the default) tries the dense
                            * auxiliary QP, QP_PHASE1_LP_FIRST tries the sparse LP
@@ -80,6 +90,40 @@ typedef struct {
                            * default unless the caller re-checks verdicts. */
 } QP;
 
+/* P1.2 sparse input: the shape a constraint-layout front end actually has.
+ *   minimize  1/2 x'(D + sum_k w_k v_k v_k') x + c'x
+ *   subject to A x <= b   (A in CSC, m x n)
+ *             Aeq x = beq (dense, optional)
+ *             l <= x <= u
+ *  D is the dense/ridge diagonal, and each rank-1 term is a sparse vector v_k
+ *  (q_rk_colptr[k]..q_rk_colptr[k+1] into q_rk_rowi/q_rk_val).  q_solve_sparse
+ *  materialises the dense Q/A that the active set consumes, so the bridge never
+ *  asks a host to marshal n^2 doubles per frame.  Everything except A/b may be
+ *  NULL (nq = 0 means no rank-1 terms; q_diag NULL means zero diagonal). */
+typedef struct {
+    int n;                 /* number of variables */
+    int m;                 /* number of inequalities (0 allowed) */
+    const double *c;       /* n */
+    const double *b;       /* m (A x <= b) */
+    const double *x0;      /* optional feasible start */
+    int phase1_order;
+    int me;                /* number of equalities */
+    const double *Aeq;     /* me*n row-major (NULL if me == 0) */
+    const double *beq;     /* me */
+    const double *l, *u;   /* bounds, same semantics as QP */
+    /* A in CSC, column-major over columns j = 0..n-1 (rows are the constraints). */
+    const int *Acolptr;    /* n+1 */
+    const int *Arow;       /* nnz */
+    const double *Aval;    /* nnz */
+    /* Q = q_diag + sum_k q_w[k] * v_k v_k^T */
+    const double *q_diag;  /* n, or NULL */
+    int nq;                /* number of rank-1 terms */
+    const double *q_w;     /* nq, or NULL when nq == 0 */
+    const int *q_rk_colptr;/* nq+1, or NULL when nq == 0 */
+    const int *q_rk_rowi;  /* total nnz of the rank-1 vectors, or NULL */
+    const double *q_rk_val;/* total nnz of the rank-1 vectors, or NULL */
+} QPSparse;
+
 #define QP_ITERATION_LIMIT 2  /* active-set iteration cap reached (no cert) */
 #define QP_KKT_FAIL        3  /* KKT solve / stationarity residual not verified */
 #define QP_NON_CONVEX      4  /* Q is not positive semi-definite / symmetric */
@@ -97,6 +141,11 @@ typedef struct {
     double *x;          /* solution (n); NULL if a stop during Phase-I left no
                            feasible point to hand back */
     double *mult;       /* Lagrange multipliers for A x <= b (m) */
+    double *mult_eq;    /* Lagrange multipliers for Aeq x = beq (me), NULL when
+                           the model has no native equalities */
+    double *mult_l;     /* lower-bound multipliers (n; 0 when a variable is
+                           not at its lower bound), NULL when qp->l == NULL */
+    double *mult_u;     /* upper-bound multipliers (n), NULL when qp->u == NULL */
     double *ray;        /* certified recession direction (n), only filled
                            when status == 1 (unbounded); NULL otherwise.
                            Verifiable against the original data: A d <= 0,
@@ -135,6 +184,9 @@ int qp_start_feasible(const QP *qp, const double *x);
 
 /* Solve the QP.  Fill *res (call qp_result_free when done). */
 void qp_solve(const QP *qp, QPResult *res);
+/* Solve the QP from the sparse P1.2 form.  Same result contract as qp_solve;
+ * the dense Q/A buffers are internal and released before returning. */
+void qp_solve_sparse(const QPSparse *s, QPResult *res);
 /* Release res->x, res->mult and res->farkas, then ZERO the struct (so a reused
  * QPResult cannot double-free).  Read status/obj/max_resid/farkas *before*
  * calling this -- afterwards res->status is 0, which reads as OPTIMAL. */

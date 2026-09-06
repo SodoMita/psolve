@@ -8,8 +8,9 @@
  * the executable statement of what each call owes the caller.
  *
  * Conventions
- *   - QP:   minimize 1/2 x'Qx + c'x  s.t.  A x <= b
- *           Q column-major n*n, A row-major m*n, b length m.
+ *   - QP:   minimize 1/2 x'Qx + c'x  s.t.  A x <= b, Aeq x = beq, l <= x <= u
+ *           Q column-major n*n, A row-major m*n, b length m.  The sparse
+ *           entry point takes A as CSC and Q as diagonal + sparse rank-1.
  *   - LP:   optimize c'x  s.t.  A x rel b, l <= x <= u (CSC, rel in "<=>").
  *   - QP statuses (src/qp.h):  0 OPTIMAL, 1 unbounded, 2 iteration limit,
  *           3 KKT not verified, 4 non-convex, 5 invalid model, 6 stopped by
@@ -74,6 +75,22 @@ int psw_qp_solve2(int n, int m, double *Q, double *c, double *A, double *b,
                   const double *x0, double budget_ms,
                   double *x_out, double *obj_out, int *iters_out,
                   double *max_resid_out);
+
+/* P1.2 sparse entry point.  Same contract as psw_qp_solve2, but:
+ *   - A is CSC (m rows x n cols): colptr[n+1], row[nnz], val[nnz];
+ *   - Q is q_diag[n] + sum_k q_w[k] v_k v_k^T, each v_k sparse via
+ *     q_rk_colptr[nq+1], q_rk_rowi/q_rk_val;
+ *   - native equalities/bounds are accepted.  nq==0 (with q_w/q_rk_* NULL) is a
+ *     diagonal Q.  QPSparse is the C-side mirror of this signature. */
+int psw_qp_solve_sparse(int n, int m,
+                        double *q_diag, int nq, double *q_w,
+                        int *q_rk_colptr, int *q_rk_rowi, double *q_rk_val,
+                        double *c, int *colptr, int *row, double *val, double *b,
+                        int me, double *Aeq, double *beq,
+                        double *l, double *u,
+                        const double *x0, double budget_ms,
+                        double *x_out, double *obj_out, int *iters_out,
+                        double *max_resid_out);
 
 /* 1 when the last psw_qp_solve* PROVED the row system empty. */
 int psw_qp_proven(void);

@@ -277,6 +277,41 @@ int main(void)
     }
 
 
+    /* [10] P1.2 sparse bridge: CSC A + diagonal/rank-1 Q, with each frame
+     * marshalling O(n + nnz) doubles instead of n*n + m*n. */
+    {
+        int sn = 2, sm = 4, snq = 0;
+        double sqd[2] = {2, 2};
+        double sc[2] = {-2, -3};
+        int scol[3] = {0, 2, 4};
+        int srow[4] = {0, 1, 2, 3};
+        double sval[4] = {1, -1, 1, -1};
+        double sb[4] = {1, 0, 1, 0};
+        double sx[2], sobj = 0; int sit = 0; double sres = -1;
+        st = psw_qp_solve_sparse(sn, sm, sqd, snq, NULL, NULL, NULL, NULL,
+                                 sc, scol, srow, sval, sb,
+                                 0, NULL, NULL, NULL, NULL, NULL, -1.0,
+                                 sx, &sobj, &sit, &sres);
+        CHECK(st == 0, "[10] sparse bridge returned %s", psw_qp_status_name(st));
+        CHECK(fabs(sx[0]-1.0) < 1e-7 && fabs(sx[1]-1.0) < 1e-7,
+              "[10] sparse point (%g,%g), expected (1,1)", sx[0], sx[1]);
+        CHECK(fabs(sobj + 3.0) < 1e-6, "[10] sparse objective %g, expected -3", sobj);
+        CHECK(sres <= 1e-9, "[10] sparse residual %g expected ~0", sres);
+
+        /* diagonal + one sparse rank-1 update: Q = diag(1,1) + vv', v=(1,1). */
+        int rq = 1, rcol[2] = {0, 2}, rrow[2] = {0, 1};
+        double rval[2] = {1, 1}, rw[1] = {1}, rd[2] = {1, 1};
+        double rc[2] = {0, 0};
+        st = psw_qp_solve_sparse(sn, sm, rd, rq, rw, rcol, rrow, rval,
+                                 rc, scol, srow, sval, sb,
+                                 0, NULL, NULL, NULL, NULL, NULL, -1.0,
+                                 sx, &sobj, &sit, &sres);
+        CHECK(st == 0, "[10] rank-1 sparse bridge returned %s", psw_qp_status_name(st));
+        CHECK(fabs(sx[0]) < 1e-7 && fabs(sx[1]) < 1e-7 && fabs(sobj) < 1e-6,
+              "[10] rank-1 sparse answer (%g,%g) obj=%g, expected (0,0), 0",
+              sx[0], sx[1], sobj);
+    }
+
     printf("%s: %d checks, %d failures\n", fails ? "FAILED" : "psw_test", checks, fails);
     return fails ? 1 : 0;
 }

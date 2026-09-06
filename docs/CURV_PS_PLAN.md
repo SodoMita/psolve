@@ -1,12 +1,14 @@
 # Improving psolve for `curv-ps` (browser Curv + `solve { }` layout blocks)
 
-Status: analysis + prioritised change list. Produced by reading
+Status: analysis + prioritised change list, with the P0 and the P1.1/P1.2
+parts of P1 implemented on this branch. Produced by reading
 [`SodoMita/curv-ps`](https://github.com/SodoMita/curv-ps) at `7a02593` (dev
 round 11) together with its vendored wasm bridge, and by measuring psolve's own
 QP core on that workload (`make ui-probe`, `tools/ui_qp_probe.c`).
 
-Nothing in `src/` is changed by this document. The probe tool is added so the
-findings are reproducible and so a fix has an acceptance test.
+Nothing in `src/` is changed *by this document alone*; the executable changes
+land with the PR that implements the marked `DONE` items. The probe tool is
+added so the findings are reproducible and so each fix has an acceptance test.
 
 ---
 
@@ -543,7 +545,7 @@ sweep reports `STATUS 1` on 110 of its 400 models (`qp_diff.py`'s own histogram 
 
 ## 3. P1 — make the model shape the right one
 
-### P1.1 Equalities and variable bounds in the QP (then delete their presolve)
+### P1.1 Equalities and variable bounds in the QP (then delete their presolve)  — DONE
 
 `QP` is `min ½xᵀQx + cᵀx  s.t. Ax ≤ b` — no equalities, no bounds. Consequences
 measured in their code:
@@ -559,16 +561,25 @@ measured in their code:
 * every `x ≥ 0` / `w ≤ maxw` box becomes a dense row of `A`, inflating `m` and
   the `(n+k)³` factorisation.
 
-**Change:** add `QP.Aeq, beq, l, u` (or a `QPEx` + `qp_solve_ex`, keeping the
-v1 struct for the physics/CLI callers). Equalities enter the working set
-permanently and are never dropped; bounds are handled in the ratio test like a
-bound-constrained simplex, so they cost **no rows at all**. This removes the
-duplicated `≤`/`≥` pairs that are the degeneracy source curv-ps keeps running
-into, and shrinks `m` by 2–3× for typical layout models. Cross-check: the same
-model solved as {eq-as-pairs} vs {native eq} must agree in verdict and
-objective — that becomes a new probe encoding (`ENC_NATIVE_EQ`).
+**Implemented.** `QP` now carries optional `me`/`Aeq`/`beq` (dense row-major)
+and `l`/`u`. `QPResult` returns the corresponding multipliers
+(`mult_eq`, `mult_l`, `mult_u`). Equalities are inserted first into the active
+working set and are never dropped; the ratio test handles active lower/upper
+bounds as zero-row working-set members, so a box costs no rows in `m`. The
+feasibility Phase-I still runs on an expanded row system (equalities as two
+inequalities, bounds as one row each), which is kept as an internal detail; the
+expanded Farkas vector is deliberately not exposed, so a proof over the
+expansion cannot be re-verified as a proof over the caller's rows. Cross-check:
+`tools/ui_qp_probe` section [6] (`--only 6`) and `tools/qp_eq_bound_test`
+compare native eq/bounds against the pair/bound-row encoding of the same
+layout model and require equal verdicts and objectives.
 
-### P1.2 Sparse QP input; stop shipping `n²` doubles per frame
+What is still open: the front end's own `constraints.ts:eliminate` and
+error-row lowering have not been deleted *here*; that is a curv-ps-side follow-up
+that can now move the hard equalities into `psw_qp_solve_sparse`'s `Aeq`/`beq`
+and the `minw`/`maxw` boxes into `l`/`u`.
+
+### P1.2 Sparse QP input; stop shipping `n²` doubles per frame  — DONE (input path)
 
 The bridge marshals dense `Q` (`n²`) and dense `A` (`m·n`) every solve, and
 `qp_solve` validates all `n²` entries (`src/qp.c:420`). At `N=32` that is
@@ -577,11 +588,18 @@ The bridge marshals dense `Q` (`n²`) and dense `A` (`m·n`) every solve, and
 per-variable quadratic terms) plus one rank-1 update per soft constraint, which
 is exactly how `constraints.ts` builds it (`Q[i*n+j] += 2*w*ti*tj`).
 
-**Change:** accept `Q = D + Σ_k w_k a_k a_kᵀ` (diagonal + rank-1 list) and `A`
-in CSC (the LP already takes CSC, so `kernels.c` has the mat-vec patterns to
-reuse). Mat-vec becomes `O(nnz)`, the input copy becomes `O(n + nnz)`, and the
-`n > 8192` guard (which is meaningless in a 256 MB wasm instance where `Q`
-alone would be 536 MB) can be replaced by an arena/byte budget.
+**Implemented (public input path; the internal active-set KKT is still dense).**
+`QPSparse` + `qp_solve_sparse` accept `A` in CSC and
+`Q = D + Σ_k w_k v_k v_kᵀ` (diagonal + sparse rank-1 vectors), including
+`me`/`beq`/`l`/`u`. The bridge exposes it as `psw_qp_solve_sparse`, so a frame
+marshes `O(n + nnz(A) + nnz(rank-1))` doubles instead of `n² + m·n`. The core
+materialises a dense `Q`/`A` once and runs the dense active set, so this is a
+capacity/input-contract change, not yet the sparse-KKT performance work; that
+is P1.3. `tools/qp_sparse_test` and `tools/psw_test` section [10] pin the
+sparse form against the dense judgement.
+
+The `n > 8192` guard is still enforced because the dense internal
+representation remains; relaxing it belongs with P1.3.
 
 ### P1.3 Diagnostics that make the front end debuggable
 
