@@ -132,6 +132,18 @@ fx_bench: tools/fx_bench.o src/err.o src/kernels.o src/lu.o src/splu.o src/solve
 tools/fx_bench.o: tools/fx_bench.c src/solver.h src/parser.h src/fx.h
 	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -I src -c -o $@ $<
 
+# P1.1 acceptance: native QP equalities/bounds vs the same rows as inequalities.
+qp_eq_bound_test: src/err.o src/qp.o src/lu.o src/splu.o src/solver.o src/kernels.o tools/qp_eq_bound_test.o
+	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -o $@ $^ $(LDFLAGS) $(LDLIBS)
+tools/qp_eq_bound_test.o: tools/qp_eq_bound_test.c src/qp.h src/solver.h
+	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -I src -c -o $@ $<
+
+# P1.2 acceptance: sparse CSC A + diagonal/rank-1 Q through qp_solve_sparse.
+qp_sparse_test: src/err.o src/qp.o src/lu.o src/splu.o src/solver.o src/kernels.o tools/qp_sparse_test.o
+	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -o $@ $^ $(LDFLAGS) $(LDLIBS)
+tools/qp_sparse_test.o: tools/qp_sparse_test.c src/qp.h src/solver.h
+	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -I src -c -o $@ $<
+
 # UI-layout problem-class probe (the shape a constraint-layout front end such as
 # curv-ps feeds the QP core).  Report tool: exits 0 unless --strict, so it can
 # be run before the issues it documents are fixed.  See docs/CURV_PS_PLAN.md.
@@ -189,7 +201,7 @@ src/main.o: src/main.c src/parser.h src/solver.h src/err.h src/presolve.h src/ce
 	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -I src -I tools -c -o $@ $<
 
 clean:
-	rm -f lpsolve qpsolve mipsolve pgsbench pgfbench pgs_vs_lp fznsolve fxsolve fx_bench ui_qp_probe cert_inject presolve_selftest src/*.o tools/*.o libpsolve.a libpsolve-lp.a libpsolve-qp.a
+	rm -f lpsolve qpsolve mipsolve pgsbench pgfbench pgs_vs_lp fznsolve fxsolve fx_bench ui_qp_probe qp_eq_bound_test qp_sparse_test cert_inject presolve_selftest src/*.o tools/*.o libpsolve.a libpsolve-lp.a libpsolve-qp.a
 	rm -rf build
 
 .PHONY: all asan clean lib liblp libqp ui-probe bridge-test wasm

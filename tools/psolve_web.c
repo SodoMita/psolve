@@ -240,6 +240,55 @@ EXPORT int psw_qp_solve2(int n, int m, double *Q, double *c, double *A, double *
     return st;
 }
 
+/* Sparse QP entry point (P1.2): a host can marshal A in CSC and Q as a diagonal
+ * plus sparse rank-1 terms, without the dense n*n / m*n marshalling that
+ * psw_qp_solve2 requires.  The solver materialises the dense formulation
+ * internally; the returned status/obj/incumbent contract is identical. */
+EXPORT int psw_qp_solve_sparse(int n, int m,
+                               double *q_diag, int nq, double *q_w,
+                               int *q_rk_colptr, int *q_rk_rowi, double *q_rk_val,
+                               double *c, int *colptr, int *row, double *val, double *b,
+                               int me, double *Aeq, double *beq,
+                               double *l, double *u,
+                               const double *x0, double budget_ms,
+                               double *x_out, double *obj_out, int *iters_out,
+                               double *max_resid_out)
+{
+    QPSparse s; QPResult res;
+    memset(&s, 0, sizeof s);
+    memset(&res, 0, sizeof res);
+    s.n = n; s.m = m; s.me = me;
+    s.c = c; s.b = b; s.x0 = x0;
+    s.phase1_order = g_lp_first ? QP_PHASE1_LP_FIRST : QP_PHASE1_DENSE_FIRST;
+    s.q_diag = q_diag; s.nq = nq; s.q_w = q_w;
+    s.q_rk_colptr = q_rk_colptr; s.q_rk_rowi = q_rk_rowi; s.q_rk_val = q_rk_val;
+    s.Acolptr = colptr; s.Arow = row; s.Aval = val;
+    s.Aeq = Aeq; s.beq = beq; s.l = l; s.u = u;
+
+    g_proven = 0;
+    g_resid = 0.0;
+    arm_budget(budget_ms);
+    qp_solve_sparse(&s, &res);
+    disarm_budget();
+    if (g_arena_armed && g_arena.used > g_arena_peak) g_arena_peak = g_arena.used;
+    if (res.x && x_out) memcpy(x_out, res.x, sizeof(double) * (size_t)n);
+    if (obj_out)       *obj_out = res.obj;
+    if (iters_out)     *iters_out = res.iterations;
+    if (max_resid_out) *max_resid_out = res.max_resid;
+    g_resid = res.max_resid;
+    if (res.status == -1 && res.infeasible_proven && m > 0 && res.farkas) {
+        double *lam = (double*)realloc(g_lam, sizeof(double) * (size_t)m);
+        if (lam) {
+            g_lam = lam; g_lam_n = m;
+            memcpy(g_lam, res.farkas, sizeof(double) * (size_t)m);
+            g_proven = 1;
+        }
+    }
+    int st = res.status;
+    qp_result_free(&res);
+    return st;
+}
+
 /* Back-compatible entry point: no warm start, no budget. */
 EXPORT int psw_qp_solve(int n, int m, double *Q, double *c, double *A, double *b,
                         double *x_out, double *obj_out, int *iters_out)

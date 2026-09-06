@@ -22,3 +22,5 @@ psw_test
 build/
 cert_inject
 presolve_selftest
+qp_eq_bound_test
+qp_sparse_test

@@ -413,6 +413,64 @@ static void sec_capacity(void)
            "  solve (n*n for Q plus m*n for A) before copying them into wasm memory.\n");
 }
 
+/* P1.1: the same layout model with hard equalities as native Aeq x = beq and
+ * min-widths as variable bounds must give the same verdict/objective as the
+ * historical pair/bound-row encoding. */
+static void sec_native_eq(void)
+{
+    printf("\n[6] native equalities/bounds vs pair rows -- P1.1\n");
+    printf("%5s %10s %10s %14s %14s\n", "N", "native", "pair", "obj(native)", "obj(pair)");
+    int hi = nmax ? nmax : (fast ? 8 : 12);
+    for (int N = 4; N <= hi; N += 4) {
+        double gap = 6.0, minw = 10.0, nat = 40.0;
+        double total = (N*(nat+gap) - gap);
+        double maxw = 1.10 * total;
+        int n = 2 * N, me = 2 + 2*(N-1), m = 1;
+        double *Q = calloc((size_t)n*n, sizeof(double));
+        double *c = calloc((size_t)n, sizeof(double));
+        double *Aeq = calloc((size_t)me*n, sizeof(double));
+        double *beq = calloc((size_t)me, sizeof(double));
+        double *l = malloc((size_t)n*sizeof(double));
+        double *u = malloc((size_t)n*sizeof(double));
+        double *A = calloc((size_t)m*n, sizeof(double));
+        double *b = malloc((size_t)m*sizeof(double));
+        int r = 0;
+        Aeq[(size_t)r*n] = 1.0; beq[r++] = 0.0;
+        for (int i = 0; i + 1 < N; i++) {
+            Aeq[(size_t)r*n + (i+1)] =  1.0;
+            Aeq[(size_t)r*n + i]     = -1.0;
+            Aeq[(size_t)r*n + (N+i)] = -1.0;
+            beq[r++] = gap;
+        }
+        A[N-1] = 1.0; A[2*N-1] = 1.0; b[0] = maxw;
+        for (int i = 0; i < n; i++) { l[i] = -1e30; u[i] = 1e30; }
+        for (int i = 0; i < N; i++) {
+            l[N+i] = minw;
+            Q[(size_t)(N+i)*n + (N+i)] += 8.0;
+            c[N+i] += -320.0;
+            Q[(size_t)i*n + i]         += 1e-7;
+            Q[(size_t)(N+i)*n + (N+i)] += 1e-7;
+        }
+        QP qn; memset(&qn, 0, sizeof qn);
+        qn.n = n; qn.m = m; qn.me = me; qn.Q = Q; qn.c = c; qn.A = A; qn.b = b;
+        qn.Aeq = Aeq; qn.beq = beq; qn.l = l; qn.u = u;
+        QPResult rn; memset(&rn, 0, sizeof rn);
+        qp_solve(&qn, &rn);
+        Model P = model_build(N, ENC_Q, 0, 1.0, 0, 0);
+        double op = NAN; int stp = solve(&P, NULL, &op, NULL, NULL);
+        char oN[32], oP[32];
+        snprintf(oN, sizeof oN, "%.6f", rn.obj);
+        snprintf(oP, sizeof oP, "%.6f", op);
+        printf("%5d %10s %10s %14s %14s\n", N, statname(rn.status), statname(stp), oN, oP);
+        check(rn.status == 0 && stp == 0, "N=%d: native %s vs pair %s", N, statname(rn.status), statname(stp));
+        check(rn.status == 0 && stp == 0 && fabs(rn.obj - op) <= 1e-6 * (1.0 + fabs(op)),
+              "N=%d: obj(native)=%.9g obj(pair)=%.9g", N, rn.obj, op);
+        qp_result_free(&rn);
+        model_free(&P);
+        free(Q); free(c); free(Aeq); free(beq); free(l); free(u); free(A); free(b);
+    }
+}
+
 int main(int argc, char **argv)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -422,7 +480,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--only") && i+1 < argc) only = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--nmax") && i+1 < argc) nmax = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--lp-first")) g_lp_first = 1;
-        else { printf("usage: %s [--strict] [--fast] [--only 1..5] [--nmax N] [--lp-first]\n", argv[0]); return 2; }
+        else { printf("usage: %s [--strict] [--fast] [--only 1..6] [--nmax N] [--lp-first]\n", argv[0]); return 2; }
     }
     psolve_stop_set(stop_cb);
     printf("psolve QP core vs the UI-layout problem class -- Phase-I order: %s\n",
@@ -433,6 +491,7 @@ int main(int argc, char **argv)
     if (!only || only == 3) sec_frames();
     if (!only || only == 5) sec_proof();
     if (!only || only == 4) sec_capacity();
+    if (!only || only == 6) sec_native_eq();
     printf("\n%s\n", fails ? "SOME CHECKS FAILED (see above)" : "all checks passed");
     return (fails && strict) ? 1 : 0;
 }
