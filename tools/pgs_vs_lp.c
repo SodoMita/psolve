@@ -90,7 +90,8 @@ static double bench_qp(int n,double*A,double*b,double*lo,double*hi,int reps)
         Ac[i*n+i]=1.0; bc[i]=hi[i];
         Ac[(n+i)*n+i]=-1.0; bc[n+i]=-lo[i];
     }
-    QP qp; qp.n=n; qp.m=m; qp.Q=A; qp.c=b; qp.A=Ac; qp.b=bc; qp.x0=NULL;
+    QP qp; memset(&qp, 0, sizeof qp);   /* extensible struct: zero it */
+    qp.n=n; qp.m=m; qp.Q=A; qp.c=b; qp.A=Ac; qp.b=bc; qp.x0=NULL;
     double t0=now_ns();
     for(int r=0;r<reps;r++){
         QPResult res; qp_solve(&qp,&res); qp_result_free(&res);

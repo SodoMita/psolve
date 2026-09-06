@@ -31,9 +31,9 @@ LDFLAGS = -pie -Wl,-z,relro,-z,now -Wl,--as-needed -Wl,-z,noexecstack
 CFLAGS   = -std=gnu11 -Wall -Wextra $(OPT) $(ARCH) $(PERF) $(HARDEN)
 LDLIBS   = -lm
 
-SRC = src/err.c src/kernels.c src/lu.c src/splu.c src/solver.c src/parser.c src/main.c
+SRC = src/err.c src/kernels.c src/lu.c src/splu.c src/solver.c src/parser.c src/cert.c src/presolve.c src/main.c
 OBJ = $(SRC:.c=.o)
-QPSRC = src/err.c src/qp.c src/lu.c src/kernels.c
+QPSRC = src/err.c src/qp.c src/lu.c src/splu.c src/solver.c src/kernels.c
 QPOBJ = $(QPSRC:.c=.o)
 
 # Library (for embedding in other projects, e.g. SmazkaVG).
@@ -44,7 +44,7 @@ LIB_SRC = src/err.c src/kernels.c src/lu.c src/splu.c src/solver.c src/parser.c 
 LIB_OBJ = $(LIB_SRC:.c=.o)
 LP_LIB_SRC = src/err.c src/kernels.c src/lu.c src/splu.c src/solver.c src/parser.c
 LP_LIB_OBJ = $(LP_LIB_SRC:.c=.o)
-QP_LIB_SRC = src/err.c src/qp.c src/lu.c src/kernels.c src/pgs.c src/pgs_fixed.c
+QP_LIB_SRC = src/err.c src/qp.c src/lu.c src/splu.c src/solver.c src/kernels.c src/pgs.c src/pgs_fixed.c
 QP_LIB_OBJ = $(QP_LIB_SRC:.c=.o)
 
 all: lpsolve qpsolve mipsolve pgsbench pgfbench fznsolve fxsolve
@@ -60,14 +60,20 @@ install_mzn:
 lpsolve: $(OBJ)
 	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -o $@ $(OBJ) $(LDFLAGS) $(LDLIBS)
 
-qpsolve: src/err.o src/qp.o src/lu.o src/kernels.o tools/qpsolve.o
+qpsolve: src/err.o src/qp.o src/lu.o src/kernels.o src/cert.o src/solver.o src/splu.o tools/qpsolve.o
 	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -o $@ $^ $(LDFLAGS) $(LDLIBS)
 
-mipsolve: src/err.o src/mip.o src/lu.o src/splu.o src/solver.o src/kernels.o src/parser.o src/fx.o tools/mipsolve.o
+mipsolve: src/err.o src/mip.o src/lu.o src/splu.o src/solver.o src/kernels.o src/parser.o src/fx.o src/cert.o tools/mipsolve.o
 	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -o $@ $^ $(LDFLAGS) $(LDLIBS)
 
 # Real-time 2D-physics kernel: projected Gauss-Seidel boxed-QP
 pgsbench: src/pgs.o tools/pgbench.o
+
+cert_inject: src/err.o src/kernels.o src/lu.o src/splu.o src/solver.o src/parser.o src/cert.o src/mip.o src/qp.o src/fx.o tools/cert_inject.o
+	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -o $@ $^ $(LDFLAGS) $(LDLIBS)
+
+# Roadmap 7.1 presolve records unit harness (apply -> restore checks)
+presolve_selftest: src/err.o src/kernels.o src/lu.o src/splu.o src/solver.o src/parser.o src/presolve.o tools/presolve_selftest.o
 	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -o $@ $^ $(LDFLAGS) $(LDLIBS)
 
 src/pgs.o: src/pgs.c src/pgs.h
@@ -84,7 +90,7 @@ tools/pgs_vs_lp.o: tools/pgs_vs_lp.c src/pgs.h src/pgs_fixed.h src/qp.h src/solv
 	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -I src -c -o $@ $<
 
 # FlatZinc reader + solver bridge (Phase 3)
-fznsolve: src/fzn.o src/mip.o src/err.o src/solver.o src/splu.o src/lu.o src/kernels.o src/parser.o src/fx.o tools/fznsolve.o
+fznsolve: src/fzn.o src/mip.o src/err.o src/solver.o src/splu.o src/lu.o src/kernels.o src/parser.o src/fx.o src/cert.o tools/fznsolve.o
 	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -o $@ $^ $(LDFLAGS) $(LDLIBS)
 
 src/fzn.o: src/fzn.c src/fzn.h src/solver.h src/err.h src/fz_cp.inc
@@ -126,6 +132,28 @@ fx_bench: tools/fx_bench.o src/err.o src/kernels.o src/lu.o src/splu.o src/solve
 tools/fx_bench.o: tools/fx_bench.c src/solver.h src/parser.h src/fx.h
 	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -I src -c -o $@ $<
 
+# UI-layout problem-class probe (the shape a constraint-layout front end such as
+# curv-ps feeds the QP core).  Report tool: exits 0 unless --strict, so it can
+# be run before the issues it documents are fixed.  See docs/CURV_PS_PLAN.md.
+ui_qp_probe: src/err.o src/qp.o src/lu.o src/splu.o src/solver.o src/kernels.o tools/ui_qp_probe.o
+	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -o $@ $^ $(LDFLAGS) $(LDLIBS)
+
+ui-probe: ui_qp_probe
+	./ui_qp_probe --fast
+
+# The wasm/FFI bridge is built and checked through its own script so a consumer
+# gets the same command that CI gets.  `bridge-test` needs no wasm toolchain: it
+# compiles the bridge plus tools/psw_test.c against the host libc, which is how the
+# ABI and its semantics are actually verified.
+bridge-test:
+	./tools/wasm_build.sh --check
+
+wasm:
+	./tools/wasm_build.sh
+
+tools/ui_qp_probe.o: tools/ui_qp_probe.c src/qp.h src/err.h
+	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -I src -I tools -c -o $@ $<
+
 # Library targets ------------------------------------------------------
 # Static archives of the solver cores (no main()).  Headers to use from a
 # consuming project: src/solver.h (LP), src/qp.h (QP), src/mip.h (MIP),
@@ -157,10 +185,11 @@ asan: clean
 # src/main.o is the LP CLI: it shares the millisecond-precision time-limit
 # helper (tools/tlimit.h) with the other CLI drivers, so give it that include
 # path too.
-src/main.o: src/main.c src/parser.h src/solver.h src/err.h tools/tlimit.h
+src/main.o: src/main.c src/parser.h src/solver.h src/err.h src/presolve.h src/cert.h tools/tlimit.h
 	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) -I src -I tools -c -o $@ $<
 
 clean:
-	rm -f lpsolve qpsolve mipsolve pgsbench pgfbench pgs_vs_lp fznsolve fxsolve fx_bench src/*.o tools/*.o libpsolve.a libpsolve-lp.a libpsolve-qp.a
+	rm -f lpsolve qpsolve mipsolve pgsbench pgfbench pgs_vs_lp fznsolve fxsolve fx_bench ui_qp_probe cert_inject presolve_selftest src/*.o tools/*.o libpsolve.a libpsolve-lp.a libpsolve-qp.a
+	rm -rf build
 
-.PHONY: all asan clean lib liblp libqp
+.PHONY: all asan clean lib liblp libqp ui-probe bridge-test wasm

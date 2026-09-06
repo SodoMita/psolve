@@ -171,3 +171,221 @@ feasible-start path without weakening the original model.
   than a widely used reference in the important sparse regime, uses the
   hardware well, and is transparent about where and why a production solver
   would pull ahead.
+
+## 8. Tolerance semantics sheets (roadmap 6.8)
+
+Every literal tolerance in `src/` is inventoried here, with its **direction
+of safety**, **what it protects**, and **what it may never justify**.  The
+motivating incident was the 2026-08-15 `mip_diff` flip (seed 12345,
+WRONG=5): an *exact* activity prune that ignored the engine's own margin —
+a semantics bug wearing a numerics costume.  The rule that fell out of it:
+a Verdict tolerance (one adjacent to OPTIMAL / INFEASIBLE / UNSAT /
+UNBOUNDED) may never decide a verdict alone; it feeds a certificate that
+stands without it (directed rounding, exact-rational re-check, or a
+printed bound), or the status degrades to the honest numerical-failure
+class.
+
+**Machine-checked closure.**  Every site carries a `/* TOLSHEET <ID> */`
+comment in the source; `tools/tolsheet_check.py` (a hard `test.sh` gate)
+greps `src/` for the canonical tolerance pattern — decimal exponent
+literals `[0-9]e±N`, `0x1pN` hex-floats, `DBL_EPSILON`, and the tolerance
+macro definitions — and requires: every hit tagged, every tag indexed
+here, every indexed ID present in the source at the recorded file:line.
+Named macros are documented at their definition; uses resolve by name.
+
+**Classes.**  V = verdict-adjacent (certificate rule above applies);
+C = convergence/heuristic switch (may cost iterations or honesty of
+*convergence claims*, never answer content); D = honest-decline guard
+(doubt → UNKNOWN/unsupported/failure, never a guess); R = recognition of
+flattener-exact data (near-1.0 treated as 1.0 etc. — sound because
+flattened FlatZinc emits exact values; the acceptance *width* is the
+documented modeling tolerance for hand-written input); S = sentinel
+magnitude (bound floors, caps) and pure division guards (stability, no
+semantics); E = exact module, no numeric margin at all.
+
+### 8.1 LP core — `src/solver.c`, `src/lu.c`, `src/splu.c`, `src/kernels.c`
+
+| ID | site | value | class | direction of safety / protects / may-never |
+|---|---|---|---|---|
+| TOL-LP-FEAS | solver.c:12 (`TOL_FEAS`) | 1e-9 | C | fixed-var width (`u−l ≤ tol`) for pricing eligibility only; protects degenerate pivots; never a verdict |
+| TOL-LP-PIV | solver.c:13 (`TOL_PIV`) | 1e-12 | S | ratio-test pivot acceptability; protects division stability; never skips a *real* blocking bound without the post-solve re-check |
+| TOL-LP-DJ | solver.c:18 (`TOL_DJ`) | 1e-9 | V | reduced-cost sign test, i.e. the optimality certificate margin; anti-cycling hysteresis; may never *prove infeasibility*, and a missed tiny negative dj ends in the final-verify re-check, not a fabricated status |
+| TOL-LP-STARTSLACK | solver.c:287, 731 | 1e-12 | C | slack-nonneg ⇒ feasible-start *shortcut*; the Phase machinery re-verifies whatever it is handed |
+| TOL-LP-SPLUPIV | solver.c:66, 487; splu.c:101 | 1e-13 / 1e-14 | S | sparse-LU pivot floor / zero-fill drop; factorization refusal surfaces as NUMERICAL, never a quiet bad basis |
+| TOL-LP-WGUARD | solver.c:836, 839, 946 | 1e-30 | S | steepest-edge weight division floors |
+| TOL-LP-RELAX | solver.c:890 | 1e-9·(1+\|θ\|) | C | Harris-style ratio relaxation; any overshoot is caught by the final bounds re-check (TOL-LP-FINALBOX) |
+| TOL-LP-AQGUARD | solver.c:928 | 1e-300 | S | division floor in the ratio denominators |
+| TOL-LP-FLAT | solver.c:1003 | 1e-9·(1+\|obj\|) | C | stall detector feeding anti-cycling; changes which *rule* runs, never what is reported |
+| TOL-LP-ARTPIN | solver.c:1080 | 1e-9 | C | pins only redundant artificials already at \|x\| ≤ tol (pinning a nonzero one would hide row violation — comment block at site); Phase-II checks stand |
+| TOL-LP-P1CERT | solver.c:1211 | 1e-6·(1+\|artsum\|) | V | Phase-I certificate admissibility (max bound violation); failure → one exact-basis Bland restart → SOLVE_NUMERICAL; never INFEASIBLE |
+| TOL-LP-P1SUM | solver.c:1214 | 1e-6 absolute | V | certified-infeasible artificial-sum threshold; the verdict it gates is *re-proven* by the directed-rounding Farkas check (TOL-LP-FARKAS) or downgraded via TOL-LP-SHAKY; may never print INFEASIBLE alone |
+| TOL-LP-FINALBOX | solver.c:1547 | 1e-6·(1+\|obj\|) | V | final point vs bounds re-check; failure ⇒ no solution leaves the solver |
+| TOL-LP-FINALROW | solver.c:1562 | 1e-5·(1+\|b_i\|) | V | final equality-residual re-check; same rule |
+| TOL-LP-FARKAS | solver.c:657 (`mar = tol·(1+\|R\|)` inside `solver_farkas_boxcert`); margin args at main.c:134, fzn.c:3990 (1e-6), mip.c:295 (MIP_TOL) | caller-set | V | directed-rounding (FE_UPWARD/FE_DOWNWARD) proof that `min_box(yᵀA)x > yᵀb + margin`; protects every printed INFEASIBLE/UNSAT verdict; may never be weakened to RN sums, may never fire on a ray that failed the sign repair, may never be bypassed when the exposure frontier (TOL-LP-SHAKY) is crossed — then the honest class is SOLVE_NUMERICAL |
+| TOL-LP-SHAKY | main.c:139, mip.c:443 | 5e-7 = ½·1e-6 | V | exposure frontier `E·DBL_EPSILON ≥ 5e-7`: the double verdict cannot distinguish infeasibility from rounding noise past this line ⇒ NUMERICAL |
+| TOL-LP-BIGCAP | solver.c:614, 671 | 1e29 | S | box-certificate big-M sentinel; a box this wide ⇒ boxcert *declines* (honest), exposure caps there |
+| TOL-LP-PRETIGHT | presolve.c:832 | 1e-9·(1+\|b_i\|+\|a·x_j\|) | D | presolve (7.1) complementarity guard feeding dual replay: an inequality singleton row implied side that is NOT tight at the postsolved point must carry dual 0 (otherwise a slack row could collect a nonzero replayed dual and inflate the psv dual-bound certificate); misclassification only declines the dual replay ⇒ psv re-proof falls back to resolving on raw data, never a wrong print |
+| TOL-LP-SCALCAP | solver.c:341 (`LP_SCALCAP`), decline guards at :376, :398 | 1e300 | D | Ruiz equilibration (7.5) per-row/column spread cap: a line whose intra-line \|a\| spread exceeds the cap is left UNSCALED (identity factor) — scaling is optional conditioning, so declining can only leave the model exactly as handed in; never a verdict input; the same guard family refuses factor products/bound maps that would go non-finite or push a finite bound across the TOL-LP-INF token (silently reclassifying huge-finite as \"infinite\" would change the model) |
+| TOL-LU-SING | lu.c:26 | 1e-300 | S | dense LU singular-pivot floor; failure ⇒ refactorization error path, not a wrong solve |
+| TOL-SPLU-PIVREL | splu.c:131 | 1e-9·maxA | S | relative pivot refusal; same NUMERICAL surfacing rule |
+| TOL-SPLU-GROWTH | splu.c:132 | 1e10 | S | factor norm-growth watchdog; crossing it fails the factorization, which surfaces as NUMERICAL |
+| TOL-SPLU-SOLVE0 | splu.c:264 | 1e-14 | S | sparse-solve zero test |
+| TOL-LP-INF | solver.h:11 | 1e30 | S | "infinite" bound encoding inside the LP data structures; structural sentinel, never compared for equality against data |
+| TOL-LP-WCAP | solver.c:947 | 1e18 | S | steepest-edge weight normalization cap (overflow guard on the score path; pairs with TOL-LP-WGUARD) |
+| TOL-KRN-YTOL | kernels.c:78–86 (fed by `hyper_tol`, default **0.0** = exact) | 0.0 | C | hyper-sparse PRICE skip threshold; 0 means no dual is ever silently dropped; a caller-set positive value is a pricing heuristic only — the DJ certificate is recomputed exactly at optimality |
+| TOL-LP-HYPERDEF | solver.c:55, 782 | 0.0 | C | the default itself: exactness until changed deliberately |
+
+### 8.2 MIP / branch-and-bound — `src/mip.c`
+
+| ID | site | value | class | direction of safety / protects / may-never |
+|---|---|---|---|---|
+| TOL-MIP-INT | mip.c:11 (`MIP_TOL`) | 1e-6 | V | integrality + incumbent feasibility acceptance (verify fn: bounds, rows, integrality); protects every integer optimum ever printed; may never *round a farther-than-tol value* into an integer assignment, never accept a violating row |
+| TOL-MIP-PROGRESS | mip.c:130, 131 | 1e-9 | C | B&B bound-progress test (node bookkeeping); no verdict content |
+| TOL-MIP-FARKAS | mip.c:240 (`mar`), 295 (arg) | 1e-6·(1+\|rhs\|) | V | node prune Farkas margin; the box comment at mip.c:169-186 records the 6.8 incident — may never prune a node whose exact-rational or exposure check disagrees |
+| TOL-MIP-SHAKY | mip.c:443 | 5e-7 | V | exposure frontier (as TOL-LP-SHAKY) for *uncertified* node infeasibility ⇒ SOLVE_NUMERICAL, never UNSAT-from-noise |
+| TOL-MIP-PROPRND | mip.c:597–613 | 1e-9 | V | bound-tightening hysteresis: `floor(ub+1e-9)`, `ceil(lb−1e-9)` — always rounds *outward* only within the margin; protects propagation strengthening; may never cross an integer the LP bound is on the other side of by more than tol |
+| TOL-MIP-CROSS | mip.c:620 | 1e-9 | V | propagated-domain crossing ⇒ node infeasible; hysteretic (a crossing must exceed tol), erring toward keeping the node — keeping a dead node costs time, pruning a live one fabricates UNSAT |
+| TOL-MIP-GAP | mip.c:652, mip.h:43; fzn default fzn.c:3951 | 1e-4 rel | V | early-stop relative gap; protects reported bound honesty; a gap-stopped result is reported *with its bound*, may never be called an exact optimum, and the gap may never touch feasibility of the incumbent (already verified by TOL-MIP-INT) |
+| TOL-MIP-FBBT | mip.c:476–557 (hysteresis slacks 1e-9) | 1e-9 | V | activity bounds under directed rounding — the replacement for the 6.8-incident RN prune; no coefficient is dropped (mip.c:463-466 comment); may never justify UNSAT without the post-prune certificate path |
+| TOL-MIP-BIGCAP | mip.c:44, 46, 191, 506 | 1e29 | S | infinite-box sentinel at the fx/Farkas bridges; ≥ cap means "no finite bound" — a classification, and the ray paths it feeds re-verify |
+| TOL-MIP-INFBOUND | mip.c:664, 666, 667 | ±1e30 | S | "no incumbent / no finite bound yet" sentinels; may never be *reported* — the result path replaces them with the honest no-solution statuses |
+
+### 8.3 QP (active-set + PSD gate) — `src/qp.c`
+
+| ID | site | value | class | direction of safety / protects / may-never |
+|---|---|---|---|---|
+| TOL-QP-INITRES | qp.c:149 | 1e-8·(1+\|rhs\|+\|x\|) | C | phase-0 KKT solve acceptance; failure only triggers the regularization ladder |
+| TOL-QP-REG | qp.c:156 | 1e-8 / 1e-6 / 1e-4 | C | KKT-matrix regularization ladder for singular PSD Q; perturbs a *work copy*; the result is re-proven against the unperturbed system by TOL-QP-KKT/COMP/PRIMAL |
+| TOL-QP-NRMDIV | qp.c:176 | 1e-9 | S | normalization division guard |
+| TOL-QP-RANK | qp.c:210 | 1e-9 | C | rank test for the orthonormal active-set basis |
+| TOL-QP-ACTIVE | qp.c:214 | 1e-7 | C | active-set candidacy `resid > −tol`; errs toward *including* a constraint (conservative for stationarity) |
+| TOL-QP-MU | qp.c:258, 261 | 1e-9·scale | C | multiplier zero/sign tests steering the drop step |
+| TOL-QP-KKT | qp.c:282 | 1e-7·(1+gmax+tmax) | V | final stationarity certificate; failure ⇒ QP_KKT_FAIL status, never a printed optimum |
+| TOL-QP-COMP | qp.c:289 | 1e-7·(1+\|b_i\|) | V | complementarity certificate; same rule |
+| TOL-QP-PRIMAL | qp.c:301, 760 | 1e-7·(1+\|b_i\|) | V | primal feasibility certificate (accumulated drift); same rule |
+| TOL-QP-UNBDIR | qp.c:326 | 1e-9·scale | V | descent-direction sign test gating UNBOUNDED claims — the curvature check stands behind it |
+| TOL-QP-CURV | qp.c:334 | 1e-12·(1+\|Q\|)·p² | V | zero-curvature test (flat-direction ⇒ unbounded/indefinite edge); may never declare curvature where a real positive step exists beyond tol |
+| TOL-QP-STEP | qp.c:370, 379, 384 | 1e-12, 1e-10 | C | line-search guards; a wrong near-1 step is caught by the terminal KKT re-check |
+| TOL-QP-FEASROW | qp.c:90 | 1e-8·row_scale | C | Phase-I hand-over test: a point the feasibility search produced is accepted as a start when every row satisfies it to 1e-8·row_scale.  Deliberately looser than TOL-QP-WARMFEAS (different arithmetic, and a start it rejects only costs a search, never a verdict); the active set's own terminal primal re-check (TOL-QP-PRIMAL) is the backstop, so loosening this one cannot fabricate an answer |
+| TOL-QP-PERTURB | qp.c:720 (`eps`) | 1e-6 | C | feasibility-QP quadratic perturbation weight; the perturbation may *never decide* feasibility — only the recheck (TOL-QP-PH1SUM/PRIMAL) may |
+| TOL-QP-PH1SUM | qp.c:753 | 1e-7 | V | feasibility-phase slack-sum verdict threshold |
+| TOL-QP-SYM | qp.c:891 | 1e-8·(1+qscale) | V | PSD-gate symmetry test; asymmetric beyond tol ⇒ the convexity proof route is *refused* (honest decline), never silently symmetrized |
+| TOL-QP-PSD | qp.c:928 | 1e-9·(1+qscale) | V | pivot `≥ −tol` accepted as PSD; protects the convexity certificate (short witnesses enumerated at qp.c:874-486); may never accept a pivot `< −tol` — that path proves indefiniteness instead (2×2 witness at qp.c:905-483) |
+| TOL-QP-DIVERGE | qp.c:256 | 1e14 | D | iterate-magnitude divergence cap ⇒ QP_ITERATION_LIMIT (honest non-answer), never a "solution" assembled from a diverging iterate |
+| TOL-QP-WARMFEAS | qp.c:69 | 1e-11·(1+|b_i|+Σ|a_ij||x_j|) | V | accepts the *caller's* x0 as a start without searching: beyond it, the feasibility phase runs.  Tight enough that the active set is never started on an infeasible point, loose enough that a warm start from the previous frame is not thrown away over rounding noise; may never be merged with TOL-QP-FEASROW — one judges data the caller owns, the other a point this file produced |
+| TOL-QP-BOX | qp.c:521 | boxmul·(1+max|b|) | S | finite box placed on the free variables of the *auxiliary* Phase-I LP so it has a bounded optimum; it exists only inside that LP and may never be reported or used as a bound of the caller's problem |
+| TOL-QP-BOXLADDER | qp.c:681 | {1e9, 1e6, 1e3, 1e12} | C | the box scales tried in turn.  No entry is canonical and none may be promoted to a single value: *which* ill-conditioned model the simplex can certify depends on it, so a fixed scale turns a numerical coin flip into a reported verdict.  Reproducible frontier: `tools/ui_qp_probe --only 2` — before this route existed the same N=8 model answered INFEASIBLE at 1e-6/1e6 and OPTIMAL at 1e-3/1/1e3; with the ladder those points end as `ok`, `KKT_FAIL` or `ITER_LIMIT` and never as a false INFEASIBLE, which is the whole contract of the route (a scale that fails is retried, not believed) |
+| TOL-QP-BOXDIV | qp.c:526 | 1e-300 | S | division guard turning the slack box into a per-variable bound; protects against a zero row coefficient only — widening it shrinks the box and can make a feasible system look bounded away from feasibility |
+| TOL-QP-BOXCAP | qp.c:528 | 1e100 | S | keeps a derived bound representable.  Measured: ±DBL_MAX on a free x makes the LP answer *infeasible*, and 1e18 certifies worse than 1e12 — so the cap is a correctness device here, not a guard rail |
+| TOL-QP-BOXIDLE | qp.c:571 | 0.25 | V | "the box was never approached, therefore the boxed optimum says something about the unboxed system".  A boxed LP may never certify infeasibility or feasibility of the caller's rows without this passing; it errs toward refusing the claim (the search then reports no start, which is not a verdict about the model) |
+| TOL-QP-FARKASINIT | qp.c:426 | 1e300 | S | sentinel initialising the max/min scan over a candidate multiplier vector; never read as a tolerance |
+| TOL-QP-FARKASSIGN | qp.c:436 | −1e-12·max|λ| | V | λ ≥ 0 acceptance for a Farkas candidate (the duals come back with an ambiguous sign, so candidates are enumerated).  May never be loosened past zero: a certificate with a negative weight proves nothing about the caller's system |
+| TOL-QP-FARKASCOL | qp.c:448 | 1e-7 | V | ‖Aᵀλ‖∞ ≈ 0, recomputed from the caller's own A — never from the LP's internal scaled copy |
+| TOL-QP-FARKASB | qp.c:451 | −1e-9·(1+Σλ|b|) | V | bᵀλ < 0.  With TOL-QP-FARKASSIGN/COL this triple *is* the whole INFEASIBLE claim: a caller may print or return infeasible only while all three hold, which is why `qp_result_free` keeps the vector alive alongside them |
+| TOL-QP-P1DENSE | qp.c:810 | n+m ≤ 600 | C | size gate choosing which feasibility search runs first (a policy threshold, not arithmetic).  Below it the dense auxiliary QP wins because of *where* it starts the active set; above it one of its iterations exceeds any interactive frame budget and cannot be interrupted (measured: 11.4 s against a 16 ms budget at n+m = 641, 180 s at 1281, versus ~20-50 ms through the LP route).  Skipping it may never be treated as a give-up: the LP route is a superset of what the dense search can conclude, including the certificate |
+
+### 8.4 Boxed-QP physics kernels (PGS) — `src/pgs.c`, `src/pgs_fixed.c`
+
+| ID | site | value | class | direction of safety / protects / may-never |
+|---|---|---|---|---|
+| TOL-PGS-CONV | pgs.c:39, 80, 91 (=`opt->tol`, pgs.h:31) | caller-set | C | convergence stop for an iterative contact solver; `0` = run all iterations; protects termination, and the *status* byte distinguishes "converged" from "iteration cap" — a capped run is never reported as converged |
+| TOL-PGS-DIAG | pgs.c:69 | 1e-14 | S | near-zero diagonal guard (row skipped; deterministic, documented) |
+| TOL-PGSF-CONV | pgs_fixed.c:63 (pgs_fixed.h:43) | caller-set (int64 units) | C | fixed-point analog of TOL-PGS-CONV; saturating arithmetic documented at pgs_fixed.c:8 |
+| TOL-PGSF-SAT | pgs_fixed.c:8 (policy comment) | exact | E | no float margins: saturation, not rounding, is the overflow policy |
+| TOL-PGS-INF | pgs.h:62 | 1e30 | S | box sentinel "no bound" for the kernel input; structural, never compared for equality |
+
+### 8.5 FlatZinc front-end — `src/fzn.c`
+
+Recognition tolerances (class R) accept flattener-exact structure
+(`coef == 1.0`, `const == 0.0`, integral constants) with width 1e-9…1e-12;
+decline guards (class D) degrade to UNKNOWN instead of acting on
+non-lattice data.  The R width is a documented modeling tolerance: only
+hand-written input with deliberate sub-width perturbations observes it.
+
+| ID | site | value | class | direction |
+|---|---|---|---|---|
+| TOL-FZN-ALIAS | fzn.c:329, 572, 590, 704, 1162 | 1e-12 | R | unit-coefficient/zero-constant recognition for aliases & array-decls |
+| TOL-FZN-CONSTBOOL | fzn.c:2524, 2593 | 1e-12 | R | constant-relation fold accepting ≈0/≈1 as false/true |
+| TOL-FZN-INTCONST | fzn.c:119, 2416, 2448 | 1e-12 | D | near-integer constant requirements; miss ⇒ parse/predicate declines (never rounds data into a model) |
+| TOL-FZN-BIGBOUND | fzn.c:657 (`FZ_BIG_BOUND`) | 1e9 | S | the ±sentinel box itself; may only ever be *hit-tested* (TOL-FZN-BIGHIT), never treated as a real bound by the verifier |
+| TOL-FZN-BIGHIT | fzn.c:658 (`FZ_BIG_HIT_TOL`), 896–899 | 1e-5 | D | big-M sentinel *hit* test ⇒ downgrade to UNKNOWN; may only ever downgrade |
+| TOL-FZN-OBJZERO | fzn.c:896 | 1e-14 | R | objective coefficient ≈0 skip in the sentinel scan |
+| TOL-FZN-LATTICE | fzn.c:748 | 1e-9 | D | fractional part ≈0/≈1 snapped to the lattice; non-uniform lattice ⇒ honest decline (comment at fzn.c:740-744 records the int_le_reif(0.6) regression) |
+| TOL-FZN-LATTICECAP | fzn.c:746, 752 | 1e15 | D | wild-magnitude coefficients ⇒ decline (no exact unit step exists) |
+| TOL-FZN-BOOLBOX | fzn.c:778, 829 | 1e-9 | R | [0,1]-box recognition widened by tol for float-boxed bools |
+| TOL-FZN-TBLCOEF | fzn.c:1225 | 1e-9 | R | integer-coefficient match for table rows; miss ⇒ predicate unsupported |
+| TOL-FZN-FIXED | fzn.c:1941 | 1e-9 | R | lo≈hi fixed-var fold in `int_pow`; the folded value is exactly re-verified (rint checks on base and pow result) |
+| TOL-FZN-DIVGUARD | fzn.c:1986 | 1e-15 | D | divisor |const| < tol ⇒ decline (near-0 division normalizes nothing honestly) |
+| TOL-FZN-CUMUL | fzn.c:2791, 2810 | 1e-9 | D | `cumulative` duration/resource args must be near-integer; else decline |
+| TOL-FZN-BOUNDINIT | fzn.c:2215, 2752, 2796, 3358, 3419 | ±1e18 | S | min/max accumulator initializers across the bounds-scan paths (send(bounds|disjunctive|cumulative); sentinels, never compared against data for equality — a model constant wider than 1e18 ends in the honest-decline lattice guards, not here) |
+| TOL-FZN-POWCAP | fzn.c:1866, 1870, 1933, 1944, 1963, 2101, 2690 | 0x1p53 | D | exact-integer mantissa-width cap on folded values (pow / related exact folds); past it ⇒ decline to UNKNOWN, never round |
+| TOL-FZN-FARKAS | fzn.c:3990 | 1e-6 | V | boxcert margin arg for fznsolve's Farkas re-verify (see TOL-LP-FARKAS) |
+| TOL-FZN-SHAKY | fzn.c:3996 | 5e-7 = ½·1e-6 | V | fznsolve's own exposure frontier on an uncertified UNSAT ⇒ honest downgrade (same family as TOL-LP-SHAKY) |
+| TOL-FZN-MIPGAP | fzn.c:3951 | 1e-4 | V | default `mip_gap` for the fznsolve MIP route (see TOL-MIP-GAP) |
+
+### 8.6 CP engine — `src/fz_cp.inc`
+
+| ID | site | value | class | direction |
+|---|---|---|---|---|
+| TOL-CP-UNIT | fz_cp.inc:222, 223 | 1e-9 | R | unit-term recognition (±1 coef, 0 const) in `cp_term_from_lin`; a miss makes the *constraint* decline to the honest path — a widened accept only fires on flattener-exact data |
+
+The CP engine is otherwise integer-exact: domain stores are `int64` sets
+and the propagators (incl. the functional-graph family) compare exactly.
+
+### 8.7 Exact module — `src/fx.c`, `src/fx_core.inc`
+
+Class E by construction: rational/nextafter lattice arithmetic — **no
+decision margins anywhere** (the comment at fx.c:30 records why even a
+1e-9 *display* rounding was a model-changing bug).  The only two literal
+magnitudes in the module are representability *guards*, class D: input or
+intermediate past the guard makes the exact path refuse the data, so the
+caller declines honestly instead of solving a lossy encoding.
+
+| ID | site | value | class | direction |
+|---|---|---|---|---|
+| TOL-FX-RANGE | fx.c:34 | ±0x1p63 | D | lattice-representability range of the binary form; outside ⇒ refuse (the *model* is too wide for the exact encoding, and the honest path is the numeric engines + their own verdict tolerances) |
+| TOL-FX-DECCAP | fx.c:109 | 9e17 | D | decimal-integer parse cap while encoding user data; overflow ⇒ refuse rather than truncate |
+
+### 8.8 Non-tolerance constants swept by the closure grep
+
+The checker (§8 preamble) is deliberately total over exponent literals; a
+few hits are not tolerances at all.  They are indexed here so that the
+closure stays complete and their classification is a decision, not an
+oversight.
+
+| ID | site | value | class | why it is not a tolerance |
+|---|---|---|---|---|
+| TOL-SYS-NSEC | main.c:109 | 1e9 | — | nanosecond→second unit conversion for wall-clock reporting; steers no verdict, bound, or branch |
+
+### 8.9 Unified evidence objects (verdict certificates) — `src/cert.c`, `src/cert.h`, wiring in `src/main.c`
+
+The 6.4 certificate layer re-verifies every CLI verdict over the caller's
+ORIGINAL model data before that verdict may print (contract: `src/cert.h`;
+rejection/defer ⇒ the printed class degrades to UNKNOWN/NUMERICAL).  Its
+margins are claim fields carried explicitly on `PsvCert`; the defaults
+below only substitute when a wiring left the field at 0, and every one of
+them merely *re-states* the producing engine's own contract value (the
+engine's site is the normative row).  Class rule: they never ACCEPT a
+verdict alone — the acceptance stands on the certificate's arithmetic
+(directed-rounding Farkas, Lagrangian dual bound, exact snapped
+integrality, KKT residuals) — but they may not be tightened past the
+engine's contract either, or legit engine evidence false-rejects into
+spurious UNKNOWNs (the dual failure mode of this class).
+
+| ID | site | value | class | direction of safety / protects / may-never |
+|---|---|---|---|---|
+| TOL-CERT-INF | cert.h:73 (`PSV_INF`) | 1e29 | S | bound at/above ⇒ "no bound" in claim data; parity with TOL-LP-BIGCAP so boxcert and the cert layer read the same infinity |
+| TOL-CERT-DEFBOX | cert.c:14 default; main.c:181, 216 (LP UNBOUNDED/OPTIMAL lanes) | 1e-6·(1+\|obj\|) | V | primal bound grace when admitting the claimed *point*; mirrors TOL-LP-FINALBOX; may never manufacture acceptance — the point still has to close the bound/descent checks |
+| TOL-CERT-DEFROW | cert.c:15 default; main.c:181, 216 | 1e-5·(1+\|b_i\|) | V | primal row-residual grace; mirrors TOL-LP-FINALROW — same re-check margin the LP core's own final verify uses |
+| TOL-CERT-DEFDJ | cert.c:16 default; main.c:181, 217 | 1e-9·(1+\|rc\| scale) | V | reduced-cost dust window in the dual bound and ray-descent tests; mirrors TOL-LP-DJ (the simplex stops at this scale) — dust reduced costs are charged upward on closed boxes, treated as zero only across open sides; a beyond-window free variable ⇒ DEFER, never a bad bound |
+| TOL-CERT-DEFGAP | cert.c:17 default; main.c:217 | 1e-7·scale | V | dual-gap closure grace for LP-OPTIMAL (B vs the point's objective); strictly looser than DEFDJ so rounding-level bound slack does not false-reject, strictly tighter than any mip_gap so a *suboptimal* point cannot close (the false-optimality injection family hits this line) |
+| TOL-CERT-DEFOBJ | cert.c:18 default; main.c:217 | 1e-9·(1+\|cx\|) | V | claimed-objective vs recomputed cᵀx consistency; protects against a payload obj detached from its point |
+| TOL-CERT-RAYMACRO | cert.c:22 (`PSV_RAY_MACRO`) | 1e-9·(1+\|d\|∞) | V | which components of an LP recession ray must show an open bound side to walk into; sub-macro entries are rounding-level and demand nothing (they cannot carry descent) |
+| TOL-CERT-QPCURV | cert.c:379 | 1e-12·(1+\|Q\|∞)·\|d\|∞² | V | dᵀQd ≈ 0 curvature test mirroring qp.c's own ray-admission scale; a genuinely convex direction rejects UNBOUNDED, rounding-level curvature defers to the descent test |
+
+Direction note (V-class): every cert-lane margin inherits the producing
+engine's direction — i.e. they mirror the engines' own terminal checks
+rather than inventing a new contract.  The two deliberately *strict*
+surfaces are EXACT integrality of MIP incumbents (engine stores them
+snapped; zero width by construction, so 1-ulp corruption is decidable —
+measured 100/100 rejection) and the discrete EXHAUSTION stamps.

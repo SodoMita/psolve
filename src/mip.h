@@ -76,6 +76,14 @@ typedef struct {
                               stop_at_feasible.  status==0 with
                               proven_optimal==0 means "this point is feasible",
                               never "this point is optimal". */
+    long farkas_certs;     /* node relaxations pruned by the directed-rounding
+                              Farkas certificate (the double solver's Phase-I
+                              dual ray re-verified against the original rows);
+                              these skipped the exact-rational re-solve that an
+                              uncertified double-INFEASIBLE verdict costs */
+    long fx_solves;        /* relaxations handed to the exact-rational fx
+                              solver (double diverged, or double claimed
+                              INFEASIBLE without a verifiable Farkas proof) */
 } MIPResult;
 
 void mip_solve(const MIP *mip, MIPResult *res);

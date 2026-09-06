@@ -3,40 +3,63 @@
 #include <stdio.h>
 #include <string.h>
 
-jmp_buf psolve_env;
-int     psolve_active = 0;
-int     psolve_code   = PSOLVE_OK;
+/* The calling thread's innermost error frame, or NULL.  This is the entire
+ * mutable state of the error protocol: caller-owned frames chained through
+ * one thread-local pointer.  Nothing here is shared between threads. */
+static _Thread_local PSolveErrFrame *psv_frame_top = NULL;
 
-int (*psolve_stop_fn)(void) = NULL;
+/* The calling thread's cooperative-stop callback (the solver polls it; the
+ * callback only reads a flag the host maintains, e.g. one set by a signal
+ * handler). */
+static _Thread_local int (*psv_stop_fn)(void) = NULL;
+
+void psolve_stop_set(int (*fn)(void))
+{
+    psv_stop_fn = fn;
+}
 
 int psolve_stop(void)
 {
-    return psolve_stop_fn ? psolve_stop_fn() : 0;
+    return psv_stop_fn ? psv_stop_fn() : 0;
 }
 
-int psolve_try(void)
+/* The code of the most recent failure unwound on this thread. */
+static _Thread_local int psv_fail_code = PSOLVE_OK;
+
+int psolve_err_code(void)
 {
-    if (psolve_active) return 1;      /* a handler is already installed */
-    psolve_active = 1;
-    psolve_code   = PSOLVE_OK;
-    return 0;
+    return psv_fail_code;
+}
+
+void psolve_frame_push(PSolveErrFrame *fr)
+{
+    fr->prev = psv_frame_top;
+    psv_frame_top = fr;
+}
+
+void psolve_frame_pop(PSolveErrFrame *fr)
+{
+    if (psv_frame_top != fr) {
+        fprintf(stderr, "psolve: error-frame pop mismatch (protocol violation)\n");
+        abort();
+    }
+    psv_frame_top = fr->prev;
 }
 
 void psolve_fail(int code)
 {
-    psolve_code = code;
-    if (psolve_active) {
-        longjmp(psolve_env, code);    /* unwinds to the psolve_try() frame */
+    psv_fail_code = code;
+    PSolveErrFrame *fr = psv_frame_top;
+    if (fr) {
+        /* Pop BEFORE the jump: the recovered handler runs with the frame
+           already off the chain (it must not pop again, and may push fresh
+           frames of its own). */
+        psv_frame_top = fr->prev;
+        longjmp(fr->env, code);       /* unwinds to the frame's setjmp point */
     }
-    /* No handler installed: exit cleanly instead of aborting. */
+    /* No frame installed on this thread: exit cleanly instead of aborting. */
     fprintf(stderr, "psolve: internal failure (code %d)\n", code);
     exit(code);
-}
-
-void psolve_end(void)
-{
-    psolve_active = 0;
-    psolve_code   = PSOLVE_OK;
 }
 
 /* ------------------------------------------------------------------ */

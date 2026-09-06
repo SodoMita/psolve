@@ -17,3 +17,8 @@ fznsolve
 fxsolve
 fx_bench
 gmon.out
+ui_qp_probe
+psw_test
+build/
+cert_inject
+presolve_selftest

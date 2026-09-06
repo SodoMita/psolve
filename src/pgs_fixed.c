@@ -5,7 +5,7 @@
 
 /* Saturating narrowing.  A 128-bit accumulator that exceeds int64 used to be
  * truncated (implementation-defined wrap-around), silently turning a huge
- * residual into a small one of the opposite sign; saturating keeps the sign
+ * residual into a small one of the opposite sign; saturating keeps the sign  [TOLSHEET TOL-PGSF-SAT]
  * and the "very large" magnitude, so the projection onto the box still does
  * the right thing and the kernel stays deterministic. */
 static inline int64_t sat64(__int128 v)
@@ -60,7 +60,7 @@ void pgsf_solve(const PGSFixedOptions *opt,
     if (w_den <= 0) { w_num = 1; w_den = 1; }
     if (w_num <= 0 || (__int128)w_num >= 2 * (__int128)w_den) { w_num = w_den; } /* default GS */
     int max_iter = opt->max_iter > 0 ? opt->max_iter : 1;
-    int64_t tol = opt->tol;
+    int64_t tol = opt->tol;  /* TOLSHEET TOL-PGSF-CONV */
 
     res->iters = 0;
     res->flops = 0;

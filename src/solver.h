@@ -8,7 +8,7 @@
 #define LP_NBU    2   /* nonbasic at upper bound */
 #define LP_REMOVED 3
 
-#define LP_INF 1e30
+#define LP_INF 1e30  /* TOLSHEET TOL-LP-INF */
 #define SOLVE_STOPPED 4   /* cooperative abort requested (time limit / Ctrl-C) */
 #define SOLVE_NUMERICAL 5 /* factorization/certificate failure */
 #define SOLVE_INVALID 6   /* NULL or structurally invalid public-API input */
@@ -106,16 +106,52 @@ typedef struct {
     long flat;             /* iterations without objective improvement */
     double last_obj;
     int needs_phase1;      /* any artificial in the initial basis */
+    int farkas_ok;         /* the last solver_solve(/warm) returned INFEASIBLE
+                              from a certified Phase-I optimum (artsum > tol on
+                              the final, certificate-clean basis).  The basis,
+                              LU/eta factors and the Phase-I objective (cobj)
+                              left behind then describe a genuine Phase-I
+                              optimum, so B^{-T} c_B is a valid Farkas-ray
+                              HINT -- see solver_farkas_duals.  Cleared at the
+                              start of every solve. */
     int negate_obj;        /* original problem was a minimization */
     /* steepest-edge (Goldfarb-Reid) pricing weights */
     double *w;             /* w[j] ~ ||d_j||^2 for nonbasic j */
     double *vw;            /* scratch: v = B^{-T} d */
     double *piw;           /* scratch: pi_p = B^{-T} e_p */
     double *duals;         /* dual (shadow-price) vector, B^{-T} c_B, M */
+    /* recession-ray evidence left behind by an UNBOUNDED verdict
+       (unb_valid==1): ray_int[q]=unb_dir, ray_int[basis[i]]=s->v[i] at
+       detection, exactly the same state the honest "is the factorization
+       accurate" dense-retry gate just cleared.  Cleared at solve start. */
+    int unb_valid, unb_var, unb_dir;
+    double *unb_ray;       /* len N */
+    /* Ruiz equilibration (roadmap 7.5): when scale_mode!=0 the engine
+       works on D_r·A·D_c with positive diagonals accumulated at create
+       time; every public input/output funnel (optimum/duals/rays,
+       set_bounds/set_objective, export/rebuild) composes them back, so
+       callers always see ORIGINAL units.  rscale[i] scales row i (rhs
+       included), cscale[j] scales core column j (split twins share the
+       original column's factor, so indexing by core column is exact);
+       all 1.0 when scaling is off. */
+    int scale_mode;
+    double *rscale;        /* len M */
+    double *cscale;        /* len n_core */
+    /* measured once at create for the --scalestat lane: pre/post-scale
+       max/min |a_ij| ratio over the data columns (0s/empty = 1) */
+    double stat_ratio_pre, stat_ratio_post;
 } Solver;
 
 /* API */
 Solver *solver_create(const LP *lp);
+/* Same as solver_create but with the equilibration-mode choice explicit:
+   scale_mode 0 = raw data path (the pre-7.5 behaviour, kept for A/B and
+   debugging), 1 = Ruiz equilibration (default).  Equilibration is a pure
+   diagonal preconditioning of the equality form: D_r·(A·D_c) with
+   positive diagonals; x = D_c·x' and the row duals/rays scale by D_r on
+   the way out, so every caller-visible value stays in ORIGINAL units and
+   every verdict keeps its original-data re-verification path. */
+Solver *solver_create_opts(const LP *lp, int scale_mode);
 void solver_destroy(Solver *s);
 /* returns status_out: 0 solved (objval set), 1 infeasible, 2 unbounded */
 int solver_solve(Solver *s);
@@ -146,6 +182,61 @@ int solver_warm_solve(Solver *s);
  * dual must be an M-vector.  The dual of row i gives the marginal change in
  * the objective per unit change in that constraint's right-hand side. */
 void solver_duals(const Solver *s, double *dual);
+
+/* Materialize a certified improving recession ray over the ORIGINAL
+ * variables for a solve that returned UNBOUNDED, using the basis state the
+ * dense-verified detection left behind: D[q] = dir, D[basic_i] = v_i, then
+ * unmapped through the x = x+ - x- split like solver_optimum.  Returns 0 on
+ * success (ray filled, n_orig doubles) and -1 when no UNBOUNDED state is
+ * available.  Like every solver hint the ray is only evidence: the caller
+ * re-verifies point feasibility, row recession, open bound sides and the
+ * objective direction against ITS original data (lpsolve does this through
+ * the psv certificate layer, cert.h). */
+int solver_unbounded_ray(const Solver *s, double *ray);
+
+/* Extract y = B^{-T} c_B at the Phase-I-optimal basis left behind by an
+ * INFEASIBLE verdict (farkas_ok == 1): one component per equality row, in
+ * the scaled-row space of this struct (multiply component i by s->mlt[i] to
+ * obtain the dual of the caller's original row i; mlt is +1/-1 by rhs sign).
+ *
+ * The returned vector is a HINT, never a certificate on its own: the caller
+ * MUST re-verify the Farkas conditions (relation-sign consistency and the
+ * y^T A x > y^T b separation over the variable box) against its own original
+ * data before using it to prune anything.  A wrong or stale hint can only
+ * fail such a check, never fabricate one.  Returns 0 on success, -1 if no
+ * Phase-I-infeasible state is available.  Fills y[0..M). */
+int solver_farkas_duals(Solver *s, double *y);
+
+/* Directed-rounding Farkas box check over the ORIGINAL rows and a given
+ * variable box, O(m + nnz).  `ys` is a candidate dual ray in the solver's
+ * scaled-row space (see solver_farkas_duals); `mlt` is the +1/-1 per-row
+ * sign.  The complete Farkas conditions are re-verified against the
+ * supplied data: relation-sign consistency (violating components are
+ * clamped to 0, soundly weakening the ray) and the separation
+ * min_box (y^T A)x > y^T b + tol*(1+|R|), with both sides computed under
+ * directed rounding (proven corner bounds for the min side, upward for the
+ * rhs side).  Any NaN/inf, infinite needed bound, or failed margin makes
+ * the check fail ("cannot say") -- it can never fabricate a separation.
+ * y/zl/zh are caller scratch of sizes m/n/n.  Returns 1 iff infeasibility
+ * of the box system is PROVEN. */
+int solver_farkas_boxcert(int n, int m, const int *colptr, const int *row,
+                          const double *val, const char *rel, const double *b,
+                          const double *lo, const double *hi, const double *ys,
+                          const int *mlt, double tol,
+                          double *y, double *zl, double *zh);
+
+/* Scale-mix exposure of a box system: max over rows of
+ * sum_j |a_ij| * min(max(|lo_j|,|hi_j|), 1e29).  The double phase-1 decides
+ * infeasibility against an ABSOLUTE artificial-sum tolerance of 1e-6, while
+ * the products feeding its residuals round by up to ~exposure*DBL_EPSILON
+ * even before accumulation; once exposure*eps approaches that tolerance the
+ * verdict ceases to distinguish infeasibility from rounding noise.  Callers
+ * use exposure*DBL_EPSILON >= 5e-7 (half tolerance) as the "shaky"
+ * frontier: an UNCERTIFIED infeasibility verdict past it must be downgraded
+ * to the honest numerical-failure class rather than pruned/printed. */
+double solver_row_exposure(int n, int m, const int *colptr, const int *row,
+                           const double *val,
+                           const double *lo, const double *hi);
 
 /* Reduced costs for all original variables (c_j - (dual . A_j)); rc must be
  * an n_orig-vector.  For a free x=x+ - x-, this is the reduced cost of the

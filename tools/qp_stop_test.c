@@ -30,6 +30,7 @@ static int failures = 0;
  * Optimum x0 = 1, objective 0.5. */
 static void build_qp(QP *qp)
 {
+    memset(qp, 0, sizeof *qp);   /* extensible struct: zero before assigning */
     static double Q[1] = {1.0};
     static double c[1] = {0.0};
     static double A[1] = {-1.0};
@@ -42,6 +43,7 @@ static void build_qp(QP *qp)
  * feasibility leaves no certified feasible point). */
 static void build_qp_infeas_start(QP *qp)
 {
+    memset(qp, 0, sizeof *qp);   /* extensible struct: zero before assigning */
     static double Q[1] = {1.0};
     static double c[1] = {0.0};
     static double A[1] = {-1.0};
@@ -55,7 +57,7 @@ int main(void)
     /* --- 1. baseline correctness preserved (no stop) --- */
     QP qp; build_qp(&qp);
     QPResult r; memset(&r, 0, sizeof(r));
-    psolve_stop_fn = NULL;
+    psolve_stop_set(NULL);
     qp_solve(&qp, &r);
     CHECK(r.status == 0, "baseline QP solves to OPTIMAL (status 0)");
     CHECK(fabs(r.obj - 0.5) < 1e-9, "baseline objective 0.5");
@@ -66,7 +68,7 @@ int main(void)
     build_qp(&qp);
     memset(&r, 0, sizeof(r));
     g_stop = 1;
-    psolve_stop_fn = stop_now;
+    psolve_stop_set(stop_now);
     qp_solve(&qp, &r);
     CHECK(r.status == QP_STOPPED, "cooperative stop -> QP_STOPPED (not OPTIMAL)");
     CHECK(r.status != 0, "stop never reports a fabricated OPTIMAL");
@@ -81,13 +83,13 @@ int main(void)
     build_qp_infeas_start(&qp);
     memset(&r, 0, sizeof(r));
     g_stop = 1;
-    psolve_stop_fn = stop_now;
+    psolve_stop_set(stop_now);
     qp_solve(&qp, &r);
     CHECK(r.status == QP_STOPPED, "stop during Phase-I -> QP_STOPPED");
     CHECK(r.x == NULL, "stop during Phase-I leaves x == NULL (no feasible incumbent)");
     qp_result_free(&r);
     g_stop = 0;
-    psolve_stop_fn = NULL;
+    psolve_stop_set(NULL);
 
     /* --- 4. stop disabled again -> solves --- */
     build_qp(&qp);

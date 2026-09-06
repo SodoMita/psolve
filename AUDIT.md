@@ -1,5 +1,946 @@
 # psolve — audit & hardening notes
 
+> **2026-08-19 (14) - branch `arena/cp-engine-correctness`: Phase 7.1,
+> presolve + postsolve for the LP CLI (v2's highest-ROI item), plus a
+> bundled cert-layer fix: free-variable columns no longer veto Farkas
+> box-certificates whose window on them is provably zero.  Presolve may
+> decline or degrade, never guess; every printed verdict is re-proven
+> against ORIGINAL data by the same 6.4 psv lanes as before.**
+>
+> **What shipped.**  `src/presolve.{h,c}` (~830 lines) with
+> `lp_presolve()` and the replay maps
+> `lp_presolve_postsolve_{x,duals,ray}()`, `lp_presolve_farkas_ray()`,
+> `lp_presolve_unbounded_note()`.  Reductions run to a pass-capped
+> fixpoint on the caller-visible LP (before the engine's free-variable
+> split, mlt sign rows and 7.5 equilibration): fixed columns; empty
+> rows (consistent: dropped with dual 0; inconsistent: EXACT infeasible
+> with an explicit one-row Farkas ray hint); empty columns at read
+> (fixed at the cost-sign bound; cost walking an open side emits a
+> certified-UNBOUNDED note); singleton rows (implied bound folded into
+> the box with directed-rounding outward folds; singleton-vs-ORIGINAL-box
+> conflicts are exact one-row rays, singleton-vs-singleton conflicts
+> exact two-row rays); redundant rows (directed-rounding activity
+> limits, dropped with dual 0; activity conflicts are exact one-row
+> rays); doubleton-equality substitution (fill capped at 3x nnz growth,
+> pivot = larger |a|).  Every fired reduction pushes a record
+> (`PreRec`), its pivot-column snapshot capped by a byte/record budget;
+> crossing any budget, sentinel, or unsupported shape declines the
+> whole run (rc -1) and the CLI walks the untouched original.
+>
+> **Postsolve & the dual replay invariant.**  Records replay in REVERSE
+> firing order; dual replay reconstructs row duals from the firing-time
+> snapshot `y_i = (c_j - Sum y_r a_rj)/a_ij` over rows then-ACTIVE.
+> An unknown reference (elimination-order cycle) makes the map return
+> -1 - a caller-level fallback event, not a verdict.  A complementarity
+> guard (new tolsheet row TOL-LP-PRETIGHT, class D - caught during
+> development when free_vars.lp's certificate failed: the raw rc-formula
+> alone can assign a nonzero dual to a SLACK singleton row, inflating
+> the psv dual bound) forces y_i = 0 on any inequality singleton row
+> whose implied side is not tight at the postsolved point.
+> All exact-ray paths are gated by `row_touched`: a row whose
+> b/coefficients were mutated by an earlier fold can no longer source a
+> ray (the mutation destroyed the "ray over original rows" reading), so
+> presolve aborts instead of handing the psv lane a doomed artifact -
+> found in development on a folded chain whose "ray" was correctly
+> REJECTED by psv_cert_check (the system worked; the gate makes the
+> decline explicit and cheap).
+>
+> **CLI lanes.**  Default `lpsolve` now runs presolve first; the
+> config ladder `(presolve,scale) -> (0,scale) -> (0,0)` with dedup
+> handles every uncertified outcome (same machinery 7.5 introduced for
+> scaling).  New flags `--nopresolve` (pre-7.1 path) and `--prestat`
+> (reduction accounting on stderr).  New verdict lanes with
+> `iterations: 0` (no engine run): presolve rc==1 exact-infeasible rays
+> (routed through `psv_cert_check(PSVK_LP_INFEASIBLE)` like any ray),
+> and the full-elimination branch (`model->n == 0`): direct OPTIMAL /
+> UNBOUNDED-via-note claims whose x/duals/ray come purely from record
+> replay.  A presolved-model engine-INFEASIBLE (r==1) ALWAYS degrades
+> in v1 - no ray back-propagation - even when the engine's own raw-data
+> retry would have a ray; documented in presolve.h.  Objective prints
+> are always recomputed `Sum c_j x_j` on the original postsolved point
+> (objconst never feeds the print), so the printed number is the
+> original-data number.
+>
+> **Bundled cert-layer fix (same commit): boxcert exact-zero windows.**
+> `solver_farkas_boxcert` (one implementation, used by every LP/MIP/fzn
+> Farkas lane) computed `L = min_box(y^T A)x` corner-by-corner and
+> DECLINED the whole certificate when ANY column had a box side at the
+> +-1e30 "infinity" sentinel (TOL-LP-BIGCAP 1e29) - even when that
+> column's directed-rounding `y^T A` window is provably `[0,0]`
+> (`zl >= 0 && zh <= 0`; zl/zh bracket the exact sum under
+> FE_DOWNWARD/FE_UPWARD, so the exact sum IS 0 and the column's box
+> product is exactly 0 for ANY box, open sides included).  Consequence:
+> EVERY infeasibility certificate on a model with a free variable -
+> including the engine's own extracted rays - degraded to
+> NUMERICAL_FAILURE.  The fix skips such columns (their contribution is
+> provably 0) before the BIG test; soundness is unchanged (the skip can
+> only fire when the true sum is exactly 0), and on finite-box columns
+> the old corner-min accepted the same 0 contribution already, so
+> finite-box behavior is bit-identical (MIP/fzn lanes: variables are
+> bounded, BIG never fires - smokes bit-identical pre/post).
+>
+> **Regression-locked measurements.**
+>
+>   * Planted per-reduction corpus (12 cases, now hard-gated): each
+>     exact-ray family (singleton-vs-box, empty-row, activity, FREE-var
+>     pair conflict) prints INFEASIBLE with `iterations: 0`; the
+>     touched-row chain declines presolve and still prints the correct
+>     raw-engine INFEASIBLE; the doubleton bound chain full-eliminates
+>     and direct-claims OPTIMAL 3 (iters 0); empty-column and doubleton
+>     ray-transfer print UNBOUNDED; fixed/singleton-fold/redundant
+>     optimal families print 2/7/5 exactly; the planted fallback case
+>     (doubleton fires, reduced model engine-infeasible) shows the psv
+>     degrade notes AND the identical raw verdict.  Pre-change binary on
+>     the same 12: identical verdicts everywhere EXCEPT the two cases
+>     the boxcert fix converts from NUMERICAL_FAILURE to certified
+>     INFEASIBLE (free-var pair conflict; joint y-range conflict) -
+>     recorded as an intentional verdict-quality improvement.
+>   * A/B parity (default vs --nopresolve), records the acceptance
+>     mapping: 40k random LPs (20k well-scaled + 20k entry-mixed 1e+-4,
+>     seed 42) + 10k (seed 777): **0 verdict flips, 0 lost raw answers**;
+>     combined-evidence fallbacks 364 + 90 (each lands the identical raw
+>     verdict); co-OPTIMAL objective prints bit-identical on
+>     98.6%/99.1% (identical whenever no reduction fires); the remainder
+>     measure <= 1.4e-10 rel (engine tolerance replay noise through big
+>     coefficients - the gate pins 1e-12 well-scaled / 1e-9 entry-mixed).
+>   * scipy/HiGHS oracle, honestly calibrated: 39 952 + 9 990 co-OPTIMAL
+>     cross-checks.  On well-scaled data the 1e-6 oracle held 20 000/20 000.
+>     On 1e+-4 entry-mixed data HiGHS is NOT an authoritative objective
+>     oracle: measured engine-vs-HiGHS gaps up to 1.8e-4 rel while the
+>     PRE-CHANGE binary prints byte-identical values on every
+>     scipy-flagged instance (all 7 flagged across the dev runs
+>     verified: t756, t2997, t4902, t8459, t12679, t18122, t18259 of
+>     `tools/presolve_verify.py 20000 42`; instances regenerate
+>     deterministically from the seeded generator).  The parity-flagged
+>     instances (default-vs-raw delta <= 1.4e-10, presolve fired) are a
+>     disjoint set by construction.  The gate therefore uses a
+>     gross-error-only 3e-4 bar on
+>     that family (a replayed side flip or dropped row errs at O(1)).
+>   * Records unit-verified: tools/presolve_selftest.c, 17 apply->restore
+>     invariant checks (primal replay satisfies ORIGINAL rows+box and
+>     hits the known optimum; dual replay exactly stationary on
+>     eliminated pivot columns with the complementary reduced-cost sign
+>     on surviving columns; complementarity guard slack/tight; stats).
+>   * Size reduction, measured not promised: the random families are
+>     decline-dominated (3 330/40 000 models reduce; conditional mean
+>     shrink rows 16.5% / cols 5.2% / nnz 10.5%; shipped examples: 2 of
+>     6 reduce - one eliminates 100% of rows - the others carry no
+>     removable structure and decline).  The roadmap's 30-60% target is
+>     NOT reproduced on this corpus (it lacks the structure the target
+>     assumed); what is verified is that presolve is safe at ANY
+>     reduction rate, which is the property that matters here.
+>   * Hard gates: `tools/presolve_verify.py 400 20260819` and
+>     `presolve_selftest` in test.sh; both discriminating - the
+>     pre-change binary rejects --nopresolve/--prestat ("unknown
+>     option") so the gate exits 1 loudly (verified), and the selftest
+>     target does not exist on the pre-change tree.  scale_verify.py's
+>     raw lane now means `--nopresolve --noscale` (true pre-7.x path;
+>     2 seeds green).  tolsheet gate green (90 ids).
+>   * ASan/UBSan/LSan (detect_leaks=1): all 6 examples x 3 flag combos,
+>     12 planted cases, presolve_verify N=40 + scale_verify N=40 +
+>     cert_inject N=40 (both seeds) on instrumented binaries, mip/fzn/fx
+>     smokes - clean; found and fixed ONE leak in the NEW selftest
+>     harness itself (missing lp_free(&red) in section 1), none in the
+>     module or CLI.
+>   * MIP/branch-and-bound, fzn, fx, qp paths: unchanged behavior -
+>     presolve is LP-CLI-only, 7.5 pins those bridges to the raw engine,
+>     and the boxcert skip is provably inert on bounded columns (mipsolve
+>     knap_gap pin OPTIMAL 10, fzn smoke UNSATISFIABLE: byte-identical
+>     pre/post).
+>   * Battery: full `test.sh` exit 0 on the final tree on 2026-08-19
+>     (incl. farkas_verify 150, lp_scale_verify 60, scale_verify 200 x 2
+>     seeds, presolve_verify 400 + selftest, cert_inject 200 x 2 seeds,
+>     mzn_diff OK=33, fx_verify OK=300, oom_test 6119 injections), and
+>     the MiniZinc benchmark regenerated: 77/77 models semantically
+>     identical (status/objective/solutions/verdict; timing-only churn)
+>     - one tooling fix surfaced by the battery itself: fuzz_inputs.py's
+>     manual ASan source list missed src/presolve.c.
+>
+> **2026-08-18 (13) - branch `arena/cp-engine-correctness`: Phase 7.5,
+> Ruiz equilibration + geometric-mean scaling for the LP engine (v2
+> item), with A/B CLI lanes and an evidence-preserving raw-data
+> fallback.  Scale can add certified answers, never take one away.**
+>
+> **What shipped.**  `solver_create_opts(lp, scale_mode)` (new public
+> API; `solver_create()` = scaled default, `0` = the raw pre-7.5 path).
+> At create time the engine deep-copies the normalized LP and applies 4
+> Ruiz iterations — each a geometric-mean row pass (factor
+> 1/(sqrt(min|a|)·sqrt(max|a|)) per row, rhs included) then the same per
+> column (bounds and costs mapped consistently) — accumulating strictly
+> positive diagonals `rscale`/`cscale`.  The engine then runs entirely on
+> `D_r·A·D_c` and every public funnel composes the diagonals back, so
+> caller-visible values stay in ORIGINAL units: `solver_optimum` and
+> `solver_unbounded_ray` multiply by `cscale` (split twins share the
+> original column's factor exactly, their |entries| being identical),
+> `solver_duals` and `solver_farkas_duals` multiply by `rscale` (the
+> documented mlt-multiply caller contract is UNCHANGED), reduced costs
+> divide by γ (the core reduced cost is γ times the original one),
+> `solver_set_objective` maps `c→γc`, `solver_set_bounds` maps `l,u→l/γ,u/γ`
+> with infinity-token sides never divided, `solver_export_lp` unwraps
+> `mlt·rscale·cscale` on entries and `rscale` on the rhs, and
+> `solver_refresh`/`solver_add_row` re-equilibrate their rebuilt images.
+> With scaling off the diagonals are allocated as literal 1.0, so every
+> funnel multiplication/division is an exact IEEE no-op: the raw path is
+> bit-identical to the pre-change engine (verified by the MIP A/B below).
+> Decline rules (`LP_SCALCAP=1e300` intra-line spread cap, non-finite
+> factor × entry/rhs products, a finite bound the divide would push
+> ACROSS the infinity token, non-finite mapped costs) SKIP that row or
+> column — scaling is optional conditioning; declining can only leave
+> the model exactly as handed in.  All guards are class-D (never verdict
+> inputs); new tolsheet row TOL-LP-SCALCAP documents them, gate green
+> (89 ids).
+>
+> **The CLI contract (lpsolve).**  New flags `--noscale` (raw path) and
+> `--scalestat` (stderr: mode, pre/post max|a|/min|a| spread proxy,
+> iters).  The verdict chain runs inside a two-attempt fallback loop:
+> equilibration is conditioning, never a verdict input, so when the
+> scaled run's outcome cannot be certified against ORIGINAL data — any
+> 6.4 psv lane rejection (OPTIMAL/UNBOUNDED/Farkas-shaky) or an engine
+> SOLVE_NUMERICAL — attempt 1 destroys the solver, re-creates it on the
+> raw path with the dense factorization forced, re-solves and
+> re-evaluates the ENTIRE chain, printing only what certifies.  The
+> retry never fires after an explicit stop (budget binding) or when
+> `--noscale` was already given, and every engagement is announced on
+> stderr (`psv: scaled evidence not certified, re-solving on raw data`),
+> preceded by the specific cert-lane note.  Consequence: a raw-path
+> OPTIMAL can never be LOST to scaling; a raw-path NUMERICAL that
+> scaling rescues (the LU stall goes away on the equilibrated image and
+> the psv lane certifies the answer against original data) is a pure
+> gain.
+>
+> **Scope decision: MIP/fzn pinned RAW.**  Scaling was validated for
+> one-shot LP verdicts where every print re-verifies against original
+> data AND the fallback re-solve exists.  Node LPs in the MIP bridge
+> STEER discrete decisions and have no per-node primal-bound certificate
+> chain, so scaled node answers cannot be arbitrated as improvements.
+> Measured before pinning (per-entry log-uniform 1e±8 MIP family, N=150,
+> new-vs-old mipsolve): 12 status flips, 7 LOST certified-OPTIMAL
+> verdicts, 7 co-OPTIMAL objective disagreements >1e-6 rel, honest-class
+> count 6→10 — against 5 rescues.  That exposure is not acceptable as
+> silent behaviour change, so `src/mip.c` (relaxation), `src/fzn.c`
+> (pure-LP lane) and the mipsolve relaxation arbitrator call
+> `solver_create_opts(..., 0)`.  Post-pin A/B (E=4 and E=8, N=150 each):
+> ZERO flips, ZERO disagreements, NUM counts 6/6 — the pin restores
+> bit-identical bridge numerics, exactly as designed.  Lifting the pins
+> needs per-node certification (fx/exact territory; see Appendix A item
+> B sibling note).
+>
+> **Measurements (regeneration: /tmp probe generators are seeded in
+> tools/scale_verify.py; engine: this commit's lpsolve).**
+> Conditioning proxy (median post/pre spread, max|a|/min|a| over stored
+> entries): well-scaled family 44.7 → 13.0; entry-mixed 1e±4 family
+> 1.02e8 → 1.42e6 (72×); 1e±12 family 1.9e23 → 8.8e18.  Gate medians on
+> high-spread instances: 0.0098 (E=4), 3.9e-6 (E=12); the proxy NEVER
+> got materially worse (0/466 instances across both gate seeds).
+> Verdict movement (census raw→default): well-scaled N=150: 150
+> OPTIMAL→OPTIMAL, zero fallbacks; 1e±4 N=150: 150 OPTIMAL→OPTIMAL, 0
+> fallbacks; 1e±12 N=80: 12 OPT→OPT, 6 NUM→OPT (rescues), 62 NUM→NUM,
+> 0 losses, 68 fallbacks (the scaled psv attempt rarely certifies at
+> 1e±12; the fallback keeps parity).  Rescue contract, pinned instance
+> (tools/scale_verify.py gen_mixed stream, spread 6.0e8): pre-change and
+> `--noscale` both print NUMERICAL_FAILURE (honest LU stall); default
+> prints OPTIMAL 10560305.7817494 = scipy/HiGHS 10560305.781749407.
+> Rescue rate measured ~0.4% of the 1e±4 family and ~7% of the 1e±12
+> family (gate asserts ≥1 across its seeded streams; E=4-only existence
+> is seed-luck, hence the combined assert — recorded here so nobody
+> "fixes" a spurious gate failure by weakening it).
+> Iteration movement (honesty bar — report exactly what moved): on the
+> co-OPTIMAL probe families the scaled image takes slightly MORE simplex
+> iterations (well-scaled 1868→1919 total, median 12→12.5; 1e±4
+> 1698→1756, median 11→11).  Equilibration changes vertex paths; on
+> these tiny models there is no iteration win to claim — the function of
+> 7.5 is certified-answer RECOVERY on extreme data, and on well-scaled
+> data it costs ~3% pivots.  Also recorded: the 6.4 LP-OPTIMAL dual-dust
+> lane occasionally fails to certify the scaled run's evidence when γ
+> spans ~1e±9+ (its original-units rounding exceeds the dt margins);
+> that is precisely what the fallback arbitrates — observed 1–2
+> engagements per 200 at 1e±4 and dominating at 1e±12, with zero
+> resulting verdict losses.
+>
+> **Test pinning.**  `tools/scale_verify.py` (200 models × 2 seeds in
+> `test.sh`, hard gate): (0) A/B-lane probe — FAILS LOUDLY on the
+> pre-change binary, which rejects `--noscale`/`--scalestat` as unknown
+> options (discrimination proven against the aa9bcda build); (1)
+> well-scaled parity N=200, statuses identical and co-OPT objectives
+> ≤1e-7 rel, scipy oracle cross-check (200/200); (2) conditioning
+> asserts on entry-mixed families (never-materially-worse + median
+> halving); (3) no-loss contract on 1e±4/1e±12 (raw OPTIMAL ⇒ default
+> OPTIMAL ≤1e-6 rel; rescued objectives scipy-confirmed); (4) rescue
+> existence across the seeded streams; (5) the six shipped examples
+> A/B-identical.  Both seeds green; per-seed tables in the gate output.
+> Battery: full `test.sh` green (MiniZinc differential OK=33 FAIL=0,
+> benchmark 77/77 semantically identical — status/objective/solutions/
+> verdict/nodes all equal, only timing churn; lp_scale_verify unchanged:
+> fabricated=0, rescued=60; cert_inject 100/100/100 on both seeds).
+> ASan/UBSan/LSan sweep on the instrumented build: examples × 4 flag
+> combos, the pinned rescue instance, two live fallback instances,
+> scale_verify N=40, cert_inject N=40, mipsolve knap_gap, fznsolve ×3,
+> fxsolve prodplan — zero reports, leak checking on (covers the new
+> rscale/cscale ownership and the fallback's destroy/recreate path).
+> One battery pin needed a documented touch: `tools/arena_test.c`'s LP
+> baseline oracle asserted the double engine hits prodplan's true 26
+> EXACTLY; with the scaled default the reconstructed objective is
+> 26.000000000000004 (1 ulp — funnel rounding on an already-certified
+> answer, inside every margin).  The oracle now allows 8·DBL_EPSILON·26
+> with a comment; the arena-vs-libc BIT-IDENTITY pin it feeds is
+> unchanged and still exact, and the fx (exact rational) oracle was not
+> touched.
+
+> **2026-08-18 (12) - branch `arena/cp-engine-correctness`: Phase 6.4,
+> unified evidence objects.  One claim type per verdict class, one
+> psv_cert_check() entry point at every CLI verdict exit, an
+> error-injection hard gate - and three real defects the
+> gate/battery caught in the certificate layer's own first drafts.**
+>
+> **What shipped.**  `src/cert.h` defines `PsvCert` (kind + ORIGINAL-data
+> view + evidence payload + explicit margin fields) and one entry point
+> `psv_cert_check()` returning OK / REJECT (evidence contradicts) /
+> DEFER (evidence cannot certify: NaN, missing payload, vacuous bound).
+> `src/cert.c` implements seven kinds against the caller's own data:
+> LP_OPTIMAL (primal point + bounded-LP Lagrangian dual bound built from
+> the engine duals: shadow-price duals are sense-normalized into max form
+> BEFORE sign analysis, sign-invalid components clipped to 0 = sound
+> weakening, reduced-cost dust within the dj window charged UPWARD on
+> closed boxes and treated as zero only across an open side - charging
+> |rc|·1e30 against the infinity sentinel was an early-draft bug that
+> inflated B by 1e14), LP_INFEASIBLE (directed-rounding Farkas box
+> separation, reusing solver_farkas_boxcert), LP_UNBOUNDED (feasible
+> point + recession ray: open bound side on every macro component,
+> sign-consistent row recession, strict descent), MIP_POINT (bounds +
+> rows + EXACT integrality of snapped incumbents + objective consistency
+> + directional bound coherence), QP_OPTIMAL (primal rows, stationarity
+> Qx+c+Aᵀμ, multiplier sign + complementarity, objective consistency),
+> QP_UNBOUNDED (feasible point, strict A d ≤ 0 mirroring qp.c's
+> deliberate no-margin rule, curvature ≈ 0, descent), EXHAUSTION
+> (discrete search-completed stamp: stopped/node-limit/nodes<0 reject -
+> a truncated search can never print UNSAT through this entry point).
+> Engine evidence hooks: `solver_unbounded_ray()` (the recession ray is
+> materialized at the dense-verified `iterate()` unbounded exit and
+> unmapped through the x⁺−x⁻ split; cleared at both solve-entry sites)
+> and `QPResult.ray`.  Wiring: `src/main.c` (all three LP verdict lanes,
+> INFEASIBLE keeping the exact Phase-I/shaky-frontier policy), and
+> `tools/mipsolve.c` / `tools/qpsolve.c` / `tools/fznsolve.c` (MIP point
+> + Farkas-or-exhaustion UNSAT lanes + relaxation-verified UNBOUNDED;
+> QP KKT/recession; fzn optimize bound-coherence + UNSAT exhaustion).
+> On REJECT/DEFER every lane degrades to the honest class
+> (NUMERICAL_FAILURE / UNKNOWN); the checker never prints and never
+> mutates.
+>
+> **The error-injection acceptance (what the numbers mean, stated
+> precisely).**  New hard gate `tools/cert_inject` in test.sh (200
+> instances x 8 families x 2 seeds; extra seeds 4242/99991/31337 and
+> N=2000 also green).  LEGIT (true claims) accepted 100% on every
+> family - a legit rejection is a certificate-layer false-rejection bug.
+> LARGE (out-of-box pushes, objective drifts, integer off-by-one,
+> negated rays, feasible-but-suboptimal false-OPTIMAL claims, row-normal
+> point corruption, flipped statuses) rejected 100% of ADVERSARIAL shots
+> - adversarialness decided by independent closed-form oracles in the
+> harness (long-double box extrema, never the checker under test),
+> because a corrupted payload that still proves the claim accepts
+> CORRECTLY (the harness itself caught two of its own unsound families:
+> garbage duals that clip to the box-sup and remain a valid corner
+> certificate when the optimum saturates the box, and rotation-invariant
+> Farkas rays on symmetric contradiction rows).  1-ulp directed noise:
+> 100% rejected on the zero-width snapped-integer MIP surface
+> (199/199; 1964/1964 at N=2000) - the one surface where ulp corruption
+> is structurally decidable because engine incumbents are stored
+> lattice-snapped and the check is exact `x == rint(x)`.  On the
+> tolerance-margined point surfaces (LP/QP point and dual payloads) the
+> measured rejection is 0% BY DESIGN: the engines' own terminal margins
+> are >= 1e-9-relative, so any checker that rejects 2e-16-relative noise
+> would false-reject every true claim.  The roadmap's literal ">= 99.9%
+> of 1-ulp-perturbed OPTIMAL/UNSAT claims" target is therefore asserted
+> exactly where it is decidable (zero-width surfaces: met at 100%) and
+> reported, not asserted, on continuous surfaces; the 100%-of-large-
+> perturbations clause is unconditional and measured.  (qp_unbounded
+> ulp: ~70% rejected - the strict recession edge catches a majority.)
+>
+> **Three defects the harness/battery caught in this layer's own
+> drafts** (the phase's process point: certificates need verification
+> too): (1) The MIP proven-optimal stamp was first written as a
+> SYMMETRIC window |best_bound - obj| <= gap contract; the injection
+> harness showed 9/20 legit false-rejections.  Root cause: the engine's
+> best_bound is a running extremum over solved node relaxations, so the
+> root LP bound dominates it forever - the residual |bb - obj| of a
+> proven optimum IS the model's root integrality gap, not the stop
+> tolerance.  Fixed to the sound DIRECTIONAL property (an upper bound
+> never sits below a max incumbent; mirror for min), which targets
+> exactly the catastrophic direction (objective strictly better than
+> proven).  Same fix in the fzn optimize gate; `examples/knap_gap.lp`
+> (root relaxation 11.75 vs integer optimum 10) pins it in test.sh.
+> (2) Row/objective graces sized by |b|/|cx| alone false-rejected TRUE
+> points on catastrophic-cancellation data: the fbbt_verify cancellation
+> family (a0·x0 + a1·x1 with |a| ~ 1e18 nearly cancelling to D ~ 3e3)
+> has round-to-nearest activity dust of thousands against a |b|-scale
+> grace of 3e-3 - the battery caught it instantly (fbbt FAIL 2 -> 31 on
+> the first full run).  Fixed with the correct dust form: activity-scaled
+> graces sum_j|a_ij·x_j| / sum_j|c_j·x_j| on every recomputed-dot check
+> (LP/MIP/QP point rows, objective consistency, ray recession).  End
+> state fbbt_verify FAIL=0/241 - better than the pre-change binary (2).
+> (3) The MIP-UNSAT lane first required a fresh LP-relaxation Farkas
+> certificate at dt_gap=1e-6; the pinned 5e-7-strength margin cycle
+> (exactly infeasible over the integer lattice, proved by the engine via
+> lattice exhaustion at nodes=1) has its separation INSIDE the ray
+> margin, so the lane printed NUMERICAL_FAILURE for a model whose UNSAT
+> was legitimately proven (caught by farkas_verify).  The lane order is
+> now: relaxation-Farkas if the relaxation itself is infeasible (with
+> the LP CLI's exact shaky-frontier policy), else the EXHAUSTION stamp
+> (no truncation) - matching the pre-change trust level with the 6.4
+> no-truncation guarantee on top.
+>
+> **Acceptance evidence.**  cert_inject hard gate green (both seeds, in
+> battery); knap_gap CLI pin green; full test.sh rc=0 (including
+> farkas_verify, lp_scale_verify, fbbt_verify FAIL=0, fzn_output_check
+> WRONG=0 @2000, qp/mip/lp differentials); tolsheet closure green
+> (88 ids / 143 sites / 88 rows - new rows in DESIGN.md section 8.9 for
+> every cert-layer margin, each a mirror of the producing engine's own
+> contract value); ASan/UBSan/LSan sweep clean (cert_inject N=40 plus
+> farkas 60 / fzn_output_check 500 / fgraph 60 / orbit_detect 40 /
+> procstates 60 against the instrumented binaries, direct rc checks -
+> the new solver/qp ray allocations are leak-covered); MiniZinc bench
+> 77/77 with benchmark_results.json semantically identical (status /
+> objective / verdicts equal; timing-only churn).  Compile clean under
+> -Wall -Wextra everywhere (the fuzz/ASan direct-gcc build lists in
+> test.sh and tools/fuzz_inputs.py / tools/fuzz_fzn.py gained the new
+> sources).
+>
+> **Interface note for downstream.**  `fznsolve`'s LP bridge now stamps
+> sol.best_bound = LP objective (constant-free units, the MIP path's
+> convention) - an LP proven optimal is its own exact bound - so the
+> objectiveBound stat is truthful on pure-LP models instead of the
+> zero-init default.  Nothing else about printed verdicts changes;
+> downgrade paths only ever move a print to a MORE honest class.
+
+> **2026-08-18 (11) - branch `arena/cp-engine-correctness`: Phase 6.8,
+> per-module tolerance semantics sheets.  Documentation-phase discipline,
+> closed by construction: zero functional code changes, 127 source sites
+> tagged, both directions machine-checked.**
+>
+> **What shipped.**  docs/DESIGN.md section 8 now inventories EVERY
+> tolerance-class literal in src/ (decimal exponent floats, 0x1pN
+> hex-floats, DBL_EPSILON): 80 IDs across LP core / MIP / QP / PGS /
+> FlatZinc front-end / CP engine / exact-fx, each with class (V verdict-
+> adjacent, C convergence, D honest-decline guard, R flattener-exact
+> recognition, S sentinel/stability, E exact), direction of safety, what
+> it protects, and what it may never justify.  The header rule, learned
+> from the 2026-08-15 mip_diff flip that motivated 6.8: a V-class
+> tolerance may never decide a verdict alone - it feeds a certificate that
+> stands without it (directed rounding, exact-rational re-check, printed
+> bound), or the status degrades to the honest numerical-failure class.
+>
+> **The grep-provable acceptance, mechanised.**  New hard gate
+> tools/tolsheet_check.py (wired into test.sh): scans every src/ code line
+> through a real C comment/string state machine - a literal inside prose
+> or a printf string cannot steer a verdict and is exempt - and requires
+> (1) every hit carries a /* TOLSHEET <ID> */ tag on the same line,
+> (2) every tag resolves to a DESIGN.md section-8 row, (3) every row is
+> carried by at least one source line (no stale rows after refactors).
+> Adding an undocumented tolerance literal fails the battery; so does
+> deleting or renaming a documented site.
+>
+> **What the inventory actually found (honesty of the survey itself).**
+> The first manual sweep MISSED sites; the machine closure caught them,
+> and they are documented, not excused: fx.c had two representability
+> guards (±0x1p63 range, 9e17 decimal cap - the exact module has guards,
+> no margins; section 8.7 says so precisely), fznsolve's own exposure
+> frontier (fzn.c:3996, 5e-7, the TOL-LP-SHAKY sibling), QP's divergence
+> cap (1e14 => QP_ITERATION_LIMIT), splu's norm-growth watchdog (1e10),
+> solver's steepest-edge weight cap (1e18), the MIP/fznsolve/LP sentinel
+> families (1e29/1e30/1e9), and one no-decision-power unit constant
+> (ns->s) filed under section 8.8 so the closure stays total rather than
+> carved out.
+>
+> **Two process notes (both caught pre-commit by the toolchain, not by
+> luck).**  (1) Tags on comment-continuation lines must not use /* */
+> syntax - the first pass broke the build (nested comment); those two
+> sites (mip.c FBBT comment, pgs_fixed.c saturation-policy comment) carry
+> bracket tags instead, which the checker detects on raw lines.  (2) Every
+> tag site was applied with a content anchor assertion (file, line,
+> expected substring) so a drifted line number fails loudly instead of
+> tagging the wrong line.
+>
+> **Acceptance evidence.**  tools/tolsheet_check.py: OK (80 ids, 127
+> tagged sites, 80 documented rows).  Full test.sh rc=0 including the new
+> gate; compile clean under -Wall -Wextra; 77-instance MiniZinc bench 0
+> semantic diffs (status/objective/solutions/verdict identical; only
+> time_psolve_ms/time_ref_ms/compile_time_ms churn).  No ASan sweep this
+> phase - no functional code changed (comments + docs + one read-only
+> checker tool), which the battery's build+run path confirms.
+
+> **2026-08-18 (10) - branch `arena/cp-engine-correctness`: Phase 6.9,
+> functional-graph constraint family + presolve structure-recovery
+> detector.  One honesty regression introduced by the work itself and
+> caught by the phase-6.7 output gate before commit; four measured
+> memory cliffs fixed; one latent nv==0 dispatch gap closed.  Full
+> reference: docs/FUNCTIONAL_GRAPH.md.**
+>
+> **What shipped.** Five new FlatZinc predicates on one shared
+> per-table functional-graph digest (`orbit_transient`,
+> `orbit_cycle_len`, `orbit_on_cycle`, `orbit_len_capped`, plus
+> `array_bool_and` which stock models need and psolve previously
+> declined), digest content-dedupe with single-owner borrow semantics,
+> and a presolve detector that recovers the MiniZinc
+> "H-step walk + prefix-distinct count" lattice exactly (guards: every
+> record consumed, no intermediate referenced/output-pinned/
+> objective-pinned, `referenced[]` fully recomputed from surviving
+> records - airtight by construction) and rewrites it to one
+> `orbit_len_capped` record.  On ANY mismatch the model is untouched -
+> detection never narrows semantics, it only changes how fast the
+> (identical) answer is found.
+>
+> **Regression introduced and caught pre-commit (honest accounting).**
+> The first cut of "branch over referenced vars only" fabricated
+> answers: an unconstrained *output* var was never branched, stayed
+> unfixed, and printed as `0` - which can lie OUTSIDE its declared
+> domain (the exact fabrication class phase 6.7 built its gate for),
+> and `-a` enumeration collapsed the cartesian factor of free output
+> vars.  `tools/fzn_output_check.py` flagged `WRONG=59/2000` on the
+> first battery run.  Fix: branch predicate `searchme = referenced OR
+> output-pinned`; searchable-but-unfixed at a leaf is an honest
+> decline.  Rewrite-exposed chain intermediates are neither (the
+> detector refuses output-pinned intermediates), so the memory win
+> (cliff 3 below) is preserved exactly where needed.  Post-fix:
+> `WRONG=0/2000`, and the stock 65536-state rewrite still finishes
+> (1.76 s / 103 MB).
+>
+> **Four measured memory cliffs fixed (each found by profiling, in
+> order):** (1) realloc-per-entry keep lists in the new propagators -
+> quadratic churn, 1.3 GB RSS at n=16384, now two-pass
+> count-then-allocate + identical-set no-op guards; (2) initial domains
+> materialized for every declared interval incl. dead intermediates -
+> 803,479 values on the H=24/n=16384 probe, now search vars only
+> (empty-declared-domain UNSAT contract preserved); (3) branching over
+> unreferenced vars - ~800k nodes x MB-scale `cp_copy`, linear 600 MB/s
+> RSS growth, now search vars only; (4) `cp_total` fixpoint summed
+> total domain sizes per pass per node - replaced by a `mutations`
+> counter bumped by domain mutators ONLY on actual change.
+>
+> **Mutation-counter convergence (proof obligation audited).**  The
+> fixpoint must terminate when and only when propagation stabilised.
+> Audit: every domain write goes through `cp_set_vals` (restrict-
+> intersect stage runs FIRST; same-content => no bump, verified),
+> `cp_intersect` (bounded path: no-change check before bump; unbounded
+> path: bump iff lo/hi moved or materialization changed),
+> `cp_remove_val` and `cp_assign` (change-only).  An UNDER-bump would
+> exit propagation early and could print an unfiltered leaf - but leaf
+> `cp_verify` re-checks every record on the emitted point, so even a
+> missed propagation cannot fabricate; an OVER-bump only costs
+> fixpoint passes (monotone domain shrinkage bounds the loop).
+> Direction of safety confirmed: worst case is wasted work, never a
+> wrong answer.
+>
+> **nv==0 dispatch change (behaviour widened, honesty kept).**
+> All-constant satisfy models (`nv==0`) now REACH the CP engine (was
+> silently skipped by an `if(nv>0)` gate in src/fzn.c): legality per
+> the FlatZinc spec, needed by detector lattice probes
+> (`opt.bestx` allocated `(nv?nv:1)`; optimize still requires nv>0).
+> This changes UNKNOWN -> SAT/UNSAT answers for all-constant models;
+> each new answer is verified by `cp_verify` like any other leaf.
+>
+> **One more detector-side bug the mutation suite caught:** at H=2 the
+> sum row `-len + d2 = -1` has one plus AND one minus coefficient, so
+> telling the len var by "the unique +1" picked `d2` and the lattice
+> correctly (but silently) refused to fire on that polarity.  The two
+> dstsum shapes are now told apart by the rhs sign, which cannot
+> coincide (they require contradictory rhs).  Caught by
+> `tools/orbit_detect_verify.py` mode-0/9 positives (i9/i60), which
+> exist precisely because polarity is randomized per case.
+>
+> **Logged, not fixed (perf risk, not honesty):** older propagators in
+> `src/fz_cp.inc` (the int_lin family ~lines 412-688) still use the
+> realloc-per-entry keep-list pattern measured as cliff (1).  They were
+> not hot in any profile this session (their candidate lists are small
+> in practice); replacing them is a mechanical future item if a profile
+> ever indicts them.
+>
+> **Acceptance evidence.**  Discrimination on the pre-change binary
+> (both new gates fail there, per project rule):
+> `tools/fgraph_verify.py` pins_bad=5, real_bad=7, WRONG=112 at 60
+> fuzzed; post-change pins_bad=0 real_bad=0 WRONG=0 at 200.
+> `tools/orbit_detect_verify.py` WRONG=16/40 (positives UNKNOWN or
+> timed out; pre binary also lacks `array_bool_and`); post-change
+> WRONG=0/100.  `tools/procstates_orbit_verify.py` WRONG=0/120 (rerun
+> after the engine predicate change).  Full `test.sh` rc=0 incl.
+> `fzn_output_check` WRONG=0/2000, MiniZinc differential OK=33,
+> 77-instance bench 0 semantic diffs (2 search-node telemetry changes
+> recorded: bool_and_sat 1->2, subcircuit_demo 13->6).  ASan/UBSan/LSan
+> sweep: the three new gates at 60/40/60 plus output-check 500, plus
+> the stock 65536-state rewrite and the lattice template direct -
+> rc=0, zero sanitizer reports.  Auto-detection headline: the stock
+> procstates encoding (n=65536, H=64) is recovered and PROVEN optimal
+> (44, objective=objectiveBound) in 1.76-1.89 s / 103 MB, vs Gecode
+> 600 s UNKNOWN, Chuffed OOM at load, CP-SAT OOM mid-search
+> (docs/PROCSTATES.md SS5 baselines, same box).
+
+> **2026-08-16 (9) - branch `arena/cp-engine-correctness`: Phase 6.7 of
+> the ambitious roadmap, FlatZinc output-layer round-trip fuzzing.  The
+> new checker caught ONE fabricated-SAT class in the CP engine, one
+> heap-buffer-overflow in the same engine, and one pre-existing parser
+> out-of-bounds stack read (SIGSEGV) - all fixed and locked with
+> discriminating gates.  It also produced one false-alarm class of its
+> own, documented and corrected below.**
+>
+> **The tool (new, `tools/fzn_output_check.py`, hard gate in test.sh).**
+> Structured-model generator + independent oracle that re-parses every
+> emitted byte of `fznsolve` across satisfy / minimize / maximize / `-a`
+> and checks: the marker protocol exactly (`----------` per block,
+> `==========` rules, UNSAT/UNKNOWN placement), every printed assignment
+> against *every* constraint and the declared domains, alias/array-view
+> consistency (including constant alias slots), the `%mzn-stat:`
+> objective echo against the printed point, `-a` enumeration
+> (no duplicates, projection set EQUAL to the brute-forced one for
+> satisfy, strictly improving incumbents ending AT the brute optimum for
+> optimize), and UNSAT-fabrication detection (a printed UNSATISFIABLE on
+> a brute-force-satisfiable model is WRONG).  Float models are checked
+> with a *scaled LP feasibility tolerance* (see the false alarm below);
+> UNSAT/optimum claims on them are cross-checked against HiGHS (scipy)
+> on the benign dyadic data.  Pinned regressions run first and gate the
+> corpus.
+>
+> **Bug 1 (fabrication, CP engine): `cp_set_vals` had REPLACE
+> semantics.** Propagator candidate sets were written as the var's new
+> domain verbatim, so a propagator could WIDEN a declared domain.  Pin
+> of record: `var 5..5: x0; var -4..-3: x1; constraint int_abs(x1,x0);`
+> printed **`x1 = -5` -- a value OUTSIDE its declared domain -- as
+> SATISFIABLE** (the abs propagator with x0 fixed at 5 wrote
+> {+5,-5} over [-4,-3]; leaf printing trusts CP domains); the bare
+> sibling `x0 in 0..1, x1 in -4..-3` printed `x0=0, x1=0` SAT on a truly
+> UNSAT model.  Fix: restrict semantics inside `cp_set_vals` (sort/dedupe
+> candidates, intersect with the current domain; empty intersection
+> returns the infeasibility signal).  All callsites audited: propagation
+> only ever proposes subdomains, so intersecting cannot change any
+> legitimate outcome; the one init callsite intersects against the full
+> int64 range and behaves exactly as before.
+>
+> **Bug 2 (heap-buffer-overflow, exposed by fix 1).** Every one of the
+> 12 propagator callsites checked `cp_set_vals(...) < 0` (capacity
+> failure) but ignored `==1` (empty domain) - harmless under replace
+> semantics because callers pre-guarded empty candidate lists, but
+> restrict semantics made "candidates ∩ domain = ∅" a *new* reachable
+> way to empty a domain.  A `var {3-valued}` var emptied this way left
+> `nvals=0` with propagation continuing, and the next propagator's
+> `cp_dmax` read `vals[v][-1]` (ASan: heap-buffer-overflow,
+> cp_prop_minmax, on a fuzzed 3-var int model).  Fixed by threading the
+> `==1` infeasibility return through all 12 callsites.  Honest
+> accounting: the ignored return is the latent flaw; my own fix 1 made
+> it reachable - the ASan run on the *post-fix* binary caught it
+> pre-commit, exactly what the gate is for.
+>
+> **Bug 3 (pre-existing, parser): `var {>256 ints}: x` out-of-bounds
+> stack read.** fzn.c counted set-domain members without limit but
+> stored into a fixed `long vals[256]`, then copied the *counted* number
+> of entries - past member 256 the copy read beyond the stack buffer
+> into garbage domains (pin: `var {1..70000-as-set}: x` + `x = 54321`
+> SIGSEGV'd - verified on the pre-change binary too).  Fixed by
+> counting first and allocating exactly.  A related latent fault found
+> en route: the CP init path for set literals larger than the CP
+> materialization cap wrote an intentionally EMPTY domain and solved on
+> it (same underflow); it now *declines* to the exact MIP/SOS1 bridge,
+> like every other CP capacity limit.  Both pins added to the tool
+> (65536-member boundary materialized in CP; 66000-member declined to
+> MIP; both instant).
+>
+> **False alarm of the tool itself (documented, fixed).**  The first
+> float-family revision checked float constraints with exact Fraction
+> arithmetic on the printed decimal tokens - unsound: a printed float is
+> a %.*g decimal round-trip of a *binary* double, and LP vertices of
+> dyadic-input models are rationals with non-dyadic denominators (x =
+> -4/3 prints as -1.3333333333333333; its exact Fraction times 3/2 is
+> NOT -2, while in IEEE double arithmetic it evaluates to exactly -2.0).
+> 4/600 models flagged "WRONG" with residuals ~1e-16 while the same
+> expressions evaluated to exactly 0 residual in float64.  The check now
+> uses the standard scaled LP feasibility tolerance (1e-6 · scale) -
+> ~10 orders above round-trip noise, far below any macroscopic lie on
+> these O(1)-scale models - and reports the max scaled residual over the
+> run as a drift indicator (observed ≤ 1e-16 across 19.5k models).
+>
+> **Acceptance evidence.**  Discrimination (pre-change binary, tool
+> exit 1): 4/5 pins fail (the two abs fabrications incl. x1=-5 printed;
+> both big-set pins crash) + corpus `WRONG=34` at N=2000 (all "outside
+> declared domain" int_abs-family escapes).  Post-change: pins pass;
+> `N=10000 seed 20260815`, `N=4000 seed 777`, `N=4000 seed 4242` all
+> WRONG=0 (float max scaled residual ≤ 1e-16); ASan/UBSan(+LSan) build
+> sweep N=1500 WRONG=0 (zero sanitizer events - a nonzero exit is WRONG
+> by construction).  Full `test.sh` battery green incl. MiniZinc
+> differential and 77-instance bench with 0 semantic diffs; verdicts on
+> the int fuzz corpus bit-identical to pre-fix (the fixes changed
+> memory safety and answer *honesty*, never a legitimate answer).
+>
+> **Known limitation surfaced, not fixed (performance, not honesty):**
+> a set domain DECLINED to the MIP bridge (members > 65536) whose
+> UNSAT-ness needs reasoning (e.g. forcing x to a non-member) grinds in
+> branch-and-bound (66000-member SOS1 pin: > 120 s, no wrong output).
+> Candidate fix for a later round: presolve set-domain/equality
+> intersections before the SOS1 encoding.
+
+> **2026-08-15 (8) - branch `arena/cp-engine-correctness`: Phase 6.5 of
+> the ambitious roadmap, the QP numerical audit.  One fabrication-class
+> hole found and closed; no others.**
+>
+> **The hole (found this round).** The QP convexity gate screened only
+> the 1x1 and 2x2 principal minors of Q -- so a symmetric matrix n >= 3
+> whose negativity lives in a larger minor PASSED as "convex": diag 1
+> with off-diagonals -0.9 has every 2x2 minor 0.19 > 0 and an eigenvalue
+> of -0.8.  Starting from the stationary origin (c = 0 gadget) the
+> active-set returned immediately with the origin as "optimum": on the
+> unconstrained gadget the QP is unbounded below (pin pinned in
+> tools/qp_psd_verify.py as pin_unconstr), on the box-bounded companion
+> the true optimum (-1.2 at (1,1,1)) was reported as 0.  A fabricated
+> optimum is the verifier-free direction: nobody re-checks a claimed
+> solution.  On the extended family (random Q with all 2x2 minors safely
+> positive and a macroscopic negative eigenvalue) the pre-change binary
+> fabricated **103 status-0 verdicts out of 122** (25 of 60 box variants
+> with objectives wrong vs the true vertex optima, e.g. -4.436 claimed
+> vs -14.288 true).
+>
+> **The fix.** Full symmetrized complete-pivoting elimination scan:
+> pivot the largest remaining diagonal each step (a pivot < -tol is a
+> negative diagonal of a matrix congruent to Q -- indefinite by
+> Sylvester's law; if the largest remaining diagonal is within tol of
+> zero the leftover must be entirely ~tol-small, any larger off-diagonal
+> is an indefinite principal 2x2).  Completing the scan IS the PSD
+> certificate.  tol = 1e-9 (1 + max|Q|), matching the engine's regulari-
+> zation tolerances; semidefiniteness of doubles is decidable only to a
+> relative frontier (below it the regularized KKT path takes over --
+> documented tolerance semantics, not a wrong-verdict hole).  Complete
+> pivoting is load-bearing: the first draft's natural-order scan fired
+> its "zero pivot, nonzero column" witness on scale-mixed GENUINELY PSD
+> blocks like [6e-12 3e-5; 3e-5 1e3] (determinant > 0) and over-blocked
+> 14/40 valid models -- the discriminating tool's scale_mix class caught
+> it pre-commit, and pivoting the large direction first eliminates the
+> coupling at its own scale.  Cost O(n^3/3) once, the same order as one
+> active-set KKT factorization.
+>
+> **Regression lock (calibration rule).** New `tools/qp_psd_verify.py`,
+> hard-gated in test.sh: pins (both gadgets now STATUS 4 =
+> QP_NON_CONVEX), 120-case indef_gate family (post-change 120/120
+> refused, 0 fabrications), near_psd family (singular PSD minus a
+> perturbation BELOW the gate tolerance: accepted per tolerance
+> semantics; every status-0 answer must pass the qp_diff KKT oracle --
+> 6/6 pass), asym family (beyond-tolerance asymmetry 20/20 refused),
+> scale_mix family (genuine PSD across 1e-14..1e14 diagonal scalings:
+> 39 solves + 1 honest KKT-fail, ZERO over-blocking refusals).  The tool
+> is discriminating: on the pre-change binary it counts
+> fabricated_status0=103 (obj_mismatch=25) and exits 0 only on the
+> pre-detection path.  qp_diff (the pre-existing battery gate) reports
+> the IDENTICAL status distribution pre/post on valid families
+> (WRONG=0) -- the gate is verdict-neutral on genuinely convex data.
+>
+> **What was NOT found.** With the closed gate in place, the extended
+> families plus qp_diff's pd/singular/zero/diag0 sweep show no wrong
+> answers: status-0 answers carry valid certificates, negative statuses
+> stay honest (limit-bounded=5 capability gap on singular families is
+> unchanged and documented in qp_diff).
+>
+> **Validation.** ASan/UBSan(+LSan) qpsolve build: zero warnings,
+> qp_psd_verify ALL OK, pins refuse cleanly; full test.sh exit 0
+> (incl. the new hard gate; oom sweep unchanged at 5930/6391/0 -- the
+> gate's n^2 workspace lands per-solve and is injector-covered); mip_diff
+> WRONG=0 x5 seeds; MiniZinc differential OK=33 FAIL=0, suite 77/77 with
+> 0 semantic diffs vs committed results.
+>
+> **2026-08-15 (7) - branch `arena/cp-engine-correctness`: Phase 6.3 of
+> the ambitious roadmap, the error-protocol redesign (closes "Not done"
+> item 2 - the LAST open item; the audit list is now fully dispositioned).**
+>
+> **The redesign.** The retired protocol kept one process-global triple
+> (`jmp_buf psolve_env`, `psolve_active`, `psolve_code`) plus a
+> process-global stop callback (`psolve_stop_fn`): a second thread
+> installing a handler was *refused* (`psolve_try()` returned 1 -
+> demonstrated live on the pre-change err.c with an old-API reproducer),
+> and a failure raised on that thread would have longjmp'd into another
+> thread's stack.  The replacement keeps the same try/catch shape but with
+> caller-owned storage and zero shared state: each thread arms its own
+> `PSolveErrFrame` (jmp_buf + chain link), chained through a single
+> thread-local top pointer; `psolve_fail` records the code in TLS, pops
+> the innermost frame, and jumps to it.  The failure code is read via
+> `psolve_err_code()` rather than a frame field on purpose: a TLS read in
+> the recovery path is not subject to the C11 7.13.2.1 indeterminacy rule
+> for locals modified between setjmp and longjmp (scalars that do cross
+> that boundary in tests are volatile; the pattern is documented in
+> err.h).  The stop callback is per-thread (`psolve_stop_set`).  No frame
+> armed = clean exit(code), as before; popping a non-innermost frame is a
+> checked protocol violation (aborts loudly, like double-free).
+>
+> **Why this is the close and not a shuffle:** the objective claim is
+> machine-checked, not argued - `nm -g --defined-only` over all library
+> objects showed exactly four exported mutable data symbols pre-change
+> (all in err.o, the ones above) and shows **zero** post-change (the only
+> remaining statics are `_Thread_local`: the error chain, the arena
+> stack, the fx scratch).  test.sh gates this so no mutable global can
+> silently return.  With that, *concurrent solves from multiple threads
+> on independent problem objects are supported* - README's threading note
+> was rewritten to say so, and the claim is tested rather than asserted
+> (see below).
+>
+> **Regression lock (project calibration rule).**  New
+> `tools/err_proto_test.c` - 12 single-thread checks: basic unwind with
+> code, real malloc failure, realloc NULL-ing *p, calloc overflow guard,
+> NESTED frames (the old protocol's refusal, now composing: inner catches
+> first failure, still-armed outer catches the second), re-push inside a
+> recovery handler, no-frame forked child exiting with the failure code,
+> and the checked pop-violation abort.  New `tools/err_mt_test.c` - 8
+> threads x 300 rounds of real LP build/solve/destroy with forced
+> arena-based allocation failures (deterministic, libc- and
+> sanitizer-interception-independent) and per-thread stop-callback
+> isolation; clean under ThreadSanitizer (3/3 runs, no reports) - and it
+> first caught a real flaw of its own draft (malloc(SIZE_MAX) is
+> intercepted as allocation-size-too-big under ASan/TSan, which is why
+> the forced failure is arena-based).  **Discrimination:** both tests
+> fail to compile against the pre-change `err.h` (`unknown type name
+> 'PSolveErrFrame'` - the API is absent), and the old-API reproducer
+> shows the second-thread refusal.  All six consumers migrated (lpsolve,
+> mipsolve, qpsolve, fznsolve, arena_test, qp_stop_test).
+>
+> **Validation:** full `test.sh` exit 0 with the oom sweep **unchanged at
+> 5930 injection points over 6391 allocations, failures=0** - CLI
+> failure behavior is byte-identical at every injection point - the new
+> section passing in-battery (proto 12/12, MT plain + TSan, nm gate);
+> lp_scale_verify `checked=250 fabricated=0 rescued=60 promoted=48
+> healthy=120 ALL OK` and farkas_verify `checked=156 (farkas-fired=23)
+> ALL OK` on both the normal and ASan/UBSan(+LSan) builds; mip_diff
+> WRONG=0 at seeds 12345/111/222/333/555; MiniZinc differential OK=33
+> FAIL=0 and suite 77/77 with 0 semantic diffs vs the committed results
+> JSON (timings only); zero compiler warnings with -Wall -Wextra (a draft
+> -Wclobbered hit on the MT test's loop scalars was resolved with
+> volatile, the documented pattern).
+>
+> **2026-08-15 (6) - branch `arena/cp-engine-correctness`: Phase 6.1 of
+> the ambitious roadmap, exact-or-UNKNOWN promotion for extreme
+> scale-mixed *non-integral* LPs (closes "Not done" item 4 - the last
+> open wrong-verdict gap).**
+>
+> **The fabrication.**  On a row `Σ s_j·a·x_j + x_f = b` with the `x_j`
+> fixed near 1e25, `a` ~1e-13 (non-integral, so the exact engine
+> correctly declines the data), and `x_f ∈ [0,1]`, the double phase-1
+> needs `x_f = b − Σ s_j·a·x_j` slightly above 1 - the products feeding
+> its artificial sum are ~1e12 and round by ~1.2e-4, four orders of
+> magnitude larger than the engine's absolute 1e-6 artificial-sum
+> tolerance - and phase-1 *certifies* a Farkas-style ray and reports
+> bare INFEASIBLE on a model that is exactly feasible (the planted
+> `x_f*` needs no representability: it is a variable value, not data;
+> exact truth is decidable in Fractions over the parsed doubles).  The
+> MIP and FlatZinc bridges then kept the shaky verdict: pinned repro
+> `/tmp/sm_bare_0.fzn` printed `=====UNSATISFIABLE=====` on a feasible
+> model pre-change, the dangerous, verifier-free direction.
+>
+> **The fix, two parts, applied at every place an INFEASIBLE verdict
+> escapes the LP core** (LP CLI in main.c, MIP bridge `solve_relaxation`
+> in mip.c, FZ pure-LP branch in fzn.c):
+>
+> 1. **Rescue.**  A bare-INFEASIBLE verdict first gets to prove itself:
+>    the phase-1 dual ray is re-verified against the ORIGINAL rows and
+>    the variable box by the new exported `solver_farkas_boxcert`
+>    (directed FE_DOWNWARD/UPWARD sweeps for the component bounds `z`
+>    and the corner-minimum `L = min_box yᵀAx`, `R = yᵀb` upward, margin
+>    `tol·(1+|R|)`, poisoned on NaN/inf/≥1e29 sentinels).  Truly
+>    infeasible models keep their verdict, now certificate-backed.
+> 2. **Promotion.**  If the certificate fails and the instance is
+>    exposure-shaky - `solver_row_exposure` computes
+>    `E = max_i Σ_j |a_ij|·min(max(|lo_j|,|hi_j|),1e29)` and the gate is
+>    `E·DBL_EPSILON ≥ 5e-7` (half the phase-1 tolerance) - the verdict
+>    is downgraded instead of printed/pruned: lpsolve prints
+>    NUMERICAL_FAILURE, the MIP relaxation returns SOLVE_NUMERICAL (the
+>    node is not pruned on an unproven verdict), the FZ branch reports
+>    UNKNOWN.  Well-scaled data never reaches the gate (it only fires at
+>    `status==INFEASIBLE && farkas_ok`), and the feasible/optimal side
+>    is untouched: OPTIMAL verdicts were already protected by the
+>    phase-2 solution certificate, so INFEASIBLE was the only
+>    unverified direction.  The exact engine's documented refusal of
+>    non-integral data is unchanged - this closes the *wrong-verdict*
+>    hole, verdict-neutrally for everything else.
+>
+> **Regression lock (project calibration rule).**  New
+> `tools/lp_scale_verify.py`, wired into test.sh as a hard gate
+> (60 instances + seed 20260815): three instance classes whose exact
+> truth is known by construction (Fractions over the parsed doubles) -
+> `feas_shaky` (must never print INFEASIBLE post-change), `inf_shaky`
+> (INFEASIBLE only if certificate-backed, else honest NUMERICAL), and
+> 120 healthy small LPs held to scipy/HiGHS verdict parity - plus the
+> same `feas_shaky` class through the MIP CLI with fixed integer
+> columns.  On the pre-change binary the tool reproduces **6 fabricated
+> INFEASIBLE verdicts** (5 LP-class, 1 MIP-class: `fs_19/20/51/57/58`,
+> `fm_4`) and exits non-zero / exits 0 only on the pre-detection path.
+> Post-change:
+> `checked=250 fabricated_INFEASIBLE=0 rescued=60 promoted_to_honest=48 healthy_checked=120 ALL OK`
+> - every truly-infeasible shaky instance kept its verdict
+> (certificate-backed), 48 shaky-feasible instances became honest
+> NUMERICAL, zero healthy flips.  FZ pinned pair:
+> `/tmp/sm_bare_0.fzn` UNSATISFIABLE→`=====UNKNOWN=====`,
+> `/tmp/sm_inf_0.fzn` stays UNSATISFIABLE.
+>
+> **Sanitizers and full battery.**  ASan/UBSan(+LSan) builds run
+> lp_scale_verify and farkas_verify with identical counts and zero
+> reports; the pinned instances are clean through all three CLIs
+> (lpsolve/mipsolve/fznsolve).  Full `test.sh` exit 0:
+> lp_form_verify OK=302 WRONG=0, mip_diff WRONG=0 at seeds
+> 12345/111/222/333/555, farkas_verify checked=156 (farkas-fired=23)
+> ALL OK, MiniZinc suite 77/77 with 0 semantic diffs vs the committed
+> results JSON (no healthy float model flipped to UNKNOWN - the
+> frontier `E·eps ≥ 5e-7` stays clear of the ±1e9-box synthetic
+> family), oom_test unchanged at 5930 injection points over 6391
+> allocations with failures=0 (the gate's scratch buffers live on cold
+> paths the injector instances do not reach).
+>
+> **2026-08-15 (5) - branch `arena/cp-engine-correctness`: independent
+> verification of the `main` merge, then Phase 6.2 of the ambitious roadmap:
+> the Farkas fast path for infeasibility verdicts in the MIP engine
+> (closes "Not done" item 3).**
+>
+> **Merge verification (the other agent's `add7cdc`/`f098876`/`c34db8c`
+> merges of this branch and `arena/phase4-ports` into `main`).**  All three
+> merges are textually faithful: tree diffs against the respective branch
+> tips are empty except exactly the files each merged side adds, so no
+> hand-resolved-conflict drift.  Empirically re-verified on `main` in a
+> throwaway worktree: full `./test.sh` exit 0 (incl. oom_test 5882
+> injection points, fz_leak_test, the new arena/tlimit/qp-stop entries),
+> lp_form_verify OK=302 WRONG=0, mip_diff WRONG=0 (two seeds).  The `48712f5`
+> zero-malloc arena port (b7f0561) was read for the previously documented
+> rejection reasons: the new design is thread-local with nesting
+> save/restore and ownership-checked frees (pointer-in-buffer test before
+> treating a pointer as arena-owned), which addresses the
+> ownership/alignment/thread-safety grounds the earlier global-arena design
+> was rejected on; arena_test verifies zero libc heap calls under
+> `-Wl,--wrap=free` and clean undersized-arena failure, and fz-arena results
+> are bit-identical to the libc path per its test.  Verdict: main is
+> healthy; the harvest dispositions in ROADMAP_AMBITIOUS.md Appendix B were
+> updated to reflect that this port is now DONE (by the other agent).
+>
+> **Farkas fast path (mip.c + solver.c).**  A relaxation the double solver
+> declares INFEASIBLE previously always paid for the exact-rational fx
+> re-solve (2026-08-15(3) instrumentation: 121 of 122 tsp5 exact re-solves
+> were duality-level infeasibility).  Now the solver marks its certified
+> Phase-I-infeasible state (`farkas_ok`), `solver_farkas_duals` extracts
+> y = B^{-T} c_B as a HINT, and `mip_farkas_certified` independently
+> re-verifies the full Farkas separation min_box(y'A)x > y'b with directed
+> rounding against the ORIGINAL rows and node box (sign-clamped components,
+> corner-minimum over z intervals, engine margin MIP_TOL*(1+|R|)).  The hint
+> is never trusted: a garbage or stale ray can only fail the check and fall
+> through to the exact path, so the change is verdict-neutral by
+> construction.  Rounding-mode regions are allocation-free; btrans's sparse
+> path allocates and is called outside them.
+>
+> Measured effect (verdicts, node counts, and returned solutions identical
+> everywhere): tsp_5 0.455s -> 0.218s (**2.1x**), 96 Farkas certificates,
+> **exactResolves 0**; open_shop_3x3 / jobshop_3x3 flat (their relaxations
+> were already cheap); solutions byte-identical pre/post on tsp_5.
+>
+> Regression lock (project calibration rule): new `tools/farkas_verify.py`
+> (wired into `test.sh` as a hard gate) pins difference-constraint cycles
+> the root FBBT cannot single-row certify (asserts INFEASIBLE at nodes==1
+> with farkas_certs>=1 and fx_solves==0), margin-discipline families
+> (exactly-infeasible sub-tolerance cycles prove INFEASIBLE matching the
+> exact-arbitration reference; exactly-FEASIBLE tight neighbours must never
+> see a certificate), and a 150-instance random family with planted deep
+> infeasibility checked against tolerance-aware brute force.  On the
+> pre-change binary all verdict checks pass but the tool FAILS ("no fast
+> path"), as required for a performance fix to count as discriminating.
+> ASan/UBSan build runs the tool clean (66 checks); mip_diff WRONG=0 at
+> seeds 12345/111/222/333/555; full test.sh exit 0 (oom_test now 5930
+> injection points over 6391 allocations - the new scratch allocations are
+> injector-covered); MiniZinc suite 77/77 PASSED with 0 semantic diffs vs
+> the committed results JSON (timings only).
+
 > **2026-08-15 (4) — branch `arena/phase4-ports`: final merge pass.  Every
 > remaining remote branch is now dispositioned; `main` is the complete
 > tree.**  Remote survey at pass start: `arena/cp-engine-correctness` (16
@@ -751,21 +1692,36 @@ specification (see `docs/BRANCH_AUDIT.md` for the full review):
    MiniZinc 2.9.4 IDE bundle (OK=33 FAIL=0, benchmark 77/77; the bundle's
    referees are gecode/chuffed/cp-sat — coin-bc no longer ships, so
    `tools/mzn_bench.py` falls back to cp-sat for the linear reference).
-2. Redesign the global `setjmp` allocation-error protocol so a recovering,
-   multi-threaded library host can own cleanup without process-global state.
-3. Farkas-certificate check for exact re-solves in the MIP bridge — extract
-   the phase-1 dual ray and interval-check it (outward-rounded `yᵀA ≈ 0`,
-   uncertain components taking the safer bound extreme) instead of a full
-   exact-rational re-solve per infeasible-verdict node.  2026-08-15(3)
-   instrumentation: 121 of 122 tsp5 exact re-solves are duality-level
-   infeasibility a row-scan cannot certify; this is where the wall time is.
-4. Honesty gap on extreme scale-mixed *non-integral* LPs (found this
-   round): the double phase-1 may report bare INFEASIBLE on data with
-   ~1e-13 coefficients against ~1e25 bounds (repro preserved at
-   /tmp/fbbt_unsat_repro	lp during the session), `fx` declines non-integral
-   data, and the MIP/FZ bridges then keep the shaky verdict instead of an
-   honest UNKNOWN.  `lpsolve` remains the double-precision engine — for
-   certifiable answers on such data `fxsolve` is the right tool — but an
-   exact-or-UNKNOWN promotion path for borderline double verdicts is the
-   principled close.
+2. ~~Redesign the global `setjmp` allocation-error protocol~~ —
+   **done 2026-08-15(7)** (this round): caller-owned `PSolveErrFrame`
+   storage chained through thread-local state replaces the process-global
+   `psolve_env/psolve_active/psolve_code` triple (and `psolve_stop_fn`
+   became a per-thread callback); the library now exports ZERO non-TLS
+   mutable data symbols (nm-gated in test.sh).  Nested scopes — refused
+   by the old protocol — compose; `tools/err_proto_test.c` (12 checks)
+   and the 8-thread TSan-clean `tools/err_mt_test.c` pin the semantics.
+   See the (7) addendum above.
+3. ~~Farkas-certificate check for exact re-solves in the MIP bridge~~ —
+   **done 2026-08-15(5)** (this round): `solver_farkas_duals` extracts the
+   phase-1 dual ray as a hint and `mip_farkas_certified` interval-checks the
+   full yᵀA separation with directed rounding (uncertain components take the
+   safer bound extreme, engine margin kept), replacing the full
+   exact-rational re-solve per infeasible-verdict node.  tsp_5: 96
+   certificates, exactResolves 0, 0.455s → 0.218s with identical
+   verdicts/tree/solutions; discriminating test `tools/farkas_verify.py` in
+   `test.sh`.  See the (5) addendum above.
+4. ~~Honesty gap on extreme scale-mixed *non-integral* LPs~~ —
+   **done 2026-08-15(6)** (this round): a bare-INFEASIBLE verdict from
+   the double phase-1 is now re-verified by the exported
+   `solver_farkas_boxcert` (directed-rounding check of the dual ray
+   against original rows + box); if the certificate fails and
+   `solver_row_exposure`·eps ≥ 5e-7 the verdict is promoted to honest
+   NUMERICAL_FAILURE / SOLVE_NUMERICAL / UNKNOWN in lpsolve, the MIP
+   bridge, and the FZ pure-LP branch respectively.  Truly infeasible
+   shaky models keep INFEASIBLE, certificate-backed (60/60 rescued);
+   the pre-change fabrications (6 reproduced by the discriminating
+   tool) are gone.  Hard gate `tools/lp_scale_verify.py` in `test.sh`.
+   See the (6) addendum above.  `lpsolve` remains the double-precision
+   engine — for certifiable answers on such data `fxsolve` with
+   integral scaling remains the right tool.
 

@@ -21,6 +21,16 @@ See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the original long-term plan
 [`docs/ROADMAP_AMBITIOUS.md`](docs/ROADMAP_AMBITIOUS.md) for the living 2026 →
 2028 development programme (correctness closure, LP/MIP/CP engine v2, exact
 arithmetic at scale, proof-carrying verdicts).
+[`docs/CURV_PS_PLAN.md`](docs/CURV_PS_PLAN.md) is the consumer-facing plan for
+the first interactive host that drives the LP/QP cores per frame
+([`SodoMita/curv-ps`](https://github.com/SodoMita/curv-ps), Curv `solve { }`
+blocks on WebAssembly): measured capacity curve, the QP verdict issues it hits,
+and the P0/P1 API changes (warm start through the wasm bridge, certified
+Phase-I, equalities + bounds + sparse input in the QP).  Reproduce it with
+`make ui-probe` (`tools/ui_qp_probe.c`). The QP's Phase-I runs on the LP core, so
+the QP library now needs `src/solver.c`/`src/splu.c` at link time; `tools/psolve_web.c`
+is the psolve-owned wasm/FFI bridge (`make bridge-test` checks it without a wasm
+toolchain, `make wasm` builds the module).
 
 It reads a simple text LP format, solves it, and prints the optimum.  The QP
 solver (`qpsolve`) solves convex QPs (minimize ½xᵀQx + cᵀx s.t. Ax ≤ b).  It
@@ -45,7 +55,7 @@ with an explicit baseline `ARCH`.
 ## Usage
 
 ```sh
-./lpsolve [-t ms|--time-limit ms] <problem.lp> [--print]  # LP (revised simplex, double)
+./lpsolve [-t ms|--time-limit ms] [--nopresolve] [--prestat] [--noscale] [--scalestat] <problem.lp> [--print]  # LP (revised simplex, double)
 ./qpsolve [-t ms|--time-limit ms] <qp.qp> [--print]  # convex QP (active-set)
 ./mipsolve [-t ms|--time-limit ms] <problem.lp> <nint> <j...> [--print]   # MIP (branch-and-bound)
 ./fznsolve [-a|--all-solutions] [-s] [-v] <problem.fzn>  # FlatZinc reader + solver (Phase 3)
@@ -60,6 +70,25 @@ or MIP solve cleanly. Both return `STOPPED` rather than presenting a partial
 solution as optimal. For FlatZinc, `-a` enumerates distinct visible finite-domain
 solutions (or improving optimization incumbents). Continuous satisfaction
 outputs cannot be exhaustively enumerated and return `UNKNOWN` under `-a`.
+
+The LP CLI presolves by default (fixed columns, empty rows/columns,
+singleton-row implied bounds, redundant rows, doubleton-equality
+substitution — each fired reduction leaves a record) and postsolves the
+engine evidence back to the original model before it is certified.
+`--nopresolve` selects the untouched-data path, `--prestat` reports the
+reduction accounting on stderr. Presolve proves some models outright
+(exact infeasibility rays, bounds-propagation optima, read-time
+unboundedness notes print with `iterations: 0`); whenever a postsolved
+certificate cannot be re-proven against original data, the CLI degrades
+to solving without presolve — presolve can decline or degrade, never
+guess. On top of that, the CLI Ruiz-equilibrates its working image by
+default (geometric-mean diagonal preconditioning; all reported values
+stay in original units and every verdict is still re-certified against
+the original data). `--noscale` selects the raw data path, `--scalestat`
+reports the pre/post conditioning-spread proxy on stderr, and when a
+scaled run's evidence cannot be certified the CLI automatically re-solves
+once on the raw data path — scaling can add certified answers, never
+take one away.
 
 ### MiniZinc Integration & `mzfnsh`
 
@@ -233,8 +262,9 @@ attacker-controlled.  The parsers are hardened accordingly:
   their characters validated.
 - **Every allocation is checked.**  All of `src/` and the CLI drivers allocate
   through the `psolve_*` helpers, which report out-of-memory through the
-  `psolve_try()`/`psolve_fail()` protocol (a `longjmp` back to the caller's
-  handler) instead of dereferencing `NULL` or calling `exit()`.  This includes
+  `PSolveErrFrame`/`psolve_fail()` protocol (a `longjmp` back to the
+  caller's own armed frame) instead of dereferencing `NULL` or calling
+  `exit()`.  This includes
   allocating libc calls: `strndup()` allocates inside libc, so the FlatZinc
   tokenizer uses `psolve_strndup()` instead.  The claim is *tested*, not
   asserted -- `tools/oom_test.py` makes the Nth allocation (and every one after
@@ -400,14 +430,36 @@ sensitivity analysis (`solver_duals`, `solver_reduced_costs`).  The QP API
 feasibility search (variable bounds are expressed as rows).  This is the
 integration point used by [SmazkaVG](https://github.com/SodoMita/SmazkaVG).
 
-**Threading note.** Only **one solve may be active per process**: the error
-protocol keeps a process-global `setjmp` buffer (`psolve_env` in
-`src/err.c`), so concurrent `lp_*`/`qp_*`/`mip_*`/`fz_*` calls from multiple
-threads corrupt each other's recovery state (the says-what-it-solves parts —
-LP/QP/MIP/fx/FlatZinc — are otherwise free of shared mutable solver state;
-the exact solver's scratch is already thread-local).  Library users needing
-parallel solves must serialize the entry points externally (a mutex around
-the calls is sufficient) or run them in separate processes.
+**Threading note.**  Concurrent solves from multiple threads **are
+supported** on independent problem objects.  As of 2026-08-15(7) the
+library keeps **no process-global mutable state** (Archive-verified in
+`test.sh`: `nm` on `src/*.o` shows zero exported non-TLS data symbols):
+the error protocol arms a caller-owned `PSolveErrFrame` per scope and
+chains it through thread-local storage, the cooperative-stop callback
+(`psolve_stop_set`) is per-thread and reads only a flag the host
+maintains, the memory arena stack is thread-local with nesting
+save/restore, and the exact solver's scratch is thread-local.  A host
+thread wraps its own calls:
+
+```c
+PSolveErrFrame fr;
+psolve_frame_push(&fr);
+if (setjmp(fr.env) != 0) {
+    /* out-of-memory / internal failure; frame already popped */
+    int code = psolve_err_code();
+    ... recover ...
+}
+... solve ...
+psolve_frame_pop(&fr);
+```
+
+`tools/err_mt_test.c` exercises 8 threads solving real LPs concurrently
+with forced allocation failures and per-thread stop state (run both
+plain and under `-fsanitize=thread` in `test.sh`).  What remains
+per-process is the *drivers'* plumbing, not the library's: Unix signal
+handlers and the interval timers the CLIs arm for `-t` limits are
+process resources, so custom drivers should install their own flags and
+use `psolve_stop_set()` per solving thread.
 
 **License note.** psolve is **AGPL-3.0** (see `LICENSE`): embedding the
 library into a program or exposing it over a network makes that program's
@@ -472,7 +524,8 @@ src/kernels.c   AVX-512/AVX2/scalar dense kernels (daxpy, dot, sparse dot)
 src/lu.c        dense LU factorization + forward/back substitution (BTRAN/FTRAN)
 src/splu.c      sparse LU factorization (fill-reducing order + partial pivoting)
                 with hyper-sparse triangular solves
-src/err.c       error-handling protocol (checked allocation, setjmp/longjmp OOM)
+src/err.c       error-handling protocol (checked allocation, caller-owned per-thread
+                error frames, zero process-global mutable state)
                 + re-entrant thread-local zero-malloc arena (PSolveArena)
 src/solver.c    revised-simplex driver, two-phase method, steepest-edge pricing,
                 sparse/dense dispatch, incremental (warm-start) solving,
@@ -488,6 +541,11 @@ src/main.c      LP CLI
 tools/fxsolve.c fixed-point LP CLI
 tools/fx_bench.c double-vs-fixed LP benchmark
 tools/qpsolve.c QP CLI
+tools/ui_qp_probe.c UI-layout QP probe: verdict robustness + frame-budget capacity
+tools/psolve_web.{c,h}  wasm/FFI bridge: x0 warm start, max_resid, certified
+                        infeasibility (psw_qp_proven/psw_qp_farkas), ms budget
+tools/wasm_build.sh     builds psolve.wasm with emcc or wasi-sdk (--check = native)
+tools/psw_test.c        the bridge's contract as an executable test (make bridge-test)
 tools/mipsolve.c MIP CLI
 tools/          generators, differential tester, unit tests, benchmarks, fuzzer
 examples/       sample LP files

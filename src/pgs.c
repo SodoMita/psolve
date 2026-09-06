@@ -36,7 +36,7 @@ void pgs_solve(const PGSOptions *opt,
     if (omega <= 0.0 || omega > 2.0) omega = 1.0;
     int max_iter = opt->max_iter;
     if (max_iter <= 0) max_iter = 1;
-    double tol = opt->tol;
+    double tol = opt->tol;  /* TOLSHEET TOL-PGS-CONV */
 
     res->iters = 0;
     res->flops = 0;
@@ -66,7 +66,7 @@ void pgs_solve(const PGSOptions *opt,
             double r = b[i] + (ax - d * x[i]);
 
             /* a non-positive diagonal contributes no step (1/d treated as 0) */
-            double xnew = (d > 1e-14) ? ((1.0 - omega) * x[i] + omega * (-r / d))
+            double xnew = (d > 1e-14) ? ((1.0 - omega) * x[i] + omega * (-r / d))  /* TOLSHEET TOL-PGS-DIAG */
                                       : ((1.0 - omega) * x[i]);
             /* project onto box */
             if (xnew < lo[i]) xnew = lo[i];

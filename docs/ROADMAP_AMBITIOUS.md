@@ -106,8 +106,30 @@ Goal: after this phase there is **no known input class** on which psolve can
 return an uncertified or misleading verdict, and the error-handling protocol
 is safe for a multi-threaded library host.
 
-### 6.1 Exact-or-UNKNOWN promotion for double verdicts
-- **What:** A verdict-grading pass on every LP/MIP/FZ result: classify the
+### 6.1 Exact-or-UNKNOWN promotion for double verdicts — **DONE 2026-08-15(6)**
+Implemented with a sharper design than the blanket scale-mix classifier
+below, aimed at the only unverified direction (INFEASIBLE — OPTIMAL was
+already protected by the phase-2 solution certificate, and integral data
+already had the fx fallback in the MIP bridge): a bare-INFEASIBLE verdict
+first attempts to **prove itself** — the exported `solver_farkas_boxcert`
+re-verifies the phase-1 dual ray against the original rows and box with
+directed rounding (rescue: truly infeasible models keep the verdict,
+certificate-backed) — and otherwise, when
+`solver_row_exposure`·DBL_EPSILON ≥ 5e-7 (half the phase-1 tolerance), the
+verdict is **promoted** to NUMERICAL_FAILURE / SOLVE_NUMERICAL / UNKNOWN
+in lpsolve, the MIP relaxation, and the FZ pure-LP branch (no pruning on
+an unproven verdict). Acceptance evidence: the pinned repros flip from
+fabricated INFEASIBLE/UNSATISFIABLE to honest UNKNOWN in all three CLIs
+(FZ `/tmp/sm_bare_0.fzn` UNSATISFIABLE→UNKNOWN, feasible model);
+discriminating hard gate `tools/lp_scale_verify.py` in test.sh reproduces
+6 fabricated INFEASIBLE verdicts on the pre-change binary (5 LP-class,
+1 MIP-class) and post-change reports `checked=250 fabricated=0
+rescued=60 promoted=48 healthy_checked=120 ALL OK` (scipy verdict parity
+on well-scaled data, zero flips); ASan/UBSan(+LSan) clean; full battery
+exit 0, mip_diff WRONG=0 ×5 seeds, MiniZinc 77/77 with 0 semantic diffs.
+AUDIT.md addendum 2026-08-15(6). Design discussion kept below for the
+record:
+- **What (original design):** A verdict-grading pass on every LP/MIP/FZ result: classify the
   instance's data scale-mix (max |aᵢⱼ| / min positive |aᵢⱼ| over the active
   rows, bound magnitudes, cancellation risk). Verdicts from the double engine
   on data beyond a measured reliability frontier are *promoted*: re-decided
@@ -124,27 +146,46 @@ is safe for a multi-threaded library host.
   binary; no regression on the existing battery (status split identical on
   well-scaled instances).
 
-### 6.2 Farkas-certificate fast path for infeasible relaxations
-- **What:** when the double solver claims a relaxation infeasible, extract
-  the phase-1 dual ray `y` and verify the Farkas conditions
-  (`yᵀA` against per-column safe bound extremes, `yᵀb < 0`) with
-  **directed rounding / interval arithmetic** — uncertain components take the
-  bound extreme that makes certification *harder*. Only a certified ray
-  yields `INFEASIBLE`; otherwise fall back to the exact re-solve.
-- **Why:** closes AUDIT not-done #3. Instrumentation on 2026-08-15 showed
-  **121 of 122** tsp5 exact re-solves decide duality-level infeasibility that
-  a row scan cannot certify — a ~1% of the cost check replaces ~99% of exact
-  re-solves. This is the single largest known wall-time item in the MIP
-  bridge on combinatorial models.
-- **Acceptance:** instrumented counter drop of exact re-solves ≥90% on the
-  tsp5/cumulative suites with **identical verdicts and identical tree**;
-  adversarial near-degenerate rays (engineered to violate margins) still go
-  to the exact path; directed-rounding implementation itself differential-
-  tested against a Fraction reference on the cancellation family from
-  `tools/fbbt_verify.py`.
+### 6.2 Farkas-certificate fast path for infeasible relaxations — **DONE 2026-08-15(5)**
+Implemented as designed (`solver_farkas_duals` hint + `mip_farkas_certified`
+directed-rounding verification against the original rows, `farkas_ok` state
+marker in `Solver`). Acceptance evidence: tsp_5 exact re-solves **122 → 0**
+(96 certificates, 0.455s → 0.218s) with identical verdicts, node counts and
+byte-identical solutions; `tools/farkas_verify.py` discriminating regression
+(fails on pre-change binary) hard-gated in `test.sh`; ASan/UBSan clean;
+full battery + MiniZinc 77/77 with 0 semantic diffs. AUDIT.md addendum
+2026-08-15(5).
 
-### 6.3 Error-protocol redesign: retire process-global `setjmp`
-- **What:** replace the global allocation-failure longjmp with per-context
+### 6.3 Error-protocol redesign: retire process-global `setjmp` — **DONE 2026-08-15(7)**
+Implemented as caller-owned per-thread error frames (`PSolveErrFrame`):
+each thread chains its own armed frames through thread-local storage and
+`psolve_fail` unwinds to the calling thread's innermost frame (popped
+before the jump, so recovery may re-push); the retired
+`psolve_env/psolve_active/psolve_code/psolve_try/psolve_end` globals are
+gone from the tree, and the cooperative-stop callback became per-thread
+(`psolve_stop_set`).  The failure code travels in TLS and is read via
+`psolve_err_code()` on purpose — unlike a field of the frame struct it is
+not subject to the C11 7.13.2.1 setjmp/longjmp indeterminacy rule.
+Nested scopes, which the old protocol *refused* (`psolve_try()` returned
+1), now compose; popping a non-innermost frame is a checked protocol
+violation.  With `nm` showing the rest of the library already free of
+exported mutable data (verified at build time), the redesign makes the
+whole library carry **zero process-global mutable state** — gated in
+`test.sh` so it stays that way.  Acceptance evidence: `tools/err_proto_test.c`
+(12 checks: basic/nested/re-push-in-handler flows, realloc NULL-out,
+calloc overflow guard, no-frame `exit(code)`, aborting pop violation) and
+`tools/err_mt_test.c` (8 threads × 300 rounds of real concurrent solves,
+forced arena-OOM recoveries, per-thread stop callbacks) both pass, the
+MT test clean under ThreadSanitizer (3/3 runs, no reports); neither test
+compiles against the pre-change `err.h` (discrimination: API absent) and
+an old-API reproducer shows `psolve_try()` refusing a second thread's
+handler.  All six consumer call sites migrated (4 CLIs + arena_test +
+qp_stop_test); full battery exit 0 with the oom sweep **unchanged at
+5930 injection points over 6391 allocations, failures=0** (CLI behavior
+identical at every injection point); MiniZinc 77/77 with 0 semantic diffs.
+AUDIT.md addendum 2026-08-15(7). Design discussion kept below for the
+record:
+- **What (original design):** replace the global allocation-failure longjmp with per-context
   error state: `Solver/ MIP/ FZ` structs carry an optional arena + error
   record; all fallible operations return status. Public API gains
   `psolve_set_alloc(ctx, alloc_fn, user)` so a host owns memory policy.
@@ -156,7 +197,43 @@ is safe for a multi-threaded library host.
   state under `-fsanitize=thread` smoke runs; API documented in README;
   all tools migrated.
 
-### 6.4 Unified evidence objects
+### 6.4 Unified evidence objects — **DONE 2026-08-18(12)**
+`src/cert.h`/`src/cert.c`: one `PsvCert` claim type per verdict class
+(LP OPTIMAL/INFEASIBLE/UNBOUNDED, MIP point + proven-optimal stamp,
+QP optimal/unbounded, search-EXHAUSTION) and one `psv_cert_check()`
+entry point; every verdict-printing CLI exit (lpsolve, mipsolve,
+qpsolve, fznsolve optimize/UNSAT lanes) fills the claim over the
+ORIGINAL model data and prints only through it (REJECT/DEFER degrade to
+the honest class).  Engine evidence hooks added: `solver_unbounded_ray`
+(recession ray materialized at the dense-verified `iterate()` exit,
+unmapped through the x⁺/x⁻ split) and `QPResult.ray`.  LP-OPTIMAL is
+certified by a bounded-LP Lagrangian dual bound in the caller's own
+data (sense-normalized duals, sign-clipped = soundly weakened, rounding
+dust charged upward on closed boxes only).  Error-injection hard gate
+`tools/cert_inject` (in `test.sh`, 2 seeds) measures: LEGIT claims
+accepted 100% on all 8 families; LARGE adversarial corruptions rejected
+100%; directed 1-ulp noise rejected 100% on the zero-width
+snapped-integer MIP surface (199/199, 1964/1964 at N=2000) — and
+**reported, not asserted, on tolerance-margined point surfaces** (0%,
+by design: a checker stricter than the engines' own terminal margins
+would false-reject every true claim; the literal "≥99.9% of 1-ulp
+OPTIMAL claims" target is decidable only on zero-width surfaces and is
+met exactly there — AUDIT addendum 12 states this precisely instead of
+claiming it).  Injection adversarialness is decided by independent
+closed-form oracles (never the checker under test), after the harness
+itself caught two of its own unsound families (garbage duals that
+collapse to a *valid* box-corner certificate; rotation-invariant Farkas
+rays).  Three real defects the gate/battery caught during construction
+and pinned: symmetric bound-coherence vs the root integrality gap
+(false-rejected ~38% of proven-optimal MIPs — fixed to directional,
+`examples/knap_gap.lp` pin), |b|-only row grace vs catastrophic
+cancellation (fbbt_verify went 2→31 FAIL then 0 with activity-scaled
+dust bounds), and MIP-UNSAT lane over-strictness on the pinned 5e-7
+margin cycle (sub-margin infeasibility proved by lattice exhaustion,
+not by a Farkas ray).  Full battery rc=0, tolsheet closure green,
+ASan/UBSan/LSan sweep clean, bench 77/77 semantics identical.
+
+### 6.4-origin specification (superseded by the DONE note above)
 - **What:** a small internal `psv_cert_t` per verdict class: OPTIMAL
   (primal point + dual vector), INFEASIBLE (Farkas ray or exact-engine
   stamp), UNBOUNDED (primal point + recession ray), with one
@@ -169,47 +246,116 @@ is safe for a multi-threaded library host.
   checker rejects ≥99.9% of perturbed OPTIMAL/UNSAT claims (and 100% of
   large perturbations).
 
-### 6.5 QP numerical audit round
-- **What:** the same adversarial methodology recently applied to LP/MIP/FBBT,
-  applied to `qp.c`: degenerate working sets, duplicated/parallel rows,
-  near-indefinite Q within tolerance of PSD, huge/small scale mixes.
-- **Why:** QP is the least-attacked engine; the 2026 audit found ~5% wrong
-  answers on singular-PSD families *after* hardening assumptions were made.
-- **Acceptance:** extended `tools/qp_diff.py` family, pre/post fail counts
-  recorded; any fabricated-class bug fixed with discriminating regressions.
+### 6.5 QP numerical audit round — **DONE 2026-08-15(8)**
+One fabrication-class hole found and closed: the QP convexity gate screened
+only 1x1/2x2 principal minors, so n ≥ 3 indefinite Q whose negativity lives
+in a larger minor passed (diag 1, off-diag −0.9: minors 0.19, eigenvalue
+−0.8), and the active-set printed the stationary origin as an "optimum" on
+problems unbounded below — **103 fabricated status-0 verdicts in 122 cases**
+on the discrimination family (25 box variants with objectives wrong vs true
+vertex optima, e.g. −4.436 claimed vs −14.288 true).  Fixed with a full
+symmetrized **complete-pivoting** elimination scan (Sylvester-sound in both
+directions in exact arithmetic; scaled tolerance 1e-9·(1+max|Q|)); complete
+pivoting is load-bearing — the natural-order draft over-blocked 14/40
+scale-mixed genuine PSD blocks (caught by the new tool's scale_mix class
+pre-commit).  Acceptance evidence: discriminating hard gate
+`tools/qp_psd_verify.py` in `test.sh` (pre-change
+`fabricated_status0=103, obj_mismatch=25`; post-change 0, ALL OK across the
+indef/near_psd/asym/scale_mix classes and both pinned gadgets at STATUS 4);
+existing `qp_diff.py` status distribution IDENTICAL pre/post (verdict-neutrality
+on convex data, WRONG=0); ASan/UBSan(+LSan) clean; full battery exit 0;
+MiniZinc 77/77 0-semantic-diff.  No other wrong-answer class found in the
+extended sweep; `qp.h` documents the gate.  AUDIT.md addendum 2026-08-15(8).
 
-### 6.6 Harvest remaining `phase4-interactive-hardening` commits
-- **What:** `48712f5` (thread-local zero-malloc arena) and `a42be76`
-  (ms-precision time limits + QP cooperative stop) are the only unmerged
-  work on any remote branch. Port each **behind verification**: an earlier
-  global-arena design (`6ebf11d`) was rejected for ownership/alignment/
-  thread-safety bugs, so the arena commit must be audited line-by-line
-  against both parents (meta-lesson: hand-resolved merges get line diffs).
-- **Acceptance:** leak/ASan/TSan evidence; per-frame zero-malloc
-  demonstrated by allocation counters; benefits recorded in AUDIT.md with
-  the same rigor as the FBBT port (`18eb475`).
+### 6.6 Harvest remaining `phase4-interactive-hardening` commits — **DONE 2026-08-15(4/5)**
+Ported by the parallel agent's `arena/phase4-ports` branch and merged to
+`main` (`f098876`): `a42be76` ms-precision time limits + QP cooperative stop
+(`4966773`) and the re-entrant thread-local zero-malloc arena (`b7f0561` +
+`df028c2`, designed to the previously documented rejection reasons — no
+process-global arena, ownership-checked frees). Independently verified this
+round: merges textually faithful (empty tree diffs vs branch tips), full
+battery green on `main`, zero-libc-heap proof under `--wrap=free`,
+oom/fz_leak gates pass. See AUDIT.md addenda (4) and (5).
 
-### 6.7 FlatZinc round-trip & output fuzzing
-- **What:** output-side adversarial tests: re-parse `fznsolve` output with a
-  strict checker (assignments satisfy *every* constraint, objective matches),
-  driven over the fuzz corpus, including `-a` enumeration (no duplicates,
-  completion markers correct) and aliased/mixed-view arrays.
-- **Why:** the bridge's *input* paths are fuzzed; its *output* paths are
-  only spot-tested. An output-layer lie is as dangerous as a solver lie.
-- **Acceptance:** `tools/fzn_output_check.py` (new) green over ≥10k fuzzed
-  models across satisfy/minimize/maximize/`-a`; wired into `test.sh`.
+### 6.7 FlatZinc round-trip & output fuzzing — **DONE 2026-08-16(9)**
+The new output-layer checker caught **one fabricated-SAT class**: the CP
+engine's `cp_set_vals` had replace semantics, letting propagators widen
+declared domains — pin of record `x0≡5, x1∈[-4,-3], int_abs(x1,x0)` printed
+**`x1 = -5`, outside its domain, as SATISFIABLE** (sibling bare case printed
+`x0=0,x1=0` SAT on a truly UNSAT model). Fixed with restrict semantics
+(sort/dedupe + intersect; empty ⇒ infeasible) plus the follow-on threading
+of the now-reachable empty-domain failure return through all 12 propagator
+callsites (its absence was a heap-buffer-overflow, ASan-caught on the
+post-fix binary pre-commit). Also fixed a pre-existing parser OOB stack
+read (`var {>256 ints}: x` → SIGSEGV, pin verified on pre-change binary)
+and the related CP-init path that wrote an intentionally empty domain for
+>CP_MAXVALS set literals instead of declining to the MIP/SOS1 bridge.
+Tool-side lesson documented in AUDIT addendum (9): exact-Fraction checks on
+decimal round-trips of binary doubles are unsound for float rows — the
+checker uses the standard scaled 1e-6 LP feasibility tolerance and reports
+the run-max residual (≤1e-16 over 19.5k models). Acceptance evidence:
+`tools/fzn_output_check.py` hard-gated in `test.sh` (5 pins first: abs
+UNSAT ×2 incl. the x1=-5 of record, abs feasible, 65536/66000-member set
+domains); **pre-change binary**: 4/5 pins fail + `WRONG=34/2000`;
+**post-change**: WRONG=0 at `N=10000 seed 20260815` and `N=4000` each at
+seeds 777/4242 (19.5k models incl. `-a`/aliases/echo checks), ASan/
+UBSan(+LSan) sweep N=1500 clean, full battery + MiniZinc 77/77
+0-semantic-diff. Known limitation logged (perf, not honesty): declined
+>65536-member set domains whose UNSAT-ness needs reasoning grind in MIP
+B&B; presolve suggestion recorded in AUDIT (9).
 
-### 6.8 Per-module tolerance semantics sheets
-- **What:** one section in `docs/DESIGN.md` per engine: every tolerance,
-  its direction of safety, what it protects, and what it may never justify
-  (e.g. a margin may never turn feasibility pruning into UNSAT without the
-  directed-rounding certificate).
-- **Why:** the 2026-08-15 `mip_diff` flip (seed 12345 WRONG=5) was caused by
-  an exact prune that ignored the engine margin — a *semantics* bug wearing
-  a numerics costume.
-- **Acceptance:** sheets exist and are cited by the code comments at each
-  tolerance site; `grep` proves every literal tolerance in `src/` has a
-  documented entry.
+### 6.8 Per-module tolerance semantics sheets — **DONE 2026-08-18(11)**
+- **What (shipped):** `docs/DESIGN.md` §8 — one subsection per engine (LP
+  core, MIP, QP, PGS float+fixed, FlatZinc front-end, CP, exact-fx, plus a
+  §8.8 for no-decision-power constants swept by the closure).  80 rows
+  covering all 127 tolerance-literal sites in `src/`, each with class
+  (verdict-adjacent V / convergence C / honest-decline D / recognition R /
+  sentinel-stability S / exact E), direction of safety, what it protects,
+  and what it may never justify.  Header rule: a V-class tolerance never
+  decides a verdict alone — it feeds a certificate that stands without it
+  (directed rounding, exact-rational re-check, printed bound), or the
+  status degrades to SOLVE_NUMERICAL.
+- **Acceptance mechanised:** every site carries a `/* TOLSHEET <ID> */`
+  comment; new hard gate `tools/tolsheet_check.py` (in `test.sh`) enforces
+  closure both directions through a real C comment/string state machine —
+  every code-line literal tagged, every tag documented, every row live.
+  Undocumented new tolerances and stale rows both fail the battery.
+- **Survey honesty:** the machine closure caught sites the manual sweep
+  missed (fx representability guards, fznsolve's own 5e-7 exposure
+  frontier, QP divergence cap, splu growth watchdog, sentinel families) —
+  they are documented as found-by-machine in AUDIT (11).  Full battery
+  rc=0, 77/77 bench 0 semantic diffs; comment-only source changes.
+
+### 6.9 Functional-graph family + presolve structure recovery — **DONE 2026-08-18(10)**
+Generalizes the procstates-specific `orbit_len` global (docs/PROCSTATES.md)
+into a reusable toolset plus auto-detection, answering: "how does a
+task-specific orbit trick become a general-purpose set of tools, or an
+automatic solving-path choice?"  Shipped (full spec in
+docs/FUNCTIONAL_GRAPH.md): (a) a shared functional-graph digest pool
+(content-deduped, single-owner) with façades `orbit_transient`,
+`orbit_cycle_len`, `orbit_on_cycle`, `orbit_len_capped` and the previously
+unparsed `array_bool_and`; (b) a presolve detector that recovers the
+MiniZinc "H-step walk + prefix-distinct count" lattice exactly — every
+consumed record verified, every intermediate proven dead (no surviving
+reference, not output-pinned, not objective-pinned), `referenced[]`
+recomputed airtight — and rewrites it to one `orbit_len_capped` record.
+Hard rule: detection never narrows semantics; on any mismatch the model is
+untouched and the generic engine answers.  Four memory cliffs fixed en
+route (measured, in order): realloc-per-entry keep lists (1.3 GB at
+n=16384 → two-pass count-then-allocate), dead-var domain materialization
+(803k dead values), dead-var branching (~800k nodes × MB-scale copies →
+branch over `searchme = referenced ∪ output` — the referenced-only first
+cut fabricated 0-valued prints for unconstrained OUTPUT vars, WRONG=59
+flagged by the phase-6.7 output gate, fixed before commit), and the
+O(Σ|dom|)-per-pass `cp_total` fixpoint (→ change-only mutation counter).
+Plus nv==0 satisfy models now reach CP (was a silent skip).  Headline:
+the **stock flattened procstates encoding** (n=65536, H=64) is auto-detected
+and PROVEN optimal (44) in 1.76–1.89 s / 103 MB — vs Gecode 600 s UNKNOWN,
+Chuffed/CP-SAT OOM (§6.9 docs; PROCSTATES §5 baselines).  Acceptance
+evidence: two new discriminating hard gates (`fgraph_verify`: pre
+pins_bad=5/WRONG=112@60 → post WRONG=0@200; `orbit_detect_verify`: pre
+WRONG=16/40 → post WRONG=0@100), procstates gate WRONG=0@120 rerun,
+full battery rc=0, 77/77 bench 0 semantic diffs, ASan/UBSan/LSan clean.
 
 **Phase 6 exit criteria:** AUDIT.md "Not done" list is empty or each item
 has a written permanent disposition; full battery + sanitizer matrix green;
@@ -225,17 +371,72 @@ where simplex is weak. Techniques and literature pointers are already
 surveyed in `SOLVER_OPTIMIZATIONS.md` §2; this phase is the implementation
 plan for it.
 
-### 7.1 Presolve + postsolve *(highest ROI in the phase)*
-- Singleton rows/columns, doubleton substitution, activity-bound row
-  elimination/redundancy removal, bound tightening on coefficients,
-  dominated/duplicate column and row detection, fixed-variable elimination.
-- **Design constraint:** every reduction must record a reversible
-  *postsolve stack* so primal/dual certificates transfer back exactly
-  (PaPILO-style reduction records, minimal from-scratch subset).
-- **Acceptance:** 30–60% size reduction on the sparse differential corpus
-  with **bit-identical objectives** post-postsolve; presolve off/on A/B
-  shows no verdict change over ≥20k random LPs; reduction records are
-  themselves unit-verified (apply → restore → identical problem).
+### 7.1 Presolve + postsolve *(highest ROI in the phase)* — **DONE 2026-08-19(14)**
+`lp_presolve()` / `lp_presolve_postsolve_{x,duals,ray}()` (src/presolve.{h,c})
+run on the caller-visible LP before the engine's free-variable split, mlt
+sign rows and 7.5 equilibration: fixed columns, empty rows (consistent:
+dropped, dual 0; inconsistent: exact infeasibility with an explicit
+one-row Farkas ray), empty columns at read (fixed at the cost-sign bound;
+cost walking an open side = certified-UNBOUNDED note), singleton-row
+implied-bound box folds (directed-rounding outward; singleton-vs-box and
+singleton-pair conflicts = exact one-/two-row rays), redundant rows
+(directed-rounding activity limits) and doubleton-equality substitution
+(fill-capped `PRE_NNZ_GROWTH`, pivot = larger |a|).  Every fired reduction
+pushes a record; postsolve replays records in REVERSE firing order, duals
+via firing-time pivot-column snapshots (`y_i = (c_j − Σ y_r a_rj)/a_ij`,
+unknown-reference cycle ⇒ the map declines), with a complementarity guard
+(TOL-LP-PRETIGHT) keeping slack singleton rows at dual 0.  Exact-ray
+paths are gated by `row_touched`: any row b/coeff-mutated by an earlier
+fold aborts presolve rather than risk a doom ray — decline or degrade,
+never guess.  The CLI climbs `(presolve,scale) → (0,scale) → (0,0)` on
+any uncertified evidence; `model->n == 0` (full elimination) takes a
+direct-claim branch with `iterations: 0`; presolve rc==1 rays go through
+the same `psv_cert_check(PSVK_LP_INFEASIBLE)` lane; a presolved-model
+engine-INFEASIBLE never prints without re-solving raw (no ray
+back-propagation in v1, documented).  Objective prints are always
+recomputed `Σ c_j·x_j` on ORIGINAL postsolved data.
+
+- **Bundled cert-layer fix (same commit):** `solver_farkas_boxcert` now
+  skips columns whose directed-rounding `yᵀA` window is provably `[0,0]`
+  (`zl ≥ 0 ∧ zh ≤ 0` forces the exact sum to 0 ⇒ box product contribution
+  exactly 0 for ANY box) *before* the TOL-LP-BIGCAP decline — previously
+  ANY free-variable column vetoed the whole certificate, so every
+  infeasibility Farkas ray on a free-variable model (engine's own rays
+  included) degraded to NUMERICAL_FAILURE.  Soundness unchanged (zl/zh
+  bracket the exact sum under FE_DOWNWARD/FE_UPWARD); measured effect on
+  the planted corpus: 2 pre-change NUMERICAL_FAILUREs now certify
+  INFEASIBLE (free-var pair conflict; y-range-joint conflict), all
+  farkas/lp_scale/scale/cert_inject gates stay green on both seeds.
+- **Acceptance, measured:** presolve off/on A/B over **40 000 random LPs**
+  (20k well-scaled + 20k entry-mixed 1e±4, seed 42, plus 5k+5k seed 777)
+  — **zero verdict flips, zero lost raw answers**, combined-evidence
+  fallbacks 364/20k·2 (each lands the identical raw verdict; the ladder
+  may only decline, never change an answer); co-OPTIMAL objective prints
+  bit-identical on 98.6%/99.1% of the corpus (identical whenever no
+  reduction fires), remainder ≤1.4e-10 rel — inside engine tolerance,
+  far under the 1e-9 psv re-proof — gate pins 1e-12 (well-scaled) /
+  1e-9 (entry-mixed); 39 952 co-OPTIMAL scipy/HiGHS cross-checks inside
+  the calibrated bars (modest 1e-6 hard 20/20k-clean; entry-mixed
+  gross-error 3e-4 — HiGHS is not an authoritative objective oracle on
+  1e±4 data, measured max engine-vs-HiGHS gap 1.8e-4 with the
+  pre-change binary printing IDENTICAL values on every flagged instance).
+  Planted per-reduction verdict cases (11): every exact-ray family
+  certifies with `iterations: 0`, the touched-row family declines and
+  still answers, the fallback family degrades with a psv note yet never
+  changes the answer.  Records unit-verified by
+  `tools/presolve_selftest.c` (17 apply→restore invariant checks: primal
+  replay exactness, exact pivot-column dual stationarity,
+  complementarity guard, stats accounting).  Size reduction on the
+  shipped corpus: honest measurement — the random families are
+  decline-dominated (3 330/40 000 models reduce; conditional shrink
+  rows 16.5% / cols 5.2% / nnz 10.5%; the structured planted chains
+  eliminate 100% of rows), so the 30–60% target is *not* reproduced on
+  this corpus (it lacks the removable structure the target assumed);
+  what is verified end-to-end is the certified-decline discipline that
+  makes presolve safe regardless of reduction rate.  CLI: `--nopresolve`
+  / `--prestat`.  Hard gates in `test.sh`: `tools/presolve_verify.py
+  400 20260819` (fails loudly on the pre-change binary — unknown option)
+  and the selftest binary (absent on the pre-change tree).
 
 ### 7.2 Dual simplex (bounded-variable, dual steepest edge)
 - **Why:** MIP re-optimization after bound changes/cuts is dual-simplex
@@ -258,7 +459,44 @@ plan for it.
 - **Acceptance:** Phase-I pivot count down ≥30% on equality-heavy families;
   the fz bridge passes its known-good bases through the new API.
 
-### 7.5 Scaling (Ruiz equilibration + geometric mean, Curtis–Reid option)
+### 7.5 Scaling (Ruiz equilibration + geometric mean, Curtis–Reid option) — **DONE 2026-08-18(13)**
+`solver_create_opts(lp, scale_mode)` / `solver_create` (= scaled default):
+4 Ruiz iterations (geometric-mean row pass then column pass) at create
+time accumulate strictly positive diagonals `D_r`/`D_c`; the engine works
+on `D_r·A·D_c` and every public funnel composes the diagonals back
+(optimum/ray ×D_c, row duals/Farkas rays ×D_r, reduced costs ÷γ,
+set_objective ×γ, set_bounds ÷γ with infinity-token sides never divided,
+export/rebuild unwrap all three factors), so callers always see ORIGINAL
+units and every verdict keeps its original-data psv re-verification.
+Decline-to-scale-less guards (`LP_SCALCAP=1e300` spread cap, non-finite
+factor products, finite-bound→token reclassification refusal) are class-D
+honest-decline, never verdict inputs.  The LP CLI gains `--noscale` (raw
+path) and `--scalestat` (pre/post spread proxy) plus an
+evidence-preserving raw-data FALLBACK: when a scaled run's evidence
+cannot be certified against the original data (any psv lane reject or an
+engine SOLVE_NUMERICAL) it re-solves once raw and re-evaluates the whole
+verdict chain, so scaling can add certified answers, never take one away.
+The MIP bridge, fzn pure-LP lane and mipsolve's relaxation arbitrator are
+pinned to the RAW path (1.0 diagonals ⇒ bit-identical pre-7.5 numerics;
+measured pre-pin MIP answer movement at per-entry 1e±8 spread — 7 lost /
+7 objective-disagreeing vs 5 rescues in 150 — showed scaled node answers
+cannot be arbitrated as strict improvements without a per-node primal
+certificate story).
+- **Acceptance, measured:** conditioning proxy — median post/pre spread
+  0.0098 at 1e±4 entry-mixing and 3.9e-6 at 1e±12, worsened on 0/466
+  gate instances; honest-failure rescues (the "before it becomes an exact
+  re-solve" knob): raw/pre-change LU-stall NUMERICAL → scaled certified
+  OPTIMAL at ~0.4% of the 1e±4 family and ~7% of the 1e±12 family,
+  objectives scipy-confirmed (pinned instance: spread 6e8 model, raw
+  NUMERICAL, scaled 10560305.7817494 == HiGHS); verdict changes — zero on
+  well-scaled data (400/400 scipy cross-checked parity across two gate
+  seeds), examples A/B-identical, MIP/fzn surfaces bit-identical by pin.
+  Hard gate `tools/scale_verify.py` (in `test.sh`, 2 seeds);
+  discriminating: pre-change binary fails the `--noscale`/`--scalestat`
+  lane probe loudly.  AUDIT addendum (13) carries the full tables,
+  including the honest iteration-movement delta (+2.7–3.4% iterations on
+  the small probe families — equilibration changes vertex paths; the win
+  is certified-answer recovery, not iteration count).
 - **Why:** cheap, and directly attacks the big-M conditioning debt
   (AUDIT finding A lineage) *before* it becomes an exact re-solve.
 - **Acceptance:** conditioning proxy (max/min pivot growth) improved on the
@@ -813,9 +1051,9 @@ nothing in M3–M6 may land without the Phase-14 CI cell being green first
 | AUDIT item | Disposition |
 |---|---|
 | 2. setjmp protocol redesign | **Phase 6.3** (M1) |
-| 3. Farkas-certificate fast path | **Phase 6.2** (M1), substrate reused by 16.1 |
-| 4. Scale-mixed non-integral honesty gap | **Phase 6.1** (M1); exact substrate 9.x makes promotion cheap (M2) |
-| B. Phase-I degenerate-infeasible convergence | **Phase 7.4/7.5** (crash+scaling) with 6.1 as the honesty backstop |
+| 3. Farkas-certificate fast path | **DONE 2026-08-15(5)** (Phase 6.2): tsp5 exact re-solves 122 → 0, 2.1× wall |
+| 4. Scale-mixed non-integral honesty gap | **DONE — Phase 6.1, 2026-08-15(6)** (rescue + exposure-gate promotion; `tools/lp_scale_verify.py`); exact substrate 9.x would make promotion *cheap* (M2) |
+| B. Phase-I degenerate-infeasible convergence | **Phase 7.4/7.5** — the 7.5 scaling half **landed 2026-08-18(13)** (rescue contract + CLI fallback); 7.4 crash bases remain, 6.1 stays the honesty backstop |
 | CP scheduling globals decline to MIP | **Phase 10.2** (edge finding) — closes `gecode_schedule_unary`/disjunctive gap |
 | `-f` free search no-op | **Phase 11.3** |
 | Phase-2 VG/UI kernels (unstarted) | **Track 17.x by host pull** — kernels own no frame budget until a consumer exists; physics (12) stays priority |
@@ -825,10 +1063,10 @@ nothing in M3–M6 may land without the Phase-14 CI cell being green first
 
 | Branch | State | Disposition |
 |---|---|---|
-| `arena/cp-engine-correctness` (HEAD) | active, 16 ahead of main | home of this roadmap |
-| `arena/phase4-interactive-hardening` | +3 vs HEAD | `3573e3a` FBBT **ported** (`18eb475`); `48712f5` + `a42be76` → **6.6** (audit-first port; earlier arena design `6ebf11d` was rejected for ownership/alignment/TSan bugs) |
+| `arena/cp-engine-correctness` (HEAD) | active | home of this roadmap; periodically merged into `main` by the integration pass |
+| `arena/phase4-interactive-hardening` | fully dispositioned | `3573e3a` FBBT **ported** (`18eb475`); `48712f5` + `a42be76` **ported** via `arena/phase4-ports` → merged in `main` (`f098876`), verified 2026-08-15(5) |
 | all other `arena/*`, `feat/*`, `fzn-table-constraint`, `mzfnsh` | fully merged (ahead 0) | none standing; re-survey each window (rule §15.1) |
-| `main` | behind 16 | merge candidate after M1 lands and CI exists |
+| `main` | **current** (contains this branch + phase4 ports) | the integration tree; quarterly review target |
 
 ## Appendix C — Technique → implementation map
 
