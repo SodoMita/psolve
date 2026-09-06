@@ -251,9 +251,13 @@ What is still open in P0.3, with the numbers behind it:
   guess.  **Do not key it on whether a stop callback is installed**: `tools/qpsolve.c`
   installs one with no deadline, just to be Ctrl-C-safe, so "armed" ≠ "in a
   hurry" and a batch caller's answers would change underneath them.
-* The remaining overshoot below the gate is the search's own iteration count; a
-  per-iteration budget (`max_iter` on the aux solve, scaled to the caller's
-  clock) is the other way to bound it without giving up the better start.
+* The floor of the residual overshoot is *one main-loop iteration*, not Phase-I:
+  with the LP route first (so Phase-I costs one sparse pivot sequence) N=64 still
+  lands at 95 ms against a 16 ms budget, because the active set's own dense
+  `(n+k)^3` factorisation is ~30-100 ms at those sizes.  An iteration cap on the
+  auxiliary solve does not buy this (at 30 ms a time it would need a cap of ~1 to
+  bound a frame, which is below what the search needs to converge), so the real
+  fix is the sparse KKT factorisation in P1.3, plus the start-order knob above.
 * Still open: iteration caps as the deterministic budget (needed for the
   reproducible-drag-film claim) and the persistent handle (P0.2 half).
 
