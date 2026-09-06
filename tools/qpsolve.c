@@ -85,7 +85,15 @@ int main(int argc, char **argv)
         if (fscanf(f, "%lf", &b[i]) != 1 || !isfinite(b[i])) goto bad;
     fclose(f);
 
-    QP qp; qp.n = n; qp.m = m; qp.Q = Q; qp.c = c; qp.A = A; qp.b = b; qp.x0 = NULL;
+    QP qp; memset(&qp, 0, sizeof qp);   /* the struct is extensible: zero it, do
+                                           not assign members one at a time */
+    qp.n = n; qp.m = m; qp.Q = Q; qp.c = c; qp.A = A; qp.b = b; qp.x0 = NULL;
+    /* A/B hook for the Phase-I ordering policy (QP.phase1_order), so the
+     * differential harness and any reviewer can compare both orders over the same
+     * models: what may differ is how many models get an answer and how fast,
+     * never what an answered model's verdict is. */
+    { const char *ab = getenv("PSOLVE_QP_PHASE1_LP_FIRST");
+      if (ab && ab[0] == '1') qp.phase1_order = QP_PHASE1_LP_FIRST; }
     QPResult r; memset(&r, 0, sizeof(r));
     qp_solve(&qp, &r);
     /* Machine-readable lines keep the historical contract the differential
@@ -140,6 +148,27 @@ int main(int argc, char **argv)
         }
     } else {
         printf("STATUS %d\n", r.status);
+        if (r.status == -1 && r.infeasible_proven) {
+            /* roadmap 6.4, applied to the QP's infeasibility claim: the proof is
+             * only worth printing if the unified checker confirms the certificate
+             * over THIS model's A and b.  The status line keeps its historical
+             * meaning (-1 = "no feasible start", which is honest either way); what
+             * is gated here is the stronger PROVEN claim, so a bug in the producer's
+             * own verifier shows up as PROVEN 0 plus a warning instead of a
+             * confidently empty model. */
+            PsvCert cl; memset(&cl, 0, sizeof(cl));
+            cl.kind = PSVK_QP_INFEASIBLE;
+            cl.n = n; cl.m = m; cl.A = A; cl.bq = b; cl.ray = r.farkas;
+            cl.gt_row = 1e-7; cl.dt_gap = 1e-9;
+            if (psv_cert_check(&cl) == PSV_OK) {
+                printf("PROVEN 1\n");
+                if (print)
+                    for (int i = 0; i < m; i++) printf("farkas[%d] = %.17g\n", i, r.farkas[i]);
+            } else {
+                fprintf(stderr, "psv: qp_infeasible certificate not confirmed\n");
+                printf("PROVEN 0\n");
+            }
+        }
     }
     qp_result_free(&r);
     free(c); free(Q); free(A); free(b);

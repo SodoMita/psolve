@@ -51,7 +51,21 @@
  *                        (strict, mirroring qp.c's deliberate no-margin
  *                        rule), d^T Q d within the curvature tolerance
  *                        and (Q x + c)^T d < 0.
- *   PSVK_EXHAUSTION      search-completed stamp for UNSAT-by-exhaustion
+ *   PSVK_QP_INFEASIBLE   the row system Ax <= b of a QP model is empty, from a
+                        Farkas multiplier vector in `ray` (m).  Checked over the
+                        QP's own dense row-major A and rhs -- no LP view, no
+                        rescaling, nothing the producer chose to reveal beyond
+                        the two arrays the caller already owns: with
+                        lam = max|ray|, every ray_i >= -gt_row*lam (a
+                        NONNEGATIVE combination), max_j |sum_i ray_i A_ij| <=
+                        gt_row*(1+sum_i |ray_i||A_ij|) (the combination kills
+                        every column), and sum_i ray_i b_i <=
+                        -dt_gap*(1+sum_i |ray_i||b_i|) (it separates).  The
+                        vector is judged as handed over: scaling it may not
+                        rescue a claim that does not close as stated.  A missing
+                        or vacuous payload, or a non-finite entry, DEFERS --
+                        "cannot say" stays distinct from "false", as elsewhere.
+   PSVK_EXHAUSTION      search-completed stamp for UNSAT-by-exhaustion
  *                        verdicts (CP-FlatZinc, MIP tree exhaustion):
  *                        discrete coherence - no node/time/cooperative
  *                        limit may be set on a completed search.  This
@@ -79,7 +93,8 @@ typedef enum {
     PSVK_MIP_POINT = 4,
     PSVK_EXHAUSTION = 5,
     PSVK_QP_OPTIMAL = 6,
-    PSVK_QP_UNBOUNDED = 7
+    PSVK_QP_UNBOUNDED = 7,
+    PSVK_QP_INFEASIBLE = 8
 } PsvKind;
 
 typedef enum { PSV_OK = 0, PSV_REJECT = 1, PSV_DEFER = 2 } PsvRc;

@@ -35,6 +35,7 @@ const char *psv_cert_kind_name(PsvKind k)
     case PSVK_EXHAUSTION:    return "exhaustion";
     case PSVK_QP_OPTIMAL:    return "qp_optimal";
     case PSVK_QP_UNBOUNDED:  return "qp_unbounded";
+    case PSVK_QP_INFEASIBLE: return "qp_infeasible";
     default:                 return "?";
     }
 }
@@ -416,12 +417,51 @@ static PsvRc check_qp_unbounded(const PsvCert *cl)
     return PSV_OK;
 }
 
+/* PSVK_QP_INFEASIBLE: see the contract in cert.h.  Deliberately its own
+ * arithmetic rather than a call into qp.c's producer-side verifier: a checker
+ * that shares code with what it checks cannot catch that code. */
+static PsvRc check_qp_infeasible(const PsvCert *cl)
+{
+    if (!cl->A || !cl->bq || !cl->ray) return PSV_DEFER;
+    if (cl->m <= 0) return PSV_DEFER;          /* an empty row set is never empty by proof */
+    double gt_row = cl->gt_row > 0 ? cl->gt_row : PSV_DEF_GT_ROW;
+    double dt_gap = cl->dt_gap > 0 ? cl->dt_gap : PSV_DEF_DT_GAP;
+    int n = cl->n, m = cl->m;
+    double lam_max = 0.0, lmin = 0.0;
+    for (int i = 0; i < m; i++) {
+        double v = cl->ray[i];
+        if (!isfinite(v)) return PSV_DEFER;
+        if (fabs(v) > lam_max) lam_max = fabs(v);
+        if (i == 0 || v < lmin) lmin = v;
+    }
+    if (!(lam_max > 0.0)) return PSV_DEFER;                  /* vacuous */
+    if (lmin < -gt_row * lam_max) return PSV_REJECT;         /* not a nonnegative combination */
+    for (int j = 0; j < n; j++) {
+        double sv = 0.0, mag = 0.0;
+        for (int i = 0; i < m; i++) {
+            double a = cl->A[(size_t)i * n + j];
+            if (!isfinite(a)) return PSV_DEFER;
+            sv  += a * cl->ray[i];
+            mag += fabs(a) * fabs(cl->ray[i]);
+        }
+        if (!(fabs(sv) <= gt_row * (1.0 + mag))) return PSV_REJECT;   /* A^T ray != 0 */
+    }
+    double bt = 0.0, bmag = 0.0;
+    for (int i = 0; i < m; i++) {
+        if (!isfinite(cl->bq[i])) return PSV_DEFER;
+        bt   += cl->ray[i] * cl->bq[i];
+        bmag += fabs(cl->ray[i]) * fabs(cl->bq[i]);
+    }
+    return (bt <= -dt_gap * (1.0 + bmag)) ? PSV_OK : PSV_REJECT;
+}
+
 PsvRc psv_cert_check(const PsvCert *cl)
 {
     if (!cl) return PSV_DEFER;
     if (cl->kind != PSVK_EXHAUSTION) {
         if (cl->n < 0 || cl->m < 0) return PSV_DEFER;
-        if (cl->kind != PSVK_QP_OPTIMAL && cl->kind != PSVK_QP_UNBOUNDED)
+        if (cl->kind != PSVK_QP_OPTIMAL && cl->kind != PSVK_QP_UNBOUNDED &&
+            cl->kind != PSVK_QP_INFEASIBLE)   /* the QP kinds carry dense rows, not the LP view */
             if (!cl->colptr || !cl->row || !cl->val || !cl->rel || !cl->b ||
                 !cl->lo || !cl->hi) return PSV_DEFER;
     }
@@ -433,6 +473,7 @@ PsvRc psv_cert_check(const PsvCert *cl)
     case PSVK_EXHAUSTION:    return check_exhaustion(cl);
     case PSVK_QP_OPTIMAL:    return check_qp_optimal(cl);
     case PSVK_QP_UNBOUNDED:  return check_qp_unbounded(cl);
+    case PSVK_QP_INFEASIBLE: return check_qp_infeasible(cl);
     default:                 return PSV_DEFER;
     }
 }

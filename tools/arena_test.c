@@ -69,6 +69,7 @@ static int failures = 0;
 
 static void build_qp(QP *qp)
 {
+    memset(qp, 0, sizeof *qp);   /* extensible struct: zero before assigning */
     static double Q[4] = {1,0,0,1};   /* 0.5 (x0^2 + x1^2) */
     static double c[2] = {0,0};
     static double A[2] = {-1,-1};     /* -(x0+x1) <= -1  =>  x0+x1 >= 1 */

@@ -253,8 +253,30 @@ int main(void)
               "[8] LP point (%.6f, %.6f), expected (3, 1)", xl[0], xl[1]);
     }
 
-    psw_free_scratch();
-    free_m(&M);
+    /* [9] the Phase-I ordering policy: additive, off by default, and it must not
+     * move a verdict -- only which search runs first.  The two orders genuinely
+     * differ in how *many* models they answer (see docs/CURV_PS_PLAN.md 1.10), so
+     * what this pins is the promise that made the knob safe to offer: on a model
+     * both routes can answer, they answer the same. */
+    {
+        double oA = 0, oB = 0, rA = 0, rB = 0;
+        int itA = 0, itB = 0;
+        double xA[16], xB[16];
+        CHECK(psw_qp_phase1_lp_first() == 0, "[9] ordering knob is not off by default");
+        psw_qp_set_phase1_lp_first(1);
+        CHECK(psw_qp_phase1_lp_first() == 1, "[9] setter did not stick");
+        int stLP = psw_qp_solve2(M.n, M.m, M.Q, M.c, M.A, M.b, NULL, -1.0, xA, &oA, &itA, &rA);
+        psw_qp_set_phase1_lp_first(0);
+        int stDense = psw_qp_solve2(M.n, M.m, M.Q, M.c, M.A, M.b, NULL, -1.0, xB, &oB, &itB, &rB);
+        CHECK(stLP == stDense, "[9] ordering changed the status (%s vs %s)",
+              psw_qp_status_name(stLP), psw_qp_status_name(stDense));
+        CHECK(stDense != 0 || fabs(oA - oB) <= 1e-9 * (1.0 + fabs(oB)),
+              "[9] ordering changed the objective (%.12g vs %.12g)", oA, oB);
+        CHECK(psw_qp_phase1_lp_first() == 0, "[9] knob left switched on");
+        (void)rA; (void)rB; (void)itA; (void)itB;
+    }
+
+
     printf("%s: %d checks, %d failures\n", fails ? "FAILED" : "psw_test", checks, fails);
     return fails ? 1 : 0;
 }

@@ -426,7 +426,8 @@ static void fam_qp_optimal(int N)
             double s = 0; for (int j = 0; j < n; j++) s += A[(size_t)i * n + j] * xi[j];
             bq[i] = s + rrange(1, 4);   /* A x <= b with slack */
         }
-        QP qp; qp.n = n; qp.m = m; qp.Q = Q; qp.c = cq; qp.A = A; qp.b = bq; qp.x0 = NULL;
+        QP qp; memset(&qp, 0, sizeof qp);
+        qp.n = n; qp.m = m; qp.Q = Q; qp.c = cq; qp.A = A; qp.b = bq; qp.x0 = NULL;
         QPResult r; memset(&r, 0, sizeof(r));
         qp_solve(&qp, &r);
         if (r.status != 0) { qp_result_free(&r); continue; }
@@ -471,7 +472,8 @@ static void fam_qp_unbounded(int N)
             A[(size_t)i * n + dir] = 0.0;
         }
         /* feasible start: interior point we built rows around */
-        QP qp; qp.n = n; qp.m = m; qp.Q = Q; qp.c = cq; qp.A = A; qp.b = bq;
+        QP qp; memset(&qp, 0, sizeof qp);
+        qp.n = n; qp.m = m; qp.Q = Q; qp.c = cq; qp.A = A; qp.b = bq;
         qp.x0 = xi;
         QPResult r; memset(&r, 0, sizeof(r));
         qp_solve(&qp, &r);

@@ -30,6 +30,7 @@ static int failures = 0;
  * Optimum x0 = 1, objective 0.5. */
 static void build_qp(QP *qp)
 {
+    memset(qp, 0, sizeof *qp);   /* extensible struct: zero before assigning */
     static double Q[1] = {1.0};
     static double c[1] = {0.0};
     static double A[1] = {-1.0};
@@ -42,6 +43,7 @@ static void build_qp(QP *qp)
  * feasibility leaves no certified feasible point). */
 static void build_qp_infeas_start(QP *qp)
 {
+    memset(qp, 0, sizeof *qp);   /* extensible struct: zero before assigning */
     static double Q[1] = {1.0};
     static double c[1] = {0.0};
     static double A[1] = {-1.0};

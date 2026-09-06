@@ -44,6 +44,12 @@
  * QP still solves models the simplex chokes on, and nothing is claimed.
  */
 
+/* Which Phase-I search runs first; see QP.phase1_order.  Values, not bits, so a
+ * caller that never touches the field keeps the historical order whatever it
+ * left in that word. */
+#define QP_PHASE1_DENSE_FIRST 0
+#define QP_PHASE1_LP_FIRST    0x4c5031   /* 'LP1' */
+
 typedef struct {
     int n;              /* number of variables */
     int m;              /* number of inequality constraints A x <= b */
@@ -52,6 +58,26 @@ typedef struct {
     const double *A;    /* m*n, row-major: A[i*n+j] */
     const double *b;    /* m */
     const double *x0;   /* optional feasible start (NULL => use x=0) */
+    int phase1_order;     /* which Phase-I search runs first: 0 or
+                           * QP_PHASE1_DENSE_FIRST (the default) tries the dense
+                           * auxiliary QP, QP_PHASE1_LP_FIRST tries the sparse LP
+                           * and falls back to the dense search.  A magic value
+                           * rather than a boolean on purpose: the struct is
+                           * extensible, some callers assign field by field
+                           * instead of zero-initialising it, and a stale or
+                           * uninitialised word must not be able to silently
+                           * change which algorithm runs (it would silently change
+                           * *which models get solved*, which is worse than a
+                           * crash).  Any value other than the magic means the
+                           * default.  Measured on the final tree, both orders
+                           * answer the same layout models (ui_qp_probe sections
+                           * 3-5 are identical to within noise) and LP-first
+                           * answers fewer random models: tools/qp_diff.py 400
+                           * 99001 checks 311 of its models with this default and
+                           * 290 with LP-first.  It also exposed one model where
+                           * the flatness band for an UNBOUNDED verdict is too
+                           * generous (docs/CURV_PS_PLAN.md 1.12), so prefer the
+                           * default unless the caller re-checks verdicts. */
 } QP;
 
 #define QP_ITERATION_LIMIT 2  /* active-set iteration cap reached (no cert) */
@@ -98,9 +124,13 @@ typedef struct {
 } QPResult;
 
 /* Returns 1 when x satisfies every row a_i^T x <= b_i within psolve's
- * relative feasibility tolerance (1e-9 * (1 + |b_i| + |a_i|^T|x|)), else 0.
+ * relative feasibility tolerance (1e-11 * (1 + |b_i| + |a_i|^T|x|)), else 0.
  * Same test the QP uses to accept a caller-supplied qp->x0 warm start, so a
  * front end can gate its own "reuse last frame's solution" logic on it. */
+/* Contract for callers: the QP struct is extensible (fields are appended), so
+ * build it as `QP q; memset(&q, 0, sizeof q);` or with designated initialisers
+ * rather than assigning members one by one -- qp_solve reads every field,
+ * including ones a particular caller was written before. */
 int qp_start_feasible(const QP *qp, const double *x);
 
 /* Solve the QP.  Fill *res (call qp_result_free when done). */

@@ -241,16 +241,44 @@ dense Phase-I *was* the runtime, not the solve.
 What is still open in P0.3, with the numbers behind it:
 
 * **N=32..120 still overshoots 3-43×**, entirely inside the dense search (the
-  gate is off below 600 on purpose).  Running the LP route first cuts N=64's
-  overshoot 682 → 95 ms and makes N=64 fit a 1500 ms solve outright
-  (`OPTIMAL`, 283 ms, where dense-first was `STOPPED`), **but it loses rescues**:
-  on the scipy differential sweep it checks 158 vs 162 models at n=200 and 293
-  vs 306 at n=400, each lost model ending as `NO_FEASIBLE_START` (never a wrong
-  verdict).  Buying speed with verified solves is a policy for the caller, so
-  this needs an explicit knob (`qp_prefer_lp_start`, or a `QP.start_hint`), not a
-  guess.  **Do not key it on whether a stop callback is installed**: `tools/qpsolve.c`
-  installs one with no deadline, just to be Ctrl-C-safe, so "armed" ≠ "in a
-  hurry" and a batch caller's answers would change underneath them.
+  gate is off below 600 on purpose), and the start-order knob P0.3 asked for is
+  how that is now offered to the caller: `QP.phase1_order` (values
+  `QP_PHASE1_DENSE_FIRST` = 0, the historical order, and `QP_PHASE1_LP_FIRST`),
+  plumbed through `psw_qp_set_phase1_lp_first()` on the bridge, `ui_qp_probe
+  --lp-first`, and `PSOLVE_QP_PHASE1_LP_FIRST=1` in `qpsolve` so a differential
+  run can A/B it without recompiling.  It is a magic value rather than a bool
+  because `QP` is extensible and several tools fill it field by field: an
+  uninitialised word must not silently pick an algorithm.  That is not
+  hypothetical - a bool appended to `QP` did exactly that during this work and
+  silently changed `qpsolve`'s answers until the value was made magic and the
+  callers zeroed the struct.
+
+  What the re-measurement on the final tree says, because two numbers in the
+  earlier draft of this bullet came from a scratch harness and did not survive it:
+
+  * On the layout family the knob is **inert**: `ui_qp_probe --only 3` cold
+    per-frame is 1.64 / 17.71 / 229.24 / 3518.75 ms (N=8/16/32/64) by default and
+    1.62 / 17.60 / 229.57 / 3599.81 ms with LP first, and `--only 4 --fast` ends
+    `STOPPED` for N=64 either way (1509.56 ms vs 1515.55 ms).  Those models are
+    feasible from the start, so Phase-I never runs and no order is used.  The
+    earlier claim here - "LP first cuts N=64's overshoot 682 → 95 ms and fits a
+    1500 ms solve outright" - is **withdrawn**: it measured a build whose default
+    order had silently been flipped by the uninitialised field.
+  * On rescue-bearing random models LP-first answers **fewer**, which is the
+    trade the knob is for.  Same binary, only the environment variable varying,
+    `tools/qp_diff.py`: 200/4242 checks 164 models by default and 156 with LP
+    first; 400/99001 checks 311 and 290.  Each lost model ends as `STATUS -1`.
+  * It also **changed one verdict**, which the earlier claim denied: at 400/99001
+    `it=53` (`[singular]`, n=5, m=4, smallest eigenvalue of Q = -1.73e-15) comes
+    back `STATUS 1`, unbounded, under LP-first, where dense-first returns the
+    optimum -7.3939738094380649 that scipy agrees with.  `qp_diff.py`'s recession
+    LP and a box-constrained SLSQP at ±10/±100/±1000 (all -7.3940, box never
+    binding) both say bounded below, so psolve is wrong, and the shipped default is
+    clear of it only because that start never reaches the flat ray.  Reproduce:
+    `PSOLVE_QP_PHASE1_LP_FIRST=1 python3 tools/qp_diff.py 400 99001`.
+  * The root cause is not the ordering - see 1.12.  The knob is off by default and
+    no shipped path depends on it, which is what makes it safe to land while 1.12
+    is open.
 * The floor of the residual overshoot is *one main-loop iteration*, not Phase-I:
   with the LP route first (so Phase-I costs one sparse pivot sequence) N=64 still
   lands at 95 ms against a 16 ms budget, because the active set's own dense
@@ -260,6 +288,19 @@ What is still open in P0.3, with the numbers behind it:
   fix is the sparse KKT factorisation in P1.3, plus the start-order knob above.
 * Still open: iteration caps as the deterministic budget (needed for the
   reproducible-drag-film claim) and the persistent handle (P0.2 half).
+
+**If you run `ui_qp_probe --only 2` you will see it fail, and it is not new.**
+The ill-scaled sweep's N=32 `dup=1` points end `STOPPED` at ~5001 ms or
+`KKT_FAIL` rather than `OPTIMAL`: below the 1.10 gate the dense Phase-I search is
+allowed to run, and on those points it needs longer than the section's own 5000 ms
+deadline.  Measured on this box with the same flags, the branch tip and this patch
+produce the same 49 `FAIL` lines, the same 6 `NO_START` / 10 `KKT_FAIL` /
+3-4 `ITER_LIMIT` / 17-19 `STOPPED` mix (the last two trade places depending on
+which of the cap and the deadline fires first), and - the number the section is
+actually about - **zero** false infeasibility verdicts in both.  `test.sh` wires
+sections 1 and 5 of the probe as gates, not 2, so this shows up only for someone
+who runs the tool by hand.  Making [2] a gate means giving it a budget it can
+meet, which is the P1.3 sparse-KKT work, not a re-tune of the deadline.
 
 ## 1.11 Reconciling with `arena/cp-engine-correctness`
 
@@ -338,12 +379,23 @@ diff.
 * **Overlap to resolve in favour of theirs, not by keeping both**: their
   `solver_farkas_duals()` and `solver_farkas_boxcert()` do, inside the LP core,
   what this patch's `farkas_verify()` guesses from the outside (a four-way
-  sign/search over the duals) and what `TOL-QP-BOXIDLE` refuses.  Now that the
-  lines are merged, the LP-side helpers should feed the QP certificate, and
-  `src/cert.h`
-  should gain `PSVK_QP_INFEASIBLE` carrying `QPResult.farkas` — their kinds list
-  has `QP_OPTIMAL`/`QP_UNBOUNDED` but no infeasible QP certificate, which is
-  exactly the hole P0.1 filled.
+  sign/search over the duals) and what `TOL-QP-BOXIDLE` refuses.  Both halves of
+  that "should" have now been tried, and they resolve differently:
+
+  * `src/cert.h` **does** carry `PSVK_QP_INFEASIBLE` and `qpsolve` re-verifies
+    `QPResult.farkas` at its verdict exit (1.11).
+  * the LP-side helpers were **not** adopted, because their semantics are not the
+    statement this certificate has to make.  `solver_farkas_boxcert()` proves a
+    *boxed* system empty and requires `Aᴺλ = 0` inside a directed-rounding
+    window; a QP row carries no bounds, and the multipliers handed over by the
+    simplex duals are good to ~1e-7, not to zero, so that check would either never
+    fire or fire only after the window is widened - which proves less, not more,
+    than the `colmax <= 1e-7` and `Σλb < 0` tests `farkas_verify()` already
+    runs.  `solver_farkas_duals()` returns a ray in the solver's row-scaled space
+    (Phase 7.5's equilibration is part of its frame) while the caller-side checker
+    works from the caller's original `A`/`b`, so adopting it would move work from
+    verified to unverified.  The honest outcome of "overlap to resolve" is one kind
+    added and two helpers left to the LP side that owns them.
 * **Measured on the merged tree** (this patch on their tip): `make all` clean;
   their full `test.sh` green end to end — including `[5.1/7]`, which is this
   branch's probe section 1 + section 5 + the bridge contract test, `[5.2/7]`
@@ -356,14 +408,24 @@ diff.
   Phase 7.5 Ruiz equilibration and this Phase-I neither rescue nor break each
   other: the ill-scaled sweep comes out with an identical verdict mix from both
   trees (12 ok / 6 NO_START / 6 KKT_FAIL / 4 ITER_LIMIT over 30 points).
-* **Left as follow-up work on the merged tree** (deliberately not folded into the
-  merge commit, so the merge stays reviewable as conflict resolution): give
-  `src/cert.h` a `PSVK_QP_INFEASIBLE` kind and route `QPResult.farkas` through
-  `psv_cert_check()` at the `qpsolve` verdict exit, so the QP's infeasibility claim
-  is re-verified at the same choke point as the LP's and the MIP's (today the
-  certificate is verified inside `qp.c` and then trusted by the caller); and make
-  `src/cert.h`'s docs mention that a QP infeasibility proof needs neither `ray` nor
-  `duals`.
+* **The follow-up listed above is done on this line.**  `src/cert.h` gained
+  `PSVK_QP_INFEASIBLE` (kind 8) and `src/cert.c` gained `check_qp_infeasible()`,
+  and `tools/qpsolve.c` prints `PROVEN 1` only when `psv_cert_check()` confirms
+  `QPResult.farkas` against the caller's own `A`/`b`.  So the QP's infeasibility
+  claim is re-verified at the same choke point as the LP's and the MIP's, and
+  `STATUS -1` keeps its historical meaning, which is what `qp_diff.py` parses.
+  The kind deliberately has no `colptr`/`rel`/`lo`/`hi` precondition - a QP has
+  dense rows, free variables and no box - which is why it is a new kind instead
+  of a reuse of `PSVK_LP_INFEASIBLE`, and the header contract now records that a
+  QP infeasibility proof needs neither `ray` nor `duals`.  It reuses the two
+  documented margins (`gt_row`, `dt_gap`) rather than adding a third constant.
+  `tools/qp_cert_test.c` does the duty `cert_inject.c` does for the LP kinds: a
+  legitimate proof accepted, then per-field sabotage (sign flip, a 1.0001x row
+  violation, a reversed normal, the `b` gap shrunk just past the threshold, 1-ulp
+  nudges, rescaling by `位_max`) all rejected - 161 checks, wired into `test.sh`
+  at `[5.15/7]`, where the CLI line is also checked (`PROVEN 1` on the empty
+  model, and no `PROVEN` line at all on its feasible twin).
+
 * **This patch is not redundant on their line.** Their `tools/qpsolve.c` no
   longer *labels* an unconstrained start "infeasible" (it prints `STATUS -1`,
   which is honest), but nothing in their tree proves a QP infeasibility or
@@ -422,7 +484,43 @@ diff.
   `max|Δx| = 0`; a curv-ps-side test drags a widget through 30 frames and
   asserts pixel-identical layout vs. per-frame cold solves.
 
-### P0.3  Budgets that actually bind, and determinism-friendly ones  — the binding part is done (see §1.10): the wall-clock budget now survives Phase-I; the start-order knob, iteration caps and the persistent handle are open
+## 1.12 Open: the flatness band that lets a rounding-level ray certify UNBOUNDED
+
+Found by the 1.10 knob, not caused by it: the test it trips runs in the shipped
+order as well, it is reached less often there (default order: 311 checked models
+across the two seeds with `WRONG=0`, LP-first: one).
+
+`src/qp.c`'s unboundedness certificate accepts a direction `p` when the slope is
+negative and the curvature is *flat within tolerance*: `p'Qp <= 1e-12*(1+
+‖Q‖₈)*‖p‖²₈` (`TOL-QP-CURV`).  For that to prove unboundedness the band has to be
+one-sided.  A `p'Qp` that is small and **positive** bounds the objective along the
+ray at about `t ≈ -g'p/p'Qp`, so accepting it can call a bounded QP unbounded;
+only `p'Qp <= 0` (linear-or-concave along the ray) combined with `A p <= 0` is a
+recession direction.  The `1.10` model does exactly this: Q's smallest eigenvalue
+is -1.73e-15, so `p'Qp` lands inside the band on a direction that is not a ray at
+all, and the answer is `STATUS 1` where the optimum is -7.3939738094380649.
+
+`src/cert.c`'s `check_qp_unbounded()` mirrors the same band, which is why the
+CLI's existing `PSVK_QP_UNBOUNDED` re-verification confirmed the ray instead of
+catching it - the checker agrees with the producer because they accept the same
+thing.  That is worth remembering about the certificate layer in general: two
+sites with the same tolerance are one check, not two.
+
+The fix is to make the comparison one-sided in both places (`p'Qp <= 0`, plus
+whatever `TOL-QP-CURV` needs to stay usable for exactly-flat directions computed
+in floating point - the honest version may be to accept `0 <= p'Qp <= band` only
+when the implied escape point `t` is far outside the model's own scale).  Its
+cost is that some genuinely flat rays stop certifying and fall back to
+`ITERATION_LIMIT`, which the code comment in `src/qp.c` already argues is
+"never wrong"; that is a verdict-semantics change to their main loop, so it goes
+through review as its own item.  The blast radius is not small: the default-order
+sweep reports `STATUS 1` on 110 of its 400 models (`qp_diff.py`'s own histogram -
+`diag0/1=38, singular/1=17, zero/1=55`), so any change to the band needs the same
+`qp_diff.py` A/B plus a look at how many of those 110 move to `ITERATION_LIMIT`.  Reproduce the failure with:
+
+    PSOLVE_QP_PHASE1_LP_FIRST=1 python3 tools/qp_diff.py 400 99001     # it=53
+
+### P0.3  Budgets that actually bind, and determinism-friendly ones  — the binding part and the start-order knob are done (1.10): the wall-clock budget survives Phase-I and `QP.phase1_order` lets a caller choose which rescue runs first. Open: iteration caps as the deterministic budget, the persistent handle, and the one-sided flatness band in 1.12
 
 * **Problem.** In the browser there is no `SIGALRM`, so the cooperative stop is
   unreachable (`psolve_stop_fn` is a C function pointer — JS cannot set it),

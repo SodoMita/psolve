@@ -180,6 +180,12 @@ EXPORT int psw_lp_solve_b(int n, int m,
  */
 
 static int    g_proven = 0;
+/* Phase-I ordering policy for every solve the bridge runs; 0 keeps the engine
+ * default (dense auxiliary QP first).  See QP.phase1_order in src/qp.h and the
+ * measured trade-off in docs/CURV_PS_PLAN.md 1.10: the LP-first route is 3-12x
+ * cheaper and stops on time, and it answers fewer models -- so it is a host
+ * choice, armed once, never a verdict change on a model either route answers. */
+static int g_lp_first = 0;
 static double g_resid = 0.0;        /* last solve's max row violation */
 static double *g_lam = NULL;        /* bridge-owned copy of the certificate */
 static int    g_lam_n = 0;
@@ -209,6 +215,7 @@ EXPORT int psw_qp_solve2(int n, int m, double *Q, double *c, double *A, double *
     memset(&qp, 0, sizeof qp);
     memset(&res, 0, sizeof res);
     qp.n = n; qp.m = m; qp.Q = Q; qp.c = c; qp.A = A; qp.b = b; qp.x0 = x0;
+    qp.phase1_order = g_lp_first ? QP_PHASE1_LP_FIRST : QP_PHASE1_DENSE_FIRST;
     g_proven = 0;
     g_resid = 0.0;
     arm_budget(budget_ms);
@@ -319,6 +326,17 @@ EXPORT const char *psw_qp_verdict_name(int status, int proven)
     if (status == -1) return proven ? "INFEASIBLE_PROVEN" : "NO_FEASIBLE_START";
     return psw_qp_status_name(status);
 }
+
+/* Phase-I ordering policy (QP.phase1_order): 0 keeps the engine default
+ * (dense auxiliary QP first, the LP route as fallback), 1 asks for the sparse LP
+ * route first with the dense search as fallback.  A host that solves inside a
+ * frame budget wants 1 -- it is 3-12x cheaper on the layout family and its
+ * "no feasible start" answer arrives on time; a host building a batch that must
+ * answer as many models as possible wants 0.  Set once at start-up: it is applied
+ * to every solve from then on, and it can never change a verdict, only how many
+ * models get one. */
+EXPORT void psw_qp_set_phase1_lp_first(int on) { g_lp_first = on ? 1 : 0; }
+EXPORT int psw_qp_phase1_lp_first(void) { return g_lp_first; }
 
 /* Release the bridge's own scratch (certificate copy).  Safe to call twice. */
 EXPORT void psw_free_scratch(void) { free(g_lam); g_lam = NULL; g_lam_n = 0; g_proven = 0; }

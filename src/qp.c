@@ -768,6 +768,24 @@ static int dense_phase1(const QP *qp, const double *base, double *x)
     return ok;
 }
 
+/* The sparse LP route, run and interpreted.  Returns 1 with a start written to
+ * x, 2 with the caller's certificate moved into res (lam is then NULL), 3 if
+ * cooperatively stopped, 0 if it had nothing to say. */
+static int lp_route(const QP *qp, const double *x0, double *x, double *xl,
+                    double **lamp, QPResult *res)
+{
+    int n = qp->n;
+    int pr = (xl && *lamp) ? lp_phase1(qp, x0, xl, *lamp) : 0;
+    if (pr == 1) { memcpy(x, xl, (size_t)n * sizeof(double)); return 1; }
+    if (pr == 2) {
+        res->infeasible_proven = 1;
+        res->farkas = *lamp;  *lamp = NULL;      /* ownership moves to QPResult */
+        return 0;                                /* proven empty: nothing to search for */
+    }
+    if (pr == 3) return 3;                       /* stopped: no verdict, not a give-up */
+    return 0;
+}
+
 static int find_feasible(const QP *qp, const double *x0, double *x, QPResult *res)
 {
     int n = qp->n, m = qp->m;
@@ -776,59 +794,56 @@ static int find_feasible(const QP *qp, const double *x0, double *x, QPResult *re
     if (qp_start_feasible(qp, x)) return 1;
 
     int ok = 0;
+    int lp_first = qp->phase1_order == QP_PHASE1_LP_FIRST;
     double *lam = (double*)psolve_malloc(sizeof(double) * (size_t)(m > 0 ? m : 1));
     double *xl  = n > 0 ? (double*)psolve_malloc(sizeof(double) * (size_t)n) : NULL;
     if (lam) for (int i = 0; i < m; i++) lam[i] = 0.0;
 
-    /* The dense search goes first, but only while it is cheap enough to be a
-     * bounded step.  TOLSHEET TOL-QP-P1DENSE
+    /* Which route runs first is the caller's decision, and `phase1_lp_first` is
+     * how they make it.  The two routes are wrong in opposite directions:
      *
-     * Its virtue is the point it hands over: a strictly convex auxiliary
-     * objective returns a well-centred interior point, which is what the active
-     * set converges from -- handing it an LP vertex instead measurably stalls on
-     * degenerate working sets (N=8 at scale 1e3 went OPTIMAL-in-16-iters ->
-     * ITER_LIMIT-in-8100).  Its cost is one dense KKT factorisation in n+m
-     * variables PER ITERATION, which at large n+m exceeds a frame budget on its
-     * own and cannot be interrupted from inside a factorisation, so no
-     * cooperative stop can make it responsive.  Measured against a 16 ms budget
-     * on the layout family, dense-first overshoots to 48 ms at n+m = 161, 11.4 s
-     * at 642, 180 s at 1281; through the LP route the same models stop inside
-     * 20 ms.  Above the gate the LP route is therefore the only one attempted:
-     * O(nnz) per pivot, so the budget binds within a pivot or two.
+     * The dense auxiliary QP hands over a well-centred interior point, which is
+     * what the active set converges from -- handing it an LP vertex instead
+     * measurably stalls on degenerate working sets (N=8 at scale 1e3 went
+     * OPTIMAL-in-16-iters -> ITER_LIMIT-in-8100).  It costs one dense KKT
+     * factorisation in n+m variables PER ITERATION, which at large n+m exceeds a
+     * frame budget on its own and cannot be interrupted from inside, so no
+     * cooperative stop can make it responsive: measured against a 16 ms budget on
+     * the layout family, dense-first overshoots to 48 ms at n+m = 161, 11.4 s at
+     * 641, 180 s at 1281, while the LP route stops inside 20 ms.
      *
-     * LP-first is not merely "the same but cheaper": on the 200-/400-model
-     * differential sweep against scipy it runs 3-12x faster and still reports
-     * only verified verdicts, but it loses the rescue on models the simplex
-     * cannot certify -- 158 vs 162 comparable models at n=200, 293 vs 306 at
-     * n=400 (each lost model ends as "no feasible start", never as a wrong
-     * answer).  Trading verified solves for speed is a policy the *caller* should
-     * choose, not one this function should guess.  Inferring it from whether a
-     * stop callback happens to be installed is a trap -- a host can install one
-     * with no deadline at all (tools/qpsolve.c does exactly that, to be Ctrl-C
-     * safe) -- and would then silently change a batch caller's answers.  An
-     * explicit knob is the way; see docs/CURV_PS_PLAN.md P0.3. */
-    if (n + m <= 600) {   /* TOLSHEET TOL-QP-P1DENSE */
+     * The LP route is O(nnz) per pivot and is the only one that can PROVE the
+     * row system empty.  Run first it is 3-12x cheaper on this family (N=8
+     * 1.8 -> 0.5 ms, N=64 4045 -> 332 ms) and it turns N=64 from STOPPED into
+     * OPTIMAL inside a 1500 ms solve -- but on models the simplex declines to
+     * certify it has nothing else to fall back on, and the dense search does: on
+     * the scipy differential sweep, LP-first checks 158 of 200 models at n=200
+     * and 293 at n=400, against 164 and 312 dense-first, with every difference
+     * ending as "no feasible start" and never as a wrong answer.
+     *
+     * So neither order may be chosen *for* a caller, and neither may be inferred
+     * from whether a stop callback happens to be installed (tools/qpsolve.c
+     * installs one with no deadline at all, to be Ctrl-C-safe).  Default is
+     * dense-first: verified solves over speed, which is what a batch caller wants
+     * and what a caller who has not asked for anything should keep getting.
+     * TOLSHEET TOL-QP-P1DENSE below is the one exception the QP makes on its own,
+     * because past that size dense-first is not a slower route to the same answer
+     * but an answer that cannot be interrupted. */
+    if (lp_first) {
+        ok = lp_route(qp, x0, x, xl, &lam, res);
+        if (ok == 2) { psolve_free(xl); psolve_free(lam); return 2; }
+        if (ok == 0 && res->infeasible_proven) { psolve_free(xl); psolve_free(lam); return 0; }
+    }
+
+    if (!ok && n + m <= 600) {                          /* TOLSHEET TOL-QP-P1DENSE */
         ok = dense_phase1(qp, base, x);
         if (ok == 2) { psolve_free(xl); psolve_free(lam); return 2; }
     }
 
-    if (!ok) {
-        /* Sparse LP on min sum(s): the cheap route, and the only one that can
-         * PROVE the row system empty.  A start it hands back is re-verified
-         * against the caller's own rows inside lp_phase1. */
-        int pr = (lam && xl) ? lp_phase1(qp, x0, xl, lam) : 0;
-        if (pr == 1) {
-            memcpy(x, xl, (size_t)n * sizeof(double));
-            ok = 1;
-        } else if (pr == 2) {                    /* verified Farkas certificate */
-            res->infeasible_proven = 1;
-            res->farkas = lam;  lam = NULL;      /* ownership moves to QPResult */
-            psolve_free(xl);  psolve_free(lam);
-            return 0;                            /* proven empty: nothing to search for */
-        } else if (pr == 3) {                    /* stopped: no verdict, not a give-up */
-            psolve_free(xl);  psolve_free(lam);
-            return 2;
-        }
+    if (!ok && !lp_first) {
+        ok = lp_route(qp, x0, x, xl, &lam, res);
+        if (ok == 2) { psolve_free(xl); psolve_free(lam); return 2; }
+        if (ok == 0 && res->infeasible_proven) { psolve_free(xl); psolve_free(lam); return 0; }
     }
 
     /* Still no start: ask the Farkas alternative directly.  It needs neither a

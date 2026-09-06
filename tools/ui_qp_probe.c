@@ -156,12 +156,17 @@ static Model model_build(int N, int enc, int dup, double S, int want_x1, int tig
     return M;
 }
 
+/* --lp-first arms QP.phase1_order on every model this tool solves (see
+ * QP_PHASE1_LP_FIRST in src/qp.h); 0 keeps the engine default. */
+static int g_lp_first = 0;
+
 static int solve_full(const Model *M, const double *x0, double *obj, double *tout, int *itout,
                       int *proven, double *lam_out)
 {
     if (proven) *proven = 0;
     QP qp; memset(&qp, 0, sizeof qp);
     qp.n = M->n; qp.m = M->m; qp.Q = M->Q; qp.c = M->c; qp.A = M->A; qp.b = M->b; qp.x0 = x0;
+    qp.phase1_order = g_lp_first ? QP_PHASE1_LP_FIRST : QP_PHASE1_DENSE_FIRST;
     QPResult res; memset(&res, 0, sizeof res);
     double t0 = now();
     qp_solve(&qp, &res);
@@ -356,6 +361,7 @@ static void sec_frames(void)
             Model P = model_build(N, ENC_Q, 0, 1.0, 0, 0);
             double px[512]; memset(px, 0, sizeof px);
             QP qp; memset(&qp, 0, sizeof qp);
+            qp.phase1_order = g_lp_first ? QP_PHASE1_LP_FIRST : QP_PHASE1_DENSE_FIRST;
             qp.n = P.n; qp.m = P.m; qp.Q = P.Q; qp.c = P.c; qp.A = P.A; qp.b = P.b;
             QPResult r; memset(&r, 0, sizeof r);
             qp_solve(&qp, &r);                         /* cold, to get a start point */
@@ -415,10 +421,13 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--fast")) { fast = 1; g_dead_ms = 1500; }
         else if (!strcmp(argv[i], "--only") && i+1 < argc) only = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--nmax") && i+1 < argc) nmax = atoi(argv[++i]);
-        else { printf("usage: %s [--strict] [--fast] [--only 1..5] [--nmax N]\n", argv[0]); return 2; }
+        else if (!strcmp(argv[i], "--lp-first")) g_lp_first = 1;
+        else { printf("usage: %s [--strict] [--fast] [--only 1..5] [--nmax N] [--lp-first]\n", argv[0]); return 2; }
     }
     psolve_stop_set(stop_cb);
-    printf("psolve QP core vs the UI-layout problem class\n");
+    printf("psolve QP core vs the UI-layout problem class -- Phase-I order: %s\n",
+           g_lp_first ? "LP route first (dense search as fallback)"
+                       : "dense auxiliary QP first (default)");
     if (!only || only == 1) sec_encodings();
     if (!only || only == 2) sec_scale();
     if (!only || only == 3) sec_frames();

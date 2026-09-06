@@ -35,6 +35,13 @@ void   psw_free(void *p);
 double psw_inf(void);
 void   psw_free_scratch(void);
 
+/* Phase-I ordering policy for every later solve: 0 = engine default (dense
+ * auxiliary QP first), 1 = sparse LP route first with the dense search as
+ * fallback.  Never changes a verdict; changes how many models get an answer
+ * inside a budget.  See docs/CURV_PS_PLAN.md 1.10. */
+void psw_qp_set_phase1_lp_first(int on);
+int  psw_qp_phase1_lp_first(void);
+
 /* Allocation-free solves: arm psolve's arena over a caller buffer. */
 void    psw_arena_set(void *buf, size_t cap);   /* cap 0 disables */
 size_t  psw_arena_used(void);       /* cumulative since reset, not live bytes */
