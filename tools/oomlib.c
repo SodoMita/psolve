@@ -2,7 +2,7 @@
  *
  * Used by tools/oom_test.py to check the claim in README's security section:
  * allocations are checked and out-of-memory is reported through the
- * psolve_try()/psolve_fail() protocol instead of dereferencing NULL.
+ * PSolveErrFrame/psolve_fail() protocol instead of dereferencing NULL.
  *
  *   gcc -shared -fPIC -o /tmp/oomlib.so tools/oomlib.c -ldl
  *   PSOLVE_OOM_AFTER=25 LD_PRELOAD=/tmp/oomlib.so ./fznsolve model.fzn

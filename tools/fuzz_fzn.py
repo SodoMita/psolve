@@ -27,7 +27,7 @@ def build_asan(bindir):
             '-fno-sanitize-recover=all','-fno-omit-frame-pointer','-I','src']
     cmd = base + ['src/err.c','src/kernels.c','src/lu.c','src/splu.c',
                   'src/solver.c','src/parser.c','src/qp.c','src/mip.c','src/fx.c',
-                  'src/pgs.c','src/pgs_fixed.c','src/fzn.c','tools/fznsolve.c',
+                  'src/pgs.c','src/pgs_fixed.c','src/fzn.c','src/cert.c','tools/fznsolve.c',
                   '-o',os.path.join(bindir,'fznsolve_asan'),'-lm']
     subprocess.run(cmd, check=True)
 

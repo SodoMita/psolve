@@ -23,7 +23,7 @@ int lu_factor(double *restrict a, int m, int *restrict piv)
             double v = fabs(A(i, k));
             if (v > best) { best = v; imax = i; }
         }
-        if (best < 1e-300) return -1;   /* singular */
+        if (best < 1e-300) return -1;   /* singular */  /* TOLSHEET TOL-LU-SING */
         piv[k] = imax;
 
         if (imax != k) {

@@ -59,6 +59,6 @@ long pgs_batch_solve(int count, const PGSOptions *opts,
                      const double *const *lo_arr, const double *const *hi_arr,
                      double **x_arr, PGSResult *res_arr);
 
-#define PGS_INF 1e30
+#define PGS_INF 1e30  /* TOLSHEET TOL-PGS-INF */
 
 #endif

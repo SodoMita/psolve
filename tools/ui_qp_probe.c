@@ -417,7 +417,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--nmax") && i+1 < argc) nmax = atoi(argv[++i]);
         else { printf("usage: %s [--strict] [--fast] [--only 1..5] [--nmax N]\n", argv[0]); return 2; }
     }
-    psolve_stop_fn = stop_cb;
+    psolve_stop_set(stop_cb);
     printf("psolve QP core vs the UI-layout problem class\n");
     if (!only || only == 1) sec_encodings();
     if (!only || only == 2) sec_scale();

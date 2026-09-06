@@ -82,7 +82,7 @@ EXPORT void psw_arena_reset(void)
  * rather than losing the solve.  Set to <= 0 to disarm. */
 
 static double  g_deadline = 0.0;             /* absolute seconds, monotonic */
-static int   (*g_saved_stop)(void) = NULL;
+static int    g_stop_mine = 0;                /* bridge owns the thread's stop slot */
 
 static double now_sec(void)
 {
@@ -99,14 +99,19 @@ static int budget_exhausted(void) { return g_deadline > 0.0 && now_sec() > g_dea
 
 EXPORT void psw_set_time_budget_ms(double ms)
 {
+    /* The stop slot is per-thread and write-only (Phase 6.3 replaced the old
+     * `psolve_stop_fn` global with psolve_stop_set()), so the bridge cannot save
+     * and restore a host callback around its own budget the way it once did --
+     * it owns the slot while a budget is armed and clears it afterwards.  A host
+     * that also wants to stop a solve on wasm has to combine both conditions in
+     * its own callback and simply not call this function. */
     if (ms > 0.0) {
         g_deadline = now_sec() + ms * 1e-3;
-        g_saved_stop = psolve_stop_fn;
-        if (psolve_stop_fn != budget_exhausted) psolve_stop_fn = budget_exhausted;
+        psolve_stop_set(budget_exhausted);
+        g_stop_mine = 1;
     } else {
         g_deadline = 0.0;
-        if (psolve_stop_fn == budget_exhausted) psolve_stop_fn = g_saved_stop;
-        g_saved_stop = NULL;
+        if (g_stop_mine) { psolve_stop_set(NULL); g_stop_mine = 0; }
     }
 }
 

@@ -7,14 +7,15 @@
 #include <stdio.h>
 #include <math.h>
 #include <limits.h>
+#include <fenv.h>
 
-#define TOL_FEAS 1e-9
-#define TOL_PIV  1e-12
+#define TOL_FEAS 1e-9  /* TOLSHEET TOL-LP-FEAS */
+#define TOL_PIV  1e-12  /* TOLSHEET TOL-LP-PIV */
 /* Dual (reduced-cost) tolerance.  A reduced cost at rounding level is *not* an
    improving direction: pivoting on one produces a meaningless search direction
    that can end in a bogus "unbounded" ray or in cycling.  Only a reduced cost
    that clears this tolerance counts as improving. */
-#define TOL_DJ   1e-9
+#define TOL_DJ   1e-9  /* TOLSHEET TOL-LP-DJ */
 
 static void *xmalloc(size_t n) {
     return psolve_malloc(n);   /* signals PSOLVE_ERR_OOM instead of exit() */
@@ -51,7 +52,7 @@ static Solver *solver_create_internal(const LP *lp)
     memset(s, 0, sizeof(Solver));
     s->N = N; s->n_orig = n; s->n_core = n; s->M = m;
     s->reinvert_interval = 100;
-    s->hyper_tol = 0.0;
+    s->hyper_tol = 0.0;  /* TOLSHEET TOL-LP-HYPERDEF */
     s->use_sparse = 0;      /* decided per-basis in refactorize */
     /* Global decision: sparse LU only pays off on genuinely sparse problems.
        On dense problems its fill-in makes it both slower and less stable than
@@ -62,7 +63,7 @@ static Solver *solver_create_internal(const LP *lp)
     }
     s->sparse_ok = 0;
     memset(&s->splu, 0, sizeof(s->splu));
-    s->splu.pivot_tol = 1e-13;
+    s->splu.pivot_tol = 1e-13;  /* TOLSHEET TOL-LP-SPLUPIV */
 
     s->l = (double*)xmalloc(N * sizeof(double));
     s->u = (double*)xmalloc(N * sizeof(double));
@@ -90,6 +91,8 @@ static Solver *solver_create_internal(const LP *lp)
     s->vw = (double*)xmalloc(m * sizeof(double));
     s->piw = (double*)xmalloc(m * sizeof(double));
     s->duals = (double*)xmalloc(m * sizeof(double));
+    s->unb_ray = (double*)xmalloc((size_t)N * sizeof(double));
+    s->unb_valid = 0; s->unb_var = -1; s->unb_dir = 0;
     for (j = 0; j < N; j++) s->w[j] = 1.0;
     s->slackVar = (int*)xmalloc(m * sizeof(int));
     s->artVar = (int*)xmalloc(m * sizeof(int));
@@ -283,7 +286,7 @@ static void build_initial_basis(Solver *s)
             /* slack coeff = mlt_i * (rel=='<' ? +1 : -1) */
             double scoef = (double)s->mlt[i] * (s->rel[i] == '<' ? 1.0 : -1.0);
             double v = resid / scoef;
-            if (v >= -1e-12) {   /* slack value nonneg => feasible start */
+            if (v >= -1e-12) {   /* slack value nonneg => feasible start */  /* TOLSHEET TOL-LP-STARTSLACK */
                 chosen = sv;
                 s->x[sv] = (v > 0.0) ? v : 0.0;
             }
@@ -317,6 +320,136 @@ static int lp_var_is_free(double lo, double hi)
     return lo <= -LP_INF && hi >= LP_INF;
 }
 
+/* ------------------------------------------------------------------ */
+/* Roadmap 7.5: Ruiz equilibration + geometric-mean scaling            */
+/*                                                                     */
+/* A pure diagonal preconditioning of the equality form: the engine    */
+/* works on D_r·A·D_c with strictly positive diagonals accumulated at  */
+/* create time; x = D_c·x' and row duals/rays come back scaled by D_r, */
+/* so every caller-visible value stays in ORIGINAL units and every     */
+/* verdict keeps its original-data re-verification path.  The map      */
+/* composes on top of the existing mlt sign rows (mlt is applied to    */
+/* the already-scaled matrix by create_internal, unchanged), and the   */
+/* free-variable split twins share a column scale automatically        */
+/* because their |entries| are identical.                              */
+/*                                                                     */
+/* Every skip rule is a DECLINE-to-scale-less guard, never a verdict   */
+/* input: scaling is optional conditioning, so declining to scale a    */
+/* pathological row/column can only leave the model exactly as the     */
+/* caller handed it in.                                                */
+/* ------------------------------------------------------------------ */
+#define LP_SCALCAP 1e300   /* TOLSHEET TOL-LP-SCALCAP */
+
+/* global max|a_ij| / min|a_ij| over the stored (nonzero) entries - the
+   conditioning-spread proxy reported by the --scalestat CLI lane */
+static double lp_spread_ratio(int n, const int *colptr, const double *val)
+{
+    double mn = 0.0, mx = 0.0; int seen = 0;
+    for (int j = 0; j < n; j++)
+        for (int k = colptr[j]; k < colptr[j + 1]; k++) {
+            double a = fabs(val[k]);
+            if (a == 0.0) continue;
+            if (!seen || a < mn) mn = a;
+            if (!seen || a > mx) mx = a;
+            seen = 1;
+        }
+    return (seen && mn > 0.0) ? mx / mn : 1.0;
+}
+
+/* one Ruiz iteration: geometric-mean row pass then column pass, over a
+   MUTABLE lp; rscale (m) / cscale (n) accumulate the diagonals */
+static void ruiz_iteration(LP *lp, double *rscale, double *cscale)
+{
+    int n = lp->n, m = lp->m;
+    for (int i = 0; i < m; i++) {
+        double mn = 0.0, mx = 0.0; int seen = 0;
+        for (int j = 0; j < n; j++)
+            for (int k = lp->Acolptr[j]; k < lp->Acolptr[j + 1]; k++)
+                if (lp->Arow[k] == i) {
+                    double a = fabs(lp->Aval[k]);
+                    if (a == 0.0) continue;
+                    if (!seen || a < mn) mn = a;
+                    if (!seen || a > mx) mx = a;
+                    seen = 1;
+                }
+        if (!seen) continue;
+        if (mx / mn > LP_SCALCAP) continue;      /* pathology: decline the row */
+        double rho = 1.0 / (sqrt(mn) * sqrt(mx));
+        if (!(rho > 0.0) || !isfinite(rho)) continue;
+        /* anything the row multiply would make non-finite declines it too
+           (b is scaled independently of A's magnitudes, so test it) */
+        if (!isfinite(mx * rho) || !isfinite(lp->b[i] * rho)) continue;
+        for (int j = 0; j < n; j++)
+            for (int k = lp->Acolptr[j]; k < lp->Acolptr[j + 1]; k++)
+                if (lp->Arow[k] == i) lp->Aval[k] *= rho;
+        lp->b[i] *= rho;
+        rscale[i] *= rho;
+    }
+    for (int j = 0; j < n; j++) {
+        double mn = 0.0, mx = 0.0; int seen = 0;
+        for (int k = lp->Acolptr[j]; k < lp->Acolptr[j + 1]; k++) {
+            double a = fabs(lp->Aval[k]);
+            if (a == 0.0) continue;
+            if (!seen || a < mn) mn = a;
+            if (!seen || a > mx) mx = a;
+            seen = 1;
+        }
+        if (!seen) continue;
+        if (mx / mn > LP_SCALCAP) continue;
+        double gam = 1.0 / (sqrt(mn) * sqrt(mx));
+        if (!(gam > 0.0) || !isfinite(gam)) continue;
+        /* bounds at the infinity token are never divided; a finite bound
+           the divide would push ACROSS the token (or non-finite) declines
+           the column - reclassifying a huge finite bound as "infinite"
+           would silently change the model */
+        double lo = lp->l[j], hi = lp->u[j];
+        double slo = (lo <= -LP_INF) ? lo : lo / gam;
+        double shi = (hi >=  LP_INF) ? hi : hi / gam;
+        if (!(lo <= -LP_INF) && (!isfinite(slo) || slo <= -LP_INF)) continue;
+        if (!(hi >=  LP_INF) && (!isfinite(shi) || shi >=  LP_INF)) continue;
+        double sc = lp->c[j] * gam;
+        if (!isfinite(sc) || !isfinite(mx * gam)) continue;
+        for (int k = lp->Acolptr[j]; k < lp->Acolptr[j + 1]; k++)
+            lp->Aval[k] *= gam;
+        lp->c[j] = sc; lp->l[j] = slo; lp->u[j] = shi;
+        cscale[j] *= gam;
+    }
+}
+
+/* Deep-copy an LP into a mutable working image and Ruiz-equilibrate it.
+   The caller's LP is const, hence the copy. */
+static int build_scaled_lp(const LP *src, LP *out,
+                           double **rscale_out, double **cscale_out)
+{
+    int n = src->n, m = src->m;
+    memset(out, 0, sizeof(*out));
+    long nnz = src->Acolptr ? src->Acolptr[n] : 0;
+    out->n = n; out->m = m; out->maximize = src->maximize;
+    out->c = (double*)xmalloc((size_t)(n ? n : 1) * sizeof(double));
+    out->l = (double*)xmalloc((size_t)(n ? n : 1) * sizeof(double));
+    out->u = (double*)xmalloc((size_t)(n ? n : 1) * sizeof(double));
+    out->b = (double*)xmalloc((size_t)(m ? m : 1) * sizeof(double));
+    out->rel = (char*)xmalloc((size_t)(m ? m : 1));
+    out->Acolptr = (int*)xmalloc((size_t)(n + 1) * sizeof(int));
+    out->Arow = (int*)xmalloc((size_t)(nnz ? nnz : 1) * sizeof(int));
+    out->Aval = (double*)xmalloc((size_t)(nnz ? nnz : 1) * sizeof(double));
+    *rscale_out = (double*)xmalloc((size_t)(m ? m : 1) * sizeof(double));
+    *cscale_out = (double*)xmalloc((size_t)(n ? n : 1) * sizeof(double));
+    memcpy(out->c, src->c, (size_t)n * sizeof(double));
+    memcpy(out->l, src->l, (size_t)n * sizeof(double));
+    memcpy(out->u, src->u, (size_t)n * sizeof(double));
+    if (m > 0) { memcpy(out->b, src->b, (size_t)m * sizeof(double));
+                 memcpy(out->rel, src->rel, (size_t)m); }
+    memcpy(out->Acolptr, src->Acolptr, (size_t)(n + 1) * sizeof(int));
+    if (nnz > 0) { memcpy(out->Arow, src->Arow, (size_t)nnz * sizeof(int));
+                   memcpy(out->Aval, src->Aval, (size_t)nnz * sizeof(double)); }
+    for (int i = 0; i < m; i++) (*rscale_out)[i] = 1.0;
+    for (int j = 0; j < n; j++) (*cscale_out)[j] = 1.0;
+    for (int it = 0; it < 4; it++)
+        ruiz_iteration(out, *rscale_out, *cscale_out);
+    return 0;
+}
+
 static void free_normalized_lp(LP *lp)
 {
     psolve_free(lp->c); psolve_free(lp->l); psolve_free(lp->u);
@@ -324,12 +457,19 @@ static void free_normalized_lp(LP *lp)
     memset(lp, 0, sizeof(*lp));
 }
 
+/* the scaled working image additionally owns its b/rel */
+static void free_scaled_lp(LP *lp)
+{
+    psolve_free(lp->b); psolve_free(lp->rel);
+    free_normalized_lp(lp);
+}
+
 /* Public construction path.  Revised simplex needs every nonbasic variable
  * to sit at a bound, so normalize a caller-visible free variable x into
  * x+ - x-, x+,x- >= 0.  This is an exact linear transformation: the positive
  * column is A_j, the negative column is -A_j, and their costs are c_j/-c_j.
  * The mapping is retained for solution, sensitivity, and incremental APIs. */
-Solver *solver_create(const LP *lp)
+Solver *solver_create_opts(const LP *lp, int scale_mode)
 {
     if (!lp || lp->n <= 0 || lp->m < 0 || lp->n > 1000000 || lp->m > 1000000 ||
         !lp->c || !lp->l || !lp->u || !lp->Acolptr ||
@@ -364,8 +504,18 @@ Solver *solver_create(const LP *lp)
     }
 
     Solver *s = NULL;
-    if (nfree == 0) {
+    double *rscale_w = NULL, *cscale_w = NULL;
+    double ratio_pre = 1.0, ratio_post = 1.0;
+    if (nfree == 0 && !scale_mode) {
         s = solver_create_internal(lp);
+    } else if (nfree == 0) {
+        /* equilibration, no splits: deep-copy then precondition */
+        LP scaled;
+        ratio_pre = lp_spread_ratio(lp->n, lp->Acolptr, lp->Aval);
+        build_scaled_lp(lp, &scaled, &rscale_w, &cscale_w);
+        ratio_post = lp_spread_ratio(scaled.n, scaled.Acolptr, scaled.Aval);
+        s = solver_create_internal(&scaled);
+        free_scaled_lp(&scaled);
     } else {
         LP norm; memset(&norm, 0, sizeof(norm));
         norm.n = ncore; norm.m = lp->m; norm.maximize = lp->maximize;
@@ -409,10 +559,20 @@ Solver *solver_create(const LP *lp)
             }
         }
         norm.Acolptr[ncore] = (int)pos;
-        s = solver_create_internal(&norm);
+        if (scale_mode) {
+            LP scaled;
+            ratio_pre = lp_spread_ratio(norm.n, norm.Acolptr, norm.Aval);
+            build_scaled_lp(&norm, &scaled, &rscale_w, &cscale_w);
+            ratio_post = lp_spread_ratio(scaled.n, scaled.Acolptr, scaled.Aval);
+            s = solver_create_internal(&scaled);
+            free_scaled_lp(&scaled);
+        } else {
+            s = solver_create_internal(&norm);
+        }
         free_normalized_lp(&norm);
     }
-    if (!s) { psolve_free(orig_pos); psolve_free(orig_neg); return NULL; }
+    if (!s) { psolve_free(orig_pos); psolve_free(orig_neg);
+              psolve_free(rscale_w); psolve_free(cscale_w); return NULL; }
 
     s->n_orig = n;
     s->n_core = ncore;
@@ -425,7 +585,27 @@ Solver *solver_create(const LP *lp)
     memcpy(s->orig_l, lp->l, (size_t)n * sizeof(double));
     memcpy(s->orig_u, lp->u, (size_t)n * sizeof(double));
     s->rebuild_pending = 0;
+    /* scale state: the funnels multiply unconditionally, so mode-off needs
+       allocated identity diagonals rather than NULLs */
+    if (!rscale_w) {
+        rscale_w = (double*)xmalloc((size_t)(lp->m ? lp->m : 1) * sizeof(double));
+        for (int i = 0; i < lp->m; i++) rscale_w[i] = 1.0;
+        cscale_w = (double*)xmalloc((size_t)(ncore ? ncore : 1) * sizeof(double));
+        for (int j = 0; j < ncore; j++) cscale_w[j] = 1.0;
+        ratio_pre = lp_spread_ratio(lp->n, lp->Acolptr, lp->Aval);
+        ratio_post = ratio_pre;
+    }
+    s->scale_mode = scale_mode ? 1 : 0;
+    s->rscale = rscale_w;
+    s->cscale = cscale_w;
+    s->stat_ratio_pre = ratio_pre;
+    s->stat_ratio_post = ratio_post;
     return s;
+}
+
+Solver *solver_create(const LP *lp)
+{
+    return solver_create_opts(lp, 1);
 }
 
 void solver_destroy(Solver *s)
@@ -439,6 +619,8 @@ void solver_destroy(Solver *s)
     psolve_free(s->lu); psolve_free(s->piv); psolve_free(s->y); psolve_free(s->d); psolve_free(s->v); psolve_free(s->xb);
     psolve_free(s->slackVar); psolve_free(s->artVar); psolve_free(s->beq); psolve_free(s->borig); psolve_free(s->mlt); psolve_free(s->artSign); psolve_free(s->rel);
     psolve_free(s->w); psolve_free(s->vw); psolve_free(s->piw); psolve_free(s->duals);
+    psolve_free(s->unb_ray);
+    psolve_free(s->rscale); psolve_free(s->cscale);
     psolve_free(s->colptr); psolve_free(s->row); psolve_free(s->val);
     splu_free(&s->splu);
     psolve_free(s->bBp); psolve_free(s->bBi); psolve_free(s->bBx);
@@ -483,7 +665,7 @@ static void refactorize(Solver *s)
         }
         splu_free(&s->splu);
         memset(&s->splu, 0, sizeof(s->splu));
-        s->splu.pivot_tol = 1e-13;
+        s->splu.pivot_tol = 1e-13;  /* TOLSHEET TOL-LP-SPLUPIV */
         s->sparse_ok = (splu_factor(&s->splu, s->bBp, s->bBi, s->bBx, M) == 0);
         s->eta_count = 0;
         if (!s->sparse_ok) {
@@ -589,6 +771,116 @@ static void btrans(Solver *s, double *y)
     }
 }
 
+int solver_farkas_duals(Solver *s, double *y)
+{
+    if (!s || !y || !s->farkas_ok || s->M <= 0) return -1;
+    /* Phase-I objective of the basic columns: cobj still holds the Phase-I
+       objective (-1 per artificial, 0 elsewhere) at the return point that set
+       farkas_ok, so y = B^{-T} c_B is the Phase-I-optimal dual vector.  The
+       LU/eta factors belong to the same basis: solve_phase ended on this
+       basis and nothing refactorized after the verdict. */
+    for (int i = 0; i < s->M; i++) y[i] = s->cobj[s->basis[i]];
+    btrans(s, y);
+    /* absorb the equilibration diagonal into the documented output space:
+       callers multiply by mlt and get the ORIGINAL-row ray, scaling or no
+       scaling (1.0 diagonals when off; roadmap 7.5) */
+    for (int i = 0; i < s->M; i++) y[i] *= s->rscale[i];
+    return 0;
+}
+
+int solver_farkas_boxcert(int n, int m, const int *colptr, const int *row,
+                          const double *val, const char *rel, const double *b,
+                          const double *lo, const double *hi, const double *ys,
+                          const int *mlt, double tol,
+                          double *y, double *zl, double *zh)
+{
+    const double BIG = 1e29;  /* TOLSHEET TOL-LP-BIGCAP */
+    if (m <= 0 || n <= 0 || !colptr || !rel || !b || !lo || !hi || !ys ||
+        !mlt || !y || !zl || !zh) return 0;
+    for (int i = 0; i < m; i++) {
+        double yi = ys[i] * (double)mlt[i];
+        if (!isfinite(yi)) return 0;
+        if (rel[i] == '<' && yi < 0.0) yi = 0.0;
+        else if (rel[i] == '>' && yi > 0.0) yi = 0.0;
+        y[i] = yi;
+    }
+    int rm = fegetround();
+    /* R = y^T b, rounded UP (proven upper bound) */
+    double R = 0.0;
+    fesetround(FE_UPWARD);
+    for (int i = 0; i < m; i++)
+        if (y[i] != 0.0) R += y[i] * b[i];
+    if (!isfinite(R)) { fesetround(rm); return 0; }
+    /* z = y^T A per column, both directions */
+    for (int j = 0; j < n; j++) zl[j] = 0.0;
+    fesetround(FE_DOWNWARD);
+    for (int j = 0; j < n; j++)
+        for (int k = colptr[j]; k < colptr[j + 1]; k++)
+            zl[j] += y[row[k]] * val[k];
+    for (int j = 0; j < n; j++) zh[j] = 0.0;
+    fesetround(FE_UPWARD);
+    for (int j = 0; j < n; j++)
+        for (int k = colptr[j]; k < colptr[j + 1]; k++)
+            zh[j] += y[row[k]] * val[k];
+    /* L = min_{box} z.x, proven LOWER bound: corner minima, rounded down */
+    fesetround(FE_DOWNWARD);
+    double L = 0.0;
+    for (int j = 0; j < n; j++) {
+        double a = zl[j], c = zh[j];
+        if (!isfinite(a) || !isfinite(c)) {
+            fesetround(rm); return 0;
+        }
+        if (a >= 0.0 && c <= 0.0) {
+            /* Provably-zero column window: zl/zh bracket the exact sum by
+               directed rounding, so z_j == 0 and the box product z_j x_j is
+               exactly 0 for ANY box, open sides included.  Skipping is
+               sound: L's bound is unchanged and no ±inf sentinel is read.
+               (Without this skip, any free-variable column — box sides at
+               the ±1e30 sentinel — would veto the whole certificate even
+               when its y^T A column cancels to an exact zero, e.g. the
+               presolve pair-conflict ray on a free x.) */
+            continue;
+        }
+        double lj = lo[j], uj = hi[j];
+        if (lj <= -BIG || uj >= BIG) {
+            fesetround(rm); return 0;
+        }
+        double t = a * lj;
+        double t2 = a * uj; if (t2 < t) t = t2;
+        double t3 = c * lj; if (t3 < t) t = t3;
+        double t4 = c * uj; if (t4 < t) t = t4;
+        L += t;
+    }
+    fesetround(rm);
+    if (!isfinite(L) || !isfinite(R)) return 0;
+    double mar = tol * (1.0 + fabs(R));  /* TOLSHEET TOL-LP-FARKAS */
+    return L > R + mar;
+}
+
+double solver_row_exposure(int n, int m, const int *colptr, const int *row,
+                           const double *val,
+                           const double *lo, const double *hi)
+{
+    const double BIGCAP = 1e29;  /* TOLSHEET TOL-LP-BIGCAP */
+    if (!colptr || !row || !val || !lo || !hi || m < 0 || n <= 0) return 0.0;
+    double worst = 0.0;
+    /* accumulate per-column contributions into a reusable row buffer */
+    double *acc = (double*)psolve_calloc((size_t)(m ? m : 1), sizeof(double));
+    if (!acc) return 0.0;
+    for (int j = 0; j < n; j++) {
+        double bj = fabs(lo[j]) > fabs(hi[j]) ? fabs(lo[j]) : fabs(hi[j]);
+        if (bj > BIGCAP) bj = BIGCAP;
+        for (int k = colptr[j]; k < colptr[j + 1]; k++) {
+            int i = row[k];
+            if (i >= 0 && i < m) acc[i] += fabs(val[k]) * bj;
+        }
+    }
+    for (int i = 0; i < m; i++)
+        if (acc[i] > worst) worst = acc[i];
+    psolve_free(acc);
+    return worst;
+}
+
 /* Re-initialize the solver to its starting basis: every original variable
    nonbasic at a bound, and each row served by a slack (if it yields a
    nonnegative value) or a sign-correct artificial.  This is used both at
@@ -635,7 +927,7 @@ static void solver_reset_to_initial(Solver *s)
             if (sv >= 0) {
                 double scoef = (double)mlt[i] * (s->rel[i] == '<' ? 1.0 : -1.0);
                 double v = resid / scoef;
-                if (v >= -1e-12) {   /* slack value nonneg => feasible start */
+                if (v >= -1e-12) {   /* slack value nonneg => feasible start */  /* TOLSHEET TOL-LP-STARTSLACK */
                     chosen = sv;
                     s->x[sv] = (v > 0.0) ? v : 0.0;
                 }
@@ -686,7 +978,7 @@ static void solver_reset_to_initial(Solver *s)
     s->iters = 0;
     s->status_out = 0;
     s->objval = 0.0;
-    s->hyper_tol = 0.0;
+    s->hyper_tol = 0.0;  /* TOLSHEET TOL-LP-HYPERDEF */
 
     /* initial refactorization (honors s->sparse_disabled / use_sparse) */
     refactorize(s);
@@ -740,10 +1032,10 @@ static int pick_entering(const Solver *s)
         double score;   /* improving reduced cost normalized by sqrt(weight) */
         if (st == LP_NBL) {
             if (rc <= TOL_DJ) continue;
-            score = rc / sqrt(s->w[j] < 1e-30 ? 1e-30 : s->w[j]);
+            score = rc / sqrt(s->w[j] < 1e-30 ? 1e-30 : s->w[j]);  /* TOLSHEET TOL-LP-WGUARD */
         } else { /* NBU */
             if (rc >= -TOL_DJ) continue;
-            score = (-rc) / sqrt(s->w[j] < 1e-30 ? 1e-30 : s->w[j]);
+            score = (-rc) / sqrt(s->w[j] < 1e-30 ? 1e-30 : s->w[j]);  /* TOLSHEET TOL-LP-WGUARD */
         }
         if (score > best) { best = score; q = j; }
     }
@@ -794,7 +1086,7 @@ static int ratio_test(const Solver *s, int q, int dir, const double *d,
 
     /* Harris pass 2: among candidates within relax of min, pick largest |v| */
     if (blockIsBasic) {
-        double relax = 1e-9 * (1.0 + fabs(theta));
+        double relax = 1e-9 * (1.0 + fabs(theta));  /* TOLSHEET TOL-LP-RELAX */
         double bestv = 0.0; int bestslot = -1;
         for (int i = 0; i < M; i++) {
             int bv = s->basis[i];
@@ -832,7 +1124,7 @@ static void update_steepest_edge(Solver *s, int q, int p)
     double wq = 0.0;
     for (int i = 0; i < M; i++) wq += s->d[i] * s->d[i];
     double aq = s->d[p];
-    if (fabs(aq) < 1e-300) aq = (aq < 0) ? -1e-300 : 1e-300;
+    if (fabs(aq) < 1e-300) aq = (aq < 0) ? -1e-300 : 1e-300;  /* TOLSHEET TOL-LP-AQGUARD */
     /* v = B^{-T} d */
     memcpy(s->vw, s->d, (size_t)M * sizeof(double));
     btrans(s, s->vw);
@@ -850,8 +1142,8 @@ static void update_steepest_edge(Solver *s, int q, int p)
         double ajv   = k_dsdot_sparse(s->vw,   s->row + s->colptr[j], s->val + s->colptr[j], nnz, 0.0);
         double t = alpha / aq;
         double nj = s->w[j] - 2.0 * t * ajv + t * t * wq;
-        if (nj < 1e-30) nj = 1e-30;
-        if (nj > 1e18) nj = 1e18;
+        if (nj < 1e-30) nj = 1e-30;  /* TOLSHEET TOL-LP-WGUARD */
+        if (nj > 1e18) nj = 1e18;  /* TOLSHEET TOL-LP-WCAP */
         s->w[j] = nj;
     }
     /* the variable leaving the basis (slot p) becomes nonbasic */
@@ -889,6 +1181,13 @@ static int iterate(Solver *s)
             recompute_basic(s);
             return 1;   /* continue iterating with the dense basis */
         }
+        /* record the evidence for solver_unbounded_ray: the ratio test just
+           left s->v holding the basic-variable move direction (-dir*d), so
+           the full improving ray is q plus the current basis update */
+        s->unb_valid = 1; s->unb_var = q; s->unb_dir = dir;
+        for (int _j = 0; _j < s->N; _j++) s->unb_ray[_j] = 0.0;
+        s->unb_ray[q] = (double)dir;
+        for (int _i = 0; _i < M; _i++) s->unb_ray[s->basis[_i]] = s->v[_i];
         return 2;
     }
 
@@ -907,7 +1206,7 @@ static int iterate(Solver *s)
         double obj = 0.0;
         for (int _j = 0; _j < s->N; _j++)
             if (s->status[_j] != LP_REMOVED) obj += s->cobj[_j] * s->x[_j];
-        if (obj > s->last_obj + 1e-9 * (1.0 + fabs(s->last_obj))) s->flat = 0;
+        if (obj > s->last_obj + 1e-9 * (1.0 + fabs(s->last_obj))) s->flat = 0;  /* TOLSHEET TOL-LP-FLAT */
         else s->flat++;
         s->last_obj = obj;
         if (s->flat > 500) s->bland = 1;
@@ -984,7 +1283,7 @@ static void remove_basic_artificials(Solver *s)
            let the artificial absorb infeasibility and report a solution that
            violates the row (e.g. -3x0=0 solved as x0=20).  Only replace an
            artificial that is basic at a nonzero value. */
-        if (fabs(s->x[bv]) <= 1e-9) {
+        if (fabs(s->x[bv]) <= 1e-9) {  /* TOLSHEET TOL-LP-ARTPIN */
             s->l[bv] = 0.0; s->u[bv] = 0.0;   /* pin the redundant artificial at 0 */
             continue;
         }
@@ -1049,6 +1348,10 @@ static int solve_phase(Solver *s)
 static int solver_solve_impl(Solver *s)
 {
     int r = 0;
+    /* The Phase-I-infeasibility marker below is only valid for the solve
+       currently running: clear it on entry so a stale certificate state can
+       never be attributed to a later verdict. */
+    s->farkas_ok = 0; s->unb_valid = 0;
     /* Empty box => INFEASIBLE, certified by construction: a variable with
        l[j] > u[j] admits no assignment at all, so no constraint examination
        is needed.  Without this up-front verdict a contradictory box (the
@@ -1111,10 +1414,19 @@ static int solver_solve_impl(Solver *s)
                     int av = s->artVar[i];
                     if (s->status[av] == LP_BASIC) artsum += s->x[av];
                 }
-                if (worst > 1e-6 * (1.0 + fabs(artsum))) certified = 0;
+                if (worst > 1e-6 * (1.0 + fabs(artsum))) certified = 0;  /* TOLSHEET TOL-LP-P1CERT */
             }
             if (certified) {
-                if (artsum > 1e-6) { s->status_out = 1; return 1; }  /* infeasible */
+                if (artsum > 1e-6) {  /* TOLSHEET TOL-LP-P1SUM */
+                    /* Certified Phase-I INFEASIBLE: keep the Phase-I-optimal
+                       basis and objective in place and mark the state, so the
+                       MIP bridge can pull the dual ray (solver_farkas_duals)
+                       as a HINT for its own directed-rounding Farkas check on
+                       the original model -- replacing most exact-rational
+                       re-solves of infeasibility verdicts. */
+                    s->farkas_ok = 1;
+                    s->status_out = 1; return 1;
+                }
                 break;                                               /* feasible */
             }
             if (attempt++ >= 1) { s->status_out = SOLVE_NUMERICAL; return SOLVE_NUMERICAL; }
@@ -1204,6 +1516,18 @@ int solver_solve(Solver *s)
     return r;
 }
 
+int solver_unbounded_ray(const Solver *s, double *ray)
+{
+    if (!s || !ray || !s->unb_valid || s->unb_var < 0) return -1;
+    for (int j = 0; j < s->n_orig; j++) {
+        int p = s->orig_pos[j], q = s->orig_neg[j];
+        double d = s->unb_ray[p] * s->cscale[p];
+        if (q >= 0) d -= s->unb_ray[q] * s->cscale[q];
+        ray[j] = d;
+    }
+    return 0;
+}
+
 void solver_duals(const Solver *s, double *dual)
 {
     if(!s||!dual)return;
@@ -1211,7 +1535,7 @@ void solver_duals(const Solver *s, double *dual)
        problem was a minimization so the reported shadow prices have the sign
        consistent with the original objective. */
     double sign = s->negate_obj ? -1.0 : 1.0;
-    for (int i = 0; i < s->M; i++) dual[i] = sign * s->duals[i];
+    for (int i = 0; i < s->M; i++) dual[i] = sign * s->rscale[i] * s->duals[i];
 }
 
 void solver_reduced_costs(const Solver *s, double *rc)
@@ -1227,6 +1551,10 @@ void solver_reduced_costs(const Solver *s, double *rc)
         rc[j] = s->cobj[p] - k_dsdot_sparse(s->duals,
                               s->row + s->colptr[p], s->val + s->colptr[p],
                               (long)(s->colptr[p+1] - s->colptr[p]), ytol);
+        /* internal row i is mlt_i*rscale_i*(orig row i) and the core cost is
+           gamma_j*c_j, so the core reduced cost is gamma_j times the
+           original-direction one; scale back out (7.5) */
+        rc[j] /= s->cscale[p];
     }
 }
 
@@ -1235,7 +1563,7 @@ void solver_optimum(const Solver *s, double *x_orig, double *obj)
     if(!s||!x_orig||!obj)return;
     for (int j = 0; j < s->n_orig; j++) {
         int p = s->orig_pos[j], q = s->orig_neg[j];
-        x_orig[j] = s->x[p] - (q >= 0 ? s->x[q] : 0.0);
+        x_orig[j] = s->x[p] * s->cscale[p] - (q >= 0 ? s->x[q] * s->cscale[q] : 0.0);
     }
     *obj = s->negate_obj ? -s->objval : s->objval;
 }
@@ -1248,8 +1576,8 @@ void solver_set_objective(Solver *s, const double *c, int maximize)
         int p = s->orig_pos[j], q = s->orig_neg[j];
         double cj = maximize ? c[j] : -c[j];
         s->orig_c[j] = c[j];
-        s->c0[p] = cj;
-        if (q >= 0) s->c0[q] = -cj;
+        s->c0[p] = cj * s->cscale[p];
+        if (q >= 0) s->c0[q] = -cj * s->cscale[q];
     }
     memcpy(s->cobj, s->c0, (size_t)s->N * sizeof(double));
     /* slacks/artificials keep zero objective (already 0 after Phase II) */
@@ -1274,7 +1602,15 @@ void solver_set_bounds(Solver *s, const double *l, const double *u)
     }
     for (int j = 0; j < s->n_orig; j++) {
         int p = s->orig_pos[j];
-        if (s->orig_neg[j] < 0) { s->l[p] = l[j]; s->u[p] = u[j]; }
+        if (s->orig_neg[j] < 0) {
+            double gam = s->cscale[p];
+            /* cscale[p] > 0 always; the infinity-token sides keep the token
+               (a finite huge bound mapped across it would clamp to the
+               token, and the original-data verification lanes then enforce
+               the true bound - certification stands, never a wrong print) */
+            s->l[p] = (l[j] <= -LP_INF) ? -LP_INF : l[j] / gam;
+            s->u[p] = (u[j] >=  LP_INF) ?  LP_INF : u[j] / gam;
+        }
     }
 }
 
@@ -1307,7 +1643,7 @@ static int solver_export_lp(const Solver *s, const double *new_a,
         lp->c[j] = s->orig_c[j];
         lp->l[j] = s->orig_l[j]; lp->u[j] = s->orig_u[j];
     }
-    for (int i = 0; i < m; i++) { lp->b[i] = s->borig[i]; lp->rel[i] = s->rel[i]; }
+    for (int i = 0; i < m; i++) { lp->b[i] = s->borig[i] / s->rscale[i]; lp->rel[i] = s->rel[i]; }
     if (add) { lp->b[m] = new_rhs; lp->rel[m] = new_rel; }
 
     long nnz = 0;
@@ -1332,7 +1668,9 @@ static int solver_export_lp(const Solver *s, const double *new_a,
         for (int k = s->colptr[p]; k < s->colptr[p+1]; k++) {
             int row = s->row[k];
             if (row < 0 || row >= m) { free_exported_lp(lp); return -1; }
-            double v = s->val[k] / s->mlt[row];  /* undo equality row scaling */
+            /* undo equality row sign AND equilibration diagonals (7.5):
+               stored = mlt * rscale_row * cscale_col * original */
+            double v = s->val[k] / (s->mlt[row] * s->rscale[row] * s->cscale[p]);
             if (v != 0.0) { lp->Arow[pos] = row; lp->Aval[pos] = v; pos++; }
         }
         if (add && new_a[j] != 0.0) { lp->Arow[pos] = m; lp->Aval[pos] = new_a[j]; pos++; }
@@ -1351,7 +1689,7 @@ static void solver_refresh(Solver *s)
         s->status_out = SOLVE_NUMERICAL;
         return;
     }
-    Solver *fresh = solver_create(&lp);
+    Solver *fresh = solver_create_opts(&lp, s->scale_mode);
     if (!fresh) {
         free_exported_lp(&lp);
         s->status_out = SOLVE_NUMERICAL;
@@ -1373,6 +1711,9 @@ static void solver_refresh(Solver *s)
 int solver_warm_solve(Solver *s)
 {
     if(!s)return SOLVE_INVALID;
+    /* same invalidation rule as solver_solve_impl: the marker describes only
+       the verdict currently being produced */
+    s->farkas_ok = 0; s->unb_valid = 0;
     if (s->rebuild_pending) {
         solver_refresh(s);
         return s->status_out;
@@ -1418,7 +1759,7 @@ int solver_add_row(Solver *s, const double *a, double rhs, char rel)
 
     LP lp;
     if (solver_export_lp(s, a, rhs, rel, &lp) != 0) return -1;
-    Solver *fresh = solver_create(&lp);
+    Solver *fresh = solver_create_opts(&lp, s->scale_mode);
     if (!fresh) { free_exported_lp(&lp); return -1; }
     fresh->iteration_limit = s->iteration_limit;
     fresh->reinvert_interval = s->reinvert_interval;
@@ -1435,7 +1776,7 @@ int solver_feasible(const Solver *s)
 {
     if(!s)return 0;
     int N = s->N, M = s->M;
-    const double tol = 1e-6 * (1.0 + fabs(s->objval));
+    const double tol = 1e-6 * (1.0 + fabs(s->objval));  /* TOLSHEET TOL-LP-FINALBOX */
     for (int j = 0; j < N; j++) {
         if (s->status[j] == LP_REMOVED) continue;
         if (s->x[j] < s->l[j] - tol || s->x[j] > s->u[j] + tol) return 0;
@@ -1450,7 +1791,7 @@ int solver_feasible(const Solver *s)
     }
     int ok = 1;
     for (int i = 0; i < M; i++)
-        if (fabs(res[i] - s->beq[i]) > 1e-5 * (1.0 + fabs(s->beq[i]))) { ok = 0; break; }
+        if (fabs(res[i] - s->beq[i]) > 1e-5 * (1.0 + fabs(s->beq[i]))) { ok = 0; break; }  /* TOLSHEET TOL-LP-FINALROW */
     psolve_free(res);
     return ok;
 }

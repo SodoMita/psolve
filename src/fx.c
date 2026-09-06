@@ -31,7 +31,7 @@ int fx_from_double(double v, Fx *out){
        status into a false status for the original MIP. */
     if(v != rv) return -1;
     /* 2^63 itself is representable as double but is one past LLONG_MAX. */
-    if(rv < -0x1p63 || rv >= 0x1p63) return -1;
+    if(rv < -0x1p63 || rv >= 0x1p63) return -1;  /* TOLSHEET TOL-FX-RANGE */
     out->num = (long long)rv; out->den = 1;
     return 0;
 }
@@ -106,7 +106,7 @@ static int fx_from_str(const char*s, Fx*out){
     if(!isdigit((unsigned char)*p)) return -1;
     /* integer part */
     long long ip=0;
-    while(isdigit((unsigned char)*p)){ if(ip>((long long)9e17))return -1; ip=ip*10+(*p-'0'); p++; }
+    while(isdigit((unsigned char)*p)){ if(ip>((long long)9e17))return -1; ip=ip*10+(*p-'0'); p++; }  /* TOLSHEET TOL-FX-DECCAP */
     long long fp=0; int frlen=0;
     if(*p=='.'){ p++;
         while(isdigit((unsigned char)*p)){

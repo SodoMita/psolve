@@ -106,6 +106,10 @@ typedef struct {
     long  iters;
     long  nodes;
     double best_bound;
+    long  farkas_certs;  /* MIP path: node relaxations pruned by the
+                            directed-rounding Farkas certificate (skipped the
+                            exact-rational re-solve such verdicts used to cost) */
+    long  fx_solves;     /* MIP path: relaxations handed to the exact fx solver */
     long  node_limit;
     int   all_solutions; /* 1 = output all solutions / intermediate incumbents */
     int   num_solutions; /* number of solutions output */

@@ -40,7 +40,7 @@ fi
 echo "[5/7] QP solver vs scipy (analytic + randomized)..."
 gcc -O2 -march=native -I src tools/qp_test.c src/qp.c src/err.c src/lu.c src/splu.c src/solver.c src/kernels.c -o /tmp/qp_test -lm
 /tmp/qp_test
-gcc -O2 -march=native -I src tools/qpsolve.c src/qp.c src/err.c src/lu.c src/splu.c src/solver.c src/kernels.c -o /tmp/qpsolve -lm
+gcc -O2 -march=native -I src tools/qpsolve.c src/qp.c src/err.c src/lu.c src/kernels.c src/splu.c src/solver.c src/cert.c -o /tmp/qpsolve -lm
 ok=0; fail=0
 for s in $(seq 1 40); do
   if python3 tools/qp_gen.py $s 2>/dev/null | grep -q '^OK'; then ok=$((ok+1)); else fail=$((fail+1)); fi
@@ -86,6 +86,19 @@ gcc -O2 -march=native -I src -I tools tools/ui_qp_probe.c src/qp.c src/err.c src
 gcc -O2 -march=native -I src -I tools tools/psw_test.c tools/psolve_web.c \
      src/qp.c src/err.c src/lu.c src/splu.c src/solver.c src/kernels.c -o /tmp/psw_test -lm
 /tmp/psw_test
+# QP convexity-gate differential (roadmap 6.5): the pre-change gate screened
+# only 1x1/2x2 principal minors, so n>=3 symmetric indefinite Q whose
+# negativity lives in a larger minor PASSED (diag 1, off-diag -0.9: 2x2
+# minors 0.19, eigenvalue -0.8), and the active-set printed the stationary
+# origin as an "optimum" on problems unbounded below.  Now a complete
+# symmetrized complete-pivoting elimination scan certifies PSD (negative
+# pivot, or an off-diagonal tail beyond the scaled tolerance, refuses with
+# QP_NON_CONVEX).  Discriminating: on the pre-change binary the tool
+# reproduces 103 fabricated status-0 verdicts (25 with objectives wrong vs
+# the true box optima); post-change it must see 0, keep 120 asymmetric/tiny-
+# perturbation over-refusals paperwork-free, and not over-block scale-mixed
+# genuine PSD.  Hard gate: rc matters.
+python3 tools/qp_psd_verify.py 120 20260815 || { echo "qp_psd_verify: FAIL"; exit 1; }
 
 echo "[5.2/7] QP cooperative stop + millisecond-precision time limits (Phase 4)..."
 gcc -O2 -march=native -I src tools/qp_stop_test.c src/qp.c src/err.c src/lu.c src/splu.c src/solver.c src/kernels.c -o /tmp/qp_stop_test -lm
@@ -120,6 +133,41 @@ gcc -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -I src \
     src/splu.c src/lu.c src/kernels.c src/parser.c -o /tmp/arena_fzn_asan -lm
 /tmp/arena_fzn_asan
 
+echo "[5.45/7] Error protocol: caller-owned per-thread frames (Phase 6.3, AUDIT #2)..."
+# The retired process-global jmp_buf/active/code triple refused a second
+# thread's handler outright and made any concurrent failure a cross-thread
+# longjmp.  Caller-owned PSolveErrFrame storage + thread-local chain state
+# closes that; these tests pin both the single-thread semantics (nested
+# frames, realloc/calloc guards, no-frame exit, checked pop violation) and
+# 8-thread concurrent solves + forced OOM recoveries + per-thread stop
+# callbacks.  Discriminating: neither test compiles against the pre-change
+# err.h (API absent); an old-API reproducer showed psolve_try() refusing a
+# second thread's handler.
+gcc -O2 -march=native -Wall -Wextra -I src tools/err_proto_test.c src/err.c -o /tmp/err_proto_test -lm
+/tmp/err_proto_test || { echo "err_proto_test: FAIL"; exit 1; }
+gcc -O2 -march=native -Wall -Wextra -pthread -I src tools/err_mt_test.c src/err.c \
+    src/solver.c src/splu.c src/lu.c src/kernels.c src/parser.c -o /tmp/err_mt_test -lm
+/tmp/err_mt_test || { echo "err_mt_test: FAIL"; exit 1; }
+# Same multithreaded test under ThreadSanitizer: must produce no reports.
+# (Skipped with a note if this toolchain lacks TSan.)
+if gcc -O1 -g -fsanitize=thread -pthread -I src tools/err_mt_test.c src/err.c \
+    src/solver.c src/splu.c src/lu.c src/kernels.c src/parser.c -o /tmp/err_mt_tsan -lm 2>/dev/null; then
+    /tmp/err_mt_tsan || { echo "err_mt_tsan: FAIL"; exit 1; }
+else
+    echo "err_mt_tsan: SKIP (no -fsanitize=thread on this toolchain)"
+fi
+# Objective archive gate: the whole library now exports ZERO non-TLS mutable
+# data symbols (pre-change err.o alone had four: psolve_env/psolve_active/
+# psolve_code/psolve_stop_fn); the remaining statics are _Thread_local.
+if nm -g --defined-only src/err.o src/solver.o src/mip.o src/fzn.o src/qp.o \
+     src/fx.o src/parser.o src/splu.o src/lu.o src/kernels.o 2>/dev/null | \
+     awk '$2 ~ /[BCDGS]/ {found=1} END {exit found?0:1}'; then
+    echo "global-state gate: FAIL (library exports mutable data symbols)"
+    exit 1
+else
+    echo "global-state gate: no exported mutable data symbols in the library"
+fi
+
 echo "[5.5/7] MIP solver (branch-and-bound) vs brute force..."
 gcc -O2 -march=native -I src tools/mip_test.c src/mip.c src/fx.c src/err.c src/solver.c src/splu.c src/lu.c src/kernels.c src/parser.c -o /tmp/mip_test -lm
 /tmp/mip_test
@@ -132,6 +180,49 @@ python3 tools/lp_form_verify.py 150 20260815 | sed 's/.*: //'
 # and additionally checks statuses and the returned point, not just the
 # objective of runs that happened to come back OPTIMAL.
 python3 tools/mip_diff.py 400 12345 | head -2
+# Farkas fast path: Phase-I dual ray re-verified with directed rounding; must
+# certify the pinned cycle relaxations with zero exact re-solves and keep
+# brute-force verdict parity everywhere (discriminating: fails on a
+# pre-change binary because it has no fast path).  Hard gate: rc matters.
+python3 tools/farkas_verify.py 150 20260815 || { echo "farkas_verify: FAIL"; exit 1; }
+# Exact-or-UNKNOWN promotion for scale-mixed LPs (AUDIT not-done #4, roadmap
+# 6.1): exactly-feasible instances with ~1e-13 coefficients against ~1e25
+# bounds must never be reported INFEASIBLE (the pre-change fabrication of
+# record); exactly-infeasible ones keep their verdict only when the directed-
+# rounding box certificate proves it, else honest NUMERICAL_FAILURE/UNKNOWN;
+# well-scaled data must be untouched (scipy verdict parity).  Discriminating:
+# on the pre-change binary it reproduces 6 fabricated INFEASIBLE verdicts.
+# Hard gate: rc matters.
+python3 tools/lp_scale_verify.py 60 20260815 || { echo "lp_scale_verify: FAIL"; exit 1; }
+# Ruiz equilibration + geometric-mean scaling, with --noscale/--scalestat
+# A/B lanes and an evidence-preserving raw-data fallback (roadmap 7.5):
+# default vs raw must print identical verdicts on well-scaled data (scipy
+# oracle cross-check), the conditioning proxy must never get materially
+# worse and must halve the median high-spread ratio, a raw-path OPTIMAL
+# may never be LOST by the default path on extreme entry-mixed data
+# (fallback re-solves on raw data whenever scaled evidence cannot be
+# certified against ORIGINAL data), at least one seeded instance must be
+# RESCUED (raw LU stall -> scaled certified OPTIMAL), and the shipped
+# examples are A/B-identical.  Discriminating: the pre-change binary
+# rejects --noscale/--scalestat, failing the lane probe loudly.  Hard
+# gate: rc matters.
+python3 tools/scale_verify.py 200 20260818 || { echo "scale_verify: FAIL"; exit 1; }
+python3 tools/scale_verify.py 200 777 || { echo "scale_verify (seed 777): FAIL"; exit 1; }
+# Roadmap 7.1 presolve + postsolve hard gate: planted per-reduction
+# verdict cases (each exact-ray family must certify with iterations: 0,
+# the touched-row family must decline presolve and still answer, the
+# fallback family must degrade with a psv note yet never change the
+# answer), default vs --nopresolve parity + bit-identical objective
+# lines + scipy oracle on the random families, and example-file A/B
+# identity.  Discriminating: the pre-change binary rejects
+# --nopresolve/--prestat, failing the lane probe loudly.  Hard gate.
+python3 tools/presolve_verify.py 400 20260819 || { echo "presolve_verify: FAIL"; exit 1; }
+# 7.1 record-level unit harness (apply -> restore bookkeeping: primal
+# replayfeasibility, pivot-column dual stationarity, complementarity guard,
+# stats accounting; does not exist on the pre-change tree, so it is
+# structurally discriminating).
+make presolve_selftest >/dev/null 2>&1
+./presolve_selftest >/dev/null || { echo "presolve_selftest: FAIL"; exit 1; }
 python3 tools/mip_verify.py 0 | tail -1
 # Adversarial differential test for the sound FBBT bound tightening: mixes
 # tiny coefficients (1e-13) with large variable magnitudes and all three
@@ -222,6 +313,91 @@ echo -n "extrema_verify (randomized, vs brute force): "
 python3 tools/extrema_verify.py 300 4242 | sed 's/.*: //'
 echo -n "divmod_verify (trunc-div/mod + pow + sets/among + edge regressions, vs brute force): "
 python3 tools/divmod_verify.py 200 20260808 | sed 's/.*: //'
+
+# FlatZinc OUTPUT-layer round-trip (roadmap 6.7): re-parse every emitted
+# byte; each printed assignment must satisfy every constraint and stay in
+# its declared domain (int: exact Fractions; float: scaled 1e-6 LP
+# feasibility tolerance), marker protocol exact, -a enumeration matches the
+# brute-forced projection set / improving incumbents, UNSAT is
+# cross-checked.  This gate caught the cp_set_vals replace-semantics
+# fabrication (int_abs printed x1=-5, outside its declared domain, as
+# SATISFIABLE) plus a heap-buffer-overflow in the fixed propagator.
+# Discriminating: on the pre-change binary it fails 4 pins and 34/2000
+# fuzzed models; post-change WRONG=0 over 19500 models (10k+4k+4k across 3
+# seeds plus a 1.5k ASan/UBSan/LSan sweep).  Hard gate: rc matters.
+python3 tools/fzn_output_check.py 2000 20260815 8 || { echo "fzn_output_check: FAIL"; exit 1; }
+
+# orbit_len global (procstates 16-bit automaton, docs/PROCSTATES.md):
+# 8 pins (incl. honest-decline on oversized index tables), the real
+# 65536-state instance re-checked state-by-state against the independent
+# C/Python ground truth (max orbit 44 at start 51641), and a 3-mode fuzz.
+# Discriminating: on the pre-change binary the run at 60 fuzz models
+# reports WRONG=68 (7 pin failures + the real instance + all 60 fuzzed;
+# every orbit model is declined UNKNOWN);
+# post-change pins OK, real instance OK, 300 fuzzed models WRONG=0 plus a
+# 150-model ASan/UBSan/LSan sweep clean.  Hard gate: rc matters.
+python3 tools/procstates_orbit_verify.py 120 20260816 || { echo "procstates_orbit_verify: FAIL"; exit 1; }
+
+# functional-graph constraint family (orbit_len / orbit_transient /
+# orbit_cycle_len / orbit_on_cycle / orbit_len_capped / array_bool_and,
+# docs/FUNCTIONAL_GRAPH.md): pins incl. honest declines, real-instance
+# spot checks, and a 4-mode fuzz against an independent Python oracle
+# (identity orbit = transient + cycle_len checked inside the models).
+# Discriminating: on the pre-change binary it reports pins_bad=5,
+# real_bad=7, WRONG=112 at 60 fuzzed models; post-change WRONG=0 at 200
+# plus an ASan/UBSan/LSan sweep.  Hard gate: rc matters.
+python3 tools/fgraph_verify.py 120 20260818 || { echo "fgraph_verify: FAIL"; exit 1; }
+
+# presolve orbit-chain detector (docs/FUNCTIONAL_GRAPH.md): positive
+# mutation suite (maximize / minimize / two-chain / satisfy -a projection)
+# where the exact rewrite must fire and the answer must match a Python
+# evaluation of the emitted model, plus negatives (extra pin on an
+# intermediate, missing AND pair, mutated reif/sum rhs, mixed tables,
+# broken chain, output-pinned or objective intermediates) where it must
+# stay silent and the generic engine must still answer correctly.
+# Discriminating: on the pre-change binary WRONG=16 at 40 cases (positives
+# decline UNKNOWN or time out); post-change WRONG=0 at 100.  Hard gate.
+python3 tools/orbit_detect_verify.py 60 20260818 || { echo "orbit_detect_verify: FAIL"; exit 1; }
+
+# tolerance semantics sheets (docs/DESIGN.md section 8, roadmap 6.8):
+# grep-provable closure - every tolerance-class literal in src/ carries a
+# TOLSHEET tag, every tag resolves to a documented sheet row, and no sheet
+# row is stale.  Adding a tolerance without documenting it (or
+# documentation rotting past a refactor) fails this gate.
+python3 tools/tolsheet_check.py || { echo "tolsheet_check: FAIL"; exit 1; }
+
+# unified evidence objects (roadmap 6.4): every verdict-printing CLI exit
+# (LP OPTIMAL/INFEASIBLE/UNBOUNDED, MIP point + proven-optimal bound
+# stamp, QP optimal/unbounded KKT+recession, fzn optimize/UNSAT lanes)
+# now passes a PsvCert claim through psv_cert_check; REJECT/DEFER degrade
+# the print to the honest class.  cert_inject drives the REAL engines on
+# randomized instances and must (a) accept 100% of TRUE claims - any
+# legit false-rejection is a certificate-layer bug, (b) reject 100% of
+# large corruptions (out-of-box pushes, objective drifts, integer
+# off-by-one, negated/permuted rays, feasible-but-suboptimal false
+# OPTIMAL claims, row-normal point corruption, flipped statuses), (c)
+# reject 100% of directed 1-ulp corruption on the zero-width
+# snapped-integer MIP surface; the tolerance-absorbing LP/QP ulp lanes
+# are reported honestly, not asserted (see AUDIT addendum 12).
+# Discriminating: pre-change binaries cannot build this (cert.h absent);
+# during development the harness caught 9/20 legit mipsolve-class
+# false-rejects (symmetric bound-coherence vs the root integrality gap)
+# and two non-adversarial injection families.  Hard gate: rc matters.
+make cert_inject >/dev/null 2>&1
+./cert_inject 200 20260818 || { echo "cert_inject: FAIL"; exit 1; }
+./cert_inject 200 777 || { echo "cert_inject (seed 777): FAIL"; exit 1; }
+# CLI-lane pin: the MIP certificate's bound-coherence stamp is
+# DIRECTIONAL (an upper bound never sits below a max incumbent; mirror
+# for min), because the engine's best_bound keeps the root-relaxation
+# bound forever - the residual |bb - obj| of a proven optimum IS the
+# model's integrality gap.  This 0-1 knapsack has root relaxation 11.75
+# vs integer optimum 10: a symmetric |bb - obj| window false-rejects it.
+make mipsolve >/dev/null 2>&1
+mip_pin=$(./mipsolve examples/knap_gap.lp 2 0 1 --print)
+echo "$mip_pin" | grep -q "status: OPTIMAL"  || { echo "knap_gap cert pin: FAIL (no OPTIMAL)";  exit 1; }
+echo "$mip_pin" | grep -q "objective: 10"    || { echo "knap_gap cert pin: FAIL (objective)";    exit 1; }
+echo "$mip_pin" | grep -q "x\[1\] = 0"       || { echo "knap_gap cert pin: FAIL (point)";        exit 1; }
+echo "  knap_gap: OPTIMAL 10 through the MIP certificate lane  OK"
 
 if command -v minizinc >/dev/null 2>&1; then
   echo "[8.5/8] MiniZinc differential (compile .mzn -> fzn -> psolve vs Gecode)..."

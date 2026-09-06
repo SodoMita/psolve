@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <float.h>
 
 /* Regression test for the re-entrant, thread-local preallocated arena
  * (Phase 4: zero-malloc per-frame solves).
@@ -154,7 +155,16 @@ int main(void)
     double lp_base = solve_lp_under(NULL, &(int){0});
     double fx_base = solve_fx_under(NULL, &(int){0});
     CHECK(isfinite(qp_base) && isfinite(lp_base) && isfinite(fx_base), "baseline solves succeed");
-    CHECK(lp_base == 26.0, "LP baseline objective 26");
+    /* Roadmap 7.5: solver_create now Ruiz-equilibrates the working image by
+       default, so the double engine's reconstructed objective is the true
+       26 only up to funnel-composition rounding (1 ulp observed on
+       prodplan: 26.000000000000004) - exactly what the certification
+       margins already allow.  The pin's intent (LP baseline reaches the
+       known optimum) is kept with a narrow ulp window; arena-vs-libc
+       bit-identity is separately asserted unchanged by run_in_arena.  The
+       fx oracle below stays EXACT: the rational engine does not round. */
+    CHECK(fabs(lp_base - 26.0) <= 8 * DBL_EPSILON * 26.0,
+          "LP baseline objective 26 (+- ulp window, 7.5 scaled default)");
     CHECK(fx_base == 26.0, "fx baseline objective 26");
 
     /* ---- QP / LP / fx inside an arena ---- */
@@ -213,17 +223,18 @@ int main(void)
         /* A solve that needs more than 64 bytes should fail via psolve_fail.
            Without a handler installed it exits; here we install one so we can
            assert a clean error path rather than a crash. */
-        if (setjmp(psolve_env) != 0) {
+        PSolveErrFrame ef;
+        psolve_frame_push(&ef);
+        if (setjmp(ef.env) != 0) {
             printf("ok: undersized arena fails cleanly (psolve_fail)\n");
-            psolve_end();
+            /* frame already popped by psolve_fail() */
             return (failures) ? 1 : 0;
         }
-        psolve_try();
         psolve_arena_use(&ta);
         solve_qp_under(&ta, &(int){0});
         printf("FAIL: undersized arena did not report OOM\n");
         failures++;
-        psolve_end();
+        psolve_frame_pop(&ef);
     }
 
     if (failures) { fprintf(stderr, "%d FAILURES\n", failures); return 1; }

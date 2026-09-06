@@ -98,7 +98,7 @@ int splu_factor(SPLU *s, const int *Bp, const int *Bi, const double *Bx, int m)
     if(!s||m<0)return -1;
     if(m==0)return 0;
     if(!Bp||!Bi||!Bx)return -1;
-    double tol = s->pivot_tol > 0 ? s->pivot_tol : 1e-14;
+    double tol = s->pivot_tol > 0 ? s->pivot_tol : 1e-14;  /* TOLSHEET TOL-LP-SPLUPIV */
 
     /* column order by increasing column degree */
     int *colorder = (int*)psolve_malloc((size_t)m * sizeof(int));
@@ -128,8 +128,8 @@ int splu_factor(SPLU *s, const int *Bp, const int *Bi, const double *Bx, int m)
     if (maxA <= 0) maxA = 1.0;
     /* instability detection: fall back to the (robust) dense path if the
        relative pivot is too small or the multipliers grow too large. */
-    double pivot_rel = 1e-9 * maxA;   /* relative pivot threshold */
-    double growth_limit = 1e10;       /* max allowable multiplier magnitude */
+    double pivot_rel = 1e-9 * maxA;   /* relative pivot threshold */  /* TOLSHEET TOL-SPLU-PIVREL */
+    double growth_limit = 1e10;       /* max allowable multiplier magnitude */  /* TOLSHEET TOL-SPLU-GROWTH */
 
     s->m = m;
     s->piv  = (int*)psolve_malloc((size_t)m * sizeof(int));   /* rperm */
@@ -261,7 +261,7 @@ void splu_solve(const SPLU *s, const double *b, double *x)
 {
     if(!s||!b||!x||s->m<=0)return;
     int m = s->m;
-    const double tol = 1e-14;
+    const double tol = 1e-14;  /* TOLSHEET TOL-SPLU-SOLVE0 */
     int *rinv = (int*)psolve_malloc((size_t)m * sizeof(int));
     build_rinv(s->piv, m, rinv);
     /* y = P b : y[i] = b[rperm[i]] */

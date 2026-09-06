@@ -87,7 +87,7 @@ int qp_start_feasible(const QP *qp, const double *x)
 static int phase1_point_ok(const QP *qp, const double *x)
 {
     for (int i = 0; i < qp->m; i++)
-        if (row_resid(qp, i, x) > 1e-8 * row_scale(qp, i, x)) return 0;   /* TOLSHEET TOL-QP-P1HANDOVER */
+        if (row_resid(qp, i, x) > 1e-8 * row_scale(qp, i, x)) return 0;   /* TOLSHEET TOL-QP-FEASROW */
     return 1;
 }
 
@@ -146,14 +146,14 @@ static int solve_kkt(const QP *qp, const int *W, int k,
             }
             double xnorm = 0.0;
             for (int i = 0; i < N; i++) xnorm = fmax(xnorm, fabs(rhs[i]));
-            if (resid <= 1e-8 * (1.0 + rhsnorm + xnorm)) good = 1;
+            if (resid <= 1e-8 * (1.0 + rhsnorm + xnorm)) good = 1;  /* TOLSHEET TOL-QP-INITRES */
         }
         if (!good && attempt < 3) {
             /* regularize the Q block with increasing strength.  A singular PSD Q
                makes the KKT matrix singular; larger regularization lets the
                active-set take a null-space-aware step rather than failing. */
             memcpy(K, K0, (size_t)N * N * sizeof(double));
-            double reg = (attempt == 0) ? 1e-8 : ((attempt == 1) ? 1e-6 : 1e-4);
+            double reg = (attempt == 0) ? 1e-8 : ((attempt == 1) ? 1e-6 : 1e-4);  /* TOLSHEET TOL-QP-REG */
             for (int i = 0; i < n; i++) K[i*N + i] += reg;
             memcpy(K0, K, (size_t)N * N * sizeof(double));
             memcpy(rhs, rhs0, (size_t)N * sizeof(double));
@@ -173,7 +173,7 @@ static int solve_kkt(const QP *qp, const int *W, int k,
 static void build_orth(const QP *qp, const int *W, int k, double *orth)
 {
     int n = qp->n;
-    double tol = 1e-9;
+    double tol = 1e-9;  /* TOLSHEET TOL-QP-NRMDIV */
     for (int c = 0; c < k; c++) {
         const double *Arow = qp->A + (size_t)W[c] * n;
         double *v = orth + (size_t)c * n;
@@ -198,6 +198,8 @@ static void active_set(const QP *qp, const double *xstart, QPResult *res)
     res->n = n;
     res->x = (double*)xmalloc((size_t)n * sizeof(double));
     res->mult = (double*)xmalloc((size_t)m * sizeof(double));
+    res->ray = (double*)xmalloc((size_t)n * sizeof(double));
+    for (int i = 0; i < n; i++) res->ray[i] = 0.0;
     for (int i = 0; i < m; i++) res->mult[i] = 0.0;
     double *x = res->x;
     memcpy(x, xstart, (size_t)n * sizeof(double));
@@ -205,11 +207,11 @@ static void active_set(const QP *qp, const double *xstart, QPResult *res)
     int *W = (int*)xmalloc((size_t)m * sizeof(int));
     double *orth = (double*)xmalloc((size_t)n * n * sizeof(double));
     double *tmp = (double*)xmalloc((size_t)n * sizeof(double));
-    double tolrank = 1e-9;
+    double tolrank = 1e-9;  /* TOLSHEET TOL-QP-RANK */
     int k = 0;
     build_orth(qp, W, 0, orth);
     for (int i = 0; i < m; i++) {
-        if (row_resid(qp, i, x) > -1e-7) {
+        if (row_resid(qp, i, x) > -1e-7) {  /* TOLSHEET TOL-QP-ACTIVE */
             const double *Arow = qp->A + (size_t)i * n;
             for (int j = 0; j < n; j++) tmp[j] = Arow[j];
             for (int d = 0; d < k; d++) {
@@ -251,12 +253,12 @@ static void active_set(const QP *qp, const double *xstart, QPResult *res)
         {
             double xmax = 0.0;
             for (int i = 0; i < n; i++) xmax = fmax(xmax, fabs(x[i]));
-            if (!(xmax < 1e14)) { status = QP_ITERATION_LIMIT; break; }
+            if (!(xmax < 1e14)) { status = QP_ITERATION_LIMIT; break; }  /* TOLSHEET TOL-QP-DIVERGE */
         }
-        if (pnorm < 1e-9 * scale) {
+        if (pnorm < 1e-9 * scale) {  /* TOLSHEET TOL-QP-MU */
             int drop = -1; double minmu = 0.0;
             for (int c = 0; c < k; c++)
-                if (mu[c] < minmu - 1e-9 * scale) { minmu = mu[c]; drop = c; }
+                if (mu[c] < minmu - 1e-9 * scale) { minmu = mu[c]; drop = c; }  /* TOLSHEET TOL-QP-MU */
             if (drop < 0) {
                 /* candidate optimum: verify the KKT stationarity residual
                    before certifying success, so a bad KKT solve cannot be
@@ -277,14 +279,14 @@ static void active_set(const QP *qp, const double *xstart, QPResult *res)
                    1e-6*(1+|obj|) grew with a diverging iterate: on an
                    unbounded QP the objective ran to 1e36, the tolerance with
                    it, and a meaningless point passed as optimal. */
-                double tol = 1e-7 * (1.0 + gmax + tmax);
+                double tol = 1e-7 * (1.0 + gmax + tmax);  /* TOLSHEET TOL-QP-KKT */
                 if (kkt > tol) { status = QP_KKT_FAIL; break; }
                 /* Complementary slackness: a multiplier may only be attached
                    to a constraint that is actually active at x. */
                 int comp_ok = 1;
                 for (int c = 0; c < k; c++) {
                     double rr = row_resid(qp, W[c], x);
-                    if (fabs(rr) > 1e-7 * (1.0 + fabs(qp->b[W[c]]))) { comp_ok = 0; break; }
+                    if (fabs(rr) > 1e-7 * (1.0 + fabs(qp->b[W[c]]))) { comp_ok = 0; break; }  /* TOLSHEET TOL-QP-COMP */
                 }
                 if (!comp_ok) { status = QP_KKT_FAIL; break; }
                 /* Stationarity alone is not a solution: the point must also be
@@ -296,7 +298,7 @@ static void active_set(const QP *qp, const double *xstart, QPResult *res)
                 int infeas = 0;
                 for (int i = 0; i < m; i++) {
                     double rr = row_resid(qp, i, x);
-                    if (rr > 1e-7 * (1.0 + fabs(qp->b[i]))) { infeas = 1; break; }
+                    if (rr > 1e-7 * (1.0 + fabs(qp->b[i]))) { infeas = 1; break; }  /* TOLSHEET TOL-QP-PRIMAL */
                 }
                 if (infeas) { status = QP_KKT_FAIL; break; }
                 for (int c = 0; c < k; c++) res->mult[W[c]] = mu[c];
@@ -321,7 +323,7 @@ static void active_set(const QP *qp, const double *xstart, QPResult *res)
                 gp += g[j] * p[j];
                 pinf = fmax(pinf, fabs(p[j]));
             }
-            if (gp < -1e-9 * scale && pinf > 0.0) {
+            if (gp < -1e-9 * scale && pinf > 0.0) {  /* TOLSHEET TOL-QP-UNBDIR */
                 for (int i = 0; i < n; i++) {
                     double qi = 0.0;
                     for (int j = 0; j < n; j++) qi += qp->Q[(size_t)j*n + i] * p[j];
@@ -329,7 +331,7 @@ static void active_set(const QP *qp, const double *xstart, QPResult *res)
                 }
                 double qnorm = 0.0;
                 for (int i = 0; i < n*n; i++) qnorm = fmax(qnorm, fabs(qp->Q[i]));
-                if (pQp <= 1e-12 * (1.0 + qnorm) * pinf * pinf) {
+                if (pQp <= 1e-12 * (1.0 + qnorm) * pinf * pinf) {  /* TOLSHEET TOL-QP-CURV */
                     int ray = 1;
                     for (int i = 0; i < m && ray; i++) {
                         const double *Ai = qp->A + (size_t)i * n;
@@ -346,7 +348,13 @@ static void active_set(const QP *qp, const double *xstart, QPResult *res)
                         (void)anorm;
                         if (ap > 0.0) ray = 0;
                     }
-                    if (ray) { status = 1; break; }   /* certified unbounded */
+                    if (ray) {
+                        status = 1;
+                        /* keep the direction as evidence: the CLI certificate
+                           layer re-verifies it against the original data */
+                        memcpy(res->ray, p, (size_t)n * sizeof(double));
+                        break;
+                    }   /* certified unbounded */
                 }
             }
         }
@@ -359,7 +367,7 @@ static void active_set(const QP *qp, const double *xstart, QPResult *res)
             const double *Ai = qp->A + (size_t)i * n;
             double ap = 0.0;
             for (int j = 0; j < n; j++) ap += Ai[j] * p[j];
-            if (ap > 1e-12) {
+            if (ap > 1e-12) {  /* TOLSHEET TOL-QP-STEP */
                 double r = -row_resid(qp, i, x) / ap;
                 /* A constraint that is already (numerically) violated gives a
                    negative ratio.  Taking that step would move the iterate
@@ -368,12 +376,12 @@ static void active_set(const QP *qp, const double *xstart, QPResult *res)
                    standard degenerate-step handling: the constraint enters the
                    working set and the next KKT solve moves along it. */
                 if (r < 0.0) r = 0.0;
-                if (r < alpha - 1e-10) { alpha = r; block = i; }
+                if (r < alpha - 1e-10) { alpha = r; block = i; }  /* TOLSHEET TOL-QP-STEP */
             }
         }
         for (int i = 0; i < n; i++) xnew[i] = x[i] + alpha * p[i];
         memcpy(x, xnew, (size_t)n * sizeof(double));
-        if (alpha < 1.0 - 1e-10 && block >= 0) {
+        if (alpha < 1.0 - 1e-10 && block >= 0) {  /* TOLSHEET TOL-QP-STEP */
             const double *Arow = qp->A + (size_t)block * n;
             for (int j = 0; j < n; j++) tmp[j] = Arow[j];
             for (int d = 0; d < k; d++) {
@@ -709,7 +717,7 @@ static int dense_phase1(const QP *qp, const double *base, double *x)
     int n = qp->n, m = qp->m;
     int ok = 0;
     int N = n + m;
-    double eps = 1e-6;                              /* TOLSHEET TOL-QP-P1RIDGE */
+    double eps = 1e-6;                              /* TOLSHEET TOL-QP-PERTURB */
     double *Q1 = (double*)psolve_calloc((size_t)N*N, sizeof(double));
     double *c1 = (double*)psolve_calloc((size_t)N, sizeof(double));
     /* minimise  sum s  +  eps/2*(||x||^2 + ||s||^2).  The linear term on s
@@ -742,14 +750,14 @@ static int dense_phase1(const QP *qp, const double *base, double *x)
     if (r1.status == 0) {
         double ssum = 0.0;
         for (int i = 0; i < m; i++) ssum += r1.x[n+i];
-        if (ssum <= 1e-7) {   /* total slack; TOLSHEET TOL-QP-P1SUM */
+        if (ssum <= 1e-7) {   /* total slack; TOLSHEET TOL-QP-PH1SUM */
             /* Trust but verify: check the candidate against the ORIGINAL rows
                instead of inferring feasibility from the slack sum. */
             int feas2 = 1;
             for (int i = 0; i < m; i++) {
                 double rr = -qp->b[i];
                 for (int j = 0; j < n; j++) rr += qp->A[(size_t)i*n + j] * r1.x[j];
-                if (rr > 1e-7 * (1.0 + fabs(qp->b[i]))) { feas2 = 0; break; }   /* TOLSHEET TOL-QP-P1VERIFY */
+                if (rr > 1e-7 * (1.0 + fabs(qp->b[i]))) { feas2 = 0; break; }   /* TOLSHEET TOL-QP-PRIMAL */
             }
             if (feas2) { for (int j = 0; j < n; j++) x[j] = r1.x[j]; ok = 1; }
         }
@@ -853,29 +861,110 @@ void qp_solve(const QP *qp, QPResult *res)
         for (int j = 0; j < n; j++) if (!isfinite(qp->A[(size_t)i*n+j])) return;
     }
     res->status = -1;
-    /* Check Q for symmetry and 1x1/2x2 principal-minor positive semi-definiteness.
-       Reject indefinite or non-symmetric Q immediately instead of iterating. */
-    for (int i = 0; i < n; i++) {
-        if (qp->Q[i*n+i] < -1e-9) {
+    /* Convexity gate.  Symmetry first (the factorization assumes it), then a
+       FULL symmetric ~Cholesky scan: the old 1x1/2x2 principal-minor screen
+       passed indefinite matrices n>=3 whose negativity only shows in a
+       larger minor (e.g. diag 1, off-diagonal -0.9: every 2x2 minor is
+       0.19 > 0 yet an eigenvalue is -0.8).  Such a Q made the active-set
+       report the stationary origin as an "optimum" on a problem unbounded
+       below -- a fabricated answer in the verifier-free direction
+       (AUDIT "Not done" 6.5; gadget pinned in tools/qp_psd_verify.py).
+
+       The scan is exact in exact arithmetic: complete it with all pivots
+       >= -tol  <=>  Q is PSD (within tolerance).  Short witnesses:
+         - a negative pivot beyond tol means a negative leading principal
+           submatrix step: the matrix is indefinite;
+         - a zero-ish pivot with a NONZERO residual column means a 2x2
+           block [0 a; a b] with a*a < 0 in the Schur complement:
+           indefinite;
+         - otherwise the eliminated remainder stays PSD, so finishing
+           certifies PSD.
+       tol is scaled (entries of Q and its Schur complements share units):
+       semidefinitedness of doubles can only ever be decided to a relative
+       frontier; past it is the documented tolerance semantics (roadmap 6.8
+       will publish the sheets).  Cost is O(n^3/3) once, the same order as
+       one active-set KKT factorization. */
+    {
+        double qscale = 1.0;
+        for (size_t k = 0; k < (size_t)n * n; k++)
+            qscale = fmax(qscale, fabs(qp->Q[k]));
+        double symtol = 1e-8 * (1.0 + qscale);  /* TOLSHEET TOL-QP-SYM */
+        for (int i = 0; i < n; i++)
+            for (int j = i + 1; j < n; j++) {
+                double diff = fabs(qp->Q[i*n+j] - qp->Q[j*n+i]);
+                if (diff > symtol) {
+                    res->status = QP_NON_CONVEX;
+                    return;
+                }
+            }
+        /* Symmetrize into a workspace (get the same answer for +/-1-ulp
+           asymmetric input), then a complete-pivoting symmetric
+           elimination scan: at each step move the largest remaining
+           diagonal to the pivot position and eliminate it.  Soundness of
+           the verdicts (exact arithmetic):
+             - a pivot < -tol is a negative diagonal of a matrix CONGRUENT
+               to the input (elimination and symmetric permutation are
+               congruences), so by Sylvester's law the input has a
+               negative eigenvalue: indefinite;
+             - if the largest remaining diagonal is within tol of zero,
+               the leftover matrix is PSD iff every off-diagonal is also
+               within tol (a 2x2 [d a; a d'] with |d|,|d'| <= tol and
+               |a| above it has determinant ~ -a^2 < 0, a principal
+               indefinite 2x2);
+             - otherwise the scan finishes with pivots >= -tol, and the
+               accumulated factorization IS a PSD certificate.
+           Complete pivoting matters: without it, a tiny leading diagonal
+           forces the "zero pivot with nonzero column" case to fire on
+           scale-mixed but genuinely PSD blocks like
+           [6e-12 3e-5; 3e-5 1e3] (det > 0), over-blocking valid models;
+           pivoting the 1e3 first eliminates the coupling at its own
+           scale and the small direction is judged against its own
+           magnitude. */
+        double *S = (double*)psolve_malloc((size_t)n * n * sizeof(double));
+        for (int i = 0; i < n; i++) {
+            for (int j = 0; j < n; j++)
+                S[i*n+j] = 0.5 * (qp->Q[i*n+j] + qp->Q[j*n+i]);
+        }
+        double ptol = 1e-9 * (1.0 + qscale);  /* TOLSHEET TOL-QP-PSD */
+        int psd = 1;
+        int k = 0;
+        for (k = 0; k < n; k++) {
+            /* largest remaining diagonal */
+            int p = k;
+            double dmax = S[k*n+k];
+            for (int i = k + 1; i < n; i++)
+                if (S[i*n+i] > dmax) { dmax = S[i*n+i]; p = i; }
+            if (dmax < -ptol) { psd = 0; break; }   /* neg. diagonal: indefinite */
+            if (dmax <= ptol) {
+                /* tail: all remaining diagonals within tol of 0 -> the
+                   leftover is PSD iff it is entirely ~0 (Cauchy-Schwarz);
+                   any larger off-diagonal is an indefinite principal 2x2. */
+                for (int i = k; i < n && psd; i++)
+                    for (int j = i + 1; j < n; j++)
+                        if (fabs(S[i*n+j]) > ptol) { psd = 0; break; }
+                break;
+            }
+            /* symmetric permutation k <-> p (full square) */
+            if (p != k) {
+                for (int j = 0; j < n; j++) {
+                    double t = S[k*n+j]; S[k*n+j] = S[p*n+j]; S[p*n+j] = t;
+                }
+                for (int i = 0; i < n; i++) {
+                    double t = S[i*n+k]; S[i*n+k] = S[i*n+p]; S[i*n+p] = t;
+                }
+            }
+            double d = S[k*n+k];
+            for (int i = k + 1; i < n; i++) {
+                double si = S[i*n+k];
+                if (si == 0.0) continue;
+                for (int j = k + 1; j < n; j++)
+                    S[i*n+j] -= si * S[j*n+k] / d;
+            }
+        }
+        psolve_free(S);
+        if (!psd) {
             res->status = QP_NON_CONVEX;
             return;
-        }
-        for (int j = 0; j < n; j++) {
-            double diff = fabs(qp->Q[i*n+j] - qp->Q[j*n+i]);
-            double scale = fmax(1.0, fmax(fabs(qp->Q[i*n+j]), fabs(qp->Q[j*n+i])));
-            if (diff > 1e-8 * scale) {
-                res->status = QP_NON_CONVEX;
-                return;
-            }
-        }
-        for (int j = i + 1; j < n; j++) {
-            double qii = fmax(0.0, qp->Q[i*n+i]);
-            double qjj = fmax(0.0, qp->Q[j*n+j]);
-            double qij = qp->Q[i*n+j];
-            if (qii * qjj - qij * qij < -1e-8 * fmax(1.0, qii * qjj)) {
-                res->status = QP_NON_CONVEX;
-                return;
-            }
         }
     }
     double *x = (double*)xmalloc((size_t)qp->n * sizeof(double));
@@ -911,6 +1000,6 @@ void qp_solve(const QP *qp, QPResult *res)
 void qp_result_free(QPResult *res)
 {
     if (!res) return;
-    psolve_free(res->x); psolve_free(res->mult); psolve_free(res->farkas);
+    psolve_free(res->x); psolve_free(res->mult); psolve_free(res->ray); psolve_free(res->farkas);
     memset(res, 0, sizeof(*res));
 }

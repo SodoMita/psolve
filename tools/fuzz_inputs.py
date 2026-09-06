@@ -25,10 +25,10 @@ def build_asan(bindir):
     base = ['gcc','-O1','-g','-march=native','-fsanitize=address,undefined',
             '-fno-omit-frame-pointer','-I','src','-I','tools']
     lp = base + ['src/err.c','src/kernels.c','src/lu.c','src/splu.c','src/solver.c',
-                 'src/parser.c','src/main.c','-o',os.path.join(bindir,'lpsolve_asan'),'-lm']
-    # src/qp.c's Phase-I uses the LP core, so the QP tool needs it linked in.
-    qp = base + ['src/err.c','tools/qpsolve.c','src/qp.c','src/lu.c','src/splu.c',
-                 'src/solver.c','src/kernels.c','-o',os.path.join(bindir,'qpsolve_asan'),'-lm']
+                 'src/parser.c','src/cert.c','src/presolve.c','src/main.c','-o',os.path.join(bindir,'lpsolve_asan'),'-lm']
+    qp = base + ['src/err.c','tools/qpsolve.c','src/qp.c','src/lu.c','src/kernels.c',
+                 'src/splu.c','src/solver.c','src/cert.c',
+                 '-o',os.path.join(bindir,'qpsolve_asan'),'-lm']
     subprocess.run(lp, check=True)
     subprocess.run(qp, check=True)
 

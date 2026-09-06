@@ -16,6 +16,20 @@
  * The KKT system is solved with the dense LU factorization used by the LP
  * solver (src/lu.c).  PSD Q is made positive definite by a tiny regularization.
  *
+ * Convexity gate (2026-08-15(8)): before iterating, Q is checked for
+ * symmetry (scaled tolerance) and then certified positive semi-definite by a
+ * complete symmetrized COMPLETE-PIVOTING elimination scan (refuse on a
+ * pivot below -(1e-9 * (1 + max|Q_ij|)), or on an off-diagonal tail entry
+ * beyond that tolerance once the remaining diagonal is within it).  The scan
+ * is a certificate in both directions in exact arithmetic -- completing it
+ * proves PSD; a negative pivot or indefinite principal 2x2 tail proves
+ * non-convexity (Sylvester's law) -- and it replaced a 1x1/2x2
+ * principal-minor screen that admitted n >= 3 indefinite matrices whose
+ * negativity only shows in a larger minor (the active-set then printed the
+ * stationary origin as an "optimum" on problems unbounded below; see
+ * tools/qp_psd_verify.py).  Semidefiniteness of doubles is decidable only
+ * to a relative frontier: below it, near-singular data is accepted and
+ * handled by the regularized KKT path (documented tolerance semantics).
  * Phase-I (finding a feasible start) runs on the LP core: `min sum s` s.t.
  * `A x - s <= b, s >= 0` through the revised simplex (src/solver.c), so the QP
  * needs the LP objects at link time.  That route is both much cheaper than a
@@ -57,6 +71,11 @@ typedef struct {
     double *x;          /* solution (n); NULL if a stop during Phase-I left no
                            feasible point to hand back */
     double *mult;       /* Lagrange multipliers for A x <= b (m) */
+    double *ray;        /* certified recession direction (n), only filled
+                           when status == 1 (unbounded); NULL otherwise.
+                           Verifiable against the original data: A d <= 0,
+                           d^T Q d ~ 0, (Q x + c)^T d < 0 (and the point x
+                           above is itself primal feasible) */
     double obj;         /* optimal objective value (or best incumbent on stop) */
     int iterations;     /* active-set iterations */
     double max_resid;   /* max_i (a_i^T x - b_i) at the returned x, in the
