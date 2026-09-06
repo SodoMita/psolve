@@ -66,7 +66,7 @@ static int row_violated(const QP *qp, int i, const double *x)
        accepted; the active set then stalls on the violated rows (measured: an
        8-chip model at scale 1e3 went OPTIMAL-in-16-iters -> ITER_LIMIT-in-8100
        when 1e-9 was tried), which trades a wrong verdict for a useless one. */
-    return row_resid(qp, i, x) > 1e-11 * row_scale(qp, i, x);
+    return row_resid(qp, i, x) > 1e-11 * row_scale(qp, i, x);   /* TOLSHEET TOL-QP-WARMFEAS */
 }
 
 int qp_start_feasible(const QP *qp, const double *x)
@@ -87,7 +87,7 @@ int qp_start_feasible(const QP *qp, const double *x)
 static int phase1_point_ok(const QP *qp, const double *x)
 {
     for (int i = 0; i < qp->m; i++)
-        if (row_resid(qp, i, x) > 1e-8 * row_scale(qp, i, x)) return 0;
+        if (row_resid(qp, i, x) > 1e-8 * row_scale(qp, i, x)) return 0;   /* TOLSHEET TOL-QP-P1HANDOVER */
     return 1;
 }
 
@@ -415,7 +415,7 @@ static int farkas_verify(const QP *qp, const double *dual, double *out)
     for (int combo = 0; combo < 4; combo++) {
         int flip  = combo & 1;            /* negate all                     */
         int byrow = (combo >> 1) & 1;     /* negate rows whose b_i is < 0   */
-        double lam_max = 0.0, lmin = 1e300;
+        double lam_max = 0.0, lmin = 1e300;   /* TOLSHEET TOL-QP-FARKASINIT */
         for (int i = 0; i < m; i++) {
             double v = dual[i];
             if (byrow && qp->b[i] < 0.0) v = -v;
@@ -425,7 +425,7 @@ static int farkas_verify(const QP *qp, const double *dual, double *out)
             if (v < lmin) lmin = v;
         }
         if (!(lam_max > 0.0)) continue;
-        if (lmin < -1e-12 * lam_max) continue;              /* requires lambda >= 0 */
+        if (lmin < -1e-12 * lam_max) continue;        /* requires lambda >= 0; TOLSHEET TOL-QP-FARKASSIGN */
         for (int i = 0; i < m; i++) out[i] /= lam_max;      /* scale-free checks below */
         double colmax = 0.0;
         for (int j = 0; j < n; j++) {
@@ -437,10 +437,10 @@ static int farkas_verify(const QP *qp, const double *dual, double *out)
             }
             colmax = fmax(colmax, fabs(sv) / (1.0 + mag));  /* A^T lambda ~ 0 */
         }
-        if (colmax > 1e-7) continue;
+        if (colmax > 1e-7) continue;                     /* TOLSHEET TOL-QP-FARKASCOL */
         double bt = 0.0, bmag = 0.0;
         for (int i = 0; i < m; i++) { bt += out[i]*qp->b[i]; bmag += out[i]*fabs(qp->b[i]); }
-        if (bt < -1e-9 * (1.0 + bmag)) return 1;            /* b^T lambda < 0  */
+        if (bt < -1e-9 * (1.0 + bmag)) return 1;      /* b^T lambda < 0; TOLSHEET TOL-QP-FARKASB */
     }
     return 0;
 }
@@ -510,14 +510,14 @@ static int lp_phase1_once(const QP *qp, const double *x0, double *x, double *far
      * for A x <= b alone.  So a too-tight box can cost a rescue, not a verdict. */
     double bmax = 0.0;
     for (int i = 0; i < m; i++) bmax = fmax(bmax, fabs(qp->b[i]));
-    double box = boxmul * (1.0 + bmax);
+    double box = boxmul * (1.0 + bmax);                  /* TOLSHEET TOL-QP-BOX */
     double *bx = (double*)psolve_malloc(sizeof(double) * (size_t)n);
     for (int j = 0; j < n; j++) {
         double aj = 0.0;
         for (int i = 0; i < m; i++) aj = fmax(aj, fabs(qp->A[(size_t)i*n + j]));
-        double u = (aj > 1e-300) ? box / aj : box;
+        double u = (aj > 1e-300) ? box / aj : box;   /* TOLSHEET TOL-QP-BOXDIV */
         if (!(u > 1.0)) u = 1.0;
-        if (u > 1e100) u = 1e100;
+        if (u > 1e100) u = 1e100;                   /* TOLSHEET TOL-QP-BOXCAP */
         if (bx) bx[j] = u;
         lL[j] = -u; uL[j] = u;
     }
@@ -560,7 +560,7 @@ static int lp_phase1_once(const QP *qp, const double *x0, double *x, double *far
              * never reported. */
             int box_touch = 0;
             for (int j = 0; j < n; j++)
-                if (fabs(xL[j]) > 0.25 * bx[j]) { box_touch = 1; break; }
+                if (fabs(xL[j]) > 0.25 * bx[j]) { box_touch = 1; break; }   /* TOLSHEET TOL-QP-BOXIDLE */
             if (!box_touch) {
             solver_duals(s, dual);
             if (farkas_verify(qp, dual, farkas)) {
@@ -670,7 +670,7 @@ static int lp_farkas(const QP *qp, double *farkas)
  * that clips the search only ever yields "no verdict" -- status -1 as before. */
 static int lp_phase1(const QP *qp, const double *x0, double *x, double *farkas)
 {
-    static const double boxmul[4] = { 1e9, 1e6, 1e3, 1e12 };
+    static const double boxmul[4] = { 1e9, 1e6, 1e3, 1e12 };   /* TOLSHEET TOL-QP-BOXLADDER */
     for (int k = 0; k < 4; k++) {
         if (psolve_stop()) return 3;      /* a budget must bound the ladder too */
         int r = lp_phase1_once(qp, x0, x, farkas, boxmul[k]);
@@ -693,20 +693,28 @@ static int lp_phase1(const QP *qp, const double *x0, double *x, double *farkas)
  * s -> 0 whenever a feasible x exists.
  * Returns 1 on success (writes x), 0 if no feasible point was certified, and 2
  * if the search was cooperatively stopped (time limit / Ctrl-C). */
-static int find_feasible(const QP *qp, const double *x0, double *x, QPResult *res)
+/* The dense Phase-I search: one strictly convex auxiliary QP
+ *
+ *     minimise  sum_i s_i + eps/2*(||x||^2 + ||s||^2)  s.t.  Ax - s <= b, s >= 0
+ *
+ * in n+m variables and 2m rows, run through the same active set (eps is a ridge,
+ * not a term that moves the optimum).  Returns 1 with a start in x, 0 with none,
+ * 2 if the search was cooperatively stopped.  Its virtue is the start it
+ * produces -- strictly convex objective, so a well-centred interior point rather
+ * than a vertex, which is what the main active set converges from; its cost is a
+ * dense (n+m)-variable KKT factorisation per iteration, which is why
+ * find_feasible gates it by size. */
+static int dense_phase1(const QP *qp, const double *base, double *x)
 {
     int n = qp->n, m = qp->m;
-    const double *base = x0 ? x0 : x;
-    memcpy(x, base, (size_t)n * sizeof(double));
-    if (qp_start_feasible(qp, x)) return 1;
-
+    int ok = 0;
     int N = n + m;
-    double eps = 1e-6;
+    double eps = 1e-6;                              /* TOLSHEET TOL-QP-P1RIDGE */
     double *Q1 = (double*)psolve_calloc((size_t)N*N, sizeof(double));
     double *c1 = (double*)psolve_calloc((size_t)N, sizeof(double));
-    /* minimize  sum s  +  eps/2*(||x||^2 + ||s||^2).  The linear term on s
-       dominates (eps tiny), so s -> 0 whenever a feasible x exists; the
-       tiny quadratic keeps the problem strictly convex and bounded. */
+    /* minimise  sum s  +  eps/2*(||x||^2 + ||s||^2).  The linear term on s
+       dominates (eps tiny), so s -> 0 whenever a feasible x exists; the tiny
+       quadratic keeps the problem strictly convex and bounded. */
     for (int j = 0; j < N; j++) Q1[j*N + j] = eps;
     for (int i = 0; i < m; i++) c1[n+i] = 1.0;
     int m1 = 2 * m;
@@ -720,13 +728,12 @@ static int find_feasible(const QP *qp, const double *x0, double *x, QPResult *re
         b1[m+i] = 0.0;
     }
     QP q1; q1.n = N; q1.m = m1; q1.Q = Q1; q1.c = c1; q1.A = A1; q1.b = b1;
-    memcpy(x, base, (size_t)n * sizeof(double));   /* lp_phase1 may have written x */
+    memcpy(x, base, (size_t)n * sizeof(double));   /* search from the given point */
     double *z0 = (double*)psolve_calloc((size_t)N, sizeof(double));
     for (int i = 0; i < m; i++) z0[n+i] = (qp->b[i] < 0) ? -qp->b[i] : 0.0;
     q1.x0 = z0;
     QPResult r1; memset(&r1, 0, sizeof(r1));
     active_set(&q1, z0, &r1);
-    int ok = 0;
     if (r1.status == QP_STOPPED) {
         qp_result_free(&r1);
         psolve_free(Q1); psolve_free(c1); psolve_free(A1); psolve_free(b1); psolve_free(z0);
@@ -735,14 +742,14 @@ static int find_feasible(const QP *qp, const double *x0, double *x, QPResult *re
     if (r1.status == 0) {
         double ssum = 0.0;
         for (int i = 0; i < m; i++) ssum += r1.x[n+i];
-        if (ssum <= 1e-7) {
+        if (ssum <= 1e-7) {   /* total slack; TOLSHEET TOL-QP-P1SUM */
             /* Trust but verify: check the candidate against the ORIGINAL rows
                instead of inferring feasibility from the slack sum. */
             int feas2 = 1;
             for (int i = 0; i < m; i++) {
                 double rr = -qp->b[i];
                 for (int j = 0; j < n; j++) rr += qp->A[(size_t)i*n + j] * r1.x[j];
-                if (rr > 1e-7 * (1.0 + fabs(qp->b[i]))) { feas2 = 0; break; }
+                if (rr > 1e-7 * (1.0 + fabs(qp->b[i]))) { feas2 = 0; break; }   /* TOLSHEET TOL-QP-P1VERIFY */
             }
             if (feas2) { for (int j = 0; j < n; j++) x[j] = r1.x[j]; ok = 1; }
         }
@@ -750,33 +757,81 @@ static int find_feasible(const QP *qp, const double *x0, double *x, QPResult *re
 
     qp_result_free(&r1);
     psolve_free(Q1); psolve_free(c1); psolve_free(A1); psolve_free(b1); psolve_free(z0);
+    return ok;
+}
 
-    /* The dense search could not produce a start.  Ask the LP core, which
-     * answers two things the dense search can not: a start found by a simplex
-     * pivot sequence on the least-violation LP (min sum s, s >= 0) -- and, more
-     * importantly, whether "no start" is a FACT.  Ordering matters: the dense
-     * search is tried first because its strictly convex objective returns a
-     * well-centred point, which is the start the active set likes; handing it a
-     * simplex vertex instead measurably stalls on degenerate working sets. */
-    if (!ok) {
-        double *lam = (double*)psolve_malloc(sizeof(double) * (size_t)(m > 0 ? m : 1));
-        if (!lam) return 0;
-        for (int i = 0; i < m; i++) lam[i] = 0.0;
-        double *xl = (double*)psolve_malloc(sizeof(double) * (size_t)n);
-        int pr = xl ? lp_phase1(qp, x0, xl, lam) : 0;
-        if (pr == 1) {
-            memcpy(x, xl, (size_t)n * sizeof(double)); ok = 1;
-        } else if (pr == 2) {                      /* verified Farkas certificate */
-            res->infeasible_proven = 1;
-            res->farkas = lam;  lam = NULL;        /* ownership -> QPResult */
-        } else if (pr == 3) { ok = 2; }            /* stopped: no verdict, but not a give-up */
-        else if (pr == 0 && !psolve_stop() && lp_farkas(qp, lam)) {  /* certificate-only route */
-            res->infeasible_proven = 1;
-            res->farkas = lam;  lam = NULL;
-        }
-        psolve_free(xl);
-        psolve_free(lam);
+static int find_feasible(const QP *qp, const double *x0, double *x, QPResult *res)
+{
+    int n = qp->n, m = qp->m;
+    const double *base = x0 ? x0 : x;
+    memcpy(x, base, (size_t)n * sizeof(double));
+    if (qp_start_feasible(qp, x)) return 1;
+
+    int ok = 0;
+    double *lam = (double*)psolve_malloc(sizeof(double) * (size_t)(m > 0 ? m : 1));
+    double *xl  = n > 0 ? (double*)psolve_malloc(sizeof(double) * (size_t)n) : NULL;
+    if (lam) for (int i = 0; i < m; i++) lam[i] = 0.0;
+
+    /* The dense search goes first, but only while it is cheap enough to be a
+     * bounded step.  TOLSHEET TOL-QP-P1DENSE
+     *
+     * Its virtue is the point it hands over: a strictly convex auxiliary
+     * objective returns a well-centred interior point, which is what the active
+     * set converges from -- handing it an LP vertex instead measurably stalls on
+     * degenerate working sets (N=8 at scale 1e3 went OPTIMAL-in-16-iters ->
+     * ITER_LIMIT-in-8100).  Its cost is one dense KKT factorisation in n+m
+     * variables PER ITERATION, which at large n+m exceeds a frame budget on its
+     * own and cannot be interrupted from inside a factorisation, so no
+     * cooperative stop can make it responsive.  Measured against a 16 ms budget
+     * on the layout family, dense-first overshoots to 48 ms at n+m = 161, 11.4 s
+     * at 642, 180 s at 1281; through the LP route the same models stop inside
+     * 20 ms.  Above the gate the LP route is therefore the only one attempted:
+     * O(nnz) per pivot, so the budget binds within a pivot or two.
+     *
+     * LP-first is not merely "the same but cheaper": on the 200-/400-model
+     * differential sweep against scipy it runs 3-12x faster and still reports
+     * only verified verdicts, but it loses the rescue on models the simplex
+     * cannot certify -- 158 vs 162 comparable models at n=200, 293 vs 306 at
+     * n=400 (each lost model ends as "no feasible start", never as a wrong
+     * answer).  Trading verified solves for speed is a policy the *caller* should
+     * choose, not one this function should guess.  Inferring it from whether a
+     * stop callback happens to be installed is a trap -- a host can install one
+     * with no deadline at all (tools/qpsolve.c does exactly that, to be Ctrl-C
+     * safe) -- and would then silently change a batch caller's answers.  An
+     * explicit knob is the way; see docs/CURV_PS_PLAN.md P0.3. */
+    if (n + m <= 600) {   /* TOLSHEET TOL-QP-P1DENSE */
+        ok = dense_phase1(qp, base, x);
+        if (ok == 2) { psolve_free(xl); psolve_free(lam); return 2; }
     }
+
+    if (!ok) {
+        /* Sparse LP on min sum(s): the cheap route, and the only one that can
+         * PROVE the row system empty.  A start it hands back is re-verified
+         * against the caller's own rows inside lp_phase1. */
+        int pr = (lam && xl) ? lp_phase1(qp, x0, xl, lam) : 0;
+        if (pr == 1) {
+            memcpy(x, xl, (size_t)n * sizeof(double));
+            ok = 1;
+        } else if (pr == 2) {                    /* verified Farkas certificate */
+            res->infeasible_proven = 1;
+            res->farkas = lam;  lam = NULL;      /* ownership moves to QPResult */
+            psolve_free(xl);  psolve_free(lam);
+            return 0;                            /* proven empty: nothing to search for */
+        } else if (pr == 3) {                    /* stopped: no verdict, not a give-up */
+            psolve_free(xl);  psolve_free(lam);
+            return 2;
+        }
+    }
+
+    /* Still no start: ask the Farkas alternative directly.  It needs neither a
+     * box the caller never asked for nor a basis the simplex can certify, so it
+     * succeeds on models where the boxed LP gave up.  Failure here is still only
+     * "no feasible start" -- never infeasible. */
+    if (!ok && lam && !psolve_stop() && lp_farkas(qp, lam)) {
+        res->infeasible_proven = 1;
+        res->farkas = lam;  lam = NULL;
+    }
+    psolve_free(xl);  psolve_free(lam);
     return ok;
 }
 

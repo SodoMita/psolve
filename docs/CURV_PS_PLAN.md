@@ -213,6 +213,127 @@ exhausted arena has no libc fallback and aborts the host, so
 
 ---
 
+## 1.10 The frame budget must actually bind (P0.3's first half, done)
+
+`psw_set_time_budget_ms` (and `qpsolve -t`) arm a wall-clock callback that the QP
+core polls once per active-set iteration.  That polling is not what limits a
+solve; the limit is the longest *uninterruptible* stretch of arithmetic, and
+Phase-I had an enormous one.  A cold layout model, one solve, 16 ms budget
+(`gcc -O2 -march=native -I src <harness> src/qp.c src/{solver,splu,lu,kernels,err}.c
+-lm`, harness = the section-1 model plus a deadline in `psolve_stop_fn`):
+
+| n+m | model | before (dense Phase-I first, no gate) | after (gate at n+m ≤ 600) |
+|---|---|---|---|
+| 81 | N=16 | 16.3 ms (1.0×) | 16.3 ms |
+| 161 | N=32 | 48 ms (3.0×) | 56 ms |
+| 321 | N=64 | 723 ms (45×) | 682 ms |
+| 641 | N=128 | **11.4 s (715×)** | **178 ms** |
+| 1281 | N=256 | **180 s (11 283×)** | **48 ms** |
+
+Cause: the dense auxiliary QP lives in `n+m` variables, so *one* of its
+iterations is an O((n+m)^3) dense KKT factorisation that no stop poll can
+interrupt.  Above the gate only the sparse LP route is attempted, whose cost per
+pivot is O(nnz); the budget then binds within a pivot or two.  Same sweep, no
+budget (batch): N=128 went 63.9 s → 4.7 s **with the same answer** (status
+OPTIMAL, obj −819126.900598, 510 iterations both ways) — at those sizes the
+dense Phase-I *was* the runtime, not the solve.
+
+What is still open in P0.3, with the numbers behind it:
+
+* **N=32..120 still overshoots 3-43×**, entirely inside the dense search (the
+  gate is off below 600 on purpose).  Running the LP route first cuts N=64's
+  overshoot 682 → 95 ms and makes N=64 fit a 1500 ms solve outright
+  (`OPTIMAL`, 283 ms, where dense-first was `STOPPED`), **but it loses rescues**:
+  on the scipy differential sweep it checks 158 vs 162 models at n=200 and 293
+  vs 306 at n=400, each lost model ending as `NO_FEASIBLE_START` (never a wrong
+  verdict).  Buying speed with verified solves is a policy for the caller, so
+  this needs an explicit knob (`qp_prefer_lp_start`, or a `QP.start_hint`), not a
+  guess.  **Do not key it on whether a stop callback is installed**: `tools/qpsolve.c`
+  installs one with no deadline, just to be Ctrl-C-safe, so "armed" ≠ "in a
+  hurry" and a batch caller's answers would change underneath them.
+* The remaining overshoot below the gate is the search's own iteration count; a
+  per-iteration budget (`max_iter` on the aux solve, scaled to the caller's
+  clock) is the other way to bound it without giving up the better start.
+* Still open: iteration caps as the deterministic budget (needed for the
+  reproducible-drag-film claim) and the persistent handle (P0.2 half).
+
+## 1.11 Reconciling with `arena/cp-engine-correctness`
+
+That branch (112 commits ahead of `main` at the time of writing, tip `a468a23`) is
+where the engine work is happening; `main` is a stale base — its tip is one of
+that branch's merges.  This branch is 2 commits of QP/bridge work on top of
+`main`, deliberately **not** rebased onto their line, so it stays reviewable
+against `main`.  What merging takes is mechanical, and it has been measured
+rather than predicted: their tree was checked out in a worktree, this branch's
+`36e7680` cherry-picked with `-n`, and every gate run on the merged result.
+
+* **6 conflict hunks in 5 files** (`src/qp.c` doc comment + tolerance-tag lines,
+  `src/qp.h` two doc paragraphs, `Makefile` the `qpsolve` target and `clean`,
+  `test.sh` where the `qp_diff` gate block is appended, `tools/fuzz_inputs.py`
+  link list).  Both sides' edits survive in every case; nothing semantic collides.
+* Their link lines already include `src/solver.c src/splu.c src/cert.c`, so this
+  patch's `test.sh`/Makefile/`fuzz_inputs.py` additions are redundant there (drop
+  them in the merge); `src/qp.c`'s new dependency on the LP core is already
+  satisfied on their line.
+* **Their Phase 6.3 replaced the global `psolve_stop_fn` with
+  `psolve_stop_set(fn)`** (per-thread, no getter).  Any tool that saved and
+  restored the global has to own its slot instead: `psolve_stop_set(my_hook)` on
+  entry, `psolve_stop_set(NULL)` on exit.  Two files here need that one-line
+  change (`tools/psolve_web.c`, `tools/ui_qp_probe.c`); after it the bridge test
+  is 42 checks, 0 failures on the merged tree.
+* **Their `tools/tolsheet_check.py` gate rejects this patch as-authored**: every
+  code line in `src/*.{c,h}` carrying a float-exponent literal must be tagged
+  `/* TOLSHEET TOL-… */`, and every tag must have a row in `docs/DESIGN.md` §8
+  (and vice versa — no stale rows).  The tags are done on this branch (15 sites
+  in `src/qp.c`); the rows below are paste-ready for their §8.3 sheet.  Values
+  are as measured, and the classes are theirs: `C` steers convergence, `S` is a
+  scaling/division guard, `V` gates a verdict or a certificate.
+
+  | ID | site | value | class | direction of safety / protects / may never |
+  |---|---|---|---|---|
+  | TOL-QP-WARMFEAS | qp.c:69 | 1e-11·(1+\|b_i\|+Σ\|a_ij\|\|x_j\|) | V | accepts the caller's x0 as a start; loose enough to keep usable warm starts, tight enough that the active set never starts infeasible (its own primal gate is the backstop) |
+  | TOL-QP-P1HANDOVER | qp.c:90 | 1e-8·row_scale | V | "feasible enough to hand to the active set" for a point the LP produced; deliberately looser than WARMFEAS (different arithmetic), never looser than the terminal primal re-check |
+  | TOL-QP-BOX | qp.c:513 | boxmul·(1+max\|b\|) | C | bounds the free variables the Phase-I LP needs; exists only in an auxiliary problem, so it may never be quoted as a bound of the caller's |
+  | TOL-QP-BOXLADDER | qp.c:673 | {1e9, 1e6, 1e3, 1e12} | C | box scales tried in turn; any single scale is a coin flip on ill-conditioned rows (12/16 vs 16/16 on the sweep), so no entry is canonical |
+  | TOL-QP-BOXDIV | qp.c:518 | 1e-300 | S | row-coefficient guard turning the slack box into a variable bound; protects division only — enlarging it shrinks the box |
+  | TOL-QP-BOXCAP | qp.c:520 | 1e100 | S | keeps a derived bound representable; measured: a 1e18 box is worse than 1e12, and ±DBL_MAX on free x must never be used (it makes the LP report infeasible) |
+  | TOL-QP-BOXIDLE | qp.c:563 | 0.25 | V | "box untouched, so the boxed optimum says something about the unboxed system" test; errs toward refusing the claim |
+  | TOL-QP-FARKASINIT | qp.c:418 | 1e300 | S | sentinel for the max/min scan, never a tolerance |
+  | TOL-QP-FARKASSIGN | qp.c:428 | −1e-12·max\|λ\| | V | λ ≥ 0 acceptance; may never be loosened past zero — a certificate with a negative λ proves nothing |
+  | TOL-QP-FARKASCOL | qp.c:440 | 1e-7 | V | ‖Aᵀλ‖∞ ≈ 0, recomputed from the caller's own A |
+  | TOL-QP-FARKASB | qp.c:443 | −1e-9·(1+Σλ\|b\|) | V | bᵀλ < 0, same source; with the two rows above it is the entire `INFEASIBLE` claim, so `qpsolve` may print it only when all three hold |
+  | TOL-QP-P1RIDGE | qp.c:712 | 1e-6 | C | ridge making the dense auxiliary QP strictly convex/bounded; must stay far below the slack objective's scale or it moves the optimum and P1VERIFY rejects the point |
+  | TOL-QP-P1SUM | qp.c:745 | 1e-7 (absolute) | V | total slack of the candidate; absolute because the auxiliary problem has its own units — P1VERIFY is what ties it to the caller's |
+  | TOL-QP-P1VERIFY | qp.c:752 | 1e-7·(1+\|b_i\|) | V | re-check of the candidate against the caller's rows, in the caller's scale; the reason P1SUM may stay absolute |
+  | TOL-QP-P1DENSE | qp.c:802 | n+m ≤ 600 | C | size gate on the dense search (policy threshold, not arithmetic): below it the centred start wins, above it one iteration exceeds a frame budget (11.4 s vs 20 ms measured) |
+
+* **Overlap to resolve in favour of theirs, not by keeping both**: their
+  `solver_farkas_duals()` and `solver_farkas_boxcert()` do, inside the LP core,
+  what this patch's `farkas_verify()` guesses from the outside (a four-way
+  sign/search over the duals) and what `TOL-QP-BOXIDLE` refuses.  On a merged
+  line the LP-side helpers should feed the QP certificate, and `src/cert.h`
+  should gain `PSVK_QP_INFEASIBLE` carrying `QPResult.farkas` — their kinds list
+  has `QP_OPTIMAL`/`QP_UNBOUNDED` but no infeasible QP certificate, which is
+  exactly the hole P0.1 filled.
+* **Measured on the merged tree** (this patch on their tip): `make all` clean;
+  their full `test.sh` green end to end — including `[5.1/7]`, which is this
+  branch's probe section 1 + section 5 + the bridge contract test, `[5.2/7]`
+  cooperative stop, `[5.3/7]` re-entrant zero-malloc arena, `[5.45/7]` the
+  caller-owned error frames that replaced the stop global, `[7/7]` 120 malformed
+  inputs under ASan/UBSan, and their own `qp_psd_verify` (242 checks,
+  **0 fabricated `status 0`**), `lp_scale_verify` (250 checks, 60 rescued,
+  60 promoted to honest), `farkas_verify` (156 checks, farkas fired 23) — with
+  the sole exception of `tolsheet_check`, i.e. the tag/doc closure above.  Their
+  Phase 7.5 Ruiz equilibration and this Phase-I neither rescue nor break each
+  other: the ill-scaled sweep comes out with an identical verdict mix from both
+  trees (12 ok / 6 NO_START / 6 KKT_FAIL / 4 ITER_LIMIT over 30 points).
+* **This patch is not redundant on their line.** Their `tools/qpsolve.c` no
+  longer *labels* an unconstrained start "infeasible" (it prints `STATUS -1`,
+  which is honest), but nothing in their tree proves a QP infeasibility or
+  re-verifies a Phase-I point — their `cert.h` has no QP-infeasible kind and
+  their Phase 6.1 "exact-or-UNKNOWN" work is LP/MIP/FlatZinc only.  The
+  certificate, the box ladder and the residual reporting are new there too.
+
 ## 2. P0 — three changes that buy the most for the least risk
 
 ### P0.1  `INFEASIBLE` must mean *proven* infeasible (kill the dense Phase-I QP)  — implemented, see §1.9
@@ -264,7 +385,7 @@ exhausted arena has no libc fallback and aborts the host, so
   `max|Δx| = 0`; a curv-ps-side test drags a widget through 30 frames and
   asserts pixel-identical layout vs. per-frame cold solves.
 
-### P0.3  Budgets that actually bind, and determinism-friendly ones  — partly: `psw_set_time_budget_ms` gives the wall-clock budget; iteration caps and the persistent handle are still open
+### P0.3  Budgets that actually bind, and determinism-friendly ones  — the binding part is done (see §1.10): the wall-clock budget now survives Phase-I; the start-order knob, iteration caps and the persistent handle are open
 
 * **Problem.** In the browser there is no `SIGALRM`, so the cooperative stop is
   unreachable (`psolve_stop_fn` is a C function pointer — JS cannot set it),
@@ -435,6 +556,10 @@ make ui_qp_probe && ./ui_qp_probe            # full, minutes: 5 s budget per cas
 make bridge-test                            # native build + run of tools/psw_test.c (the wasm ABI)
 ./tools/wasm_build.sh                       # needs emcc or wasi-sdk; --check works without either
 
+# budget boundedness (section 1.10) is a third variant of the same harness:
+# one cold solve per N, psolve_stop_fn polling a CLOCK_MONOTONIC deadline, print
+# (elapsed - budget) and the status; compare a build of src/qp.c against a build
+# of `git show <before>:src/qp.c` in the same tree.
 # marginal cost per active-set iteration, LP-vs-QP Phase-I, and the libc-vs-arena
 # comparison in section 1/4 all come from variants of the same harness: replace
 # the wall-clock deadline in psolve_stop_fn with a poll counter (a deterministic
