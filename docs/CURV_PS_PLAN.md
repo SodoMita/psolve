@@ -263,9 +263,25 @@ What is still open in P0.3, with the numbers behind it:
 
 ## 1.11 Reconciling with `arena/cp-engine-correctness`
 
-That branch (112 commits ahead of `main` at the time of writing, tip `a468a23`) is
-where the engine work is happening; `main` is a stale base — its tip is one of
-that branch's merges.  This branch is 2 commits of QP/bridge work on top of
+That branch is where the engine work is happening: **13 commits ahead of `main`,
+0 behind** (tip `a468a23`, 2026-08-19), so `main` is a stale base — its tip is one
+of that branch's merges.  Counting matters here: of the 16 other branches on the
+remote, **11 are already fully merged into `main`** (`exactness-and-status-audit`,
+`flatzinc-float-correctness`, `fzn-all-solutions`, `fzn-set-const-ops`,
+`fzn-set-status-ports`, `phase4-ports`, `unmerged-audit-and-correctness`,
+`finite-domain-cp-engine`, `flatzinc-complete`, `fzn-table-constraint`, `mzfnsh`)
+and 3 carry small tails of superseded drafts (`audit-hardening` 3,
+`phase4-interactive-hardening` 3, `continue-hardening` 2 — their arena / FBBT /
+time-limit / FlatZinc-audit work landed on `main` rewritten, patch-id differs,
+content does not).  Nothing on any of them is needed before merging this: `main`
+already carries "QP: never report an infeasible or non-optimal point as solved"
+(the origin of `tools/qp_diff.py`) and "Fix LP Phase I degeneracy", and no branch
+has anything resembling the wasm bridge — `tools/psolve_web.[ch]`,
+`tools/wasm_build.sh` and `tools/ui_qp_probe.c` exist on this branch only.  (The
+ahead/behind numbers here are from an unshallowed clone: the sandbox clone is
+shallow, and a truncated history makes every branch look ~100 commits ahead of
+`main`.  Verify with `git rev-list --count origin/main..BR`, not by counting log
+lines.)  This branch is 2 commits of QP/bridge work on top of
 `main`, deliberately **not** rebased onto their line, so it stays reviewable
 against `main`.  What merging takes is mechanical, and it has been measured
 rather than predicted: their tree was checked out in a worktree, this branch's
