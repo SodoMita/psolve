@@ -386,10 +386,12 @@ rows found ~5% of instances answered wrongly.  Causes and fixes:
   a divergence guard stops the loop when the iterate runs away.
 - **Unbounded QPs ground to the iteration limit.**  Added a recession-direction
   certificate (`Q d = 0`, `A d <= 0`, `g.d < 0`): honest `UNBOUNDED` instead of
-  4,000 wasted iterations.  Its tolerances are deliberately one-sided -- a row
-  with even a rounding-level positive slope disqualifies the ray -- so a failed
-  certificate degrades to the old iteration limit rather than risking a wrong
-  answer.
+  4,000 wasted iterations.  All three parts are judged one-sided -- the base
+  point against the engine's own primal rule (so a ray is never built on an
+  iterate that has drifted out of the feasible set), the curvature's *sign* over
+  a double-double evaluation, the rows over each row's own cancellation scale
+  (CURV_PS_PLAN 1.12) -- so a failed certificate degrades to the old iteration
+  limit rather than risking a wrong answer.
 - `solve_kkt()` now takes one scratch allocation per call instead of three
   (Phase 4 wants zero per-frame allocation; this at least moves the right way).
   A 2-variable indefinite case dropped from 12,917 allocations to 8,617, and a
