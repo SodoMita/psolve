@@ -131,6 +131,66 @@ case "$out" in
 esac
 echo "  qp_cert_test + the CLI PROVEN line: OK"
 
+echo "[5.16/7] QP unboundedness certificate: one-sided ray admission (CURV_PS_PLAN 1.12)..."
+# The ray test used to admit any direction whose curvature was small relative to
+# ||Q|| ||p||^2, which is scale-blind: the Newton step of a bounded model passes
+# it, and the model comes back UNBOUNDED (docs/CURV_PS_PLAN.md 1.12 -- measured
+# on qp_diff.py 400/99001 it=53 under PSOLVE_QP_PHASE1_LP_FIRST=1, optimum
+# -7.3939738094380649).  Both halves of the certificate are now decided over the
+# caller's own data -- curvature in double-double, rows over each row's
+# cancellation scale -- and both layers (engine and evidence checker) are pinned
+# on FROZEN data from that run, so the regression cannot depend on a seed.
+gcc -O2 -march=native -I src tools/qp_ray_test.c src/qp.c src/cert.c src/solver.c \
+    src/splu.c src/lu.c src/kernels.c src/err.c -o /tmp/qp_ray_test -lm
+/tmp/qp_ray_test
+# the same model through the shipped binary and the .qp parser, in both Phase-I
+# orders: no order may call this bounded model unbounded (and the default one
+# must still find the optimum scipy agrees with).  The in-process test above
+# covers the engine; this covers the model as a file, which is how a user meets
+# it.
+/tmp/qp_ray_test --emit-qp /tmp/qp_ray_case53.qp >/dev/null
+for _order in default lpfirst; do
+  if [ "$_order" = lpfirst ]; then
+    _out=$(PSOLVE_QP_PHASE1_LP_FIRST=1 ./qpsolve /tmp/qp_ray_case53.qp)
+  else
+    _out=$(./qpsolve /tmp/qp_ray_case53.qp)
+  fi
+  # qpsolve prints a STATUS line for every status but 0 (SOLUTION/OBJ/ITERS)
+  _st=$(printf '%s\n' "$_out" | awk '/^STATUS/{print $2}')
+  [ -n "$_st" ] || _st=0
+  if [ "$_st" = "1" ]; then
+    echo "  qpsolve ($_order order) called the 1.12 model UNBOUNDED"
+    printf '%s\n' "$_out"
+    exit 1
+  fi
+  if [ "$_order" = default ]; then
+    _obj=$(printf '%s\n' "$_out" | awk '/^OBJ/{print $2}')
+    if [ "$_st" = "0" ] && [ "$_obj" != "-7.3939738094380649" ]; then
+      echo "  qpsolve (default order) got objective $_obj, want -7.3939738094380649"
+      printf '%s\n' "$_out"
+      exit 1
+    fi
+    echo "  qpsolve on the emitted model (default order): status=$_st obj=${_obj:-n/a}"
+  else
+    echo "  qpsolve on the emitted model (LP-first order): status=$_st (1 would be the bug)"
+  fi
+done
+# and the seed-dependent reproduction itself (its verdicts must be honest: the
+# differential test fails on any wrong answer, and this order is where the wrong
+# one was found)
+if python3 -c 'import numpy, scipy' 2>/dev/null; then
+  out=$(PSOLVE_QP_PHASE1_LP_FIRST=1 python3 tools/qp_diff.py 400 99001 2>&1)
+  echo "  LP-first sweep: $(echo "$out" | head -1)"
+  case "$out" in
+    *"checked="*"WRONG=0"*) : ;;
+    *"checked="*) echo "qp_diff (LP-first): WRONG answers (see above)"; exit 1 ;;
+    *) echo "qp_diff (LP-first): no summary line produced"; exit 1 ;;
+  esac
+else
+  echo "  LP-first sweep SKIPPED (numpy/scipy not installed)"
+fi
+echo "  ray test + frozen 1.12 regression: OK"
+
 echo "[5.2/7] QP cooperative stop + millisecond-precision time limits (Phase 4)..."
 gcc -O2 -march=native -I src tools/qp_stop_test.c src/qp.c src/err.c src/lu.c src/splu.c src/solver.c src/kernels.c -o /tmp/qp_stop_test -lm
 /tmp/qp_stop_test

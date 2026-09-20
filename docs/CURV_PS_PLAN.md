@@ -276,9 +276,9 @@ What is still open in P0.3, with the numbers behind it:
     binding) both say bounded below, so psolve is wrong, and the shipped default is
     clear of it only because that start never reaches the flat ray.  Reproduce:
     `PSOLVE_QP_PHASE1_LP_FIRST=1 python3 tools/qp_diff.py 400 99001`.
-  * The root cause is not the ordering - see 1.12.  The knob is off by default and
-    no shipped path depends on it, which is what makes it safe to land while 1.12
-    is open.
+  * The root cause was not the ordering but the ray-admission band the knob
+    reached first, and 1.12 is now fixed: the three sweeps below report
+    `WRONG=0` in both orders (`LP-first` 400/99001 was the one that failed).
 * The floor of the residual overshoot is *one main-loop iteration*, not Phase-I:
   with the LP route first (so Phase-I costs one sparse pivot sequence) N=64 still
   lands at 95 ms against a 16 ms budget, because the active set's own dense
@@ -484,43 +484,118 @@ diff.
   `max|Δx| = 0`; a curv-ps-side test drags a widget through 30 frames and
   asserts pixel-identical layout vs. per-frame cold solves.
 
-## 1.12 Open: the flatness band that lets a rounding-level ray certify UNBOUNDED
+## 1.12 The flatness band that lets a rounding-level ray certify UNBOUNDED — **DONE**
 
 Found by the 1.10 knob, not caused by it: the test it trips runs in the shipped
-order as well, it is reached less often there (default order: 311 checked models
-across the two seeds with `WRONG=0`, LP-first: one).
+order as well, it is reached less often there.
 
-`src/qp.c`'s unboundedness certificate accepts a direction `p` when the slope is
-negative and the curvature is *flat within tolerance*: `p'Qp <= 1e-12*(1+
-‖Q‖₈)*‖p‖²₈` (`TOL-QP-CURV`).  For that to prove unboundedness the band has to be
-one-sided.  A `p'Qp` that is small and **positive** bounds the objective along the
-ray at about `t ≈ -g'p/p'Qp`, so accepting it can call a bounded QP unbounded;
-only `p'Qp <= 0` (linear-or-concave along the ray) combined with `A p <= 0` is a
-recession direction.  The `1.10` model does exactly this: Q's smallest eigenvalue
-is -1.73e-15, so `p'Qp` lands inside the band on a direction that is not a ray at
-all, and the answer is `STATUS 1` where the optimum is -7.3939738094380649.
+**What was wrong.** `src/qp.c`'s unboundedness certificate accepted a direction
+`p` when the slope was negative and the curvature was *flat within tolerance*:
+`p'Qp <= 1e-12*(1+||Q||_inf)*||p||_inf^2` (`TOL-QP-CURV`).  For that to prove
+unboundedness the band has to be one-sided.  A `p'Qp` that is small and
+**positive** bounds the objective along the ray at about `t = -g'p/p'Qp`, so
+accepting it can call a bounded QP unbounded; only `p'Qp <= 0` combined with
+`A p <= 0` is a recession direction.  The `1.10` model does exactly this: Q's
+smallest eigenvalue is -1.73e-15, so `p'Qp` lands inside the band on a direction
+that is not a ray at all, and the answer is `STATUS 1` where the optimum is
+-7.3939738094380649.
 
-`src/cert.c`'s `check_qp_unbounded()` mirrors the same band, which is why the
-CLI's existing `PSVK_QP_UNBOUNDED` re-verification confirmed the ray instead of
-catching it - the checker agrees with the producer because they accept the same
-thing.  That is worth remembering about the certificate layer in general: two
-sites with the same tolerance are one check, not two.
+Worse than the sign-blindness is the *shape* of that band: it scales with
+`||p||^2`, so it grows with the very thing that makes a false ray dangerous.  The
+`1.12` ray is a plain Newton step of magnitude 7.2e15 whose curvature,
+`+2.5301e20`, is 1.5e-13 of `sum|q_ij p_i p_j|` -- 13 orders of magnitude above
+what a double dot product can resolve, and still `1/13` of the band.  Shrinking
+the constant only relocates that; the rule had to change, not the tolerance.
 
-The fix is to make the comparison one-sided in both places (`p'Qp <= 0`, plus
-whatever `TOL-QP-CURV` needs to stay usable for exactly-flat directions computed
-in floating point - the honest version may be to accept `0 <= p'Qp <= band` only
-when the implied escape point `t` is far outside the model's own scale).  Its
-cost is that some genuinely flat rays stop certifying and fall back to
-`ITERATION_LIMIT`, which the code comment in `src/qp.c` already argues is
-"never wrong"; that is a verdict-semantics change to their main loop, so it goes
-through review as its own item.  The blast radius is not small: the default-order
-sweep reports `STATUS 1` on 110 of its 400 models (`qp_diff.py`'s own histogram -
-`diag0/1=38, singular/1=17, zero/1=55`), so any change to the band needs the same
-`qp_diff.py` A/B plus a look at how many of those 110 move to `ITERATION_LIMIT`.  Reproduce the failure with:
+Two neighbouring holes were found while validating the fix, and are closed with
+it:
 
-    PSOLVE_QP_PHASE1_LP_FIRST=1 python3 tools/qp_diff.py 400 99001     # it=53
+* `src/cert.c`'s `check_qp_unbounded()` mirrored the same band, which is why the
+  CLI's existing `PSVK_QP_UNBOUNDED` re-verification *confirmed* the ray instead
+  of catching it.  Worth remembering about the certificate layer in general: two
+  sites with the same tolerance are one check, not two.
+* the row half of the certificate (`A p <= 0`, tested as a rounded double against
+  `0.0`) has no decidable sign either: `d` is a *computed* direction, so a row
+  slope is only meaningful to ~`eps*sum|a_ij p_j|`.  Measured: of the rays the
+  tree certified on seed 99001, nine had exact row slopes of +1e-8 absolute
+  against row scales of 1e8 (relative 3e-17) -- i.e. the code was already using a
+  silent band, and the comment claiming "no tolerance here on purpose" described
+  a test it was not running.
 
-### P0.3  Budgets that actually bind, and determinism-friendly ones  — the binding part and the start-order knob are done (1.10): the wall-clock budget survives Phase-I and `QP.phase1_order` lets a caller choose which rescue runs first. Open: iteration caps as the deterministic budget, the persistent handle, and the one-sided flatness band in 1.12
+**What changed** (`src/qp.c`, `src/cert.c`; `tools/qp_ray_test.c` pins it):
+
+* **Curvature is decided, not tolerated.**  `curvature_nonpositive()` (qp.c) and
+  `cert_qp_curv_ok()` (cert.c, its own arithmetic and summation order) evaluate
+  `p'Qp` in double-double -- exact two-products plus compensated series -- and
+  admit the ray only if the resulting sign is non-positive.  A coarse
+  double-precision pass around it keeps the cost at zero where the sign is clear
+  (accept `sum + bound <= 0`, reject `sum - bound > 0`, refine in between).  The
+  refinement is accurate to **6.7e-33** of `sum|terms|` (worst case measured
+  against exact rational arithmetic over every candidate the coarse pass left
+  ambiguous, 0 sign mismatches), i.e. 20 orders below the curvature that caused
+  the bug -- while exactly flat data (`Q = 0`, a null coordinate, a cancelling
+  pair of terms) evaluates to `0.0` and is still admitted.  Refusing is always
+  safe: the ray certificate is dropped and the loop runs on to its iteration
+  limit, which claims nothing.
+* **Rows get the window they were implicitly using** (`row_recession_ok()`,
+  `TOL-QP-RAYROW`; the checker mirrors it value for value as `TOL-CERT-QPROW`).
+  A row slope inside `8*n*eps*sum|a_ij p_j|` counts as zero because the direction
+  it was computed from carries that much uncertainty; outside it the row blocks
+  the ray, since such a direction leaves the feasible set in finite time.  The
+  window is the dot product's own error term, not a policy grace: the LP core's
+  ray check uses 1e-9 relative (`TOL-CERT-DEFDJ`) because a simplex ray is a
+  basis direction, and on this family a 1e-9-relative slope would be 1e8 per unit
+  step, which the data does not resolve.
+* `tools/qp_ray_test.c` freezes the failing model, both rays the old rule
+  certified on it, a rounding-level curvature gadget (sign decided at +-1e-15)
+  and the row window's two sides; `test.sh` gates it at `[5.16/7]` together with
+  the LP-first sweep itself, and with the frozen model driven through `qpsolve`
+  as a file (`--emit-qp`) in both Phase-I orders, so the claim is pinned at the
+  CLI/parser level as well as in-process.
+
+**Measured, this change vs the branch it was made on** (`tools/qp_diff.py`,
+`WRONG = 0` is the gate; `checked` counts models the oracle could judge,
+`status 1` is a certified UNBOUNDED):
+
+| sweep | before | after |
+|---|---|---|
+| default, 400/99001 | `checked=311 WRONG=0`; zero/1=55, singular/1=17, diag0/1=38; limit-unbounded=64 | `checked=322 WRONG=0`; zero/1=**84**, singular/1=2, diag0/1=35; limit-unbounded=54 |
+| default, 200/4242 | `checked=164 WRONG=0`; zero/1=32, singular/1=7, diag0/1=13 | `checked=162 WRONG=0`; zero/1=**40**, singular/1=1, diag0/1=9 |
+| LP-first, 400/99001 | `checked=290 **WRONG=1**` (it=53) | `checked=297 WRONG=0`; it=53 is now `status 2` |
+| LP-first, 200/4242 | `checked=156 WRONG=0` | `checked=152 WRONG=0` |
+
+Every certified ray was then re-checked in exact rational arithmetic over five
+sweeps (2200 models, 638 certified rays): `p'Qp <= 0` exactly, and every row
+inside the documented window -- 0 exceptions.  Note where the numbers *moved up*:
+the explicit row window certifies 29 more `zero`-family models on 400/99001 than
+the silent `> 0.0` test did, because those rays' row slopes are a rounding-level
+positive in the *computed* sum and a genuine zero in the data.
+
+**What it cost.** The certificates that disappeared are the ones no certificate
+exists for: the `singular` family's rays (17 -> 2 on 400/99001) have a
+*provably positive* curvature in the model's own doubles -- the models are
+"unbounded" only in the sense that a different, exact null direction would do
+it, which is a **capability** gap, not a soundness one: those models now end as
+`ITERATION_LIMIT`/`KKT_FAIL`, which `qp_diff.py` counts as honest non-answers,
+never as wrong ones.  Closing it would mean *searching* for a flat direction
+(e.g. projecting the Newton direction onto Q's numerical null space and
+re-verifying both halves) rather than certifying the one the KKT solve happened
+to produce; the `ui_qp_probe` layout family is unaffected either way, since its
+models are strictly convex along the ray and end in Phase-I/active-set outcomes.
+
+Reproduce (the model is frozen in `tools/qp_ray_test.c`; `--emit-qp` writes it
+back out in `tools/qp_diff.py`'s `.qp` format, bit for bit):
+
+    gcc -O2 -march=native -I src tools/qp_ray_test.c src/qp.c src/cert.c \
+        src/solver.c src/splu.c src/lu.c src/kernels.c src/err.c -o /tmp/qp_ray_test -lm
+    /tmp/qp_ray_test                              # frozen data, 26 checks
+    /tmp/qp_ray_test --emit-qp /tmp/case53.qp
+    ./qpsolve /tmp/case53.qp                      # OPTIMAL, OBJ -7.3939738094380649
+    PSOLVE_QP_PHASE1_LP_FIRST=1 ./qpsolve /tmp/case53.qp
+                                                  # was STATUS 1 (unbounded); now STATUS 2
+    PSOLVE_QP_PHASE1_LP_FIRST=1 python3 tools/qp_diff.py 400 99001
+
+### P0.3  Budgets that actually bind, and determinism-friendly ones  — the binding part and the start-order knob are done (1.10): the wall-clock budget survives Phase-I and `QP.phase1_order` lets a caller choose which rescue runs first, and the one-sided flatness band that the knob exposed is fixed (1.12). Open: iteration caps as the deterministic budget, and the persistent handle
 
 * **Problem.** In the browser there is no `SIGALRM`, so the cooperative stop is
   unreachable (`psolve_stop_fn` is a C function pointer — JS cannot set it),

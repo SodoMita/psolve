@@ -47,10 +47,19 @@
  *                        (Global optimality additionally rests on the
  *                        engine-side PSD gate; the evidence object
  *                        records that the gate ran.)
- *   PSVK_QP_UNBOUNDED    primal-feasible point + ray d with A d <= 0
- *                        (strict, mirroring qp.c's deliberate no-margin
- *                        rule), d^T Q d within the curvature tolerance
- *                        and (Q x + c)^T d < 0.
+ *   PSVK_QP_UNBOUNDED    primal-feasible point + ray d with (Q x + c)^T d < 0,
+ *                        d^T Q d <= 0 and A d <= 0.  The two last are decided
+ *                        differently on purpose (docs/DESIGN.md TOL-QP-CURV /
+ *                        TOL-QP-RAYROW): the curvature is the qualitative half
+ *                        -- d^T Q d > 0 gives the objective a finite minimiser
+ *                        along the ray -- so it is recomputed in double-double
+ *                        from the certificate's own Q and d and refused unless
+ *                        the sign is non-positive; the rows are the
+ *                        quantitative half and are judged over each row's own
+ *                        cancellation scale, because d is a computed direction
+ *                        whose last bits are not evidence.  A ray refused by
+ *                        either test costs the UNBOUNDED verdict and nothing
+ *                        else (no wrong answer is manufactured).
  *   PSVK_QP_INFEASIBLE   the row system Ax <= b of a QP model is empty, from a
                         Farkas multiplier vector in `ray` (m).  Checked over the
                         QP's own dense row-major A and rhs -- no LP view, no

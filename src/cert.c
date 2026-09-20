@@ -372,6 +372,71 @@ static PsvRc check_qp_optimal(const PsvCert *cl)
     return PSV_OK;
 }
 
+/* ------------------------------------------------------------------------
+ * d^T Q d <= 0 for a claimed QP ray, decided independently of qp.c.
+ *
+ * The claim being checked is "the objective diverges along x + t d": with
+ * d^T Q d < 0 the quadratic term dominates, with d^T Q d = 0 the objective is
+ * linear in t and diverges too, and with d^T Q d > 0 it has a *finite*
+ * minimiser at t = -(Qx+c).d / d^T Q d, so the ray proves nothing and the
+ * caller would be reporting a bounded QP as UNBOUNDED.
+ *
+ * A signed band cannot decide this: the natural one, relative to ||Q|| ||d||^2,
+ * scales with ||d||^2 and so admits big directions of any slope -- exactly the
+ * shape of the bug this check now catches (docs/CURV_PS_PLAN.md 1.12, a Newton
+ * step with d^T Q d = +2.5e20 on a model with optimum -7.3940, admitted by the
+ * 1e-12 band this replaced).  The check below is therefore one-sided: it
+ * accepts only a *proven* non-positive value, and proves it to second order by
+ * evaluating the form in double-double where a double dot product cannot
+ * decide.  Rejecting is always allowed -- an unproven ray only costs the
+ * UNBOUNDED verdict, which then falls back to a non-answer.
+ *
+ * This is the same statement qp.c's curvature_nonpositive() tests, reached by
+ * its own arithmetic and its own summation order (j outer, i inner) on purpose:
+ * a checker that shares an implementation with the producer cannot catch the
+ * producer's errors, only its own.
+ * ------------------------------------------------------------------------ */
+static void cert_two_prod(double a, double b, double *hi, double *lo)
+{
+    double h = a * b;                 /* exact residual via IEEE-754 fma */
+    *hi = h;
+    *lo = fma(a, b, -h);
+}
+
+static void cert_comp_add(double t, double *sum, double *comp)
+{
+    double s = *sum + t;
+    *comp += (fabs(*sum) >= fabs(t)) ? ((*sum - s) + t) : ((t - s) + *sum);
+    *sum = s;
+}
+
+/* 1 iff d^T Q d <= 0 for the certificate's own Q and d, as resolved by a
+   double-double evaluation (exact products, compensated sums): the sign of
+   that value is the decision, and its accuracy -- 6.7e-33 of sum|terms|,
+   measured against exact rational arithmetic -- is what makes the sign
+   meaningful where a double dot product's is not.  The residual bound is the
+   overflow guard, not part of the decision. */
+static int cert_qp_curv_ok(const PsvCert *cl)
+{
+    int n = cl->n;
+    double hs = 0.0, hc = 0.0, ls = 0.0, lc = 0.0, abs_sum = 0.0;
+    for (int j = 0; j < n; j++) {
+        for (int i = 0; i < n; i++) {
+            double t1, e1, t2, e2;
+            cert_two_prod(cl->Q[(size_t)j * n + i], cl->ray[j], &t1, &e1);
+            cert_two_prod(t1, cl->ray[i], &t2, &e2);
+            double lo = e2 + e1 * cl->ray[i];
+            cert_comp_add(t2, &hs, &hc);
+            cert_comp_add(lo, &ls, &lc);
+            abs_sum += fabs(t2) + fabs(lo);
+        }
+    }
+    double value = (hs + hc) + (ls + lc);
+    double resid = 64.0 * (double)n * (double)n * DBL_EPSILON * DBL_EPSILON * abs_sum;  /* TOLSHEET TOL-CERT-QPCURVDD */
+    if (!isfinite(value) || !isfinite(resid)) return 0;
+    return value <= 0.0;
+}
+
 static PsvRc check_qp_unbounded(const PsvCert *cl)
 {
     if (!cl->x || !cl->ray || !cl->Q || !cl->A || !cl->bq || !cl->cq)
@@ -384,28 +449,31 @@ static PsvRc check_qp_unbounded(const PsvCert *cl)
         double rr = qp_row_res(cl, i, cl->x, &act);
         if (rr > gt_row * (1.0 + act)) { return PSV_REJECT; }
     }
-    double pinf = 0.0, qnorm = 0.0;
+    double pinf = 0.0;
     for (int j = 0; j < cl->n; j++) {
         if (!isfinite(cl->ray[j])) return PSV_DEFER;
         pinf = fmax(pinf, fabs(cl->ray[j]));
     }
     if (!(pinf > 0.0)) return PSV_DEFER;
-    for (int i = 0; i < cl->n * cl->n; i++) qnorm = fmax(qnorm, fabs(cl->Q[i]));
-    /* A d <= 0 strictly, mirroring qp.c's deliberate no-margin rule: any
-       rounding-level positive slope eventually blocks the ray */
+    for (int i = 0; i < cl->n * cl->n; i++)
+        if (!isfinite(cl->Q[i])) return PSV_DEFER;
+    /* Recession rows: a_i.d <= 0, judged over the row's own cancellation scale
+       rather than against 0.0 (TOL-CERT-QPROW).  d is a computed direction, so
+       a slope inside that window has no decidable sign -- see the same rule in
+       qp.c's row_recession_ok(), which this mirrors value for value so the two
+       layers cannot disagree about which rays exist.  Outside the window the
+       slope decides and the claim is refused: it would describe a direction
+       that leaves the feasible set in finite time. */
     for (int i = 0; i < cl->m; i++) {
-        double ap = 0.0;
-        for (int j = 0; j < cl->n; j++) ap += cl->A[(size_t)i * cl->n + j] * cl->ray[j];
-        if (ap > 0.0) { return PSV_REJECT; }
+        double ap = 0.0, terms = 0.0;
+        for (int j = 0; j < cl->n; j++) {
+            double t = cl->A[(size_t)i * cl->n + j] * cl->ray[j];
+            ap += t; terms += fabs(t);
+        }
+        if (ap > 8.0 * (double)cl->n * DBL_EPSILON * terms) return PSV_REJECT;  /* TOLSHEET TOL-CERT-QPROW */
     }
-    /* curvature d^T Q d ~ 0 */
-    double pQp = 0.0;
-    for (int i = 0; i < cl->n; i++) {
-        double qi = 0.0;
-        for (int j = 0; j < cl->n; j++) qi += cl->Q[(size_t)j * cl->n + i] * cl->ray[j];
-        pQp += qi * cl->ray[i];
-    }
-    if (pQp > 1e-12 * (1.0 + qnorm) * pinf * pinf) return PSV_REJECT;  /* TOLSHEET TOL-CERT-QPCURV */
+    /* curvature d^T Q d <= 0, one-sided and proven (see above) */
+    if (!cert_qp_curv_ok(cl)) return PSV_REJECT;   /* TOLSHEET TOL-CERT-QPCURV */
     /* descent: (Q x + c)^T d < 0 */
     double *g = (double*)malloc((size_t)(cl->n ? cl->n : 1) * sizeof(double));
     if (!g) return PSV_DEFER;
