@@ -36,7 +36,19 @@
  *       the row's cancellation scale) and of 1e-13 (outside it) are decided the
  *       way TOL-QP-RAYROW/TOL-CERT-QPROW document;
  *   [E] genuinely flat rays still certify end to end -- engine status 1 AND the
- *       checker's confirmation of the ray it returns.
+ *       checker's confirmation of the ray it returns;
+ *   [F] the base point is part of the evidence.  A ray proves nothing from a
+ *       point outside the feasible set, and the engine's OPTIMAL path already
+ *       refuses such a point (its terminal primal re-check); its ray path did
+ *       not, so it certified rays from iterates that had drifted out -- which
+ *       the certificate layer then refused, downgrading every one of them to
+ *       KKT_FAIL with "certificate not confirmed" on stderr.  Two frozen models
+ *       from the sweeps that did exactly this are pinned here: the checker must
+ *       refuse their (infeasible base point, ray) certificates, and the engine
+ *       must never return status 1 with a ray its checker refuses.  This defect
+ *       pre-dates the ray rules of 1.12 -- it reproduces on the tree as it was
+ *       before them -- and the sweeps now count it separately (qp_diff.py's
+ *       UNCONFIRMED, gated at zero by test.sh).
  *
  * Usage: qp_ray_test            (exit code = number of failures)
  */
@@ -141,6 +153,60 @@ static int emit_qp(const char *path)
     printf("wrote %s (the frozen 1.12 model, n=%d m=%d)\n", path, N12, M12);
     return 0;
 }
+
+/* ---- the two "infeasible base point" models (section [F]) ------------------ */
+
+/* qp_diff.py 200/4242 it=65, [singular] n=3 m=4 (also the head of exactly this
+   family: the pre-1.12 row rule refused it by accident, for a rounding-level
+   positive slope, and never reached the base-point question). */
+static const double c65_Q[9] = {
+    0.68319113218073146, 0.4538488250309945, 1.4028910622925119,
+    0.4538488250309945, 0.30149506672391146, 0.93195070936533686,
+    1.4028910622925119, 0.93195070936533686, 2.8807507005807715
+};
+static const double c65_c[3] = {
+    2.2787264844311217, -1.8717841980529215, -1.9198708141376661
+};
+static const double c65_A[12] = {
+    -0.52667460693618295, 1.8006469046619955, -0.30215790637068185,
+    -2.4751439379481783, 1.2180332900666402, -2.0630287704122932,
+    -1.7754411640376435, 1.8339524067294244, 1.5438563689060345,
+    2.5094594775545671, -0.080290612290093044, 0.68682474389839232
+};
+static const double c65_b[4] = {
+    0.00045248752772397705, 0.72956763995021934, 1.3450417414727673, 4.193436884667797
+};
+static const double c65_x[3] = {          /* the iterate it certified from */
+    -1.5330814934223054, -1.2777781087723925, 0.73128085885582284
+};
+static const double c65_ray[3] = {
+    -6043524246716240, -11445247598683006, 6645772147191067
+};
+
+/* qp_diff.py 600/777 it=70, [zero] n=4 m=5: Q = 0, so curvature and rows are
+   trivially fine and the base point is the ONLY thing wrong (row 2 by 2e-2
+   relative) -- this is the case that isolates the rule. */
+static const double c70_Q[16] = { 0 };
+static const double c70_c[4] = {
+    3.5660976885488118, 4.2421740884331456, 4.9820468094177564, 4.6913789191819077
+};
+static const double c70_A[20] = {
+    -0.082856751936820849, -2.4937981902118027, 0.62652720446768484, -1.2522575066870376,
+    -1.5636495271202433, 2.3991290716183853, 0.60683900279124181, -0.24869734073132044,
+    -0.94643893768308018, -1.1611630918391225, -1.3666648556562935, -0.070603744948943614,
+    0.62388299153347404, -0.52472930580682009, 1.3418600108712946, 2.2110160309374765,
+    -0.082856751936820849, -2.4937981902118027, 0.62652720446768484, -1.2522575066870376
+};
+static const double c70_b[5] = {
+    0.98816317951772481, 4.0752007159175712, 0.98154068306147202, 1.3585582660498308,
+    1.2628513074291043
+};
+static const double c70_x[4] = {
+    -0.59775796957399185, 1.229333672119477, -1.2521954654003269, -3.8241970850438389
+};
+static const double c70_ray[4] = {
+    123635317.59604524, 90967878.130831704, -149269246.79930845, -264019814.48337799
+};
 
 /* exact-ish curvature of d over Q, in double-double, to state in the test what
    the data really says (the same evaluation qp.c/cert.c use for the verdict) */
@@ -342,6 +408,63 @@ int main(int argc, char **argv)
                      "[E] ... at the right point");
         }
         qp_result_free(&r);
+    }
+
+    /* ---- [F] the base point is part of the evidence ----------------------- */
+    {
+        struct {
+            const char *what;
+            int n, m;
+            const double *Q, *c, *A, *b, *x, *ray;
+        } F[2] = {
+            { "200/4242 it=65 [singular]", 3, 4, c65_Q, c65_c, c65_A, c65_b, c65_x, c65_ray },
+            { "600/777 it=70 [zero]",     4, 5, c70_Q, c70_c, c70_A, c70_b, c70_x, c70_ray },
+        };
+        for (int f = 0; f < 2; f++) {
+            int n = F[f].n, m = F[f].m;
+            /* (i) the evidence the old producer emitted IS refused -- and it is
+               refused *by the base point*: state that's so, by showing the other
+               two parts of it are fine (non-positive curvature, every row slope
+               inside the documented window), and the row the point violates */
+            double worst = 0.0;
+            int worst_row = -1;
+            for (int i = 0; i < m; i++) {
+                double rr = -F[f].b[i], act = fabs(F[f].b[i]);
+                for (int j = 0; j < n; j++) {
+                    double t = F[f].A[(size_t)i * n + j] * F[f].x[j];
+                    rr += t; act += fabs(t);
+                }
+                if (rr > worst) { worst = rr; worst_row = i; }
+            }
+            double curv = curvature_exact(F[f].Q, F[f].ray, n);
+            PsvCert cl = qp_cert(F[f].Q, F[f].A, F[f].b, F[f].c, F[f].x, F[f].ray, n, m);
+            printf("  [F] %s: base point violates row %d by %+.3g, curvature %+.3g\n",
+                   F[f].what, worst_row, worst, curv);
+            WANT_INT(worst > 1e-7, 1, "[F] the frozen base point really is outside the rows");
+            WANT_INT(curv <= 0.0, 1, "[F] ... while the ray's curvature is non-positive");
+            WANT(psv_cert_check(&cl), PSV_REJECT,
+                 "[F] so the certificate is refused, by the base point");
+            /* (ii) and the engine does not emit that evidence: status 1 always
+               comes with a ray the checker confirms (the invariant the sweeps
+               gate too -- qp_diff.py's UNCONFIRMED must stay 0) */
+            QP qp; QPResult r;
+            memset(&qp, 0, sizeof qp);
+            qp.n = n; qp.m = m; qp.Q = F[f].Q; qp.c = F[f].c;
+            qp.A = F[f].A; qp.b = F[f].b;
+            memset(&r, 0, sizeof r);
+            qp_solve(&qp, &r);
+            PsvRc conf = PSV_DEFER;
+            if (r.status == 1 && r.x && r.ray) {
+                PsvCert c2 = qp_cert(F[f].Q, F[f].A, F[f].b, F[f].c, r.x, r.ray, n, m);
+                conf = psv_cert_check(&c2);
+            }
+            printf("  [F] %s: engine status %d after %d iterations (ray confirmed: %s)\n",
+                   F[f].what, r.status, r.iterations,
+                   r.status == 1 ? rcname(conf) : "n/a -- no ray claimed");
+            WANT_INT(r.status != 1 || conf == PSV_OK, 1,
+                     "[F] no UNBOUNDED claim without its confirmation");
+            qp_result_free(&r);
+        }
     }
 
     printf("qp_ray_test: %d checks, %d failures\n", checks, fails);

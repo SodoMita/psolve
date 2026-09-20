@@ -57,9 +57,14 @@ if python3 -c 'import numpy, scipy' 2>/dev/null; then
   # A differential test whose verdict is only printed is a diff test that can
   # regress in silence, and a missing scipy is not a solver failure: gate on the
   # first explicitly and skip on the second.
+  # WRONG is a wrong answer; UNCONFIRMED is the other failure mode: the engine
+  # emitted evidence (a ray) its own checker refused, which the CLI then
+  # downgrades to KKT_FAIL -- honest, but a producer/checker disagreement that
+  # must never happen (CURV_PS_PLAN 1.12).
   case "$out" in
-    *"checked="*"WRONG=0"*) : ;;
-    *"checked="*) echo "qp_diff: WRONG answers (see above)"; exit 1 ;;
+    *"WRONG=0 UNCONFIRMED=0"*) : ;;
+    *"UNCONFIRMED=0"*) echo "qp_diff: WRONG answers (see above)"; exit 1 ;;
+    *"checked="*) echo "qp_diff: engine evidence its own checker refused (see above)"; exit 1 ;;
     *) echo "qp_diff: no summary line produced"; exit 1 ;;
   esac
 else
@@ -136,10 +141,14 @@ echo "[5.16/7] QP unboundedness certificate: one-sided ray admission (CURV_PS_PL
 # ||Q|| ||p||^2, which is scale-blind: the Newton step of a bounded model passes
 # it, and the model comes back UNBOUNDED (docs/CURV_PS_PLAN.md 1.12 -- measured
 # on qp_diff.py 400/99001 it=53 under PSOLVE_QP_PHASE1_LP_FIRST=1, optimum
-# -7.3939738094380649).  Both halves of the certificate are now decided over the
-# caller's own data -- curvature in double-double, rows over each row's
-# cancellation scale -- and both layers (engine and evidence checker) are pinned
-# on FROZEN data from that run, so the regression cannot depend on a seed.
+# -7.3939738094380649).  All three parts of the certificate are now decided over
+# the caller's own data -- the base point's feasibility, curvature in
+# double-double, rows over each row's cancellation scale -- and both layers
+# (engine and evidence checker) are pinned on FROZEN data from that run, so the
+# regression cannot depend on a seed.  qp_ray_test's section [F] pins the third
+# part on two frozen models whose iterates had drifted out of the feasible set,
+# which the engine used to certify rays from (upstream main does too: run it with
+# PSOLVE_QPSOLVE pointed at an older binary and the sweep reports UNCONFIRMED).
 gcc -O2 -march=native -I src tools/qp_ray_test.c src/qp.c src/cert.c src/solver.c \
     src/splu.c src/lu.c src/kernels.c src/err.c -o /tmp/qp_ray_test -lm
 /tmp/qp_ray_test
@@ -182,8 +191,9 @@ if python3 -c 'import numpy, scipy' 2>/dev/null; then
   out=$(PSOLVE_QP_PHASE1_LP_FIRST=1 python3 tools/qp_diff.py 400 99001 2>&1)
   echo "  LP-first sweep: $(echo "$out" | head -1)"
   case "$out" in
-    *"checked="*"WRONG=0"*) : ;;
-    *"checked="*) echo "qp_diff (LP-first): WRONG answers (see above)"; exit 1 ;;
+    *"WRONG=0 UNCONFIRMED=0"*) : ;;
+    *"UNCONFIRMED=0"*) echo "qp_diff (LP-first): WRONG answers (see above)"; exit 1 ;;
+    *"checked="*) echo "qp_diff (LP-first): engine evidence its own checker refused (see above)"; exit 1 ;;
     *) echo "qp_diff (LP-first): no summary line produced"; exit 1 ;;
   esac
 else

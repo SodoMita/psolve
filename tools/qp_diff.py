@@ -105,7 +105,7 @@ def main():
     exe = os.environ.get("PSOLVE_QPSOLVE", os.path.join(ROOT, "qpsolve"))
 
     kinds = ["pd", "singular", "zero", "diag0"]
-    bad, counts, checked = [], {}, 0
+    bad, counts, checked, unconfirmed = [], {}, 0, []
     for it in range(N):
         kind = kinds[it % len(kinds)]
         n, m, Q, c, A, b = make_case(rng, kind)
@@ -118,6 +118,15 @@ def main():
         if r.returncode != 0:
             bad.append((it, kind, "exit %d %s" % (r.returncode, r.stderr.strip()[:60])))
             continue
+        # The CLI only prints STATUS 1 after its own evidence checker confirms the
+        # ray over the model's original data; when it refuses, it downgrades to
+        # KKT_FAIL and says so on stderr.  That downgrade is an honest non-answer
+        # (not a wrong one), but it is also a producer/checker disagreement about
+        # the same claim -- engine-side evidence its own checker must reject --
+        # so the sweeps count it separately and the gates require zero of it
+        # (roadmap CURV_PS_PLAN 1.12).
+        if "certificate not confirmed" in r.stderr:
+            unconfirmed.append((it, kind, r.stderr.strip().splitlines()[0][:70]))
         x = None
         status = 0
         for ln in r.stdout.splitlines():
@@ -189,12 +198,15 @@ def main():
             bad.append((it, kind, "negative multiplier %.3g (not a minimum)" % neg))
             continue
 
-    print("qp_diff: checked=%d WRONG=%d  (N=%d, seed=%d)" % (checked, len(bad), N, seed))
+    print("qp_diff: checked=%d WRONG=%d UNCONFIRMED=%d  (N=%d, seed=%d)"
+          % (checked, len(bad), len(unconfirmed), N, seed))
     order = sorted(counts.items(), key=lambda kv: (kv[0][0], str(kv[0][1])))
     print("  (kind,status): " + ", ".join("%s/%s=%d" % (k[0], k[1], v) for k, v in order))
     for b_ in bad[:15]:
         print("  it=%d [%s] %s" % b_)
-    return 1 if bad else 0
+    for u_ in unconfirmed[:15]:
+        print("  it=%d [%s] engine evidence refused by its own checker: %s" % u_)
+    return 1 if (bad or unconfirmed) else 0
 
 
 if __name__ == "__main__":

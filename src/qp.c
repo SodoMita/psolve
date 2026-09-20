@@ -202,6 +202,26 @@ static int curvature_nonpositive(const QP *qp, const double *p, double qnorm)
     return curvature_nonpositive_dd(qp, p);
 }
 
+/* 1 when every row is satisfied at x to 1e-7 * (1 + |b_i|) -- the primal
+   feasibility claim both terminal verdicts stand on (TOL-QP-PRIMAL).  It is one
+   helper because it must be one rule: the OPTIMAL path refuses to certify a
+   point that fails it, and the UNBOUNDED path must not build a ray on a point
+   that fails it either.  It is deliberately tighter than the evidence checker's
+   own version of the same test in cert.c, which uses 1 + |b_i| + |a_i|^T |x|
+   (a larger scale, hence a looser window): a base point admitted here therefore
+   cannot be refused there for its point, so the producer never emits evidence
+   its own checker must reject.  That asymmetry is not academic -- before this
+   rule existed the active set certified rays from iterates that had drifted up
+   to 2e-2 (relative) outside a row, and `qpsolve` downgraded every one of them
+   to KKT_FAIL with "certificate not confirmed" on stderr (docs/CURV_PS_PLAN.md
+   1.12). */
+static int primal_feasible(const QP *qp, const double *x)
+{
+    for (int i = 0; i < qp->m; i++)
+        if (row_resid(qp, i, x) > 1e-7 * (1.0 + fabs(qp->b[i]))) return 0;  /* TOLSHEET TOL-QP-PRIMAL */
+    return 1;
+}
+
 /* 1 when row i is violated at x beyond the relative tolerance. */
 static int row_violated(const QP *qp, int i, const double *x)
 {
@@ -445,12 +465,7 @@ static void active_set(const QP *qp, const double *xstart, QPResult *res)
                    of the pair is rank-independent enough to enter the working
                    set) can leave a constraint violated.  Report a failure
                    rather than a stationary point outside the feasible set. */
-                int infeas = 0;
-                for (int i = 0; i < m; i++) {
-                    double rr = row_resid(qp, i, x);
-                    if (rr > 1e-7 * (1.0 + fabs(qp->b[i]))) { infeas = 1; break; }  /* TOLSHEET TOL-QP-PRIMAL */
-                }
-                if (infeas) { status = QP_KKT_FAIL; break; }
+                if (!primal_feasible(qp, x)) { status = QP_KKT_FAIL; break; }
                 for (int c = 0; c < k; c++) res->mult[W[c]] = mu[c];
                 status = 0; break;
             }
@@ -464,7 +479,7 @@ static void active_set(const QP *qp, const double *xstart, QPResult *res)
            walks along such a ray until the iteration cap and reports
            ITERATION_LIMIT -- honest, but uninformative and ~4000 wasted
            iterations (measurably: a 2-variable Q=0 case did 12917 mallocs).
-           The two halves of that certificate are judged differently on
+           The three parts of that certificate are judged differently on
            purpose.  The curvature is the qualitative one -- a positive p'Qp
            turns the ray into a step with a finite minimiser -- so it must be
            PROVEN, and curvature_nonpositive() proves it in double-double
@@ -475,7 +490,14 @@ static void active_set(const QP *qp, const double *xstart, QPResult *res)
            that window (TOL-QP-RAYROW) instead of testing a rounded double
            against 0.0.  Either refusal just falls through to the old
            behaviour, so the worst case is a lost certificate, never a wrong
-           UNBOUNDED. */
+           UNBOUNDED.  The third part of the claim is the base point itself: a
+           ray is only evidence from a point that is IN the feasible set, which
+           is the same primal rule the OPTIMAL verdict answers to
+           (primal_feasible, TOL-QP-PRIMAL).  The active set can leave the
+           feasible set by drift -- the ratio test only blocks a row the step
+           pushes into, and a violated row with a_i.p <= 0 is never restored --
+           so without this gate the engine certified rays from infeasible
+           iterates, and the certificate layer refused every one of them. */
         {
             double gp = 0.0, pinf = 0.0;
             for (int j = 0; j < n; j++) {
@@ -483,6 +505,7 @@ static void active_set(const QP *qp, const double *xstart, QPResult *res)
                 pinf = fmax(pinf, fabs(p[j]));
             }
             if (gp < -1e-9 * scale && pinf > 0.0 &&  /* TOLSHEET TOL-QP-UNBDIR */
+                primal_feasible(qp, x) &&              /* TOLSHEET TOL-QP-PRIMAL */
                 curvature_nonpositive(qp, p, qnorm)) {  /* TOLSHEET TOL-QP-CURV */
                 int ray = 1;
                 for (int i = 0; i < m && ray; i++)

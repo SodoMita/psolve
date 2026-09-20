@@ -508,7 +508,8 @@ what a double dot product can resolve, and still `1/13` of the band.  Shrinking
 the constant only relocates that; the rule had to change, not the tolerance.
 
 Two neighbouring holes were found while validating the fix, and are closed with
-it:
+it.  A third part of the same claim turned out not to be a hole in the *rules*
+but a missing gate, and it is fixed here too (see the base point below):
 
 * `src/cert.c`'s `check_qp_unbounded()` mirrored the same band, which is why the
   CLI's existing `PSVK_QP_UNBOUNDED` re-verification *confirmed* the ray instead
@@ -521,6 +522,17 @@ it:
   against row scales of 1e8 (relative 3e-17) -- i.e. the code was already using a
   silent band, and the comment claiming "no tolerance here on purpose" described
   a test it was not running.
+* the **base point** was never checked at all.  A ray is only evidence from a
+  point that is *inside* the feasible set, and the checker has always required
+  that (`check_qp_unbounded`'s first loop); the producer never did, so it
+  certified rays from iterates that had drifted out of the feasible set -- the
+  ratio test only blocks a row the step pushes *into*, and a violated row with
+  `a_i.p <= 0` is never restored.  Every such claim was then refused by the
+  checker and downgraded by the CLI to `KKT_FAIL` with "certificate not
+  confirmed" on stderr.  This one is **not** new: it reproduces on the tree as it
+  was before these ray rules (`PSOLVE_QPSOLVE=<older binary> python3
+  tools/qp_diff.py 200 4242` reports `UNCONFIRMED=1`, `it=21 [singular]`), and it
+  was invisible because nothing counted it.
 
 **What changed** (`src/qp.c`, `src/cert.c`; `tools/qp_ray_test.c` pins it):
 
@@ -546,6 +558,43 @@ it:
   ray check uses 1e-9 relative (`TOL-CERT-DEFDJ`) because a simplex ray is a
   basis direction, and on this family a 1e-9-relative slope would be 1e8 per unit
   step, which the data does not resolve.
+* **The base point joins the certificate** (`primal_feasible()`, `TOL-QP-PRIMAL`).
+  The engine now has exactly one notion of "this point is in the feasible set" --
+  the rule the OPTIMAL verdict has always answered to -- and the ray path asks it
+  before building a ray, so the producer never emits evidence its own checker
+  must reject.  The gate is deliberately *tighter* than the checker's version of
+  the same test (the checker scales by `1 + |b_i| + |a_i|^T |x|`, the engine by
+  `1 + |b_i|`): tighter implies looser, so a base point admitted here cannot be
+  refused there for its point, and the implication does not depend on the two
+  written orders having identical rounding.  Per model over the six sweeps
+  (2000 models, `tools/qp_status_diff.py` against the same tree without the gate
+  -- zero objectives changed and no model moved except these):
+
+  | config | what moved |
+  |---|---|
+  | 400/99001 default | *nothing at all* (400/400 identical) |
+  | 200/4242 default | `it=65 [singular]` 3 -> 2: the refused ray is gone |
+  | 200/4242 LP-first | `it=65 [singular]` 3 -> 2: the refused ray is gone |
+  | 600/777 default | `it=70 [zero]` 3 -> 2: the refused ray is gone |
+  | 600/777 LP-first | `it=70 [zero]` 3 -> 2 (gone); `it=334 [zero]` 3 -> **1** (a different, confirmed ray is now found at a later iterate) |
+  | 400/99001 LP-first | `it=34`, `it=178` (`zero`) 1 -> 2: two *confirmable* certificates dropped, because their base points sit between the engine's `1e-7*(1+|b|)` and the checker's looser `1e-7*row_scale` |
+
+  So the gate removes all five producer/checker disagreements (three distinct
+  models across the four configs) and costs exactly two certificates, on the one
+  sweep where the two windows disagree (`checked` 297 -> 295).  The deeper fix
+  for those two -- and for the models that now run to the iteration limit --
+  is *feasibility restoration*: the active set is a pure null-space method, so
+  once an iterate drifts out of the feasible set nothing pulls it back, and a
+  restoration (or a Phase-I re-entry) would recover both the certificates and
+  the ~4900-iteration runs.  That is a solver change, not a certificate change,
+  and the gate is the honest interim: the engine does not claim what it cannot
+  certify.
+* `tools/qp_diff.py` now counts that failure mode separately (`UNCONFIRMED`, from
+  the CLI's own "certificate not confirmed" stderr line) and `test.sh` gates both
+  sweeps on `WRONG=0 UNCONFIRMED=0`; a sweep can no longer pass while the engine
+  emits evidence its checker refuses.  `tools/qp_ray_test.c` section [F] pins it
+  on two frozen models from those sweeps, one of them `Q = 0` so that the base
+  point is the *only* thing wrong with the evidence.
 * `tools/qp_ray_test.c` freezes the failing model, both rays the old rule
   certified on it, a rounding-level curvature gadget (sign decided at +-1e-15)
   and the row window's two sides; `test.sh` gates it at `[5.16/7]` together with
@@ -561,12 +610,19 @@ it:
 |---|---|---|
 | default, 400/99001 | `checked=311 WRONG=0`; zero/1=55, singular/1=17, diag0/1=38; limit-unbounded=64 | `checked=322 WRONG=0`; zero/1=**84**, singular/1=2, diag0/1=35; limit-unbounded=54 |
 | default, 200/4242 | `checked=164 WRONG=0`; zero/1=32, singular/1=7, diag0/1=13 | `checked=162 WRONG=0`; zero/1=**40**, singular/1=1, diag0/1=9 |
-| LP-first, 400/99001 | `checked=290 **WRONG=1**` (it=53) | `checked=297 WRONG=0`; it=53 is now `status 2` |
+| LP-first, 400/99001 | `checked=290 **WRONG=1**` (it=53) | `checked=295 WRONG=0`; it=53 is now `status 2` |
 | LP-first, 200/4242 | `checked=156 WRONG=0` | `checked=152 WRONG=0` |
 
-Every certified ray was then re-checked in exact rational arithmetic over five
-sweeps (2200 models, 638 certified rays): `p'Qp <= 0` exactly, and every row
-inside the documented window -- 0 exceptions.  Note where the numbers *moved up*:
+All four sweeps also report `UNCONFIRMED=0` (no engine evidence refused by the
+certificate layer) on the final tree, where the same sweeps on the tree before
+these changes report `UNCONFIRMED=1` (200/4242, `it=65 [singular]`) -- and the
+tree before *that* reports `UNCONFIRMED=1` on 200/4242 as well (`it=21`), which
+is where the base-point hole came from.
+
+Every certified ray was then re-checked in exact rational arithmetic over six
+sweeps (2400 models, 682 certified rays): `p'Qp <= 0` exactly, every row inside
+the documented window, and every one of them confirmed by the checker -- 0
+exceptions.  Note where the numbers *moved up*:
 the explicit row window certifies 29 more `zero`-family models on 400/99001 than
 the silent `> 0.0` test did, because those rays' row slopes are a rounding-level
 positive in the *computed* sum and a genuine zero in the data.
@@ -594,6 +650,11 @@ back out in `tools/qp_diff.py`'s `.qp` format, bit for bit):
     PSOLVE_QP_PHASE1_LP_FIRST=1 ./qpsolve /tmp/case53.qp
                                                   # was STATUS 1 (unbounded); now STATUS 2
     PSOLVE_QP_PHASE1_LP_FIRST=1 python3 tools/qp_diff.py 400 99001
+    python3 tools/qp_diff.py 200 4242                 # must print UNCONFIRMED=0
+    python3 tools/qp_status_diff.py 200 4242 <older-qpsolve> ./qpsolve
+                                                      # which models a change moved
+    PSOLVE_QPSOLVE=/path/to/an/older/qpsolve python3 tools/qp_diff.py 200 4242
+                                                  # ... it prints UNCONFIRMED=1 and exits 1
 
 ### P0.3  Budgets that actually bind, and determinism-friendly ones  — the binding part and the start-order knob are done (1.10): the wall-clock budget survives Phase-I and `QP.phase1_order` lets a caller choose which rescue runs first, and the one-sided flatness band that the knob exposed is fixed (1.12). Open: iteration caps as the deterministic budget, and the persistent handle
 

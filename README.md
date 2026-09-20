@@ -400,10 +400,12 @@ objectives with a reference solver -- they check the **status** and validate the
 - `mip_diff` requires the printed solution to be integral, inside its bounds,
   to satisfy every row, and to evaluate to the reported objective, and it
   compares the status against exhaustive enumeration of the integer box.
-- the QP's `UNBOUNDED` verdict has to survive its own certificate: the ray is
-  re-verified over the caller's `Q`/`A`/`b` by an independent checker, with
-  non-positive curvature decided in double-double rather than by a tolerance
-  band (`tools/qp_ray_test.c`, `docs/CURV_PS_PLAN.md` 1.12).
+- the QP's `UNBOUNDED` verdict has to survive its own certificate: the base
+  point, the ray's curvature and its rows are re-verified over the caller's
+  `Q`/`A`/`b` by an independent checker, with non-positive curvature decided in
+  double-double rather than by a tolerance band, and the sweep gates require that
+  the engine never emit evidence that checker refuses (`UNCONFIRMED=0`;
+  `tools/qp_ray_test.c`, `docs/CURV_PS_PLAN.md` 1.12).
 - `qp_diff` certifies with the KKT conditions plus an exact LP recession test,
   so it does not depend on a second optimizer converging, and it separates
   "hit the iteration limit on a genuinely unbounded problem" from a real gap.

@@ -59,7 +59,11 @@
  *                        cancellation scale, because d is a computed direction
  *                        whose last bits are not evidence.  A ray refused by
  *                        either test costs the UNBOUNDED verdict and nothing
- *                        else (no wrong answer is manufactured).
+ *                        else (no wrong answer is manufactured).  The base
+ *                        point x must be primal feasible too, judged here over
+ *                        each row's activity scale and by the engine over the
+ *                        tighter 1e-7*(1+|b_i|) -- a ray is only evidence from
+ *                        a point inside the feasible set.
  *   PSVK_QP_INFEASIBLE   the row system Ax <= b of a QP model is empty, from a
                         Farkas multiplier vector in `ray` (m).  Checked over the
                         QP's own dense row-major A and rhs -- no LP view, no
