@@ -93,6 +93,10 @@ typedef struct {
 
     /* controls / stats */
     long iters;
+    long dual_iters;         /* how many of those were dual-simplex pivots */
+    long refreshes;          /* warm solves that degraded to a clean re-solve */
+    long dual_certs;         /* dual infeasibility detections proven by the
+                                directed-rounding box certificate */
     int phase;
     int reinvert_interval;
     double hyper_tol;      /* hyper-sparsity skip threshold for PRICE */
@@ -114,6 +118,18 @@ typedef struct {
                               optimum, so B^{-T} c_B is a valid Farkas-ray
                               HINT -- see solver_farkas_duals.  Cleared at the
                               start of every solve. */
+    /* dual-simplex infeasibility state (roadmap 7.2): the last warm solve
+       returned INFEASIBLE from a certified dual-simplex detection -- the
+       dual ratio test found no candidate for leaving slot dfarkas_slot
+       (direction dfarkas_dir), so row dfarkas_slot of B^{-1} (times the
+       direction) is an exact-arithmetic Farkas ray over the current box,
+       already re-proven with directed rounding before the verdict was
+       issued.  The basis and LU/eta factors left behind are the detection
+       basis, so the ray can be re-materialized on demand -- see
+       solver_dual_farkas.  Cleared at the start of every solve. */
+    int dfarkas_ok;
+    int dfarkas_slot;
+    int dfarkas_dir;
     int negate_obj;        /* original problem was a minimization */
     /* steepest-edge (Goldfarb-Reid) pricing weights */
     double *w;             /* w[j] ~ ||d_j||^2 for nonbasic j */
@@ -206,6 +222,20 @@ int solver_unbounded_ray(const Solver *s, double *ray);
  * fail such a check, never fabricate one.  Returns 0 on success, -1 if no
  * Phase-I-infeasible state is available.  Fills y[0..M). */
 int solver_farkas_duals(Solver *s, double *y);
+
+/* Materialize the Farkas-ray HINT left behind by a dual-simplex INFEASIBLE
+ * verdict from solver_warm_solve (dfarkas_ok == 1): the detection-time
+ * pivot row of B^{-1} signed by the leaving direction, one component per
+ * equality row, in the same scaled-row space as solver_farkas_duals
+ * (multiply component i by s->mlt[i] for the original row i; the
+ * equilibration diagonal is already composed in like solver_farkas_duals).
+ *
+ * Same discipline as solver_farkas_duals: the ray is evidence, not a proof
+ * -- the caller MUST re-verify the Farkas conditions against ITS original
+ * data (solver_farkas_boxcert); a wrong or stale hint can only fail such a
+ * check, never fabricate one.  Returns 0 on success, -1 when no
+ * dual-infeasible state is available.  Fills y[0..M). */
+int solver_dual_farkas(Solver *s, double *y);
 
 /* Directed-rounding Farkas box check over the ORIGINAL rows and a given
  * variable box, O(m + nnz).  `ys` is a candidate dual ray in the solver's

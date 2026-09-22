@@ -316,6 +316,9 @@ typedef struct {
     double *fzhi;
     long    farkas_certs;  /* nodes certified infeasible by the Farkas path */
     long    fx_solves;     /* relaxations handed to the exact fx solver */
+    long    lp_iters;      /* simplex iterations consumed across all nodes
+                              (cold solves, warm re-solves and the refresh
+                              fallbacks they subsume: deltas of s->iters) */
 } MipWarm;
 
 /* build an LP from the MIP with per-node tightened bounds, and solve it;
@@ -350,6 +353,8 @@ static int solve_relaxation(const MIP *mip, const Node *node, MipWarm *ws,
 
     Solver *s;
     int r;
+    long iters_before = 0;
+    if (ws->started) iters_before = ws->s->iters;
     if (!ws->started) {
         LP lp;
         memset(&lp, 0, sizeof(lp));
@@ -386,6 +391,7 @@ static int solve_relaxation(const MIP *mip, const Node *node, MipWarm *ws,
         solver_set_bounds(s, lo, hi);
         r = solver_warm_solve(s);
     }
+    if (s) ws->lp_iters += s->iters - iters_before;
     int status = r;
     if (r == 0) {
         double *xo = (double*)psolve_malloc((size_t)n * sizeof(double));
@@ -394,17 +400,27 @@ static int solve_relaxation(const MIP *mip, const Node *node, MipWarm *ws,
         psolve_free(xo);
     } else if (r == SOLVE_NUMERICAL || r == 1) {
         int need_exact = 1;
-        if (r == 1 && mip->m > 0 && s->farkas_ok) {
-            /* Farkas fast path: pull the Phase-I dual ray as a hint and prove
-               (or fail to prove) infeasibility against the ORIGINAL rows and
-               node box with directed rounding.  A certified node prunes for
-               O(nnz) instead of paying the exact-rational re-solve; any hint
-               the re-verification rejects (sign-incoherent, numerically
-               poisoned, margin-borderline) falls through to the exact path
-               unchanged, so this cannot alter a verdict.  (2026-08-15(3)
-               instrumentation: 121 of 122 tsp5 exact re-solves were
-               duality-level infeasibility -- precisely this case.) */
-            if (solver_farkas_duals(s, ws->fy) == 0 &&
+        if (r == 1 && mip->m > 0 && (s->farkas_ok || s->dfarkas_ok)) {
+            /* Farkas fast path: pull the infeasibility dual ray as a hint and
+               prove (or fail to prove) infeasibility against the ORIGINAL
+               rows and node box with directed rounding.  Two ray sources,
+               same HINT discipline: the Phase-I-optimal duals of a cold or
+               refreshed solve (solver_farkas_duals) and the leaving-row ray
+               of a certified dual-simplex detection from a warm solve
+               (solver_dual_farkas, roadmap 7.2 -- dual runs certify their
+               own infeasibility in engine space before verdict 1, so this
+               lane re-proves it against node-box data at MIP margins).  A
+               certified node prunes for O(nnz) instead of paying the
+               exact-rational re-solve; any hint the re-verification rejects
+               (sign-incoherent, numerically poisoned, margin-borderline)
+               falls through to the exact path unchanged, so this cannot
+               alter a verdict.  (2026-08-15(3) instrumentation: 121 of 122
+               tsp5 exact re-solves were duality-level infeasibility --
+               precisely this case.) */
+            int have_ray = s->farkas_ok
+                ? (solver_farkas_duals(s, ws->fy) == 0)
+                : (solver_dual_farkas(s, ws->fy) == 0);
+            if (have_ray &&
                 mip_farkas_certified(mip, lo, hi, ws->fy, s->mlt,
                                      ws->fyc, ws->fzlo, ws->fzhi)) {
                 status = 1;      /* certified infeasible: skip the re-solve */
@@ -919,6 +935,7 @@ void mip_solve(const MIP *mip, MIPResult *res)
     res->nodes = nodes;
     res->best_bound = best_bound;
     res->farkas_certs = ws.farkas_certs;
+    res->lp_iters = ws.lp_iters;
     res->fx_solves = ws.fx_solves;
     /* `obj` is a proven optimum only if nothing cut the search short: no node
        or iteration limit, no cooperative stop, and no stop_at_feasible. */

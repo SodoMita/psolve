@@ -98,6 +98,17 @@ gcc -O2 -march=native -I src -I tools tools/psw_test.c tools/psolve_web.c \
 # the true box optima); post-change it must see 0, keep 120 asymmetric/tiny-
 # perturbation over-refusals paperwork-free, and not over-block scale-mixed
 # genuine PSD.  Hard gate: rc matters.
+echo "[5.2/7] Dual simplex warm-restart battery (roadmap 7.2)..."
+# Bounded-variable dual simplex behind solver_set_*: verdict parity against
+# fresh cold solves on 2x4000 random LPs (tighten / widen / pin->widen
+# lanes), bit-deterministic state hashes; declines are only tolerated where
+# the untouched pre-change engine produces the identical decline (see
+# docs/DUAL7_NOTES.md).  rc matters: any warm-vs-fresh verdict disagreement
+# aborts the suite.
+gcc -O2 -march=native -I src tools/dual_test.c src/solver.c src/splu.c src/lu.c src/kernels.c src/err.c -o /tmp/dual_test -lm
+/tmp/dual_test 4000 20260921 >/dev/null && echo "  dual_test seed=20260921: ALL OK"
+/tmp/dual_test 4000 424242 >/dev/null && echo "  dual_test seed=424242:   ALL OK"
+
 python3 tools/qp_psd_verify.py 120 20260815 || { echo "qp_psd_verify: FAIL"; exit 1; }
 
 echo "[5.15/7] QP infeasibility proof through the unified evidence checker (roadmap 6.4)..."
