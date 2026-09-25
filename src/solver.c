@@ -26,6 +26,9 @@ static void get_col(const Solver *s, int var, double *out);
 static void refactorize(Solver *s);
 static void recompute_basic(Solver *s);
 static void solver_reset_to_initial(Solver *s);
+static void price(Solver *s);
+static int dual_phase(Solver *s);
+static int dual_cert_infeasible(Solver *s);
 
 /* ------------------------------------------------------------------ */
 /* Construction                                                        */
@@ -788,6 +791,22 @@ int solver_farkas_duals(Solver *s, double *y)
     return 0;
 }
 
+int solver_dual_farkas(Solver *s, double *y)
+{
+    if (!s || !y || !s->dfarkas_ok || s->M <= 0) return -1;
+    /* The dual-infeasible verdict left the DETECTION basis (and its LU/eta
+       factors) untouched: dual_iterate returned before pivoting and the
+       engine-space certification only read them, so row dfarkas_slot of
+       B^{-1} -- signed by the leaving direction -- re-materializes here as
+       exactly the ray the box certificate already proved. */
+    for (int i = 0; i < s->M; i++) y[i] = 0.0;
+    y[s->dfarkas_slot] = (double)s->dfarkas_dir;
+    btrans(s, y);
+    /* same output-space contract as solver_farkas_duals */
+    for (int i = 0; i < s->M; i++) y[i] *= s->rscale[i];
+    return 0;
+}
+
 int solver_farkas_boxcert(int n, int m, const int *colptr, const int *row,
                           const double *val, const char *rel, const double *b,
                           const double *lo, const double *hi, const double *ys,
@@ -1330,6 +1349,252 @@ static void recompute_basic(Solver *s)
     psolve_free(rhs);
 }
 
+/* ------------------------------------------------------------------ */
+/* Bounded-variable dual simplex (roadmap 7.2).                        */
+/*                                                                      */
+/* After solver_set_bounds + solver_warm_solve the previous optimal     */
+/* basis is still DUAL feasible (reduced costs do not depend on the     */
+/* bounds) but typically PRIMAL infeasible (a basic variable violates   */
+/* its tightened bound).  That is exactly the dual simplex starting     */
+/* condition: keep dual feasibility throughout and pivot basic          */
+/* bound-violations away.  Convention matches the primal engine:        */
+/* maximize form, rc_j = c_j - y^T A_j, nonbasic at lower (NBL) /       */
+/* upper (NBU).                                                         */
+/* ------------------------------------------------------------------ */
+
+/* One dual iteration.  Requires: current factorization, rc[] priced from
+   the true objective, and the basis dual feasible.
+   Returns 0 = primal feasible (optimal for the warm basis), 1 = continue,
+   2 = dual unbounded (primal infeasible; the leaving row in
+   dfarkas_slot/dfarkas_dir is an exact-arithmetic Farkas ray over the
+   current box), SOLVE_NUMERICAL = the factorization/freshness state can
+   no longer be trusted. */
+static int dual_iterate(Solver *s)
+{
+    int M = s->M, N = s->N;
+
+    price(s);
+
+    /* Leaving variable: the basic variable with the worst scaled bound
+       violation.  D = +1: x_bv is below its lower bound and must increase
+       (it will leave to NBL); D = -1: above its upper bound (leaves NBU). */
+    int p = -1, D = 0, bv = -1;
+    double worst = 0.0;
+    for (int i = 0; i < M; i++) {
+        int j = s->basis[i];
+        double xb = s->x[j];
+        double tol_lo = TOL_FEAS * (1.0 + fabs(s->l[j]));
+        double tol_hi = TOL_FEAS * (1.0 + fabs(s->u[j]));
+        double v, sc;
+        if (xb < s->l[j] - tol_lo)      { v = s->l[j] - xb; sc = v / (1.0 + fabs(s->l[j])); }
+        else if (xb > s->u[j] + tol_hi) { v = xb - s->u[j]; sc = v / (1.0 + fabs(s->u[j])); }
+        else continue;
+        if (sc > worst) { worst = sc; p = i; bv = j; D = (xb < s->l[j]) ? 1 : -1; }
+    }
+    if (p < 0) return 0;   /* primal feasible: dual feasibility maintained
+                              throughout, so this basis is optimal */
+
+    /* Pivot row: pi = row p of B^{-1} (BTRAN of e_p). */
+    memset(s->piw, 0, (size_t)M * sizeof(double));
+    s->piw[p] = 1.0;
+    btrans(s, s->piw);
+    const double *pi = s->piw;
+
+    /* Dual minimum-ratio test.  For a nonbasic variable j let sigma = +1
+       (at lower) or -1 (at upper) be its off-bound move direction, g_j =
+       sigma * (pi . A_j) the induced rate of change of x_bv per unit
+       off-bound move, and rc_hat = sigma * rc_j its off-bound reduced cost
+       (rc_hat <= 0 is exactly dual feasibility, maximize form).  Moving
+       entering variable q off its bound by t changes x_bv by -g_q * t, so
+       restoring x_bv in direction D needs D*g_q < 0; keeping every rc_hat'
+       <= 0 limits the step to the minimum normalized ratio
+       rho_j = D*rc_hat_j / g_j  (>= 0 in exact arithmetic). */
+    int q = -1, sq = 0;
+    double bestrho = LP_INF;
+    int first_art = N - M;
+    int saw_neg_ratio = 0;
+    for (int j = 0; j < N; j++) {
+        char st = s->status[j];
+        if (st == LP_BASIC || st == LP_REMOVED) continue;
+        if (j >= first_art) continue;                 /* artificials never enter */
+        if (s->u[j] - s->l[j] <= TOL_FEAS) continue;  /* fixed var */
+        int sj = (st == LP_NBU) ? -1 : 1;
+        long nnz = (long)(s->colptr[j+1] - s->colptr[j]);
+        double alpha = k_dsdot_sparse(pi, s->row + s->colptr[j],
+                                      s->val + s->colptr[j], nnz, 0.0);
+        double g = sj * alpha;
+        if ((double)D * g >= -TOL_PIV) continue;      /* cannot move x_bv the needed way */
+        double rchat = sj * s->rc[j];
+        double rho = (double)D * rchat / g;
+        if (rho < 0.0) {
+            /* tolerance-class negatives clamp to a degenerate step; a real
+               negative ratio means the dual-feasibility invariant was lost
+               to rounding -- flag it for the drift recovery below. */
+            if (rho > -1e-9 * (1.0 + fabs(rchat))) rho = 0.0;  /* TOLSHEET TOL-LP-DUALRHO */
+            else { saw_neg_ratio = 1; continue; }
+        }
+        if (rho < bestrho) { bestrho = rho; q = j; sq = sj; }
+    }
+    if (q < 0) {
+        if (saw_neg_ratio) {
+            /* Lost the dual invariant numerically: rebuild the factors and
+               the exact basic values, then let the loop re-price. */
+            refactorize(s);
+            recompute_basic(s);
+            return 1;
+        }
+        /* No entering variable can restore row p: in exact arithmetic the
+           box is provably empty (the pivot row is a Farkas ray).  Record
+           the detection state; certification happens in dual_phase. */
+        s->dfarkas_slot = p;
+        s->dfarkas_dir  = D;
+        return 2;
+    }
+
+    /* Harris pass: among the candidates within a relaxation of the minimum
+       ratio, pick the largest |g| for pivot stability. */
+    {
+        double relax = 1e-9 * (1.0 + bestrho);  /* TOLSHEET TOL-LP-RELAX */
+        int bq = -1, bsq = 0;
+        double bestg = 0.0;
+        for (int j = 0; j < N; j++) {
+            char st = s->status[j];
+            if (st == LP_BASIC || st == LP_REMOVED) continue;
+            if (j >= first_art) continue;
+            if (s->u[j] - s->l[j] <= TOL_FEAS) continue;
+            int sj = (st == LP_NBU) ? -1 : 1;
+            long nnz = (long)(s->colptr[j+1] - s->colptr[j]);
+            double alpha = k_dsdot_sparse(pi, s->row + s->colptr[j],
+                                          s->val + s->colptr[j], nnz, 0.0);
+            double g = sj * alpha;
+            if ((double)D * g >= -TOL_PIV) continue;
+            double rchat = sj * s->rc[j];
+            double rho = (double)D * rchat / g;
+            if (rho < 0.0) rho = 0.0;
+            if (rho <= bestrho + relax && fabs(g) > bestg) {
+                bestg = fabs(g); bq = j; bsq = sj;
+            }
+        }
+        if (bq >= 0) { q = bq; sq = bsq; }
+    }
+
+    /* FTRAN the entering column, pivot, and update. */
+    get_col(s, q, s->d);
+    ftran(s, s->d);
+    double gq = sq * s->d[p];
+    double tgt = (D > 0) ? s->l[bv] : s->u[bv];
+    if ((double)D * gq >= -TOL_PIV * (1.0 + fabs(s->d[p]))) {
+        /* row/column views of the same pivot disagree: drifted factors. */
+        refactorize(s);
+        recompute_basic(s);
+        return 1;
+    }
+    double t = (s->x[bv] - tgt) / gq;
+    if (!isfinite(t)) { refactorize(s); recompute_basic(s); return 1; }
+    if (t < 0.0) {
+        if (t < -1e-6 * (1.0 + fabs(s->x[bv]))) {  /* TOLSHEET TOL-LP-DUALSTEP */
+            refactorize(s);
+            recompute_basic(s);
+            return 1;
+        }
+        t = 0.0;
+    }
+    /* In the bounded dual simplex the entering variable may cross its whole
+       box in one step: it becomes BASIC and is then allowed to be primal
+       infeasible, exactly like every other basic in this algorithm. */
+    for (int i = 0; i < M; i++)
+        if (i != p) s->x[s->basis[i]] -= sq * s->d[i] * t;
+    s->x[bv] = tgt;
+    s->status[bv] = (D > 0) ? LP_NBL : LP_NBU;
+    s->x[q] = (sq > 0 ? s->l[q] : s->u[q]) + (double)sq * t;
+    s->status[q] = LP_BASIC;
+    s->basis[p] = q;
+    s->basispos[q] = p;
+    s->basispos[bv] = -1;
+    push_eta(s, p, s->d);
+
+    s->iters++;
+    s->dual_iters++;
+
+    if (s->eta_count >= s->reinvert_interval) {
+        refactorize(s);
+        /* re-derive the basic values from the nonbasic ones so numerical
+           drift cannot accumulate inside a long dual run */
+        recompute_basic(s);
+    }
+    return 1;
+}
+
+/* Dual phase driver.  Returns 0 = optimal (primal feasibility restored),
+   2 = dual unbounded (primal infeasible, detection state in dfarkas_*),
+   -1 = iteration budget exhausted (honest limit), -2 = degenerate plateau
+   (cycling risk: the caller falls back to a clean re-solve),
+   SOLVE_STOPPED / SOLVE_NUMERICAL as usual. */
+static int dual_phase(Solver *s)
+{
+    long cap = s->iteration_limit > 0 ? s->iteration_limit : 2000000;
+    long local = 0, poll = 0, flat = 0;
+    double last = LP_INF;
+    int r;
+    for (;;) {
+        r = dual_iterate(s);
+        if (r == SOLVE_NUMERICAL) return SOLVE_NUMERICAL;
+        if (r != 1) return r;            /* 0 optimal, 2 dual unbounded */
+        if (++local > cap) return -1;
+        if ((++poll & 255) == 0 && psolve_stop()) return SOLVE_STOPPED;
+        /* For maximize the warm point is superoptimal: its objective (the
+           dual bound) strictly decreases on every non-degenerate pivot.  A
+           long plateau is the documented cycling hazard, surfaced honestly
+           instead of spinning. */
+        double obj = 0.0;
+        for (int j = 0; j < s->N; j++)
+            if (s->status[j] != LP_REMOVED) obj += s->cobj[j] * s->x[j];
+        if (obj < last - 1e-9 * (1.0 + fabs(last))) flat = 0;  /* TOLSHEET TOL-LP-FLAT */
+        else flat++;
+        last = obj;
+        if (flat > 500) return -2;
+    }
+}
+
+/* Directed-rounding re-proof of a dual-simplex infeasibility detection.
+   dual_iterate showed (in floating point) that no off-bound nonbasic move
+   can pull row p's basic variable back into its box, i.e.
+       min_box (y^T A) x  >  y^T b      for  y = D * (row p of B^-1) .
+   That claim is independent of how y was found, and the shared Farkas box
+   certificate re-verifies it from raw data (removed/pinned columns boxed
+   at [0,0]; original relation signs passed so provably-unusable components
+   can be clamped to zero, weakening but never strengthening the ray).
+   A decline means only "cannot say": the caller pays a clean re-solve.
+   Returns 1 iff infeasibility of the current engine box is PROVEN. */
+static int dual_cert_infeasible(Solver *s)
+{
+    int M = s->M, N = s->N;
+    if (M <= 0 || N <= 0) return 0;
+    double *ray = (double*)xmalloc((size_t)M * sizeof(double));
+    char   *rel = (char*)xmalloc((size_t)M);
+    int    *one = (int*)xmalloc((size_t)M * sizeof(int));
+    double *lo  = (double*)xmalloc((size_t)N * sizeof(double));
+    double *hi  = (double*)xmalloc((size_t)N * sizeof(double));
+    double *yc  = (double*)xmalloc((size_t)M * sizeof(double));
+    double *zl  = (double*)xmalloc((size_t)N * sizeof(double));
+    double *zh  = (double*)xmalloc((size_t)N * sizeof(double));
+    memset(ray, 0, (size_t)M * sizeof(double));
+    ray[s->dfarkas_slot] = (double)s->dfarkas_dir;   /* D * e_p */
+    btrans(s, ray);                                  /* D * (row p of B^-1) */
+    for (int i = 0; i < M; i++) { rel[i] = s->rel[i]; one[i] = 1; }
+    for (int j = 0; j < N; j++) {
+        if (s->status[j] == LP_REMOVED) { lo[j] = 0.0; hi[j] = 0.0; }
+        else { lo[j] = s->l[j]; hi[j] = s->u[j]; }
+    }
+    int ok = solver_farkas_boxcert(N, M, s->colptr, s->row, s->val,
+                                   rel, s->beq, lo, hi, ray, one,
+                                   TOL_FEAS, yc, zl, zh);
+    psolve_free(ray); psolve_free(rel); psolve_free(one);
+    psolve_free(lo); psolve_free(hi);
+    psolve_free(yc); psolve_free(zl); psolve_free(zh);
+    return ok;
+}
+
 static int solve_phase(Solver *s)
 {
     int r;
@@ -1348,10 +1613,10 @@ static int solve_phase(Solver *s)
 static int solver_solve_impl(Solver *s)
 {
     int r = 0;
-    /* The Phase-I-infeasibility marker below is only valid for the solve
-       currently running: clear it on entry so a stale certificate state can
-       never be attributed to a later verdict. */
-    s->farkas_ok = 0; s->unb_valid = 0;
+    /* The infeasibility markers below are only valid for the solve currently
+       running: clear them on entry so stale certificate state can never be
+       attributed to a later verdict. */
+    s->farkas_ok = 0; s->unb_valid = 0; s->dfarkas_ok = 0;
     /* Empty box => INFEASIBLE, certified by construction: a variable with
        l[j] > u[j] admits no assignment at all, so no constraint examination
        is needed.  Without this up-front verdict a contradictory box (the
@@ -1685,12 +1950,17 @@ static int solver_export_lp(const Solver *s, const double *new_a,
 static void solver_refresh(Solver *s)
 {
     LP lp;
+    /* the struct swap below transplants the fresh solver's counters into *s,
+       so count the refresh AFTER it (an early-exit keeps its own ++) */
+    long nref = s->refreshes + 1;
     if (solver_export_lp(s, NULL, 0.0, 0, &lp) != 0) {
+        s->refreshes = nref;
         s->status_out = SOLVE_NUMERICAL;
         return;
     }
     Solver *fresh = solver_create_opts(&lp, s->scale_mode);
     if (!fresh) {
+        s->refreshes = nref;
         free_exported_lp(&lp);
         s->status_out = SOLVE_NUMERICAL;
         return;
@@ -1699,7 +1969,14 @@ static void solver_refresh(Solver *s)
     fresh->reinvert_interval = s->reinvert_interval;
     fresh->hyper_tol = s->hyper_tol;
     solver_solve(fresh);
+    /* the refresh pays for a full solve's pivots: keep the cumulative
+       statistics honest across the struct transplant below */
+    long it_total = s->iters + fresh->iters;
+    long dit_total = s->dual_iters + fresh->dual_iters;
+    long dc_total = s->dual_certs + fresh->dual_certs;
     Solver hold = *fresh; *fresh = *s; *s = hold;
+    s->iters = it_total; s->dual_iters = dit_total; s->dual_certs = dc_total;
+    s->refreshes = nref;
     solver_destroy(fresh);
     free_exported_lp(&lp);
 }
@@ -1711,9 +1988,9 @@ static void solver_refresh(Solver *s)
 int solver_warm_solve(Solver *s)
 {
     if(!s)return SOLVE_INVALID;
-    /* same invalidation rule as solver_solve_impl: the marker describes only
+    /* same invalidation rule as solver_solve_impl: the markers describe only
        the verdict currently being produced */
-    s->farkas_ok = 0; s->unb_valid = 0;
+    s->farkas_ok = 0; s->unb_valid = 0; s->dfarkas_ok = 0;
     if (s->rebuild_pending) {
         solver_refresh(s);
         return s->status_out;
@@ -1724,10 +2001,144 @@ int solver_warm_solve(Solver *s)
         if (s->l[j] > s->u[j]) { s->status_out = 1; return 1; }
     }
     s->phase = 2;
+    /* Restore the true objective: a previous Phase-I terminal (INFEASIBLE)
+       may have left the artificial-cost vector in cobj, and no code path
+       below re-establishes it.  c0 always holds the true coefficients. */
+    memcpy(s->cobj, s->c0, (size_t)s->N * sizeof(double));
     s->bland = 0; s->flat = 0; s->last_obj = -LP_INF;
     refactorize(s);
-    recompute_basic(s);     /* restore primal feasibility for the current basis */
-    int r = solve_phase(s);
+    /* Nonbasic box repair: solver_set_bounds may have tightened a bound past
+       the value a NONBASIC variable is parked at.  The whole simplex state
+       rests on "nonbasic == sitting at its status bound", so snap such
+       values into the current box before recompute_basic reads them --
+       otherwise the warm start describes a point that never existed (the
+       pre-7.2 code then pivoted garbage until the final certificate bounced
+       the whole solve into solver_refresh).  The STATUS must follow the
+       snapped bound, not just the value: the dual ratio test derives its
+       off-bound sign from LP_NBL/LP_NBU, and a status parked on the wrong
+       side feeds it a flipped reduced-cost sign, silently breaking dual
+       feasibility and fabricating false optima (caught by the dual_bench
+       fresh-check: a warm chain reporting x-0.22 against a true x-3.15). */
+    for (int j = 0; j < s->N; j++) {
+        char st = s->status[j];
+        if (st == LP_BASIC || st == LP_REMOVED) continue;
+        double lj = s->l[j], uj = s->u[j], xj = s->x[j];
+        if (xj < lj) xj = lj;
+        if (xj > uj) xj = uj;
+        /* Status reconciliation, not just value snapping: the status must
+           NAME THE BOUND the value is actually parked on.  A variable that
+           left the basis at [1,1] (NBL at 1) and whose lower bound a later
+           solver_set_bounds widened back to 0 still carries x==u: trusting
+           its stale NBL makes the dual gate and ratio test evaluate the
+           off-bound sign into the interior, i.e. the one direction that
+           matters for optimality is mis-signed -- a fabricated "dual
+           feasible" state and a provably false optimum (dual_bench, kd=20
+           node=96: warm -0.220381 vs fresh -3.154291 on identical boxes).
+           An interior value contradicts the invariant too; snap it to the
+           nearer bound, ties to the lower bound. */
+        if (uj - lj <= TOL_FEAS)  { xj = lj; s->status[j] = LP_NBL; }
+        else if (xj - lj <= uj - xj) { xj = lj; s->status[j] = LP_NBL; }
+        else                         { xj = uj; s->status[j] = LP_NBU; }
+        s->x[j] = xj;
+    }
+    recompute_basic(s);     /* exact basic values for the current basis+box */
+
+    /* Warm-start safety: only a Phase-II-shaped basis may seed a warm
+       re-solve.  A NON-OPTIMAL terminal (Phase-I infeasible, an unbounded
+       ray, an aborted solve) leaves LIVE artificial columns -- not REMOVED,
+       not pinned -- in play: those columns relax the equality form (any box
+       becomes "feasible" once an artificial may absorb the row residual),
+       and the solution certificate solver_feasible() cannot see the fraud
+       because artificial columns are part of the equality form it checks.
+       Phase-2 work from such a basis is a fabrication lane for OPTIMAL --
+       the honest answer for "the previous solve did not end optimal" is a
+       clean full re-solve.  ([0,0]-pinned basic artificials at ~0 are
+       legitimate Phase-II leftovers and allowed through.) */
+    {
+        int first_art = s->N - s->M;
+        for (int j = first_art; j < s->N; j++) {
+            if (s->status[j] == LP_REMOVED) continue;
+            if (s->status[j] == LP_BASIC &&
+                s->l[j] == 0.0 && s->u[j] == 0.0 &&
+                fabs(s->x[j]) <= 1e-9) continue;  /* TOLSHEET TOL-LP-ARTPIN */
+            solver_refresh(s);
+            return s->status_out;
+        }
+    }
+
+    /* Roadmap 7.2: bound changes keep the previous basis DUAL feasible
+       (reduced costs are bound-independent), so a bounded-variable dual
+       simplex is the structurally right re-solve -- it pivots away exactly
+       the basic bound violations the tightening created.  Engage it only
+       when the warm basis is genuinely dual feasible for the true
+       objective (after solver_set_objective, or a non-OPTIMAL terminal
+       basis -- unbounded ray, phase-1 infeasible -- it need not be);
+       otherwise fall through to the legacy primal warm path unchanged. */
+    int dual_ok = 1;
+    price(s);
+    for (int j = 0; j < s->N; j++) {
+        char st = s->status[j];
+        if (st == LP_BASIC || st == LP_REMOVED) continue;
+        if (s->u[j] - s->l[j] <= TOL_FEAS) continue;
+        if ((st == LP_NBL && s->rc[j] >  TOL_DJ) ||
+            (st == LP_NBU && s->rc[j] < -TOL_DJ)) { dual_ok = 0; break; }
+    }
+
+    int r;
+    if (dual_ok) {
+        r = dual_phase(s);
+        if (r == 2 && dual_cert_infeasible(s)) {
+            s->dual_certs++;
+            /* Certified dual unboundedness: the box is provably empty, and
+               the detection basis is left in place so the MIP bridge can
+               pull the ray (solver_dual_farkas) as a HINT for its own
+               directed-rounding check against the ORIGINAL rows and node
+               box -- same discipline as the Phase-I ray, without paying
+               for a phase-1 from scratch. */
+            s->dfarkas_ok = 1;
+            s->status_out = 1;
+            return 1;
+        }
+        /* Everything the dual path could not certify degrades to the same
+           honest fallbacks as anywhere else: numeric drift, degenerate
+           plateau, uncertified infeasibility, or an elapsed budget the dual
+           run burned through -- a clean full re-solve decides. */
+        if (r == SOLVE_NUMERICAL) { s->status_out = SOLVE_NUMERICAL; return SOLVE_NUMERICAL; }
+        if (r == SOLVE_STOPPED)   { s->status_out = SOLVE_STOPPED;   return SOLVE_STOPPED; }
+        if (r == -1)              { s->status_out = 3;               return 3; }
+        if (r != 0)               { solver_refresh(s); return s->status_out; }
+        /* r == 0: dual-phase claims primal feasibility was restored while
+           dual feasibility held throughout.  That second half is the whole
+           optimality argument, so verify it before claiming OPTIMAL: the
+           cheap certificate epilogue (one pricing pass) catches any state
+           whose reduced-cost signs drifted off the bounded-variable dual
+           optimum.  A violation is not a wrong answer -- it declines to
+           the same clean re-solve every other "cannot say" takes. */
+        {
+            int opt_ok = 1;
+            price(s);
+            for (int j = 0; j < s->N; j++) {
+                char st = s->status[j];
+                if (st == LP_BASIC || st == LP_REMOVED) continue;
+                if (s->u[j] - s->l[j] <= TOL_FEAS) continue;   /* pinned: sign-free */
+                double rh = (st == LP_NBU) ? -s->rc[j] : s->rc[j];
+                if (rh > TOL_DJ * (1.0 + fabs(s->rc[j]))) { opt_ok = 0; break; }
+            }
+            if (!opt_ok) { solver_refresh(s); return s->status_out; }
+        }
+        int basis_valid = (s->use_sparse && s->sparse_ok) || (!s->use_sparse && s->lu_valid);
+        if (!basis_valid || !solver_feasible(s)) { solver_refresh(s); return s->status_out; }
+        double obj = 0.0;
+        for (int i = 0; i < s->M; i++) obj += s->cobj[s->basis[i]] * s->x[s->basis[i]];
+        for (int j = 0; j < s->N; j++)
+            if (s->status[j] != LP_BASIC && s->status[j] != LP_REMOVED)
+                obj += s->cobj[j] * s->x[j];
+        s->objval = obj;
+        s->status_out = 0;
+        return 0;
+    }
+
+    r = solve_phase(s);
     /* Honest-status parity with solver_solve_impl: an iteration limit, a
        cooperative stop, or a factorization failure must surface as its own
        status, never fall through to the "optimal" return below (the previous
