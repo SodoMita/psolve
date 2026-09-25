@@ -28,9 +28,11 @@
  *   dual_bench [models=40] [base_seed=77031] [node_budget=3000]
  *
  * Diagnostics are env-gated and off by default:
- *   BENCH_FRESHCHECK=1  at every optimal node also solve a FRESH solver on
- *                       the node's box and print MISMATCH when warm and
- *                       fresh objectives disagree beyond 1e-9-relative.
+ *   --strict            self-gating mode: at EVERY optimal node also solve
+ *                       a FRESH solver on the node's box; any warm-vs-fresh
+ *                       objective divergence beyond 1e-9-relative prints
+ *                       evidence and fails the exit code at the end
+ *                       (equivalently BENCH_FRESHCHECK=1, non-gating).
  *   BENCH_GENDEBUG=1    per-model root stats, BENCH_TRACE=1 node walk,
  *   BENCH_CHAIN=1       infeasible-node certificate counter stream,
  *   BENCH_DUMP=kd (+BENCH_DUMP2=node) full engine column dump at a node,
@@ -119,10 +121,18 @@ extern long solver_burned_iters(void);
 
 int main(int argc, char **argv)
 {
-    int models = (argc > 1) ? atoi(argv[1]) : 40;
-    unsigned base = (argc > 2) ? (unsigned)strtoul(argv[2], NULL, 10) : 77031u;
-    long budget = (argc > 3) ? atol(argv[3]) : 3000;
+    int strict = 0;
+    const char *pos[3] = { NULL, NULL, NULL };
+    int np = 0;
+    for (int a = 1; a < argc; a++) {
+        if (!strcmp(argv[a], "--strict")) { strict = 1; continue; }
+        if (np < 3) pos[np++] = argv[a];
+    }
+    int models = pos[0] ? atoi(pos[0]) : 40;
+    unsigned base = pos[1] ? (unsigned)strtoul(pos[1], NULL, 10) : 77031u;
+    long budget = pos[2] ? atol(pos[2]) : 3000;
     long tot_nodes = 0, tot_iters = 0, tot_infeas = 0, tot_bound = 0, tot_leaves = 0;
+    long tot_mismatches = 0;
     long tot_refresh = 0;
     unsigned long long tree_hash = 1469598103934665603ULL;
     long skips = 0;
@@ -273,7 +283,7 @@ int main(int argc, char **argv)
                 T.obj_hash *= 1099511628211ULL;
                 if (getenv("BENCH_TRACE")) printf("TRACE node=%ld sp=%d r=0 obj=%.15g inc=%.15g\n",
                                                   T.nodes, sp, obj, T.incumbent);
-                if (getenv("BENCH_FRESHCHECK")) {   /* adjudicator mode */
+                if (strict || getenv("BENCH_FRESHCHECK")) {   /* adjudicator mode */
                     LP t = B.lp;
                     double tlo[64], thi[64];
                     memcpy(tlo, B.lp.l, sizeof(double)*n);
@@ -286,8 +296,10 @@ int main(int argc, char **argv)
                     double of = 1e300;
                     if (rf == 0) { double xf[64]; solver_optimum(F, xf, &of); }
                     int mm = (rf == 0 && fabs(of - obj) > 1e-9 * (1.0 + fabs(obj)));
-                    printf("FRESH node=%ld kd=%d rf=%d obj=%.15g warm=%.15g %s\n",
-                           T.nodes, kd, rf, of, obj, mm ? "MISMATCH" : "ok");
+                    if (!strict || mm)
+                        printf("FRESH node=%ld kd=%d rf=%d obj=%.15g warm=%.15g %s\n",
+                               T.nodes, kd, rf, of, obj, mm ? "MISMATCH" : "ok");
+                    if (mm) tot_mismatches++;
                     if (mm) {
                         /* whose fault? check the warm point against rows+box */
                         double wx[64]; double wo2;
@@ -362,5 +374,9 @@ int main(int argc, char **argv)
     printf("dual_bench: models=%d nodes=%ld infeas=%ld bound=%ld leaves=%ld lp_iters=%ld wall=%.3fs tree_hash=%016llx\n",
            models, tot_nodes, tot_infeas, tot_bound, tot_leaves, tot_iters, wall, tree_hash);
     printf("draws skipped: %ld\n", skips);
+    if (tot_mismatches) {
+        printf("dual_bench: %ld warm-vs-fresh objective MISMATCHES -- FAIL\n", tot_mismatches);
+        return 1;
+    }
     return 0;
 }

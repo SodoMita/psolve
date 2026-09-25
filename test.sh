@@ -109,6 +109,20 @@ gcc -O2 -march=native -I src tools/dual_test.c src/solver.c src/splu.c src/lu.c 
 /tmp/dual_test 4000 20260921 >/dev/null && echo "  dual_test seed=20260921: ALL OK"
 /tmp/dual_test 4000 424242 >/dev/null && echo "  dual_test seed=424242:   ALL OK"
 
+echo "[5.3/7] Dual simplex branching-walk strict adjudicator..."
+# The DFS branch-and-bound walk through solver_set_bounds + warm_solve (the
+# MipWarm pattern): every optimal node is re-adjudicated against a FRESH
+# solver on the identical node box, --strict fails rc=1 on any objective
+# divergence.  Proven gating: on the reconstructed pre-fix semantics (warm
+# entry snapping only the value, not the nonbasic status) this exact run
+# reproduces the 14 fabricated optima that motivated the status
+# reconciliation fix (docs/DUAL7_NOTES.md, kd=20 node=96 class).
+gcc -O2 -march=native -I src tools/dual_bench.c src/solver.c src/splu.c src/lu.c src/kernels.c src/err.c -o /tmp/dual_bench -lm
+/tmp/dual_bench --strict 40 77031 1500 > /tmp/dual_bench_gate.out && \
+    grep -q "tree_hash=3ee8adb03f07d5ae" /tmp/dual_bench_gate.out && \
+    echo "  dual_bench --strict: ALL OK (deterministic tree hash 3ee8adb0)" || \
+    { echo "dual_bench --strict: FAIL"; cat /tmp/dual_bench_gate.out; exit 1; }
+
 python3 tools/qp_psd_verify.py 120 20260815 || { echo "qp_psd_verify: FAIL"; exit 1; }
 
 echo "[5.15/7] QP infeasibility proof through the unified evidence checker (roadmap 6.4)..."
