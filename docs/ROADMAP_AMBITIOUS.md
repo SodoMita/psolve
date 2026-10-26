@@ -438,14 +438,40 @@ recomputed `Σ c_j·x_j` on ORIGINAL postsolved data.
   400 20260819` (fails loudly on the pre-change binary — unknown option)
   and the selftest binary (absent on the pre-change tree).
 
-### 7.2 Dual simplex (bounded-variable, dual steepest edge)
-- **Why:** MIP re-optimization after bound changes/cuts is dual-simplex
-  shaped; today every relaxation re-runs primal (warm starts help — tsp_5
-  20695→63 iterations — but dual is the structurally right answer once cuts
-  land in Phase 8).
+### 7.2 Dual simplex (bounded-variable, dual steepest edge) — **DONE 2026-09-21(1)**
+`solver_set_bounds`/`solver_set_single_bound` + `solver_warm_solve` now
+engage a bounded-variable **dual simplex** (`dual_phase`/`dual_iterate`,
+src/solver.c) whenever the warm basis prices dual feasible for the true
+objective — exactly the state bound changes leave behind, since reduced
+costs do not depend on bounds.  Worst scaled violation leaves; BTRAN
+pivot row; dual minimum-ratio test with a Harris tie-break (largest `|g|`
+within a relaxation of the minimum ratio); eta-file updates with periodic
+refactorize + exact basic re-derivation; plateau and budget caps surface
+honest statuses, never silent spins.  When no column can repair a row the
+leaving row of B⁻¹ is a dual Farkas ray: infeasibility returns only after
+`dual_cert_infeasible` re-proves it against the ORIGINAL data through the
+directed-rounding `solver_farkas_boxcert`, and declines otherwise — every
+uncertified/numerical lane lands on one clean re-solve.  Warm entry
+reconciles *status with value*, not just value with box (a variable
+pinned at [1,1] in an ancestor and widened later must not enter the ratio
+test with a mis-signed off-bound direction — the one bench-caught bug of
+the landing, fixed with its reproduction lanes kept in the battery).
+`mip.c` pulls the dual-certified ray as a second hint through
+`solver_dual_farkas` under the same re-verify discipline as the Phase-I
+ray, and reports `lp_iters` across the B&B walk.
 - **Acceptance:** dual vs primal verdict/objective agreement on ≥20k random
   LPs; on a branching-workload benchmark, dual re-solve beats primal warm
-  start ≥2× on iterations.
+  start ≥2× on iterations.  **MET**: 47,993–47,995 warm rounds per wall
+  × 2 walls (24k seeds each), 0 verdict disagreements, worst objective
+  gap 1.4e-11, ASan-clean, bit-stable state hashes (tools/dual_test.c,
+  also gated in test.sh); on the 300-model/38,808-node DFS B&B bench the
+  two engines walk byte-identical trees while the dual re-solve spends
+  265,573 iterations against the primal warm start's 552,930 — 2.08× on
+  iterations (tools/dual_bench.c; the baseline's own instrumentation
+  attributes 62% of its pivots to refresh-transplanted garbage burn).
+  MIP end-to-end: byte-identical verdict chains with `lp_iters` down
+  2.05× (200 generated MIPs, `mipsolve --print`).  Full evidence:
+  docs/DUAL7_NOTES.md.
 
 ### 7.3 Forrest–Tomlin basis updates + Markowitz upgrade
 - Product-form eta file replaced by FT update with bump structure; splu

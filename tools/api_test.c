@@ -11,6 +11,7 @@
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 
 static void test_linear_apis(void)
 {
@@ -97,6 +98,27 @@ static void test_batch_apis(void)
     assert(pgs_batch_solve(2,fo,As,bs,los,his,xs,rr)>0);
     assert(rr[0].status==0&&rr[1].status==0&&x0[0]==3.0&&x1[0]==1.0);
 
+    /* Coupled 2D members: verifies the batch stride/index routing actually
+       carries full n*n matrices per system (a 1D case cannot trip that),
+       plus a box-clamped member (ported from the historical
+       arena_batch_test.c on the Aug arena lineage). */
+    {
+        PGSOptions go[3]={{2,20,1.0,1e-9},{2,20,1.0,1e-9},{2,20,1.0,1e-9}};
+        double G0[4]={2.0,0.5,0.5,2.0},   G1[4]={3.0,0.0,0.0,4.0},   G2[4]={1.0,0.0,0.0,1.0};
+        double gb0[2]={-3.0,-2.0},        gb1[2]={-6.0,-8.0},         gb2[2]={-1.0,-1.0};
+        double gl0[2]={0.0,0.0},          gl1[2]={0.0,0.0},           gl2[2]={0.0,0.0};
+        double gh0[2]={10.0,10.0},        gh1[2]={5.0,5.0},           gh2[2]={0.5,0.5};
+        double gx0[2]={0.0,0.0},          gx1[2]={0.0,0.0},           gx2[2]={0.0,0.0};
+        const double *GAs[3]={G0,G1,G2},*Gbs[3]={gb0,gb1,gb2},*Glos[3]={gl0,gl1,gl2},*Ghis[3]={gh0,gh1,gh2};
+        double *Gxs[3]={gx0,gx1,gx2};
+        PGSResult gr[3];
+        assert(pgs_batch_solve(3,go,GAs,Gbs,Glos,Ghis,Gxs,gr)>0);
+        assert(gr[0].status==0&&gr[1].status==0&&gr[2].status==0);
+        assert(fabs(gx0[0]-(4.0/3.0))<1e-5 && fabs(gx0[1]-(2.0/3.0))<1e-5);
+        assert(fabs(gx1[0]-2.0)<1e-5 && fabs(gx1[1]-2.0)<1e-5);
+        assert(fabs(gx2[0]-0.5)<1e-5 && fabs(gx2[1]-0.5)<1e-5);
+    }
+
     assert(pgsf_batch_solve(-1,NULL,NULL,NULL,NULL,NULL,NULL,NULL)==-1);
     assert(pgsf_batch_solve(0,NULL,NULL,NULL,NULL,NULL,NULL,NULL)==0);
     PGSFixedOptions io[2]={{1,10,1,1,1},{1,10,1,1,1}};
@@ -106,6 +128,24 @@ static void test_batch_apis(void)
     int64_t *ixs[2]={ix0,ix1};
     assert(pgsf_batch_solve(2,io,iAs,ibs,ilos,ihis,ixs,rr)>0);
     assert(rr[0].status==0&&rr[1].status==0&&ix0[0]==3&&ix1[0]==1);
+
+    /* Fixed-point 2x2 member with an upper-clamped box: integer batch
+       routing and clamp interaction, scale 256 (same provenance as the
+       coupled-floating case above). */
+    {
+        PGSFixedOptions to[2]={{2,20,1,1,0},{2,20,1,1,0}};
+        int64_t T0[4]={2,0,0,2},          T1[4]={1,0,0,1};
+        int64_t tb0[2]={-768,-512},       tb1[2]={-256,-256};
+        int64_t tl0[2]={0,0},             tl1[2]={0,0};
+        int64_t th0[2]={2560,2560},       th1[2]={128,128};
+        int64_t tx0[2]={0,0},             tx1[2]={0,0};
+        const int64_t *TAs[2]={T0,T1},*Tbs[2]={tb0,tb1},*Tlos[2]={tl0,tl1},*This[2]={th0,th1};
+        int64_t *Txs[2]={tx0,tx1};
+        PGSResult tr[2];
+        assert(pgsf_batch_solve(2,to,TAs,Tbs,Tlos,This,Txs,tr)>0);
+        assert(tx0[0]==384 && tx0[1]==256);
+        assert(tx1[0]==128 && tx1[1]==128);
+    }
 }
 
 static void test_parser_fzn_apis(void)

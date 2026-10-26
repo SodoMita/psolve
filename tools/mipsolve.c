@@ -258,6 +258,7 @@ done_mip:
     if (print) {
         printf("farkas_certs: %ld\n", res.farkas_certs);
         printf("fx_solves: %ld\n", res.fx_solves);
+        printf("lp_iters: %ld\n", res.lp_iters);   /* simplex iterations, all nodes */
     }
 
     mip_result_free(&res);
