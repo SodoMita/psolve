@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <float.h>
 #include <stdio.h>
 
 static double *xmalloc(size_t n){ return psolve_malloc(n); }
@@ -55,6 +56,170 @@ static double row_scale(const QP *qp, int i, const double *x)
     const double *Ai = qp->A + (size_t)i * qp->n;
     for (int j = 0; j < qp->n; j++) s += fabs(Ai[j]) * fabs(x[j]);
     return 1.0 + s;
+}
+
+/* ------------------------------------------------------------------------
+ * Unboundedness evidence: is p'Qp <= 0 *proven* for the model's own doubles?
+ *
+ * The ray test in active_set() (A p <= 0) together with a descent slope
+ * (g.p < 0) certifies "unbounded below" only if the curvature along p is also
+ * non-positive.  With p'Qp < 0 the quadratic term dominates and the objective
+ * diverges along the ray; with p'Qp = 0 it is linear in the step length and
+ * diverges too.  A *positive* p'Qp is the opposite case: it turns the ray into
+ * a step with a finite minimiser at t = -g.p / p'Qp, so admitting one reports a
+ * bounded model as UNBOUNDED.  Not hypothetical -- the band this replaced
+ * (`p'Qp <= 1e-12*(1+||Q||)*||p||^2`) admitted a plain Newton step with
+ * p'Qp = +2.5e20 on a model whose optimum is -7.3939738094380649
+ * (docs/CURV_PS_PLAN.md 1.12).
+ *
+ * A band of that shape cannot be repaired by shrinking it, because it scales
+ * with ||p||^2: the directions whose curvature is genuinely rounding-level (p
+ * in Q's numerical null space) are exactly the ones with huge ||p||, so they
+ * carry a huge band with them.  The test therefore stops being about a width:
+ * a double-precision pass decides every case it can (proving the sign from a
+ * classical summation bound) and hands the window around zero to a
+ * double-double refinement, whose *sign* is the decision -- an evaluation good
+ * to 6.7e-33 of sum|terms|, against the 1.5e-13 relative curvature that made
+ * the bug.  Failing the test is always safe: the ray certificate is skipped and
+ * the main loop runs on to its iteration limit, which claims nothing.  See
+ * TOL-QP-CURV / TOL-QP-CURVBND / TOL-QP-CURVDD.
+ * ------------------------------------------------------------------------ */
+
+/* exact two-product: a*b == *hi + *lo with no rounding, for products that do
+   not overflow (IEEE-754 fma is exact, so the residual is the rounding error of
+   the plain product).  Used only by the double-double refinement below. */
+static void two_prod(double a, double b, double *hi, double *lo)
+{
+    double h = a * b;
+    *hi = h;
+    *lo = fma(a, b, -h);
+}
+
+/* Neumaier-compensated accumulation of t into *sum, keeping the rounding error
+   in *comp: a series of additions reads back at ~2 eps instead of n eps. */
+static void comp_add(double t, double *sum, double *comp)
+{
+    double s = *sum + t;
+    *comp += (fabs(*sum) >= fabs(t)) ? ((*sum - s) + t) : ((t - s) + *sum);
+    *sum = s;
+}
+
+/* p'Qp, refined to double-double: each term is represented exactly as hi+lo by
+   two exact products and both series are summed with compensation, so what is
+   left is second-order in the input eps.  Measured against exact rational
+   arithmetic over the `tools/qp_diff.py` sweeps this is the exact curvature to
+   6.7e-33 of sum|q_ij p_i p_j| (0 sign mismatches over every candidate the
+   coarse pass left ambiguous), so the *sign* of the result is the decision.
+ *
+ * Note what that admits and what it does not.  Exactly flat data -- Q = 0, a
+ * null coordinate of a diagonal Q, a cancelling pair of terms -- comes out as
+ * 0.0 and is admitted; a curvature with any positive sign the refinement can
+ * resolve, however small, is not (TOL-QP-CURV says why the acceptance may not
+ * be a band).  The residual bound below is not part of that decision: it guards
+ * the evaluation against terms that overflowed, which would otherwise leave NaN
+ * comparing false to everything. */
+static int curvature_nonpositive_dd(const QP *qp, const double *p)
+{
+    int n = qp->n;
+    double hs = 0.0, hc = 0.0, ls = 0.0, lc = 0.0, abs_sum = 0.0;
+    for (int i = 0; i < n; i++) {
+        for (int j = 0; j < n; j++) {
+            double t1, e1, t2, e2;
+            two_prod(qp->Q[(size_t)j * n + i], p[j], &t1, &e1);
+            two_prod(t1, p[i], &t2, &e2);
+            double lo = e2 + e1 * p[i];
+            comp_add(t2, &hs, &hc);
+            comp_add(lo, &ls, &lc);
+            abs_sum += fabs(t2) + fabs(lo);
+        }
+    }
+    double value = (hs + hc) + (ls + lc);
+    double resid = 64.0 * (double)n * (double)n * DBL_EPSILON * DBL_EPSILON * abs_sum;  /* TOLSHEET TOL-QP-CURVDD */
+    if (!isfinite(value) || !isfinite(resid)) return 0;   /* overflowed: no evidence */
+    return value <= 0.0;
+}
+
+/* 1 iff row i stays satisfied along the whole ray x + t*p (t >= 0), i.e. its
+   slope a_i.p is non-positive.
+ *
+ * This half of the certificate cannot be a proof and does not pretend to be
+ * one: p is a *computed* direction, good to ~eps per component, so a_i.p is
+ * only meaningful to ~eps*sum|a_ij p_j| -- the row's own cancellation scale.
+ * Inside that window the sign is not decidable, and the honest rule is to
+ * state the window rather than to test a computed double against 0.0 and let
+ * the rounding decide.  It matters in practice: `tools/qp_diff.py` certifies
+ * rays (huge directions on a numerically flat Q) whose exact row slopes are
+ * +1e-17 of that scale in both directions of the check.
+ *
+ * The window is deliberately the *computation's* error term and not the LP
+ * core's 1e-9 reduced-cost grace (TOL-CERT-DEFDJ): the LP's ray is a basis
+ * direction whose meaning is fixed by the simplex state, while this p is a
+ * KKT solution whose only guarantee is a small residual -- and a slope of
+ * 1e-9 relative on a row whose terms cancel at 1e17 is 1e8 per unit step, far
+ * outside anything the data resolves.  A row that clears the window is a
+ * recession row; one that does not, blocks the ray, and the certificate is
+ * dropped (a lost verdict, never a fabricated one). */
+static int row_recession_ok(const QP *qp, int i, const double *p)
+{
+    int n = qp->n;
+    const double *Ai = qp->A + (size_t)i * n;
+    double ap = 0.0, terms = 0.0;
+    for (int j = 0; j < n; j++) {
+        double t = Ai[j] * p[j];
+        ap += t;
+        terms += fabs(t);
+    }
+    double band = 8.0 * (double)n * DBL_EPSILON * terms;  /* TOLSHEET TOL-QP-RAYROW */
+    return ap <= band;
+}
+
+/* 1 iff p'Qp is non-positive over the model's own doubles, as decided by the
+   double-precision pass where it can be and by the refinement where it cannot;
+   0 means "resolved positive" (the certificate layer may not claim UNBOUNDED
+   from it).  qnorm is max|Q|, computed once per solve. */
+static int curvature_nonpositive(const QP *qp, const double *p, double qnorm)
+{
+    int n = qp->n;
+    if (qnorm == 0.0) return 1;                 /* Q == 0: p'Qp is exactly 0 */
+    double sum = 0.0, abs_sum = 0.0;
+    for (int i = 0; i < n; i++) {
+        double qi = 0.0, qabs = 0.0;
+        for (int j = 0; j < n; j++) {
+            double qij = qp->Q[(size_t)j * n + i];
+            qi += qij * p[j];
+            qabs += fabs(qij * p[j]);
+        }
+        sum += qi * p[i];
+        abs_sum += qabs * fabs(p[i]);
+    }
+    /* Classical summation bound for the two n-term sums plus the term roundings
+       (well above n*eps*sum|terms|, and only the ambiguous band around zero is
+       ever handed to the refinement below, so the slack costs a DD pass and
+       never a verdict). */
+    double coarse = 8.0 * (double)n * DBL_EPSILON * abs_sum;  /* TOLSHEET TOL-QP-CURVBND */
+    if (sum + coarse <= 0.0) return 1;   /* proven <= 0: coarse upper-bounds the error */
+    if (sum - coarse > 0.0) return 0;    /* proven > 0: a step, not a ray */
+    return curvature_nonpositive_dd(qp, p);
+}
+
+/* 1 when every row is satisfied at x to 1e-7 * (1 + |b_i|) -- the primal
+   feasibility claim both terminal verdicts stand on (TOL-QP-PRIMAL).  It is one
+   helper because it must be one rule: the OPTIMAL path refuses to certify a
+   point that fails it, and the UNBOUNDED path must not build a ray on a point
+   that fails it either.  It is deliberately tighter than the evidence checker's
+   own version of the same test in cert.c, which uses 1 + |b_i| + |a_i|^T |x|
+   (a larger scale, hence a looser window): a base point admitted here therefore
+   cannot be refused there for its point, so the producer never emits evidence
+   its own checker must reject.  That asymmetry is not academic -- before this
+   rule existed the active set certified rays from iterates that had drifted up
+   to 2e-2 (relative) outside a row, and `qpsolve` downgraded every one of them
+   to KKT_FAIL with "certificate not confirmed" on stderr (docs/CURV_PS_PLAN.md
+   1.12). */
+static int primal_feasible(const QP *qp, const double *x)
+{
+    for (int i = 0; i < qp->m; i++)
+        if (row_resid(qp, i, x) > 1e-7 * (1.0 + fabs(qp->b[i]))) return 0;  /* TOLSHEET TOL-QP-PRIMAL */
+    return 1;
 }
 
 /* 1 when row i is violated at x beyond the relative tolerance. */
@@ -208,6 +373,11 @@ static void active_set(const QP *qp, const double *xstart, QPResult *res)
     double *orth = (double*)xmalloc((size_t)n * n * sizeof(double));
     double *tmp = (double*)xmalloc((size_t)n * sizeof(double));
     double tolrank = 1e-9;  /* TOLSHEET TOL-QP-RANK */
+    /* max|Q|: the scale every curvature statement in this file is relative to.
+       Computed once per solve -- it used to be rescanned inside the ray block
+       on every iteration. */
+    double qnorm = 0.0;
+    for (size_t i = 0; i < (size_t)n * (size_t)n; i++) qnorm = fmax(qnorm, fabs(qp->Q[i]));
     int k = 0;
     build_orth(qp, W, 0, orth);
     for (int i = 0; i < m; i++) {
@@ -295,12 +465,7 @@ static void active_set(const QP *qp, const double *xstart, QPResult *res)
                    of the pair is rank-independent enough to enter the working
                    set) can leave a constraint violated.  Report a failure
                    rather than a stationary point outside the feasible set. */
-                int infeas = 0;
-                for (int i = 0; i < m; i++) {
-                    double rr = row_resid(qp, i, x);
-                    if (rr > 1e-7 * (1.0 + fabs(qp->b[i]))) { infeas = 1; break; }  /* TOLSHEET TOL-QP-PRIMAL */
-                }
-                if (infeas) { status = QP_KKT_FAIL; break; }
+                if (!primal_feasible(qp, x)) { status = QP_KKT_FAIL; break; }
                 for (int c = 0; c < k; c++) res->mult[W[c]] = mu[c];
                 status = 0; break;
             }
@@ -314,48 +479,44 @@ static void active_set(const QP *qp, const double *xstart, QPResult *res)
            walks along such a ray until the iteration cap and reports
            ITERATION_LIMIT -- honest, but uninformative and ~4000 wasted
            iterations (measurably: a 2-variable Q=0 case did 12917 mallocs).
-           Tolerances are deliberately strict: if the ray cannot be certified
-           we fall through to the old behaviour rather than risk a wrong
-           UNBOUNDED. */
+           The three parts of that certificate are judged differently on
+           purpose.  The curvature is the qualitative one -- a positive p'Qp
+           turns the ray into a step with a finite minimiser -- so it must be
+           PROVEN, and curvature_nonpositive() proves it in double-double
+           rather than accepting a band (TOL-QP-CURV).  The rows are the
+           quantitative one -- a positive a_i.p only delays the escape -- and
+           p is a computed direction, so a_i.p has no decidable sign inside the
+           row's own cancellation window; row_recession_ok() encodes exactly
+           that window (TOL-QP-RAYROW) instead of testing a rounded double
+           against 0.0.  Either refusal just falls through to the old
+           behaviour, so the worst case is a lost certificate, never a wrong
+           UNBOUNDED.  The third part of the claim is the base point itself: a
+           ray is only evidence from a point that is IN the feasible set, which
+           is the same primal rule the OPTIMAL verdict answers to
+           (primal_feasible, TOL-QP-PRIMAL).  The active set can leave the
+           feasible set by drift -- the ratio test only blocks a row the step
+           pushes into, and a violated row with a_i.p <= 0 is never restored --
+           so without this gate the engine certified rays from infeasible
+           iterates, and the certificate layer refused every one of them. */
         {
-            double gp = 0.0, pQp = 0.0, pinf = 0.0;
+            double gp = 0.0, pinf = 0.0;
             for (int j = 0; j < n; j++) {
                 gp += g[j] * p[j];
                 pinf = fmax(pinf, fabs(p[j]));
             }
-            if (gp < -1e-9 * scale && pinf > 0.0) {  /* TOLSHEET TOL-QP-UNBDIR */
-                for (int i = 0; i < n; i++) {
-                    double qi = 0.0;
-                    for (int j = 0; j < n; j++) qi += qp->Q[(size_t)j*n + i] * p[j];
-                    pQp += qi * p[i];
-                }
-                double qnorm = 0.0;
-                for (int i = 0; i < n*n; i++) qnorm = fmax(qnorm, fabs(qp->Q[i]));
-                if (pQp <= 1e-12 * (1.0 + qnorm) * pinf * pinf) {  /* TOLSHEET TOL-QP-CURV */
-                    int ray = 1;
-                    for (int i = 0; i < m && ray; i++) {
-                        const double *Ai = qp->A + (size_t)i * n;
-                        double ap = 0.0, anorm = 0.0;
-                        for (int j = 0; j < n; j++) {
-                            ap += Ai[j] * p[j];
-                            anorm = fmax(anorm, fabs(Ai[j]));
-                        }
-                        /* No tolerance here on purpose: a row with even a
-                           rounding-level positive slope does eventually block
-                           the ray, so claiming UNBOUNDED would be a wrong
-                           answer.  Failing the test just falls back to the
-                           iteration limit, which is never wrong. */
-                        (void)anorm;
-                        if (ap > 0.0) ray = 0;
-                    }
-                    if (ray) {
-                        status = 1;
-                        /* keep the direction as evidence: the CLI certificate
-                           layer re-verifies it against the original data */
-                        memcpy(res->ray, p, (size_t)n * sizeof(double));
-                        break;
-                    }   /* certified unbounded */
-                }
+            if (gp < -1e-9 * scale && pinf > 0.0 &&  /* TOLSHEET TOL-QP-UNBDIR */
+                primal_feasible(qp, x) &&              /* TOLSHEET TOL-QP-PRIMAL */
+                curvature_nonpositive(qp, p, qnorm)) {  /* TOLSHEET TOL-QP-CURV */
+                int ray = 1;
+                for (int i = 0; i < m && ray; i++)
+                    if (!row_recession_ok(qp, i, p)) ray = 0;   /* TOLSHEET TOL-QP-RAYROW */
+                if (ray) {
+                    status = 1;
+                    /* keep the direction as evidence: the CLI certificate
+                       layer re-verifies it against the original data */
+                    memcpy(res->ray, p, (size_t)n * sizeof(double));
+                    break;
+                }   /* certified unbounded */
             }
         }
 
