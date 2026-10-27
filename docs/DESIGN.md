@@ -232,6 +232,8 @@ semantics); E = exact module, no numeric margin at all.
 | TOL-SPLU-SOLVE0 | splu.c:264 | 1e-14 | S | sparse-solve zero test |
 | TOL-LP-INF | solver.h:11 | 1e30 | S | "infinite" bound encoding inside the LP data structures; structural sentinel, never compared for equality against data |
 | TOL-LP-WCAP | solver.c:947 | 1e18 | S | steepest-edge weight normalization cap (overflow guard on the score path; pairs with TOL-LP-WGUARD) |
+| TOL-LP-DUALRHO | solver.c:1433 | 1e-9·(1+\|rchat\|) | C | dual-ratio negative clamp: a ratio more negative than this scale means the dual-feasibility invariant was lost to rounding, so it sets `saw_neg_ratio` and triggers drift recovery (refactorize + recompute). The clamp never decides a verdict — it only suppresses a negative pivot ratio that would otherwise be chosen on corrupted dual data; a genuine negative (infeasible/unbounded) direction is still detected by the unbounded-ratio test, not by this band |
+| TOL-LP-DUALSTEP | solver.c:1495 | 1e-6·(1+\|x[bv]\|) | C | dual step-length negativity guard: a step more negative than this scale refuses the iteration and refactorizes instead of accepting a backward step. Pure convergence hygiene on the Phase-II/Phase-I update; it cannot manufacture optimality or feasibility, and the terminal LP re-verification (TOL-LP-FINALROW / DJ) is what decides the status |
 | TOL-KRN-YTOL | kernels.c:78–86 (fed by `hyper_tol`, default **0.0** = exact) | 0.0 | C | hyper-sparse PRICE skip threshold; 0 means no dual is ever silently dropped; a caller-set positive value is a pricing heuristic only — the DJ certificate is recomputed exactly at optimality |
 | TOL-LP-HYPERDEF | solver.c:55, 782 | 0.0 | C | the default itself: exactness until changed deliberately |
 
@@ -321,7 +323,7 @@ hand-written input with deliberate sub-width perturbations observes it.
 | TOL-FZN-DIVGUARD | fzn.c:1986 | 1e-15 | D | divisor |const| < tol ⇒ decline (near-0 division normalizes nothing honestly) |
 | TOL-FZN-CUMUL | fzn.c:2791, 2810 | 1e-9 | D | `cumulative` duration/resource args must be near-integer; else decline |
 | TOL-FZN-BOUNDINIT | fzn.c:2215, 2752, 2796, 3358, 3419 | ±1e18 | S | min/max accumulator initializers across the bounds-scan paths (send(bounds|disjunctive|cumulative); sentinels, never compared against data for equality — a model constant wider than 1e18 ends in the honest-decline lattice guards, not here) |
-| TOL-FZN-POWCAP | fzn.c:1866, 1870, 1933, 1944, 1963, 2101, 2690 | 0x1p53 | D | exact-integer mantissa-width cap on folded values (pow / related exact folds); past it ⇒ decline to UNKNOWN, never round |
+| TOL-FZN-POWCAP | fzn.c (constant-exponent pow folds, `ipow_exact` cap, `int_div` guard) | 0x1p53 | D | exact-integer mantissa-width cap on folded values (pow / related exact folds); past it ⇒ decline to UNKNOWN, never round. In the variable-exponent `int_pow` lattice encoding the same cap bounds `base^exp` computed in `ipow_exact`: an overflowed cell is *skipped* as infeasible (its true magnitude exceeds the capped result-variable domain), never rounded into a coefficient |
 | TOL-FZN-FARKAS | fzn.c:3990 | 1e-6 | V | boxcert margin arg for fznsolve's Farkas re-verify (see TOL-LP-FARKAS) |
 | TOL-FZN-SHAKY | fzn.c:3996 | 5e-7 = ½·1e-6 | V | fznsolve's own exposure frontier on an uncertified UNSAT ⇒ honest downgrade (same family as TOL-LP-SHAKY) |
 | TOL-FZN-MIPGAP | fzn.c:3951 | 1e-4 | V | default `mip_gap` for the fznsolve MIP route (see TOL-MIP-GAP) |

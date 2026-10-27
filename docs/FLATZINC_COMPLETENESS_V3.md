@@ -4,6 +4,14 @@
 **Solver version:** `1.2.0` → `1.7.0` (`share/minizinc/solvers/psolve.msc`)
 **Status:** landed. `make -s` clean; `fzn_output_check 200/42` and `500/123` `HONEST=0 WRONG=0`; `fgraph_verify 60 WRONG=0`; `cumulative_verify 200/200`; `divmod_verify 228/228`; `lex_reif_verify 180/180`; `lex_reif_differential 56/56`; `vpc_reif_verify 63/63`; `16/16 examples/fzn/*.fzn` OK.
 
+> **Superseded in part by v3.6** — see
+> [`FLATZINC_COMPLETENESS_V36.md`](FLATZINC_COMPLETENESS_V36.md). v3.5's 2D
+> body-less mznlib declarations were invalid FlatZinc builtins under real
+> MiniZinc, so `minizinc --solver psolve` could not compile any model. v3.6
+> replaces them with Gecode-style file-name shadowing, adds a real-MiniZinc
+> differential harness, and closes variable-exponent `int_pow`. All v3.5 C
+> handlers and verifiers still apply unchanged.
+
 ---
 
 ## 1. Motivation

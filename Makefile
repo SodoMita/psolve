@@ -55,6 +55,8 @@ bench_mzn: fznsolve
 install_mzn:
 	mkdir -p $(HOME)/.minizinc/solvers
 	cp share/minizinc/solvers/psolve.msc $(HOME)/.minizinc/solvers/psolve.msc
+	rm -rf $(HOME)/.minizinc/psolve
+	cp -r share/minizinc/psolve $(HOME)/.minizinc/psolve
 
 
 lpsolve: $(OBJ)

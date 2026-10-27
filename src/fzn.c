@@ -798,6 +798,43 @@ static int lin_unit_var(const Lin*l,int*out)
     *out=l->idx[0];return 0;
 }
 
+/* Saturating exact integer power for the int_pow bounded-lattice encoding.
+   Returns base^exp (exp>=0) as long long, or IPOW_OVERFLOW when the true
+   magnitude would exceed 2^53, the exact-double integer limit.  MiniZinc
+   defines 0^0 = 1, matching the initial result of 1 with exp=0. */
+#define IPOW_OVERFLOW_SENTINEL 0x1p53  /* TOLSHEET TOL-FZN-POWCAP */
+static int ipow_exact(long long base, long long exp, long long *out)
+{
+    if(exp < 0) return 1;              /* caller handles negative exponents */
+    long long r = 1;
+    const double CAP = 0x1p53;  /* TOLSHEET TOL-FZN-POWCAP */
+    for(long long i=0;i<exp;i++){
+        /* |r*base| must stay <= 2^53 to remain an exact double coefficient */
+        double prod = (double)r * (double)base;
+        if(!isfinite(prod) || fabs(prod) > CAP) return 1;
+        r *= base;
+    }
+    *out = r;
+    return 0;
+}
+
+/* MiniZinc int_pow semantics for a NEGATIVE exponent exp (exp<0):
+     z = 1 div pow(base, |exp|)
+   where div truncates toward zero.  For |base|>=2 and |exp|>=1 the
+   denominator has magnitude >=2, so the result is always 0.  For base=1 the
+   result is 1; for base=-1 it is (-1)^|exp| (1 div -1 = -1).  base=0 is
+   undefined (MiniZinc rejects it at flatten time) -> decline. */
+static int ipow_negative_exp(long long base, long long exp, long long *out)
+{
+    if(base == 0) return 1;                 /* undefined: 1 div 0 */
+    long long k = -exp;                     /* > 0 */
+    if(base == 1){ *out = 1; return 0; }
+    if(base == -1){ *out = (k & 1LL) ? -1 : 1; return 0; }
+    /* |base|>=2 -> |base^k|>=2 -> trunc(1 / base^k) = 0 */
+    *out = 0;
+    return 0;
+}
+
 /* Materialize an arbitrary linear form as a plain solver variable: a bare
    variable (unit coefficient, no constant) maps to its own index; anything
    else (constant or affine expression) gets a fresh alias variable pinned by
@@ -2229,6 +2266,13 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
         lin_free(&l1);lin_free(&l2);lin_free(&l3);
         return handled?0:1;
     }
+    /* Exact integer power with saturation, used by the int_pow lattice
+       encoding.  MiniZinc defines 0^0 = 1.  Returns base^exp clamped to a
+       sentinel of 2^53 once the magnitude exceeds exact-double range; the
+       caller then treats such a tuple as out of the result variable's domain
+       (which is itself capped well below 2^53), i.e. infeasible.  exp>=0. */
+    /* (helper is a file-scope static, defined just before fzn_post_constraint) */
+
     /* int_pow(x, y, z): z = x^y when linear (constant exponent/base or bounded lattice). */
     if(strcmp(p,"int_pow")==0||strcmp(p,"int_pow_fixed")==0){
         if(c->nargs<3)return -1;
@@ -2292,6 +2336,84 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
                     for(int k=0;k<nvals;k++) lin_term(&ones, zs[k], 1.0);
                     ones.constant = -1.0; b_put(b,'=',0.0,&ones); lin_free(&ones);
                     psolve_free(zs); lin_free(&l1);lin_free(&l2);lin_free(&l3); return 0;
+                }
+            }
+        }
+        /* ---- Bounded lattice enumeration for a VARIABLE exponent ----
+           Real mzn2fzn (2.10.1) emits `int_pow(x, e, y)` with all three
+           operands unit vars on small finite domains whenever a model uses
+           pow(x,e) with a decision-variable exponent.  The previous code
+           returned UNKNOWN for that whole family.  Mirror int_times/int_div:
+           enumerate every (base, exp) lattice point, compute the exact
+           MiniZinc result (x^e for e>=0, 1 div pow(x,|e|) for e<0), and
+           encode the feasible triples with selector binaries.  Caps keep the
+           MIP honest; anything larger stays UNKNOWN.  Never fabricate a
+           value for an inexact/overflowed power. */
+        {
+            int va,vb,vc;
+            if(lin_unit_var(&l1,&va)==0 && lin_unit_var(&l2,&vb)==0 &&
+               lin_unit_var(&l3,&vc)==0){
+                double lo_a,hi_a,lo_b,hi_b,lo_c,hi_c;
+                if(lin_bounds(b,&l1,&lo_a,&hi_a)==0 &&
+                   lin_bounds(b,&l2,&lo_b,&hi_b)==0 &&
+                   lin_bounds(b,&l3,&lo_c,&hi_c)==0){
+                    long la_lo=(long)llround(lo_a), la_hi=(long)llround(hi_a);
+                    long lb_lo=(long)llround(lo_b), lb_hi=(long)llround(hi_b);
+                    long lc_lo=(long)llround(lo_c), lc_hi=(long)llround(hi_c);
+                    long na=la_hi-la_lo+1, nb=lb_hi-lb_lo+1;
+                    if(na>0 && nb>0 && na<=32 && nb<=32 && na*nb<=1024 &&
+                       la_lo>=-1000000 && la_hi<=1000000 &&
+                       lb_lo>=-1000 && lb_hi<=1000 &&
+                       lc_lo>=-1000000000LL && lc_hi<=1000000000LL){
+                        /* Guard the domain against overflow in llround of
+                           unbounded vars: lin_bounds returns -1 for those. */
+                        long *t_a=NULL,*t_b=NULL,*t_c=NULL;
+                        int cnt=0;
+                        t_a=(long*)psolve_malloc((size_t)(na*nb)*sizeof(long));
+                        t_b=(long*)psolve_malloc((size_t)(na*nb)*sizeof(long));
+                        t_c=(long*)psolve_malloc((size_t)(na*nb)*sizeof(long));
+                        for(long da=la_lo;da<=la_hi;da++){
+                            for(long db=lb_lo;db<=lb_hi;db++){
+                                long long dc=0; int rc;
+                                if(db>=0) rc=ipow_exact(da,db,&dc);
+                                else      rc=ipow_negative_exp(da,db,&dc);
+                                /* rc!=0 means either an undefined cell
+                                   (base=0 with a negative exponent, which
+                                   MiniZinc excludes with its pow_t totality
+                                   guard `x!=0 \/ y>=0`) or an overflowed
+                                   power (>2^53, hence necessarily outside the
+                                   capped z domain).  Either way that lattice
+                                   point is infeasible, so skip it rather than
+                                   declining the whole constraint. */
+                                if(rc!=0) continue;
+                                if(dc<lc_lo || dc>lc_hi) continue;  /* result outside z domain -> infeasible tuple */
+                                t_a[cnt]=da; t_b[cnt]=db; t_c[cnt]=(long)dc; cnt++;
+                            }
+                        }
+                        if(cnt==0){
+                            /* No lattice point can satisfy z=x^y -> UNSAT */
+                            Lin imp;memset(&imp,0,sizeof(imp));b_put(b,'=',1.0,&imp);lin_free(&imp);
+                            psolve_free(t_a);psolve_free(t_b);psolve_free(t_c);
+                            lin_free(&l1);lin_free(&l2);lin_free(&l3);return 0;
+                        } else {
+                            int *z=(int*)psolve_malloc((size_t)cnt*sizeof(int));
+                            for(int i=0;i<cnt;i++) z[i]=b_newvar(b,0.0,1.0);
+                            Lin sum;memset(&sum,0,sizeof(sum));
+                            for(int i=0;i<cnt;i++) lin_term(&sum,z[i],1.0);
+                            b_put(b,'=',1.0,&sum); lin_free(&sum);
+                            Lin ea;memset(&ea,0,sizeof(ea)); lin_term(&ea,va,1.0);
+                            for(int i=0;i<cnt;i++) lin_term(&ea,z[i],-(double)t_a[i]);
+                            b_put(b,'=',0.0,&ea); lin_free(&ea);
+                            Lin eb;memset(&eb,0,sizeof(eb)); lin_term(&eb,vb,1.0);
+                            for(int i=0;i<cnt;i++) lin_term(&eb,z[i],-(double)t_b[i]);
+                            b_put(b,'=',0.0,&eb); lin_free(&eb);
+                            Lin ec;memset(&ec,0,sizeof(ec)); lin_term(&ec,vc,1.0);
+                            for(int i=0;i<cnt;i++) lin_term(&ec,z[i],-(double)t_c[i]);
+                            b_put(b,'=',0.0,&ec); lin_free(&ec);
+                            psolve_free(z);psolve_free(t_a);psolve_free(t_b);psolve_free(t_c);
+                            lin_free(&l1);lin_free(&l2);lin_free(&l3);return 0;
+                        }
+                    }
                 }
             }
         }
@@ -4193,10 +4315,14 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
         return 0;
     }
 
-    /* ===== regular family: DFA acceptance (fzn_regular, fzn_regular_set, reif) ===== */
+    /* ===== regular family: DFA acceptance (fzn_regular, fzn_regular_set, reif).
+       psolve_regular / psolve_regular_reif are the 1D-native forms emitted by
+       share/minizinc/psolve/fzn_regular.mzn: the transition table is flattened
+       with array1d(), which is what table_values() already expects. ===== */
     if(strcmp(p,"fzn_regular")==0||strcmp(p,"regular")==0||
        strcmp(p,"fzn_regular_set")==0||strcmp(p,"fzn_regular_reif")==0||
-       strcmp(p,"fzn_regular_set_reif")==0||strcmp(p,"regular_reif")==0){
+       strcmp(p,"fzn_regular_set_reif")==0||strcmp(p,"regular_reif")==0||
+       strcmp(p,"psolve_regular")==0||strcmp(p,"psolve_regular_reif")==0){
         int is_reif = (strstr(p,"_reif")!=NULL);
         int is_set = (strstr(p,"_set")!=NULL);
         int need = is_reif ? 7 : 6;
@@ -4433,7 +4559,7 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
             if(is_reif){ Lin e;memset(&e,0,sizeof(e));lin_term(&e,rvar,1.0);b_put(b,'=',1.0,&e);lin_free(&e); }
             free_lins(xs_arr3,nxs3); return 0;
         }
-        double dlo=1e18, dhi=-1e18;
+        double dlo=1e18, dhi=-1e18;  /* TOLSHEET TOL-FZN-BOUNDINIT */
         for(int i=0;i<nxs3;i++){ double lo,hi; if(lin_bounds(b,&xs_arr3[i],&lo,&hi)!=0){ free_lins(xs_arr3,nxs3); return 1; } if(lo<dlo) dlo=lo; if(hi>dhi) dhi=hi; }
         long loL=(long)llround(dlo), hiL=(long)llround(dhi);
         if(hiL-loL+1>64 || hiL-loL+1<=1){ free_lins(xs_arr3,nxs3); return 1; }
@@ -4596,7 +4722,7 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
             }
         }
         /* m = min/max value */
-        double alo=1e18,ahi=-1e18;
+        double alo=1e18,ahi=-1e18;  /* TOLSHEET TOL-FZN-BOUNDINIT */
         for(int i=0;i<narr;i++){ double lo,hi; if(lin_bounds(b,&arr[i],&lo,&hi)!=0){ lin_free(&il); free_lins(arr,narr); return 1; } if(lo<alo)alo=lo; if(hi>ahi)ahi=hi; }
         int m_var=b_newvar(b,alo,ahi);
         /* m <= (or >=) x_i for all i */

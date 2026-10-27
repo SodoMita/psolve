@@ -449,6 +449,20 @@ echo -n "lex_reif_differential (strict/_imp + full -a solution-set equality): "
 python3 tools/lex_reif_differential.py || { echo "lex_reif_differential: FAIL"; exit 1; }
 echo -n "vpc_reif_verify (value/seq_precede reif/imp, full -a solution-set equality): "
 python3 tools/vpc_reif_verify.py || { echo "vpc_reif_verify: FAIL"; exit 1; }
+# v3.6: variable-exponent int_pow bounded-lattice encoding, vs brute-force
+# MiniZinc semantics (x^y, and 1 div pow(x,|y|) for y<0).  Full -a
+# solution-set equality on satisfy instances; exact optimum on optimize ones.
+echo -n "pow_var_verify (variable-exponent int_pow, vs brute force): "
+python3 tools/pow_var_verify.py 120 20261027 || { echo "pow_var_verify: FAIL"; exit 1; }
+# v3.6: real MiniZinc 2.10.1 differential - compile a 38-model corpus with
+# the SHIPPED psolve.msc/mznlib and compare exact -a solution sets / optima
+# against Gecode.  This is the gate that caught the invalid 2D-array
+# body-less declarations that made `minizinc --solver psolve` fail to compile
+# ANY model.  Skips gracefully (exit 0) when no MiniZinc toolchain is found;
+# run tools/mzn_setup.sh once to enable it.
+echo -n "mzn_real_diff (real MiniZinc corpus vs Gecode): "
+python3 tools/mzn_real_diff.py | tail -1
+if [ "${PIPESTATUS[0]}" -ne 0 ]; then echo "mzn_real_diff: FAIL"; exit 1; fi
 
 # FlatZinc OUTPUT-layer round-trip (roadmap 6.7): re-parse every emitted
 # byte; each printed assignment must satisfy every constraint and stay in
@@ -535,13 +549,26 @@ echo "$mip_pin" | grep -q "objective: 10"    || { echo "knap_gap cert pin: FAIL 
 echo "$mip_pin" | grep -q "x\[1\] = 0"       || { echo "knap_gap cert pin: FAIL (point)";        exit 1; }
 echo "  knap_gap: OPTIMAL 10 through the MIP certificate lane  OK"
 
+# Locate a MiniZinc toolchain: PATH, an explicit MINIZINC env var, or the
+# bundle fetched by tools/mzn_setup.sh (scratch/ or ~/.cache/psolve-mzn/).
 if command -v minizinc >/dev/null 2>&1; then
+  MZN_BIN=minizinc
+elif [ -n "$MINIZINC" ] && [ -x "$MINIZINC" ]; then
+  MZN_BIN="$MINIZINC"
+else
+  MZN_BIN=$(ls -1 "$PWD"/scratch/mzn/MiniZinc-*/bin/minizinc \
+               "$HOME"/.cache/psolve-mzn/MiniZinc-*/bin/minizinc 2>/dev/null | tail -1)
+fi
+if [ -n "$MZN_BIN" ] && [ -x "$MZN_BIN" ]; then
+  MZN_ROOT=$(dirname "$(dirname "$MZN_BIN")")
+  export PATH="$(dirname "$MZN_BIN"):$PATH"
+  export MZN_STDLIB_DIR="$MZN_ROOT/share/minizinc"
   echo "[8.5/8] MiniZinc differential (compile .mzn -> fzn -> psolve vs Gecode)..."
   python3 tools/mzn_diff.py | tail -1
   echo "[8.75/8] MiniZinc full benchmark suite..."
   python3 tools/mzn_bench.py | tail -2
 else
-  echo "[8.5/8] MiniZinc differential SKIPPED (minizinc not installed)"
+  echo "[8.5/8] MiniZinc differential SKIPPED (run tools/mzn_setup.sh to enable)"
 fi
 
 echo "[9/10] Fixed-point exact-rational LP solver (fxsolve) vs double lpsolve..."
