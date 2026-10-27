@@ -439,6 +439,16 @@ echo -n "extrema_verify (randomized, vs brute force): "
 python3 tools/extrema_verify.py 300 4242 | sed 's/.*: //'
 echo -n "divmod_verify (trunc-div/mod + pow + sets/among + edge regressions, vs brute force): "
 python3 tools/divmod_verify.py 200 20260808 | sed 's/.*: //'
+# Native reified/half-reified lex + value_precede/seq_precede (v3.5): exact
+# MIP reifications with pinned success indicators.  Differential vs brute
+# force; the -a all-solutions gate compares the full feasible set, which is
+# what caught the fzn_lex2_reif WRONG bug and the nxs<=1 vacuous-shortcut bug.
+echo -n "lex_reif_verify (reified lex/chain/lex2, vs brute force): "
+python3 tools/lex_reif_verify.py || { echo "lex_reif_verify: FAIL"; exit 1; }
+echo -n "lex_reif_differential (strict/_imp + full -a solution-set equality): "
+python3 tools/lex_reif_differential.py || { echo "lex_reif_differential: FAIL"; exit 1; }
+echo -n "vpc_reif_verify (value/seq_precede reif/imp, full -a solution-set equality): "
+python3 tools/vpc_reif_verify.py || { echo "vpc_reif_verify: FAIL"; exit 1; }
 
 # FlatZinc OUTPUT-layer round-trip (roadmap 6.7): re-parse every emitted
 # byte; each printed assignment must satisfy every constraint and stay in

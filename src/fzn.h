@@ -38,6 +38,8 @@ typedef struct {
     int   is_array;    /* 1 = array decl */
     int   n;           /* number of elements (array) or 1 (scalar) */
     int   index_lo;    /* FlatZinc lower array index (1 for scalars/default arrays) */
+    int   is_2d;       /* 1 if declared as array[lo1..hi1,lo2..hi2] */
+    int   dim1_lo, dim1_hi, dim2_lo, dim2_hi;
     int   base_idx;    /* first solver index for owned contiguous vars */
     int   is_output;   /* ::output_var / ::output_array */
     /* An initialized var declaration is an alias/view in FlatZinc.  Each

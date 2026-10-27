@@ -22,3 +22,7 @@ psw_test
 build/
 cert_inject
 presolve_selftest
+scratch/
+node_modules/
+package.json
+package-lock.json

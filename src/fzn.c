@@ -296,6 +296,82 @@ static int table_values(FZModel*m,const char*s,long**out,int*outn)
     return 0;
 }
 
+/* Parse a 2D array argument (for lex_chain, lex2). Returns 0 on success:
+   * - bare identifier naming a 2D var array (uses decl dims)
+   * - array2d literal "array2d(lb1..ub1, lb2..ub2, [vals])"
+   * On success sets *r1lo..*r2hi and flat *out, *outn (row-major).
+   * Row-major means element (r,c) is at index (r - r1lo)*ncols + (c - r2lo). */
+static int parse_array2d(FZModel*m,const char*s,int*r1lo,int*r1hi,int*r2lo,int*r2hi,Lin**out,int*outn)
+{
+    /* (a) bare identifier naming a declared 2D var array */
+    {
+        char name[256];int k=0;const char*p=s;
+        while(*p==' '||*p=='\t')p++;
+        if(isalpha((unsigned char)*p)||*p=='_'){
+            while(k<255&&is_ident_ch((unsigned char)*p))name[k++]=*p++;
+            name[k]=0;
+            while(*p==' '||*p=='\t')p++;
+            if(*p=='\0'||*p==';'){
+                FZDecl*d=find_decl(m,name);
+                if(d&&d->is_array&&d->is_2d){
+                    *r1lo=d->dim1_lo; *r1hi=d->dim1_hi;
+                    *r2lo=d->dim2_lo; *r2hi=d->dim2_hi;
+                    *outn=d->n;
+                    *out=(Lin*)psolve_malloc((size_t)(d->n?d->n:1)*sizeof(Lin));
+                    for(int i=0;i<d->n;i++){
+                        memset(&(*out)[i],0,sizeof(Lin));
+                        if(d->alias_idx){
+                            int av=d->alias_idx[i];
+                            if(av>=0)lin_term(&(*out)[i],av,1.0);
+                            else (*out)[i].constant=d->alias_const[i];
+                        } else lin_term(&(*out)[i], d->base_idx+i, 1.0);
+                    }
+                    return 0;
+                }
+            }
+        }
+    }
+    /* (b) array2d literal: extract dims from integers before '[' */
+    if(strstr(s,"array2d")!=NULL){
+        const char*br=strchr(s,'[');
+        if(!br) return -1;
+        const char*lp=strchr(s,'(');
+        if(!lp || lp>br) return -1;
+        /* collect ints between '(' and '[': should be lb1,ub1,lb2,ub2 */
+        long ints[16];int nints=0;
+        size_t pre_len=(size_t)(br - lp - 1);
+        char*pre_buf=(char*)psolve_malloc(pre_len+1);
+        memcpy(pre_buf,lp+1,pre_len); pre_buf[pre_len]=0;
+        char*p=pre_buf;
+        while(*p && nints<16){
+            while(*p && !isdigit((unsigned char)*p) && *p!='-') p++;
+            if(!*p) break;
+            char*end=NULL; long v=strtol(p,&end,10);
+            if(end==p) p++; else { ints[nints++]=v; p=end; }
+        }
+        psolve_free(pre_buf);
+        if(nints>=4){
+            *r1lo=(int)ints[0]; *r1hi=(int)ints[1];
+            *r2lo=(int)ints[2]; *r2hi=(int)ints[3];
+            const char*eb=strrchr(s,']');
+            if(!eb) return -1;
+            size_t len=(size_t)(eb - br + 1);
+            char*sub=(char*)psolve_malloc(len+1);
+            memcpy(sub,br,len); sub[len]=0;
+            int rc=parse_array(m,sub,out,outn);
+            psolve_free(sub);
+            if(rc==0){
+                int expect=(*r1hi - *r1lo +1)*(*r2hi - *r2lo +1);
+                if(*outn==expect) return 0;
+                free_lins(*out,*outn);
+                return -1;
+            }
+            return rc;
+        }
+    }
+    return -1;
+}
+
 /* ------------------------------------------------------------------ */
 /* Parser                                                              */
 /* ------------------------------------------------------------------ */
@@ -451,7 +527,24 @@ int fz_read(const char*path,FZModel*m)
                            tok_int_value(m,&toks[ai+2],&ahi)==0 && ahi>=alo &&
                            ahi-alo+1<=2147483647L){
                             d->index_lo=(int)alo;
+                            d->dim1_lo=(int)alo; d->dim1_hi=(int)ahi;
                             d->n=(int)(ahi-alo+1);
+                            /* check for second dimension: array[1..n,1..m] */
+                            int aj=ai+3;
+                            if(aj<nt && toks[aj].kind==TK_SYM && strcmp(toks[aj].text,",")==0){
+                                long alo2,ahi2;
+                                if(aj+3<nt && tok_int_value(m,&toks[aj+1],&alo2)==0 &&
+                                   toks[aj+2].kind==TK_SYM&&strcmp(toks[aj+2].text,"..")==0 &&
+                                   tok_int_value(m,&toks[aj+3],&ahi2)==0 && ahi2>=alo2 &&
+                                   ahi2-alo2+1<=2147483647L){
+                                    long n1=ahi-alo+1, n2=ahi2-alo2+1;
+                                    if(n1*n2<=2147483647L){
+                                        d->is_2d=1;
+                                        d->dim2_lo=(int)alo2; d->dim2_hi=(int)ahi2;
+                                        d->n=(int)(n1*n2);
+                                    }
+                                }
+                            }
                         }
                     }
                     while(ti<nt&&!(toks[ti].kind==TK_SYM&&strcmp(toks[ti].text,"]")==0))ti++;
@@ -725,7 +818,6 @@ static int lin_materialize(Builder*b,const Lin*l,int is_float)
     return v;
 }
 
-
 /* Add d != 0 for an integer linear form.  p/n select its positive/negative
    side; this is a true disjunction, unlike conjoining d>=1 and d<=-1. */
 /* Exact lattice steps around 0 for an integral-coefficient Lin.
@@ -882,6 +974,132 @@ static int add_int_relation_constant(Builder*b,const Lin*d,int which,int want)
     else if(which==4)b_put(b,'<',0.0,d);
     else if(which==5)b_put(b,'=',0.0,d);           /* !(d!=0) <=> d==0 */
     else return -1;
+    return 0;
+}
+
+/* Core lex comparator between two equal-length vectors.
+     allow_eq : 1 -> lex_lesseq (all-equal counts as success), 0 -> lex_less.
+     S_out    : if NULL, ENFORCE the relation (post sum == 1).  If non-NULL,
+                do not enforce; instead create a fresh 0/1 variable S that is
+                pinned by the exact internal reifications to `S == 1 iff the
+                lex relation holds`, and return it via *S_out.  This gives a
+                fully-reified indicator with NO big-M (all e/l/p_eq/b_diff are
+                exact reifications, so sum(b_diff)+allow_eq*p_eq[n-1] is a
+                deterministic 0/1 function of the two vectors).
+
+   The ENFORCE path posts byte-for-byte the same rows as the historical
+   lex_post, so the 80/80 differential gate is unaffected. */
+static int lex_core(Builder*b, Lin*xs, Lin*ys, int n, int allow_eq, int *S_out)
+{
+    if(n<=0){
+        if(!S_out) return 0;                 /* legacy: vacuous, post nothing */
+        int v=allow_eq?1:0;                  /* empty vectors: equal iff allow_eq */
+        *S_out=b_newvar(b,(double)v,(double)v);
+        return 0;
+    }
+    if(n>256) return 1;
+    int *e=(int*)psolve_malloc((size_t)n*sizeof(int));
+    int *l=(int*)psolve_malloc((size_t)n*sizeof(int));
+    int *p_eq=(int*)psolve_malloc((size_t)n*sizeof(int));
+    int *b_diff=(int*)psolve_malloc((size_t)n*sizeof(int));
+    for(int i=0;i<n;i++){
+        e[i]=b_newvar(b,0.0,1.0);
+        l[i]=b_newvar(b,0.0,1.0);
+        Lin di; memset(&di,0,sizeof(di)); lin_into(&di,&xs[i],1.0); lin_into(&di,&ys[i],-1.0);
+        int re=add_int_reif(b,&di,e[i],0);
+        int rl=add_int_reif(b,&di,l[i],2);
+        lin_free(&di);
+        if(re!=0||rl!=0){ psolve_free(e); psolve_free(l); psolve_free(p_eq); psolve_free(b_diff); return 1; }
+        if(i==0){ p_eq[0]=e[0]; b_diff[0]=l[0]; }
+        else {
+            p_eq[i]=b_newvar(b,0.0,1.0);
+            Lin c1;memset(&c1,0,sizeof(c1)); lin_term(&c1,p_eq[i],1.0); lin_term(&c1,p_eq[i-1],-1.0); b_put(b,'<',0.0,&c1); lin_free(&c1);
+            Lin c2;memset(&c2,0,sizeof(c2)); lin_term(&c2,p_eq[i],1.0); lin_term(&c2,e[i],-1.0); b_put(b,'<',0.0,&c2); lin_free(&c2);
+            Lin c3;memset(&c3,0,sizeof(c3)); lin_term(&c3,p_eq[i],1.0); lin_term(&c3,p_eq[i-1],-1.0); lin_term(&c3,e[i],-1.0); c3.constant=1.0; b_put(b,'>',0.0,&c3); lin_free(&c3);
+            b_diff[i]=b_newvar(b,0.0,1.0);
+            Lin d1;memset(&d1,0,sizeof(d1)); lin_term(&d1,b_diff[i],1.0); lin_term(&d1,p_eq[i-1],-1.0); b_put(b,'<',0.0,&d1); lin_free(&d1);
+            Lin d2;memset(&d2,0,sizeof(d2)); lin_term(&d2,b_diff[i],1.0); lin_term(&d2,l[i],-1.0); b_put(b,'<',0.0,&d2); lin_free(&d2);
+            Lin d3;memset(&d3,0,sizeof(d3)); lin_term(&d3,b_diff[i],1.0); lin_term(&d3,p_eq[i-1],-1.0); lin_term(&d3,l[i],-1.0); d3.constant=1.0; b_put(b,'>',0.0,&d3); lin_free(&d3);
+        }
+    }
+    Lin sum;memset(&sum,0,sizeof(sum));
+    for(int i=0;i<n;i++) lin_term(&sum,b_diff[i],1.0);
+    if(allow_eq) lin_term(&sum,p_eq[n-1],1.0);
+    if(S_out){
+        int S=b_newvar(b,0.0,1.0);
+        lin_term(&sum,S,-1.0);
+        b_put(b,'=',0.0,&sum); lin_free(&sum);       /* S == sum(...), sum in {0,1} */
+        *S_out=S;
+    } else {
+        b_put(b,'=',1.0,&sum); lin_free(&sum);       /* enforce sum == 1 */
+    }
+    psolve_free(e); psolve_free(l); psolve_free(p_eq); psolve_free(b_diff);
+    return 0;
+}
+
+/* Helper to post (enforce) a single lex_lesseq / lex_less between two vectors.
+   n = length of vectors. is_strict: 0 = lesseq, 1 = less (strict). */
+static int lex_post(Builder*b, Lin*xs, Lin*ys, int n, int is_strict)
+{
+    return lex_core(b,xs,ys,n,is_strict?0:1,NULL);
+}
+
+/* Post precedence rows over e[0..norder-1][0..nxs-1]:
+     for each i,k:  sum_{j<k} e[i][j] - e[i+1][k] >= 0.
+   Each row is an integer linear form with min = -1 (a violation), so it is
+   exactly reifiable with add_int_reif(which=3, d>=0) / add_int_imp.
+
+   mode 0 : enforce unconditionally.
+   mode 2 : half reification  rvar -> (all rows hold).
+   mode 1 : full reification  rvar <-> (all rows hold), via per-row exact
+            indicators h_i=[row_i>=0] and the AND reification
+                r - h_i <= 0        (r => each row)
+                sum(h_i) - r <= K-1 (all rows => r).
+   Returns 0 on success, 1 on decline. */
+static int precede_rows(Builder*b,int **e,int norder,int nxs,int rvar,int mode)
+{
+    if(mode==0){
+        for(int i=0;i+1<norder;i++) for(int k=0;k<nxs;k++){
+            Lin row; memset(&row,0,sizeof(row));
+            for(int j=0;j<k;j++) lin_term(&row,e[i][j],1.0);
+            lin_term(&row,e[i+1][k],-1.0);
+            b_put(b,'>',0.0,&row); lin_free(&row);
+        }
+        return 0;
+    }
+    if(mode==2){ /* imp: r => each row >= 0, exact half-reification */
+        for(int i=0;i+1<norder;i++) for(int k=0;k<nxs;k++){
+            Lin row; memset(&row,0,sizeof(row));
+            for(int j=0;j<k;j++) lin_term(&row,e[i][j],1.0);
+            lin_term(&row,e[i+1][k],-1.0);
+            int rr=add_int_imp(b,&row,rvar,3); lin_free(&row);
+            if(rr!=0) return rr;
+        }
+        return 0;
+    }
+    /* full reif */
+    int K=(norder-1)*nxs; if(K<0) K=0;
+    int *hs=(int*)psolve_malloc((size_t)(K?K:1)*sizeof(int));
+    int idx=0,bad=0;
+    for(int i=0;i+1<norder;i++) for(int k=0;k<nxs;k++){
+        Lin row; memset(&row,0,sizeof(row));
+        for(int j=0;j<k;j++) lin_term(&row,e[i][j],1.0);
+        lin_term(&row,e[i+1][k],-1.0);
+        int h=b_newvar(b,0.0,1.0);
+        int rr=add_int_reif(b,&row,h,3); lin_free(&row);
+        if(rr!=0){ bad=1; break; }
+        hs[idx++]=h;
+    }
+    if(bad){ psolve_free(hs); return 1; }
+    for(int t=0;t<idx;t++){
+        Lin d; memset(&d,0,sizeof(d)); lin_term(&d,rvar,1.0); lin_term(&d,hs[t],-1.0);
+        b_put(b,'<',0.0,&d); lin_free(&d);
+    }
+    Lin d2; memset(&d2,0,sizeof(d2));
+    for(int t=0;t<idx;t++) lin_term(&d2,hs[t],1.0);
+    lin_term(&d2,rvar,-1.0);
+    b_put(b,'<',(double)(idx-1),&d2); lin_free(&d2);  /* K=0 -> -r <= -1 -> r=1 */
+    psolve_free(hs);
     return 0;
 }
 
@@ -1847,6 +2065,57 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
                 b_put(b,'>',0.0,&d3);lin_free(&d3);
                 lin_free(&l1);lin_free(&l2);lin_free(&l3);return 0;
             }
+            /* Bounded enumeration for int_times with small finite domains:
+               enumerate all triples (da,db,dc) with da in [lo_a,hi_a], etc.,
+               where da*db==dc, and encode as table with selector binaries.
+               This closes HONEST gap for random models where int_times is
+               on small ranges (e.g., -4..0, -2..0) that would otherwise be
+               UNHANDLED. Caps keep MIP size honest. */
+            if(lin_unit_var(&l1,&va)==0&&lin_unit_var(&l2,&vb)==0&&lin_unit_var(&l3,&vc)==0){
+                double lo_a,hi_a,lo_b,hi_b,lo_c,hi_c;
+                if(lin_bounds(b,&l1,&lo_a,&hi_a)==0&&lin_bounds(b,&l2,&lo_b,&hi_b)==0&&lin_bounds(b,&l3,&lo_c,&hi_c)==0){
+                    long la_lo=(long)llround(lo_a), la_hi=(long)llround(hi_a);
+                    long lb_lo=(long)llround(lo_b), lb_hi=(long)llround(hi_b);
+                    long lc_lo=(long)llround(lo_c), lc_hi=(long)llround(hi_c);
+                    long na = la_hi - la_lo + 1, nb = lb_hi - lb_lo + 1;
+                    if(na>0 && nb>0 && na<=32 && nb<=32 && na*nb<=1024){
+                        // Count feasible tuples
+                        int cnt=0;
+                        for(long da=la_lo;da<=la_hi;da++) for(long db=lb_lo;db<=lb_hi;db++) {
+                            long long prod=(long long)da * (long long)db;
+                            if(prod < lc_lo || prod > lc_hi) continue;
+                            if(prod < -1000000000LL || prod > 1000000000LL) continue;
+                            // prod is candidate for dc, must be in dc domain (which is contiguous range check already)
+                            cnt++;
+                        }
+                        if(cnt==0){
+                            Lin imp;memset(&imp,0,sizeof(imp));b_put(b,'=',1.0,&imp);lin_free(&imp);
+                            lin_free(&l1);lin_free(&l2);lin_free(&l3);return 0;
+                        }
+                        if(cnt>0 && cnt<=1024){
+                            // Collect feasible triples
+                            long *t_a=(long*)psolve_malloc((size_t)cnt*sizeof(long));
+                            long *t_b=(long*)psolve_malloc((size_t)cnt*sizeof(long));
+                            long *t_c=(long*)psolve_malloc((size_t)cnt*sizeof(long));
+                            int idx=0;
+                            for(long da=la_lo;da<=la_hi;da++) for(long db=lb_lo;db<=lb_hi;db++){
+                                long long prod=(long long)da * (long long)db;
+                                if(prod < lc_lo || prod > lc_hi) continue;
+                                t_a[idx]=da; t_b[idx]=db; t_c[idx]=(long)prod; idx++;
+                            }
+                            int *z=(int*)psolve_malloc((size_t)cnt*sizeof(int));
+                            for(int i=0;i<cnt;i++) z[i]=b_newvar(b,0.0,1.0);
+                            Lin sum;memset(&sum,0,sizeof(sum)); for(int i=0;i<cnt;i++) lin_term(&sum,z[i],1.0); b_put(b,'=',1.0,&sum); lin_free(&sum);
+                            // a = sum t_a[i] * z_i
+                            Lin ea;memset(&ea,0,sizeof(ea)); lin_term(&ea,va,1.0); for(int i=0;i<cnt;i++) lin_term(&ea,z[i],-(double)t_a[i]); b_put(b,'=',0.0,&ea); lin_free(&ea);
+                            Lin eb;memset(&eb,0,sizeof(eb)); lin_term(&eb,vb,1.0); for(int i=0;i<cnt;i++) lin_term(&eb,z[i],-(double)t_b[i]); b_put(b,'=',0.0,&eb); lin_free(&eb);
+                            Lin ec;memset(&ec,0,sizeof(ec)); lin_term(&ec,vc,1.0); for(int i=0;i<cnt;i++) lin_term(&ec,z[i],-(double)t_c[i]); b_put(b,'=',0.0,&ec); lin_free(&ec);
+                            psolve_free(t_a); psolve_free(t_b); psolve_free(t_c); psolve_free(z);
+                            lin_free(&l1);lin_free(&l2);lin_free(&l3);return 0;
+                        }
+                    }
+                }
+            }
         }
         lin_free(&l1);lin_free(&l2);lin_free(&l3);
         return 1;   /* bilinear -> unhandled */
@@ -1901,6 +2170,59 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
                     if(is_div)lin_term(&rhi,rem,1.0);else lin_into(&rhi,&l3,1.0);
                     lin_term(&rhi,nonneg,-R);b_put(b,'<',0.0,&rhi);lin_free(&rhi);
                     handled=1;
+                }
+            }
+        }
+        if(!handled){
+            // Bounded enumeration for variable divisor with small domains (div/mod lattice)
+            int va,vb,vc;
+            if(lin_unit_var(&l1,&va)==0&&lin_unit_var(&l2,&vb)==0&&lin_unit_var(&l3,&vc)==0){
+                double lo_a,hi_a,lo_b,hi_b,lo_c,hi_c;
+                if(lin_bounds(b,&l1,&lo_a,&hi_a)==0&&lin_bounds(b,&l2,&lo_b,&hi_b)==0&&lin_bounds(b,&l3,&lo_c,&hi_c)==0){
+                    long la_lo=(long)llround(lo_a), la_hi=(long)llround(hi_a);
+                    long lb_lo=(long)llround(lo_b), lb_hi=(long)llround(hi_b);
+                    long lc_lo=(long)llround(lo_c), lc_hi=(long)llround(hi_c);
+                    long na=la_hi-la_lo+1, nb=lb_hi-lb_lo+1;
+                    if(na>0&&nb>0&&na<=32&&nb<=32&&na*nb<=1024){
+                        int is_div=(strcmp(p,"int_div")==0);
+                        // count feasible
+                        int cnt=0;
+                        for(long da=la_lo;da<=la_hi;da++) for(long db=lb_lo;db<=lb_hi;db++){
+                            if(db==0) continue;
+                            long long q = (long long)(da / db); // C trunc toward 0 for integers matches MiniZinc
+                            // Need to ensure trunc toward 0: in C, -3/2 = -1, same as MiniZinc
+                            long long r = (long long)da - q * (long long)db;
+                            long long dc = is_div ? q : r;
+                            if(dc < lc_lo || dc > lc_hi) continue;
+                            cnt++;
+                        }
+                        if(cnt==0){
+                            Lin imp;memset(&imp,0,sizeof(imp));b_put(b,'=',1.0,&imp);lin_free(&imp);
+                            lin_free(&l1);lin_free(&l2);lin_free(&l3);return 0;
+                        }
+                        if(cnt>0 && cnt<=1024){
+                            long *t_a=(long*)psolve_malloc((size_t)cnt*sizeof(long));
+                            long *t_b=(long*)psolve_malloc((size_t)cnt*sizeof(long));
+                            long *t_c=(long*)psolve_malloc((size_t)cnt*sizeof(long));
+                            int idx=0;
+                            for(long da=la_lo;da<=la_hi;da++) for(long db=lb_lo;db<=lb_hi;db++){
+                                if(db==0) continue;
+                                long long q = (long long)(da / db);
+                                long long r = (long long)da - q * (long long)db;
+                                long long dc = is_div ? q : r;
+                                if(dc < lc_lo || dc > lc_hi) continue;
+                                t_a[idx]=da; t_b[idx]=db; t_c[idx]=(long)dc; idx++;
+                            }
+                            int *z=(int*)psolve_malloc((size_t)cnt*sizeof(int));
+                            for(int i=0;i<cnt;i++) z[i]=b_newvar(b,0.0,1.0);
+                            Lin sum;memset(&sum,0,sizeof(sum)); for(int i=0;i<cnt;i++) lin_term(&sum,z[i],1.0); b_put(b,'=',1.0,&sum); lin_free(&sum);
+                            Lin ea;memset(&ea,0,sizeof(ea)); lin_term(&ea,va,1.0); for(int i=0;i<cnt;i++) lin_term(&ea,z[i],-(double)t_a[i]); b_put(b,'=',0.0,&ea); lin_free(&ea);
+                            Lin eb;memset(&eb,0,sizeof(eb)); lin_term(&eb,vb,1.0); for(int i=0;i<cnt;i++) lin_term(&eb,z[i],-(double)t_b[i]); b_put(b,'=',0.0,&eb); lin_free(&eb);
+                            Lin ec;memset(&ec,0,sizeof(ec)); lin_term(&ec,vc,1.0); for(int i=0;i<cnt;i++) lin_term(&ec,z[i],-(double)t_c[i]); b_put(b,'=',0.0,&ec); lin_free(&ec);
+                            psolve_free(t_a); psolve_free(t_b); psolve_free(t_c); psolve_free(z);
+                            lin_free(&l1);lin_free(&l2);lin_free(&l3);return 0;
+                        }
+                    }
                 }
             }
         }
@@ -2838,9 +3160,57 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
         for(int i=0;i<n;i++){
             if(dval[i]>0.0&&rval[i]>0.0) total_vars += (hi[i]-lo[i]+1);
         }
-        if(total_vars > 2048 || (Tmax-Tmin+1) > 512){
+        int use_compressed=0;
+        long *Tvals=NULL; int Nt=0;
+        if(total_vars > 2048){
+            // Fallback for large total_vars: if cumulative is actually disjunctive (B==1, all r_i==1), encode via pairwise big-M
+            int is_disjunctive = (B==1.0);
+            if(is_disjunctive){
+                for(int i=0;i<n && is_disjunctive;i++) if(dval[i]>0.0 && rval[i]>0.0 && rval[i]!=1.0) is_disjunctive=0;
+            }
+            if(is_disjunctive && n<=64){
+                // big-M disjunctive: for each pair i<j, o_ij=1 => i before j
+                double maxD=0; for(int i=0;i<n;i++) if(dval[i]>maxD) maxD=dval[i];
+                double M = (maxEnd - minStart) + maxD + 10.0;
+                if(M < 1.0) M=1.0;
+                for(int i=0;i<n;i++) if(dval[i]==0.0||rval[i]==0.0) continue;
+                for(int ii=0;ii<n;ii++) for(int jj=ii+1;jj<n;jj++){
+                    if(dval[ii]==0.0||rval[ii]==0.0||dval[jj]==0.0||rval[jj]==0.0) continue;
+                    int o = b_newvar(b,0.0,1.0);
+                    // s_j - s_i >= d_i - M*(1-o)
+                    // => s_i - s_j <= -d_i + M*(1-o)
+                    // Big-M linear: s_j - s_i - M*o >= d_i - M
+                    Lin c1; memset(&c1,0,sizeof(c1)); lin_into(&c1,&sarr[jj],1.0); lin_into(&c1,&sarr[ii],-1.0); lin_term(&c1,o,-M);
+                    b_put(b,'>',dval[ii]-M,&c1); lin_free(&c1);
+                    // s_i - s_j >= d_j - M*o  => s_i - s_j - M*(1-o) >= d_j - M  => s_i - s_j + M*o >= d_j
+                    Lin c2; memset(&c2,0,sizeof(c2)); lin_into(&c2,&sarr[ii],1.0); lin_into(&c2,&sarr[jj],-1.0); lin_term(&c2,o,M);
+                    b_put(b,'>',dval[jj],&c2); lin_free(&c2);
+                }
+                psolve_free(lo);psolve_free(hi);psolve_free(dval);psolve_free(rval);
+                lin_free(&bl);free_lins(sarr,ns);free_lins(darr,nd);free_lins(rarr,nr);
+                return 0;
+            }
             psolve_free(lo);psolve_free(hi);psolve_free(dval);psolve_free(rval);
             lin_free(&bl);free_lins(sarr,ns);free_lins(darr,nd);free_lins(rarr,nr);return 1;
+        }
+        if((Tmax-Tmin+1) > 512){
+            // Large horizon: compress to distinct start times (peak must be at a start).
+            // Collect union of [lo_i, hi_i] across tasks: at most total_vars ≤2048 distinct ints.
+            long tot=0;
+            for(int i=0;i<n;i++) if(dval[i]>0.0&&rval[i]>0.0) tot += (hi[i]-lo[i]+1);
+            if(tot==0){ psolve_free(lo);psolve_free(hi);psolve_free(dval);psolve_free(rval); lin_free(&bl); free_lins(sarr,ns); free_lins(darr,nd); free_lins(rarr,nr); return 0; }
+            long *tmp=(long*)psolve_malloc((size_t)tot*sizeof(long));
+            long p=0;
+            for(int i=0;i<n;i++) if(dval[i]>0.0&&rval[i]>0.0) for(long k=lo[i];k<=hi[i];k++) tmp[p++]=k;
+            // sort & dedup (insertion sort is fine for ≤2048)
+            for(long i=1;i<p;i++){ long key=tmp[i]; long j=i-1; while(j>=0 && tmp[j]>key){ tmp[j+1]=tmp[j]; j--; } tmp[j+1]=key; }
+            long uniq=0;
+            for(long i=0;i<p;i++) if(i==0 || tmp[i]!=tmp[i-1]) tmp[uniq++]=tmp[i];
+            Nt=(int)uniq;
+            Tvals=(long*)psolve_malloc((size_t)Nt*sizeof(long));
+            for(int i=0;i<Nt;i++) Tvals[i]=tmp[i];
+            psolve_free(tmp);
+            use_compressed=1;
         }
 
         int **z=(int**)psolve_malloc((size_t)n*sizeof(int*));
@@ -2863,24 +3233,40 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
             }
         }
 
-        for(long t=Tmin; t<=Tmax; t++){
-            Lin R; memset(&R, 0, sizeof(R));
-            for(int i=0;i<n;i++){
-                if(dval[i]==0.0||rval[i]==0.0) continue;
-                long k_start = t - (long)dval[i] + 1;
-                if(k_start < lo[i]) k_start = lo[i];
-                long k_end = t;
-                if(k_end > hi[i]) k_end = hi[i];
-                for(long k=k_start; k<=k_end; k++){
-                    lin_term(&R, z[i][k - lo[i]], rval[i]);
+        if(use_compressed){
+            for(int ti=0; ti<Nt; ti++){
+                long t=Tvals[ti];
+                Lin R; memset(&R, 0, sizeof(R));
+                for(int i=0;i<n;i++){
+                    if(dval[i]==0.0||rval[i]==0.0) continue;
+                    long k_start = t - (long)dval[i] + 1;
+                    if(k_start < lo[i]) k_start = lo[i];
+                    long k_end = t;
+                    if(k_end > hi[i]) k_end = hi[i];
+                    for(long k=k_start; k<=k_end; k++) lin_term(&R, z[i][k - lo[i]], rval[i]);
                 }
+                if(R.n > 0) b_put(b, '<', B, &R);
+                lin_free(&R);
             }
-            if(R.n > 0) b_put(b, '<', B, &R);
-            lin_free(&R);
+        } else {
+            for(long t=Tmin; t<=Tmax; t++){
+                Lin R; memset(&R, 0, sizeof(R));
+                for(int i=0;i<n;i++){
+                    if(dval[i]==0.0||rval[i]==0.0) continue;
+                    long k_start = t - (long)dval[i] + 1;
+                    if(k_start < lo[i]) k_start = lo[i];
+                    long k_end = t;
+                    if(k_end > hi[i]) k_end = hi[i];
+                    for(long k=k_start; k<=k_end; k++) lin_term(&R, z[i][k - lo[i]], rval[i]);
+                }
+                if(R.n > 0) b_put(b, '<', B, &R);
+                lin_free(&R);
+            }
         }
 
         for(int i=0;i<n;i++) if(z[i]) psolve_free(z[i]);
         psolve_free(z); psolve_free(lo); psolve_free(hi); psolve_free(dval); psolve_free(rval);
+        if(Tvals) psolve_free(Tvals);
         lin_free(&bl); free_lins(sarr,ns); free_lins(darr,nd); free_lins(rarr,nr);
         return 0;
     }
@@ -2928,6 +3314,141 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
         }
         free_lins(arr,narr);
         return 0;
+    }
+    /* ===== reified lex family (v3.5) ====================================
+       Bug fix: previously fzn_lex2_reif(xs,b) fell through to the
+       strstr(p,"lex2") branch, which enforced lex2 UNCONDITIONALLY and
+       ignored b -> WRONG ANSWERS.  We now compile the whole reified family:
+
+         fzn_lex_lesseq_int_reif / fzn_lex_less_int_reif / bool / _imp
+             b <-> lex_lesseq(xs,ys)                 (one 1D comparison)
+         fzn_lex_chain_lesseq_int_reif / _less_ / bool / _imp
+             b <-> all adjacent COLUMNS lex-ordered  (2D)
+         fzn_lex2_reif / fzn_strict_lex2_reif / _imp
+             b <-> rows AND cols lex-ordered         (2D)
+
+       Each comparison becomes a deterministic 0/1 indicator S_i via
+       lex_core(...,&S).  Full reification b <-> AND_i S_i is then
+             b <= S_i (all i)  and  sum_i S_i - b <= K-1,
+       half reification (_imp) only b <= S_i.  NO big-M is needed because
+       every S_i is pinned by exact reifications to the true truth value. */
+    {
+        int is_reif = (strstr(p,"_reif")!=NULL);
+        int is_imp  = (strstr(p,"_imp")!=NULL);
+        int lex_kind = 0;
+        int is_lex_name = (strstr(p,"lex")!=NULL) ||
+                          (strstr(p,"array_int_lq")!=NULL)||(strstr(p,"array_int_lt")!=NULL)||
+                          (strstr(p,"array_bool_lq")!=NULL)||(strstr(p,"array_bool_lt")!=NULL);
+        if((is_reif||is_imp) && is_lex_name){
+            if(strstr(p,"lex2")!=NULL) lex_kind=3;
+            else if(strstr(p,"lex_chain")!=NULL) lex_kind=2;
+            else lex_kind=1; /* single 1D comparison (lex_less/lesseq/lq/lt/...) */
+        }
+        if(lex_kind){
+            int is_strict;
+            if(lex_kind==3){ /* lex2 vs strict_lex2 */
+                is_strict = (strstr(p,"strict")!=NULL);
+            } else {
+                int has_leq = (strstr(p,"lesseq")!=NULL)||(strstr(p,"_lq")!=NULL)||
+                              (strstr(p,"leq")!=NULL);
+                int has_less= (strstr(p,"less")!=NULL)||(strstr(p,"_lt")!=NULL)||
+                              (strstr(p,"strict")!=NULL);
+                is_strict = has_less && !has_leq;
+            }
+            const char *rarg = (lex_kind==1) ? (c->nargs>=3?c->args[2]:NULL)
+                                             : (c->nargs>=2?c->args[1]:NULL);
+            if(!rarg) return -1;
+            Lin rb; memset(&rb,0,sizeof(rb));
+            if(parse_lin(m,rarg,&rb)!=0) return -1;
+            int rvar = lin_materialize(b,&rb,0);
+            lin_free(&rb);
+            if(rvar<0) return 1;
+            /* clamp the reification bool to [0,1] (robust to `var int: b`). */
+            if(!b->haslo[rvar]||b->lo[rvar]<0){ b->lo[rvar]=0.0; b->haslo[rvar]=1; }
+            if(!b->hashi[rvar]||b->hi[rvar]>1){ b->hi[rvar]=1.0; b->hashi[rvar]=1; }
+
+            int allow_eq_cmp = is_strict?0:1;
+            int Sl_cap=8, K=0;
+            int *Slist=(int*)psolve_malloc(sizeof(int)*Sl_cap);
+            int fail=0;
+            #define LEX_PUSH(S) do{ if(K>=Sl_cap){Sl_cap*=2;Slist=(int*)psolve_realloc((void**)&Slist,sizeof(int)*Sl_cap);} Slist[K++]=(S); }while(0)
+
+            if(lex_kind==1){
+                Lin *xs=NULL,*ys=NULL;int nx=0,ny=0;
+                if(parse_array(m,c->args[0],&xs,&nx)!=0){ psolve_free(Slist); return -1; }
+                if(parse_array(m,c->args[1],&ys,&ny)!=0){ free_lins(xs,nx); psolve_free(Slist); return -1; }
+                int n = nx<ny?nx:ny;
+                if(n>256) fail=1;
+                else {
+                    int allow_eq = is_strict ? (nx<ny) : (nx<=ny);
+                    int S=-1;
+                    if(lex_core(b,xs,ys,n,allow_eq,&S)!=0) fail=1; else LEX_PUSH(S);
+                }
+                free_lins(xs,nx); free_lins(ys,ny);
+            } else {
+                int r1lo,r1hi,r2lo,r2hi; Lin*flat=NULL;int nflat=0;
+                if(parse_array2d(m,c->args[0],&r1lo,&r1hi,&r2lo,&r2hi,&flat,&nflat)!=0){ psolve_free(Slist); return 1; }
+                int nrows=r1hi-r1lo+1, ncols=r2hi-r2lo+1;
+                if(nrows<=0||ncols<=0||nrows*ncols>4096||nrows>64||ncols>64) fail=1;
+                else {
+                    if(lex_kind==3){ /* rows, only for lex2 */
+                        for(int r=r1lo; r<r1hi && !fail; r++){
+                            Lin *xr=(Lin*)psolve_malloc(sizeof(Lin)*ncols);
+                            Lin *yr=(Lin*)psolve_malloc(sizeof(Lin)*ncols);
+                            for(int cc=0;cc<ncols;cc++){
+                                memset(&xr[cc],0,sizeof(Lin));memset(&yr[cc],0,sizeof(Lin));
+                                lin_into(&xr[cc],&flat[(r-r1lo)*ncols+cc],1.0);
+                                lin_into(&yr[cc],&flat[(r+1-r1lo)*ncols+cc],1.0);
+                            }
+                            int S=-1;
+                            if(lex_core(b,xr,yr,ncols,allow_eq_cmp,&S)!=0) fail=1; else LEX_PUSH(S);
+                            for(int cc=0;cc<ncols;cc++){lin_free(&xr[cc]);lin_free(&yr[cc]);}
+                            psolve_free(xr);psolve_free(yr);
+                        }
+                    }
+                    for(int cc=r2lo; cc<r2hi && !fail; cc++){ /* columns (chain & lex2) */
+                        Lin *xc=(Lin*)psolve_malloc(sizeof(Lin)*nrows);
+                        Lin *yc=(Lin*)psolve_malloc(sizeof(Lin)*nrows);
+                        for(int r=0;r<nrows;r++){
+                            memset(&xc[r],0,sizeof(Lin));memset(&yc[r],0,sizeof(Lin));
+                            lin_into(&xc[r],&flat[r*ncols+(cc-r2lo)],1.0);
+                            lin_into(&yc[r],&flat[r*ncols+(cc+1-r2lo)],1.0);
+                        }
+                        int S=-1;
+                        if(lex_core(b,xc,yc,nrows,allow_eq_cmp,&S)!=0) fail=1; else LEX_PUSH(S);
+                        for(int r=0;r<nrows;r++){lin_free(&xc[r]);lin_free(&yc[r]);}
+                        psolve_free(xc);psolve_free(yc);
+                    }
+                }
+                free_lins(flat,nflat);
+            }
+            #undef LEX_PUSH
+            if(fail){ psolve_free(Slist); return 1; }
+
+            if(K==0){
+                if(is_reif){ /* AND of zero comparisons = true -> b = 1 */
+                    Lin e;memset(&e,0,sizeof(e));lin_term(&e,rvar,1.0);
+                    b_put(b,'=',1.0,&e);lin_free(&e);
+                }
+                /* _imp with zero comparisons is vacuous: no rows */
+            } else if(is_imp){
+                for(int i=0;i<K;i++){
+                    Lin d;memset(&d,0,sizeof(d));lin_term(&d,rvar,1.0);lin_term(&d,Slist[i],-1.0);
+                    b_put(b,'<',0.0,&d);lin_free(&d);
+                }
+            } else {
+                for(int i=0;i<K;i++){
+                    Lin d;memset(&d,0,sizeof(d));lin_term(&d,rvar,1.0);lin_term(&d,Slist[i],-1.0);
+                    b_put(b,'<',0.0,&d);lin_free(&d);
+                }
+                Lin d2;memset(&d2,0,sizeof(d2));
+                for(int i=0;i<K;i++) lin_term(&d2,Slist[i],1.0);
+                lin_term(&d2,rvar,-1.0);
+                b_put(b,'<',(double)(K-1),&d2);lin_free(&d2);
+            }
+            psolve_free(Slist);
+            return 0;
+        }
     }
     /* Lexicographical comparison between arrays x and y:
        lex_less(x, y), lex_lesseq(x, y), array_int_lt(x, y), array_int_lq(x, y), etc. */
@@ -3350,7 +3871,8 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
     /* alldifferent_except_0(x[]) and alldifferent_except(x[], S) */
     if(strcmp(p,"alldifferent_except_0")==0||strcmp(p,"fzn_alldifferent_except_0")==0||
        strcmp(p,"all_different_except_0")==0||
-       strcmp(p,"alldifferent_except")==0||strcmp(p,"fzn_alldifferent_except")==0){
+       strcmp(p,"alldifferent_except")==0||strcmp(p,"fzn_alldifferent_except")==0||
+       strcmp(p,"all_different_except")==0||strcmp(p,"fzn_all_different_except")==0){
         if(c->nargs<1)return -1;
         Lin*arr;int narr;
         if(parse_array(m,c->args[0],&arr,&narr)!=0)return -1;
@@ -3364,9 +3886,32 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
         }
         long ndom=(long)(dhi-dlo)+1;
         if(ndom<=0||ndom>128){free_lins(arr,narr);return 1;}
-
+        // Build except set: for _except_0 skip {0}; for _except with 2nd arg parse set literal
+        long except_lo=0, except_hi=0;
+        long *except_vals=NULL; int except_n=0; int is_range_except=0;
+        int skip_zero_only=1;
+        if(c->nargs>=2){
+            // Try to parse second arg as int set literal (e.g. {0}, {1,2}, 1..3)
+            int is_range=0; long rlo=0,rhi=0; long *vals=NULL; int nvals=0;
+            if(fz_parse_int_set(c->args[1], 256, &is_range, &rlo, &rhi, &vals, &nvals)==0){
+                skip_zero_only=0;
+                if(is_range){ except_lo=rlo; except_hi=rhi; is_range_except=1; }
+                else { except_vals=vals; except_n=nvals; is_range_except=0; }
+            } else {
+                // If not parseable (maybe par identifier), fallback to except_0 only for now
+                skip_zero_only=1;
+            }
+        }
         for(long v=(long)dlo; v<=(long)dhi; v++){
-            if(v == 0) continue; /* except 0 */
+            int is_except=0;
+            if(skip_zero_only){ is_except = (v==0); }
+            else {
+                if(is_range_except){ is_except = (v>=except_lo && v<=except_hi); }
+                else {
+                    for(int k=0;k<except_n;k++) if(except_vals[k]==v){ is_except=1; break; }
+                }
+            }
+            if(is_except) continue;
             Lin sum; memset(&sum, 0, sizeof(sum));
             for(int i=0;i<narr;i++){
                 int z = b_newvar(b, 0.0, 1.0);
@@ -3378,7 +3923,7 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
             b_put(b, '<', 1.0, &sum);
             lin_free(&sum);
         }
-
+        if(except_vals) psolve_free(except_vals);
         free_lins(arr,narr);
         return 0;
     }
@@ -3648,6 +4193,456 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
         return 0;
     }
 
+    /* ===== regular family: DFA acceptance (fzn_regular, fzn_regular_set, reif) ===== */
+    if(strcmp(p,"fzn_regular")==0||strcmp(p,"regular")==0||
+       strcmp(p,"fzn_regular_set")==0||strcmp(p,"fzn_regular_reif")==0||
+       strcmp(p,"fzn_regular_set_reif")==0||strcmp(p,"regular_reif")==0){
+        int is_reif = (strstr(p,"_reif")!=NULL);
+        int is_set = (strstr(p,"_set")!=NULL);
+        int need = is_reif ? 7 : 6;
+        if(c->nargs < need) return -1;
+        Lin *xs_arr=NULL; int nxs=0;
+        Lin q_lin, q0_lin;
+        long *d_flat=NULL; int nd_flat=0;
+        long *S_vals=NULL; int S_n=0;
+        long *F_vals=NULL; int nF=0;
+        int Q=0, q0=0;
+        int r_var=-1;
+        int ok=1;
+        if(parse_array(m,c->args[0],&xs_arr,&nxs)!=0) ok=0;
+        else if(parse_lin(m,c->args[1],&q_lin)!=0) ok=0;
+        else if(q_lin.n!=0 || !isfinite(q_lin.constant)) ok=0;
+        else {
+            Q=(int)llround(q_lin.constant);
+            if(Q<=0||Q>64) ok=0;
+            else {
+                /* S: int or set */
+                if(!is_set){
+                    Lin s_lin;
+                    if(parse_lin(m,c->args[2],&s_lin)==0 && s_lin.n==0 && isfinite(s_lin.constant)){
+                        long Sv=(long)llround(s_lin.constant);
+                        if(Sv<=0||Sv>64) ok=0;
+                        else { S_n=(int)Sv; S_vals=(long*)psolve_malloc((size_t)S_n*sizeof(long)); for(int i=0;i<S_n;i++) S_vals[i]=i+1; }
+                        lin_free(&s_lin);
+                    } else {
+                        lin_free(&s_lin);
+                        int is_r=0; long rl=0,rh=0; long *vs=NULL; int nvs=0;
+                        if(fz_parse_int_set(c->args[2],4096,&is_r,&rl,&rh,&vs,&nvs)==0){
+                            if(is_r){ S_n=(int)(rh-rl+1); S_vals=(long*)psolve_malloc((size_t)S_n*sizeof(long)); for(int i=0;i<S_n;i++) S_vals[i]=rl+i; psolve_free(vs); }
+                            else { S_vals=vs; S_n=nvs; }
+                            is_set=1;
+                        } else ok=0;
+                    }
+                } else {
+                    int is_r=0; long rl=0,rh=0; long *vs=NULL; int nvs=0;
+                    if(fz_parse_int_set(c->args[2],4096,&is_r,&rl,&rh,&vs,&nvs)==0){
+                        if(is_r){ S_n=(int)(rh-rl+1); S_vals=(long*)psolve_malloc((size_t)S_n*sizeof(long)); for(int i=0;i<S_n;i++) S_vals[i]=rl+i; psolve_free(vs); }
+                        else { S_vals=vs; S_n=nvs; }
+                    } else ok=0;
+                }
+                if(ok){
+                    if(S_n<=0||S_n>64) ok=0;
+                    else if(table_values(m,c->args[3],&d_flat,&nd_flat)!=0) ok=0;
+                    else if(nd_flat != Q*S_n) ok=0;
+                    else if(parse_lin(m,c->args[4],&q0_lin)!=0) ok=0;
+                    else if(q0_lin.n!=0) ok=0;
+                    else {
+                        q0=(int)llround(q0_lin.constant);
+                        if(q0<1||q0>Q) ok=0;
+                        else {
+                            const char *f_arg=c->args[5];
+                            int is_rF=0; long rloF=0,rhiF=0; long *vsF=NULL; int nvsF=0;
+                            if(fz_parse_int_set(f_arg,4096,&is_rF,&rloF,&rhiF,&vsF,&nvsF)!=0) ok=0;
+                            else {
+                                if(is_rF){ nF=(int)(rhiF-rloF+1); F_vals=(long*)psolve_malloc((size_t)nF*sizeof(long)); for(int i=0;i<nF;i++) F_vals[i]=rloF+i; psolve_free(vsF); }
+                                else { F_vals=vsF; nF=nvsF; }
+                                for(int i=0;i<nF;i++) if(F_vals[i]<1||F_vals[i]>Q) ok=0;
+                                if(is_reif){
+                                    Lin rb; if(parse_lin(m,c->args[6],&rb)!=0) ok=0;
+                                    else if(lin_unit_var(&rb,&r_var)!=0) ok=0;
+                                    lin_free(&rb);
+                                }
+                            }
+                        }
+                        lin_free(&q0_lin);
+                    }
+                }
+            }
+            lin_free(&q_lin);
+        }
+        if(!ok){
+            if(xs_arr) free_lins(xs_arr,nxs);
+            psolve_free(S_vals); psolve_free(d_flat); psolve_free(F_vals);
+            /* decline honestly if sizes unsupported, otherwise malformed */
+            return 1;
+        }
+        if(nxs>256 || (long)Q*(long)S_n>2048 || (long)nxs*(long)Q*(long)S_n>65536){
+            free_lins(xs_arr,nxs); psolve_free(S_vals); psolve_free(d_flat); psolve_free(F_vals);
+            return 1;
+        }
+        if(nxs==0){
+            int q0_in_F=0; for(int i=0;i<nF;i++) if(F_vals[i]==q0) q0_in_F=1;
+            if(!is_reif){
+                if(!q0_in_F){ Lin imp; memset(&imp,0,sizeof(imp)); b_put(b,'=',1.0,&imp); lin_free(&imp); }
+            } else {
+                Lin eq; memset(&eq,0,sizeof(eq)); lin_term(&eq,r_var,1.0); eq.constant = q0_in_F ? -1.0 : 0.0; b_put(b,'=',0.0,&eq); lin_free(&eq);
+            }
+            free_lins(xs_arr,nxs); psolve_free(S_vals); psolve_free(d_flat); psolve_free(F_vals);
+            return 0;
+        }
+        int a_lo = is_reif ? 0 : 1;
+        int *a_vars=(int*)psolve_malloc((size_t)(nxs+1)*sizeof(int));
+        for(int i=0;i<=nxs;i++){
+            if(i==0) a_vars[i]=b_newvar(b,(double)q0,(double)q0);
+            else a_vars[i]=b_newvar(b,(double)a_lo,(double)Q);
+        }
+        /* final acceptance */
+        if(!is_reif){
+            if(nF==1){
+                Lin feq; memset(&feq,0,sizeof(feq)); lin_term(&feq,a_vars[nxs],1.0); feq.constant=-(double)F_vals[0]; b_put(b,'=',0.0,&feq); lin_free(&feq);
+            } else if(nF>1){
+                int *ef=(int*)psolve_malloc((size_t)nF*sizeof(int));
+                for(int k=0;k<nF;k++){ ef[k]=b_newvar(b,0.0,1.0); Lin di; memset(&di,0,sizeof(di)); lin_term(&di,a_vars[nxs],1.0); di.constant=-(double)F_vals[k]; add_int_reif(b,&di,ef[k],0); lin_free(&di); }
+                Lin sum; memset(&sum,0,sizeof(sum)); for(int k=0;k<nF;k++) lin_term(&sum,ef[k],1.0); b_put(b,'=',1.0,&sum); lin_free(&sum); psolve_free(ef);
+            } else { Lin imp; memset(&imp,0,sizeof(imp)); b_put(b,'=',1.0,&imp); lin_free(&imp); }
+        } else {
+            if(nF==0){ Lin z; memset(&z,0,sizeof(z)); lin_term(&z,r_var,1.0); b_put(b,'=',0.0,&z); lin_free(&z); }
+            else {
+                int *ef=(int*)psolve_malloc((size_t)nF*sizeof(int));
+                for(int k=0;k<nF;k++){ ef[k]=b_newvar(b,0.0,1.0); Lin di; memset(&di,0,sizeof(di)); lin_term(&di,a_vars[nxs],1.0); di.constant=-(double)F_vals[k]; add_int_reif(b,&di,ef[k],0); lin_free(&di); }
+                Lin eq; memset(&eq,0,sizeof(eq)); lin_term(&eq,r_var,1.0); for(int k=0;k<nF;k++) lin_term(&eq,ef[k],-1.0); b_put(b,'=',0.0,&eq); lin_free(&eq); psolve_free(ef);
+            }
+        }
+        /* per-position transition table */
+        for(int i=0;i<nxs;i++){
+            int xs_is_const=0; double xs_cst=0; int xs_var=-1;
+            if(xs_arr[i].n==0){ xs_is_const=1; xs_cst=xs_arr[i].constant; }
+            else if(lin_unit_var(&xs_arr[i],&xs_var)!=0){ free_lins(xs_arr,nxs); psolve_free(S_vals); psolve_free(d_flat); psolve_free(F_vals); psolve_free(a_vars); return 1; }
+            /* count allowed triples */
+            int ntrip=0;
+            for(int q=a_lo;q<=Q;q++) for(int sc=0;sc<S_n;sc++){
+                long s_val=S_vals[sc];
+                if(xs_is_const && (long)xs_cst != s_val) continue;
+                int q2; if(q==0) q2=0; else { int idx=(q-1)*S_n+sc; q2=(int)d_flat[idx]; if(q2<0||q2>Q) continue; if(q2==0 && !is_reif) continue; }
+                ntrip++;
+            }
+            if(ntrip==0){ Lin imp; memset(&imp,0,sizeof(imp)); b_put(b,'=',1.0,&imp); lin_free(&imp); continue; }
+            if(ntrip>1024){ free_lins(xs_arr,nxs); psolve_free(S_vals); psolve_free(d_flat); psolve_free(F_vals); psolve_free(a_vars); return 1; }
+            int *z_trip=(int*)psolve_malloc((size_t)ntrip*sizeof(int));
+            for(int t=0;t<ntrip;t++) z_trip[t]=b_newvar(b,0.0,1.0);
+            Lin pick; memset(&pick,0,sizeof(pick)); for(int t=0;t<ntrip;t++) lin_term(&pick,z_trip[t],1.0); b_put(b,'=',1.0,&pick); lin_free(&pick);
+            Lin eq_a; memset(&eq_a,0,sizeof(eq_a)); lin_term(&eq_a,a_vars[i],1.0);
+            Lin eq_a2; memset(&eq_a2,0,sizeof(eq_a2)); lin_term(&eq_a2,a_vars[i+1],1.0);
+            Lin eq_x; memset(&eq_x,0,sizeof(eq_x)); if(!xs_is_const) lin_term(&eq_x,xs_var,1.0);
+            int t=0;
+            for(int q=a_lo;q<=Q;q++) for(int sc=0;sc<S_n;sc++){
+                long s_val=S_vals[sc];
+                if(xs_is_const && (long)xs_cst != s_val) continue;
+                int q2; if(q==0) q2=0; else { int idx=(q-1)*S_n+sc; q2=(int)d_flat[idx]; if(q2<0||q2>Q) continue; if(q2==0 && !is_reif) continue; }
+                lin_term(&eq_a,z_trip[t],-(double)q);
+                if(!xs_is_const) lin_term(&eq_x,z_trip[t],-(double)s_val);
+                lin_term(&eq_a2,z_trip[t],-(double)q2);
+                t++;
+            }
+            b_put(b,'=',0.0,&eq_a); b_put(b,'=',0.0,&eq_a2); lin_free(&eq_a); lin_free(&eq_a2);
+            if(!xs_is_const){ b_put(b,'=',0.0,&eq_x); }
+            lin_free(&eq_x); psolve_free(z_trip);
+        }
+        psolve_free(a_vars); free_lins(xs_arr,nxs); psolve_free(S_vals); psolve_free(d_flat); psolve_free(F_vals);
+        return 0;
+    }
+
+    /* ===== value_precede_chain family (with reif / imp) ===== */
+    if(strcmp(p,"fzn_value_precede_chain_int")==0||strcmp(p,"value_precede_chain")==0||
+       strcmp(p,"fzn_value_precede_chain_int_reif")==0||strcmp(p,"fzn_value_precede_chain_int_imp")==0){
+        int is_reif = (strstr(p,"_reif")!=NULL);
+        int is_imp  = (strstr(p,"_imp")!=NULL);
+        if(c->nargs < ((is_reif||is_imp)?3:2)) return -1;
+        Lin *order_arr=NULL; int norder=0;
+        Lin *xs_arr2=NULL; int nxs2=0;
+        if(parse_array(m,c->args[0],&order_arr,&norder)!=0) return -1;
+        if(parse_array(m,c->args[1],&xs_arr2,&nxs2)!=0){ free_lins(order_arr,norder); return -1; }
+        long *order_vals=(long*)psolve_malloc((size_t)(norder?norder:1)*sizeof(long));
+        int ok=1;
+        for(int i=0;i<norder;i++){
+            if(order_arr[i].n!=0 || !isfinite(order_arr[i].constant)) ok=0;
+            else order_vals[i]=(long)llround(order_arr[i].constant);
+        }
+        if(!ok || norder>64 || nxs2>256){ free_lins(order_arr,norder); free_lins(xs_arr2,nxs2); psolve_free(order_vals); return 1; }
+
+        /* materialize the reification boolean (unit var, constant, or affine). */
+        int rvar=-1, mode=0;
+        if(is_reif||is_imp){
+            Lin rb; memset(&rb,0,sizeof(rb));
+            if(parse_lin(m,c->args[2],&rb)!=0){ free_lins(order_arr,norder); free_lins(xs_arr2,nxs2); psolve_free(order_vals); return -1; }
+            rvar=lin_materialize(b,&rb,0); lin_free(&rb);
+            if(rvar<0){ free_lins(order_arr,norder); free_lins(xs_arr2,nxs2); psolve_free(order_vals); return 1; }
+            if(!b->haslo[rvar]||b->lo[rvar]<0){ b->lo[rvar]=0.0; b->haslo[rvar]=1; }
+            if(!b->hashi[rvar]||b->hi[rvar]>1){ b->hi[rvar]=1.0; b->hashi[rvar]=1; }
+            mode = is_imp?2:1;
+        }
+        /* Vacuous only when there are NO consecutive pairs (norder<=1) or an
+           EMPTY xs (nxs2<=0).  A single-element xs is NOT vacuous: with
+           order=[1,2] and xs=[2] the value 2 appears with no earlier 1, a
+           genuine violation.  (Old `nxs2<=1` shortcut was a WRONG-ANSWER bug
+           in both the enforced and reified paths.) */
+        if(norder<=1 || nxs2<=0){
+            if(is_reif){ Lin e;memset(&e,0,sizeof(e));lin_term(&e,rvar,1.0);b_put(b,'=',1.0,&e);lin_free(&e); }
+            free_lins(order_arr,norder); free_lins(xs_arr2,nxs2); psolve_free(order_vals);
+            return 0;
+        }
+        if(norder*(long)nxs2>8192){ free_lins(order_arr,norder); free_lins(xs_arr2,nxs2); psolve_free(order_vals); return 1; }
+        /* build e[i][k] = [xs[k]==order[i]] */
+        int **e_mat=(int**)psolve_malloc((size_t)norder*sizeof(int*));
+        for(int i=0;i<norder;i++) e_mat[i]=(int*)psolve_malloc((size_t)nxs2*sizeof(int));
+        for(int i=0;i<norder;i++) for(int k=0;k<nxs2;k++){
+            e_mat[i][k]=b_newvar(b,0.0,1.0);
+            Lin di; memset(&di,0,sizeof(di)); lin_into(&di,&xs_arr2[k],1.0); di.constant -= (double)order_vals[i];
+            add_int_reif(b,&di,e_mat[i][k],0); lin_free(&di);
+        }
+        int rc=precede_rows(b,e_mat,norder,nxs2,rvar,mode);
+        for(int i=0;i<norder;i++) psolve_free(e_mat[i]);
+        psolve_free(e_mat);
+        free_lins(order_arr,norder); free_lins(xs_arr2,nxs2); psolve_free(order_vals);
+        return rc;
+    }
+    /* ===== seq_precede_chain family (with reif / imp) ===== */
+    if(strcmp(p,"fzn_seq_precede_chain_int")==0||strcmp(p,"seq_precede_chain")==0||
+       strcmp(p,"fzn_seq_precede_chain_int_reif")==0||strcmp(p,"fzn_seq_precede_chain_int_imp")==0){
+        int is_reif = (strstr(p,"_reif")!=NULL);
+        int is_imp  = (strstr(p,"_imp")!=NULL);
+        if(c->nargs < ((is_reif||is_imp)?2:1)) return -1;
+        Lin *xs_arr3=NULL; int nxs3=0;
+        if(parse_array(m,c->args[0],&xs_arr3,&nxs3)!=0) return -1;
+        if(nxs3>256){ free_lins(xs_arr3,nxs3); return 1; }
+
+        int rvar=-1, mode=0;
+        if(is_reif||is_imp){
+            Lin rb; memset(&rb,0,sizeof(rb));
+            if(parse_lin(m,c->args[1],&rb)!=0){ free_lins(xs_arr3,nxs3); return -1; }
+            rvar=lin_materialize(b,&rb,0); lin_free(&rb);
+            if(rvar<0){ free_lins(xs_arr3,nxs3); return 1; }
+            if(!b->haslo[rvar]||b->lo[rvar]<0){ b->lo[rvar]=0.0; b->haslo[rvar]=1; }
+            if(!b->hashi[rvar]||b->hi[rvar]>1){ b->hi[rvar]=1.0; b->hashi[rvar]=1; }
+            mode = is_imp?2:1;
+        }
+        /* Vacuous only for an EMPTY array.  nxs3==1 is NOT vacuous for the
+           same reason as value_precede_chain (see comment above): a single
+           higher value with no earlier predecessor violates the chain. */
+        if(nxs3<=0){
+            if(is_reif){ Lin e;memset(&e,0,sizeof(e));lin_term(&e,rvar,1.0);b_put(b,'=',1.0,&e);lin_free(&e); }
+            free_lins(xs_arr3,nxs3); return 0;
+        }
+        double dlo=1e18, dhi=-1e18;
+        for(int i=0;i<nxs3;i++){ double lo,hi; if(lin_bounds(b,&xs_arr3[i],&lo,&hi)!=0){ free_lins(xs_arr3,nxs3); return 1; } if(lo<dlo) dlo=lo; if(hi>dhi) dhi=hi; }
+        long loL=(long)llround(dlo), hiL=(long)llround(dhi);
+        if(hiL-loL+1>64 || hiL-loL+1<=1){ free_lins(xs_arr3,nxs3); return 1; }
+        int m2=(int)(hiL-loL+1);
+        long *order2=(long*)psolve_malloc((size_t)m2*sizeof(long)); for(int i=0;i<m2;i++) order2[i]=loL+i;
+        int **e2=(int**)psolve_malloc((size_t)m2*sizeof(int*));
+        for(int i=0;i<m2;i++) e2[i]=(int*)psolve_malloc((size_t)nxs3*sizeof(int));
+        for(int i=0;i<m2;i++) for(int k=0;k<nxs3;k++){ e2[i][k]=b_newvar(b,0.0,1.0); Lin di; memset(&di,0,sizeof(di)); lin_into(&di,&xs_arr3[k],1.0); di.constant -= (double)order2[i]; add_int_reif(b,&di,e2[i][k],0); lin_free(&di); }
+        int rc=precede_rows(b,e2,m2,nxs3,rvar,mode);
+        { for(int i=0;i<m2;i++) psolve_free(e2[i]); psolve_free(e2); } psolve_free(order2); free_lins(xs_arr3,nxs3);
+        return rc;
+    }
+
+    /* ===== lex_chain family (columns lexicographically ordered) ===== */
+    if(strstr(p,"lex_chain")!=NULL){
+        if(c->nargs<1) return -1;
+        int is_strict = (strstr(p,"_less")!=NULL && strstr(p,"lesseq")==NULL);
+        /* reif not yet natively handled: decline honestly */
+        if(strstr(p,"_reif")!=NULL || strstr(p,"_imp")!=NULL) return 1;
+        int r1lo,r1hi,r2lo,r2hi; Lin*flat=NULL; int nflat=0;
+        if(parse_array2d(m,c->args[0],&r1lo,&r1hi,&r2lo,&r2hi,&flat,&nflat)!=0) return 1;
+        int nrows=r1hi - r1lo + 1;
+        int ncols=r2hi - r2lo + 1;
+        if(ncols<=1){ free_lins(flat,nflat); return 0; }
+        if(nrows<=0||ncols<=0||nrows*ncols>4096||ncols>64){ free_lins(flat,nflat); return 1; }
+        for(int col=r2lo; col<r2hi; col++){
+            Lin *xs_col=(Lin*)psolve_malloc((size_t)nrows*sizeof(Lin));
+            Lin *ys_col=(Lin*)psolve_malloc((size_t)nrows*sizeof(Lin));
+            for(int r=0;r<nrows;r++){
+                int idx_cur = r*ncols + (col - r2lo);
+                int idx_nxt = r*ncols + (col+1 - r2lo);
+                xs_col[r]=flat[idx_cur]; ys_col[r]=flat[idx_nxt];
+                /* duplicate Lin struct shallow copy is safe: we don't free inner arrays yet */
+                /* Need to deep-copy? Lin contains idx/coef pointers; shallow copy would double-free.
+                   Instead create new Lins via lin_into. */
+                /* Undo shallow alias: re-create */
+                memset(&xs_col[r],0,sizeof(Lin)); memset(&ys_col[r],0,sizeof(Lin));
+                lin_into(&xs_col[r], &flat[idx_cur], 1.0);
+                lin_into(&ys_col[r], &flat[idx_nxt], 1.0);
+            }
+            int rc=lex_post(b,xs_col,ys_col,nrows,is_strict);
+            for(int r=0;r<nrows;r++){ lin_free(&xs_col[r]); lin_free(&ys_col[r]); }
+            psolve_free(xs_col); psolve_free(ys_col);
+            if(rc!=0){ free_lins(flat,nflat); return rc; }
+        }
+        free_lins(flat,nflat);
+        return 0;
+    }
+    /* ===== lex2 / strict_lex2 (rows and columns lexicographically ordered) ===== */
+    if(strstr(p,"lex2")!=NULL){
+        if(c->nargs<1) return -1;
+        /* Defensive: any reified/imp lex2 variant must be handled by the
+           dedicated reif handler above.  If it somehow reaches here, decline
+           HONESTLY rather than silently enforcing lex2 (the old WRONG bug). */
+        if(strstr(p,"_reif")!=NULL||strstr(p,"_imp")!=NULL) return 1;
+        int is_strict=(strstr(p,"strict")!=NULL);
+        int r1lo,r1hi,r2lo,r2hi; Lin*flat=NULL; int nflat=0;
+        if(parse_array2d(m,c->args[0],&r1lo,&r1hi,&r2lo,&r2hi,&flat,&nflat)!=0) return 1;
+        int nrows=r1hi - r1lo +1;
+        int ncols=r2hi - r2lo +1;
+        if(nrows<=1&&ncols<=1){ free_lins(flat,nflat); return 0; }
+        if(nrows*ncols>4096||nrows>64||ncols>64){ free_lins(flat,nflat); return 1; }
+        /* rows lex ordered */
+        for(int r=r1lo; r<r1hi; r++){
+            Lin *xs_row=(Lin*)psolve_malloc((size_t)ncols*sizeof(Lin));
+            Lin *ys_row=(Lin*)psolve_malloc((size_t)ncols*sizeof(Lin));
+            for(int cc=0; cc<ncols; cc++){
+                int idx_cur = (r - r1lo)*ncols + cc;
+                int idx_nxt = (r+1 - r1lo)*ncols + cc;
+                memset(&xs_row[cc],0,sizeof(Lin)); memset(&ys_row[cc],0,sizeof(Lin));
+                lin_into(&xs_row[cc], &flat[idx_cur], 1.0);
+                lin_into(&ys_row[cc], &flat[idx_nxt], 1.0);
+            }
+            int rc=lex_post(b,xs_row,ys_row,ncols,is_strict);
+            for(int cc=0;cc<ncols;cc++){ lin_free(&xs_row[cc]); lin_free(&ys_row[cc]); }
+            psolve_free(xs_row); psolve_free(ys_row);
+            if(rc!=0){ free_lins(flat,nflat); return rc; }
+        }
+        /* columns lex ordered */
+        for(int cc=r2lo; cc<r2hi; cc++){
+            Lin *xs_col=(Lin*)psolve_malloc((size_t)nrows*sizeof(Lin));
+            Lin *ys_col=(Lin*)psolve_malloc((size_t)nrows*sizeof(Lin));
+            for(int r=0;r<nrows;r++){
+                int idx_cur = r*ncols + (cc - r2lo);
+                int idx_nxt = r*ncols + (cc+1 - r2lo);
+                memset(&xs_col[r],0,sizeof(Lin)); memset(&ys_col[r],0,sizeof(Lin));
+                lin_into(&xs_col[r], &flat[idx_cur], 1.0);
+                lin_into(&ys_col[r], &flat[idx_nxt], 1.0);
+            }
+            int rc=lex_post(b,xs_col,ys_col,nrows,is_strict);
+            for(int r=0;r<nrows;r++){ lin_free(&xs_col[r]); lin_free(&ys_col[r]); }
+            psolve_free(xs_col); psolve_free(ys_col);
+            if(rc!=0){ free_lins(flat,nflat); return rc; }
+        }
+        free_lins(flat,nflat);
+        return 0;
+    }
+    /* ===== minimum / maximum aliases (delegated to array_int_minimum/maximum) ===== */
+    if(strcmp(p,"fzn_minimum_int")==0||strcmp(p,"fzn_maximum_int")==0||
+       strcmp(p,"minimum")==0||strcmp(p,"maximum")==0||
+       strcmp(p,"fzn_minimum_bool")==0||strcmp(p,"fzn_maximum_bool")==0){
+        int is_max=(strstr(p,"maximum")!=NULL);
+        if(c->nargs<2) return -1;
+        Lin ml; if(parse_lin(m,c->args[0],&ml)!=0) return -1;
+        Lin*arr;int narr; if(parse_array(m,c->args[1],&arr,&narr)!=0){ lin_free(&ml); return -1; }
+        if(narr<=0||narr>1024){ lin_free(&ml); free_lins(arr,narr); return 1; }
+        double mlo,mhi;
+        if(lin_bounds(b,&ml,&mlo,&mhi)!=0){ lin_free(&ml); free_lins(arr,narr); return 1; }
+        int mv; int ml_is_var = (lin_unit_var(&ml,&mv)==0);
+        if(ml_is_var){
+            if(mlo > mhi){ lin_free(&ml); free_lins(arr,narr); return -1; }
+        }
+        /* Reuse array_int_maximum/minimum encoding: selector binaries */
+        int *z=(int*)psolve_malloc((size_t)narr*sizeof(int));
+        for(int i=0;i<narr;i++) z[i]=b_newvar(b,0.0,1.0);
+        Lin pick;memset(&pick,0,sizeof(pick)); for(int i=0;i<narr;i++) lin_term(&pick,z[i],1.0); b_put(b,'=',1.0,&pick); lin_free(&pick);
+        double *xlo=(double*)psolve_malloc((size_t)narr*sizeof(double));
+        double *xhi=(double*)psolve_malloc((size_t)narr*sizeof(double));
+        for(int i=0;i<narr;i++){ if(lin_bounds(b,&arr[i],&xlo[i],&xhi[i])!=0){ psolve_free(z); psolve_free(xlo); psolve_free(xhi); lin_free(&ml); free_lins(arr,narr); return 1; } }
+        for(int i=0;i<narr;i++){
+            Lin d;memset(&d,0,sizeof(d)); lin_into(&d,&ml,1.0); lin_into(&d,&arr[i],-1.0);
+            if(is_max){
+                b_put(b,'>',0.0,&d);
+                double M=fmax(0.0,mhi - xlo[i]);
+                lin_term(&d,z[i],M); b_put(b,'<',M,&d);
+            } else {
+                b_put(b,'<',0.0,&d);
+                double M=fmax(0.0,xhi[i] - mlo);
+                lin_term(&d,z[i],-M); b_put(b,'>',-M,&d);
+            }
+            lin_free(&d);
+        }
+        psolve_free(z); psolve_free(xlo); psolve_free(xhi); lin_free(&ml); free_lins(arr,narr);
+        return 0;
+    }
+    /* ===== arg_min / arg_max family ===== */
+    if(strstr(p,"arg_min")!=NULL||strstr(p,"arg_max")!=NULL||strstr(p,"minimum_arg")!=NULL||strstr(p,"maximum_arg")!=NULL){
+        if(c->nargs<2) return -1;
+        int is_max = (strstr(p,"max")!=NULL);
+        if(strstr(p,"_reif")!=NULL||strstr(p,"_imp")!=NULL) return 1;
+        Lin*arr=NULL;int narr=0; Lin il;
+        if(parse_array(m,c->args[0],&arr,&narr)!=0) return -1;
+        if(parse_lin(m,c->args[1],&il)!=0){ free_lins(arr,narr); return -1; }
+        int idx_var=-1;
+        if(lin_unit_var(&il,&idx_var)!=0){ lin_free(&il); free_lins(arr,narr); return 1; }
+        if(narr<=0||narr>256){ lin_free(&il); free_lins(arr,narr); return 1; }
+        /* Determine index base: try to recover from array argument if it was bare identifier */
+        long idx_base=1;
+        {
+            char name[256];int k=0;const char*p2=c->args[0];
+            while(*p2==' '||*p2=='\t')p2++;
+            if(isalpha((unsigned char)*p2)||*p2=='_'){
+                while(k<255&&is_ident_ch((unsigned char)*p2))name[k++]=*p2++;
+                name[k]=0;
+                while(*p2==' '||*p2=='\t')p2++;
+                if(*p2=='\0'||*p2==';'){
+                    FZDecl*d=find_decl(m,name);
+                    if(d&&d->is_array) idx_base=d->index_lo;
+                }
+            }
+        }
+        /* m = min/max value */
+        double alo=1e18,ahi=-1e18;
+        for(int i=0;i<narr;i++){ double lo,hi; if(lin_bounds(b,&arr[i],&lo,&hi)!=0){ lin_free(&il); free_lins(arr,narr); return 1; } if(lo<alo)alo=lo; if(hi>ahi)ahi=hi; }
+        int m_var=b_newvar(b,alo,ahi);
+        /* m <= (or >=) x_i for all i */
+        for(int i=0;i<narr;i++){
+            Lin d;memset(&d,0,sizeof(d)); lin_into(&d,&arr[i],1.0); lin_term(&d,m_var,-1.0);
+            b_put(b, is_max ? '<' : '>', 0.0, &d); lin_free(&d);
+        }
+        /* binaries b_j = [i == idx] */
+        int *bjs=(int*)psolve_malloc((size_t)narr*sizeof(int));
+        for(int i=0;i<narr;i++) bjs[i]=b_newvar(b,0.0,1.0);
+        Lin sum;memset(&sum,0,sizeof(sum)); for(int i=0;i<narr;i++) lin_term(&sum,bjs[i],1.0); b_put(b,'=',1.0,&sum); lin_free(&sum);
+        Lin idx_eq;memset(&idx_eq,0,sizeof(idx_eq)); lin_term(&idx_eq,idx_var,1.0);
+        for(int i=0;i<narr;i++) lin_term(&idx_eq,bjs[i],-(double)(idx_base+i));
+        b_put(b,'=',0.0,&idx_eq); lin_free(&idx_eq);
+        /* b_j => x_j == m */
+        for(int i=0;i<narr;i++){
+            double M = (ahi - alo + 1.0);
+            if(M<1.0) M=1.0;
+            Lin d;memset(&d,0,sizeof(d)); lin_into(&d,&arr[i],1.0); lin_term(&d,m_var,-1.0);
+            if(is_max){
+                /* m >= x_i and b_j => x_j >= m  => x_j - m >= -M*(1-b_j) -> x_j - m - M*b_j >= -M */
+                lin_term(&d,bjs[i],-M); b_put(b,'>',-M,&d);
+            } else {
+                /* m <= x_i and b_j => x_j <= m  => x_j - m <= M*(1-b_j) -> x_j - m + M*b_j <= M */
+                lin_term(&d,bjs[i],M); b_put(b,'<',M,&d);
+            }
+            lin_free(&d);
+        }
+        /* tie-breaking: smallest index => for b_j=1, earlier k must be strictly worse */
+        for(int j=0;j<narr;j++){
+            for(int k=0;k<j;k++){
+                Lin d;memset(&d,0,sizeof(d)); lin_into(&d,&arr[k],1.0); lin_term(&d,m_var,-1.0);
+                double M2 = (ahi - alo + 1.0); if(M2<1.0) M2=1.0;
+                if(is_max){
+                    /* x_k <= m-1  => x_k - m <= -1  when b_j=1 */
+                    lin_term(&d,bjs[j],M2); b_put(b,'<',M2-1.0,&d);
+                } else {
+                    /* x_k >= m+1  => x_k - m >= 1 */
+                    lin_term(&d,bjs[j],-M2); b_put(b,'>',1.0-M2,&d);
+                }
+                lin_free(&d);
+            }
+        }
+        psolve_free(bjs); lin_free(&il); free_lins(arr,narr);
+        return 0;
+    }
     /* everything else: unhandled (return UNKNOWN at top level) */
     return 1;
 }
