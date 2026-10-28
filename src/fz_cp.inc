@@ -214,6 +214,8 @@ typedef struct {
 #define CPK_ONCYCLE 15 /* `start` lies on a cycle of the functional graph */
 #define CPK_ORBITCAP 16 /* len = min(orbit length of `start`, cap in rhs); presolve rewrite target */
 #define CPK_AND 17     /* terms[0] <-> AND(terms[1..n)) of bools */
+#define CPK_CIRCUIT 18 /* Hamiltonian successor circuit: terms[0..n) = succ
+                          vars, rhs = node-index offset (usually 1) */
 /* the functional-graph constraint family sharing one FZOrbit digest */
 static int fg_kind(int k){ return k==CPK_ORBIT||k==CPK_ORBITTR||k==CPK_ORBITCL||k==CPK_ONCYCLE||k==CPK_ORBITCAP; }
 
@@ -1656,6 +1658,28 @@ static int cp_parse(FZModel*m,CPCR**out_cr,int*out_n,unsigned char*referenced,in
             Lin dd;memset(&dd,0,sizeof(dd)); lin_into(&dd,&l2,1.0); lin_into(&dd,&l1,1.0);
             lin_free(&l1);lin_free(&l2); if(cp_make_lin(&rec,&dd,0)!=0){lin_free(&dd);ok=0;break;} lin_free(&dd);
         }
+        /* ---------- circuit (Hamiltonian successor cycle) ---------- */
+        else if(cp_pred_is(p,"fzn_circuit")||cp_pred_is(p,"gecode_circuit")||cp_pred_is(p,"circuit")){
+            int is_gec=cp_pred_is(p,"gecode_circuit");
+            if(c->nargs<(is_gec?2:1)){ok=0;break;}
+            const char*xarg=is_gec?c->args[1]:c->args[0];
+            int64_t off=1;
+            if(is_gec){ Lin ol; if(parse_lin(m,c->args[0],&ol)!=0){ok=0;break;}
+                if(ol.n!=0||ol.constant!=rint(ol.constant)){lin_free(&ol);ok=0;break;}
+                off=(int64_t)llround(ol.constant); lin_free(&ol); }
+            if(parse_array(m,xarg,&arr,&narr)!=0){ok=0;break;}
+            if(narr<=0||narr>256){free_lins(arr,narr);ok=0;break;}
+            rec.kind=CPK_CIRCUIT; rec.n=narr; rec.rhs=off;
+            rec.terms=(CPT*)psolve_calloc((size_t)narr,sizeof(CPT));
+            int bad=0;
+            for(int i=0;i<narr;i++){
+                if(cp_term_from_lin(&arr[i],&rec.terms[i])!=0){bad=1;break;}
+                if(!rec.terms[i].isc) referenced[rec.terms[i].v]=1;
+            }
+            free_lins(arr,narr);
+            if(bad){psolve_free(rec.terms);ok=0;break;}
+            motivating=1;
+        }
         /* ---------- all_different ---------- */
         else if(cp_pred_is(p,"all_different")||cp_pred_is(p,"all_different_int")){
             if(c->nargs<1){ok=0;break;}
@@ -2004,6 +2028,103 @@ static int cp_parse(FZModel*m,CPCR**out_cr,int*out_n,unsigned char*referenced,in
     return 0;
 }
 
+/* forward decl: defined below (after the propagators) */
+static int64_t cp_term_out(const CPT*t,const double*outx);
+
+/* ---- Hamiltonian circuit propagation ---------------------------------
+   succ[i] is the successor of node i, values are node indices offset..offset+n-1.
+   Enforces: (a) all_different (successors form a permutation), (b) no self arc
+   succ[i] != i+offset, (c) NO PROPER SUBTOUR.  For (c) we follow the chain of
+   *fixed* successors from each node i: if it returns to i before consuming all
+   n nodes, that is a closed subtour -> inconsistent.  If the chain reaches an
+   unfixed node j, then succ[j] may not take the value that closes back to i
+   (unless that would close the FULL n-cycle).  This is the standard
+   "no subcycle" propagation used by CP circuit solvers; it prunes the search
+   tree dramatically compared with a flat MIP MTZ relaxation.
+
+   Returns 1 (inconsistent), 0 (ok), -1 (uncertifiable -> caller declines). */
+static int cp_prop_circuit(CP*cp,CPCR*c){
+    int n=c->n;
+    int64_t off=c->rhs;
+    CPT *t=c->terms;
+    if(n<=1) return 0;
+    /* (a) all_different + (b) no self arc */
+    if(cp_prop_alldiff(cp,t,n)) return 1;
+    for(int i=0;i<n;i++){
+        if(t[i].isc){ if(t[i].c==off+i) return 1; }
+        else if(cp_remove_val(cp,t[i].v,off+i)) return 1;
+    }
+    /* (c) chain following over fixed successors */
+    int64_t *succ=(int64_t*)psolve_malloc((size_t)n*sizeof(int64_t));
+    for(int i=0;i<n;i++){
+        int64_t v;
+        if(cp_term_value(cp,&t[i],&v)){
+            int64_t j=v-off;
+            if(j<0||j>=n){ psolve_free(succ); return 1; }
+            succ[i]=j;
+        } else succ[i]=-1;
+    }
+    for(int s=0;s<n;s++){
+        /* walk from s while successors are fixed */
+        int cur=s, steps=0;
+        int *vis=(int*)psolve_calloc((size_t)n,sizeof(int));
+        int closed=0, bad=0;
+        while(cur>=0&&cur<n&&steps<n){
+            if(vis[cur]){ closed=1; break; }
+            vis[cur]=1;
+            if(succ[cur]<0) break;      /* unfixed tail at cur */
+            cur=(int)succ[cur]; steps++;
+        }
+        /* If the walk closed back on itself before visiting all n nodes,
+           that is a proper subtour among fixed arcs -> UNSAT. */
+        if(closed && steps<n){ bad=1; }
+        else if(!closed && cur>=0 && cur<n && succ[cur]<0 && steps>0){
+            /* The chain s -> ... -> cur ends at unfixed cur.  Forbid
+               succ[cur] = off+s unless it would close the full cycle. */
+            if(steps+1 < n){
+                if(t[cur].isc){ if(t[cur].c==off+s) bad=1; }
+                else if(cp_remove_val(cp,t[cur].v,off+s)) bad=1;
+            }
+        }
+        psolve_free(vis);
+        if(bad){ psolve_free(succ); return 1; }
+    }
+    psolve_free(succ);
+    return 0;
+}
+
+/* Verify a circuit at a fully fixed assignment.  Exact: all successors in
+   range, all distinct, and one single cycle covering all n nodes. */
+static int cp_verify_circuit(const CPCR*r,const double*outx){
+    int n=r->n; int64_t off=r->rhs;
+    if(n<=0) return 1;
+    int *seen=(int*)psolve_calloc((size_t)n,sizeof(int));
+    int ok=1;
+    for(int i=0;i<n;i++){
+        int64_t v=cp_term_out(&r->terms[i],outx);
+        int64_t j=v-off;
+        if(j<0||j>=n||seen[j]){ ok=0; break; }
+        seen[j]=1;
+    }
+    if(ok){
+        /* all_different + every successor in range = a permutation.
+           Walk from node 0: a valid circuit returns to 0 after exactly n
+           steps (any earlier return is a proper subtour). */
+        int cur=0, cnt=0;
+        for(int i=0;i<n;i++){
+            int64_t v=cp_term_out(&r->terms[cur],outx);
+            int nx=(int)(v-off);
+            if(nx<0||nx>=n){ ok=0; break; }
+            cnt++;
+            if(nx==0){ cur=0; break; }
+            cur=nx;
+        }
+        if(!(cnt==n&&cur==0)) ok=0;
+    }
+    psolve_free(seen);
+    return ok;
+}
+
 /* propagate all constraints to fixpoint. returns 0 ok, 1 inconsistent, -1 uncertifiable. */
 static int cp_propagate(CP*cp,CPCR*cr,int nc){
     for(int pass=0;pass<CP_MAXNODES;pass++){
@@ -2029,6 +2150,7 @@ static int cp_propagate(CP*cp,CPCR*cr,int nc){
                 case CPK_ORBITCAP: r=cp_prop_orbit_gen(cp,&cr[i],3); break;
                 case CPK_ONCYCLE: r=cp_prop_oncycle(cp,&cr[i]); break;
                 case CPK_AND: r=cp_prop_and(cp,&cr[i]); break;
+                case CPK_CIRCUIT: r=cp_prop_circuit(cp,&cr[i]); break;
             }
             if(r==1) return 1;
             if(r==-1) return -1;
@@ -2102,6 +2224,9 @@ static int cp_verify(const CP*cp,CPCR*cr,int nc,const double*outx){
             if(sv<0||sv>=o->n) return 0;
             int a,t,cl; fg_facts(o,(int)sv,&a,&t,&cl);
             if(t!=0) return 0;
+        }
+        else if(r->kind==CPK_CIRCUIT){
+            if(!cp_verify_circuit(r,outx)) return 0;
         }
         else if(r->kind==CPK_AND){
             int64_t ov=cp_term_out(&r->terms[0],outx), and=1;

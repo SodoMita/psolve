@@ -432,7 +432,46 @@ constraint x <= 3;
 constraint y <= 3;
 solve satisfy;
 '''))
-    
+
+    # v3.7: set decision variables (`var set of U`).  MiniZinc emits these
+    # for value_precede_chain over var set of int.  Exact -a set equality vs
+    # Gecode through the showDzn output normalizer.
+    corpus.append(("set_vpc1", "sat", '''include "value_precede_chain.mzn";
+array[1..3] of var set of 1..3: x :: output_array([1..3]);
+constraint value_precede_chain({1,2,3}, x);
+solve satisfy;
+'''))
+    corpus.append(("set_vpc_tight", "sat", '''include "value_precede_chain.mzn";
+array[1..3] of var set of 1..2: x :: output_array([1..3]);
+constraint value_precede_chain({1,2}, x);
+constraint 1 in x[3];
+solve satisfy;
+'''))
+    # var opt int value_precede_chain (stdlib decomposes the opt variant)
+    corpus.append(("opt_vpc1", "sat", '''include "value_precede_chain.mzn";
+array[1..4] of var opt 1..3: x :: output_array([1..4]);
+constraint value_precede_chain([1,2,3], x);
+solve satisfy;
+'''))
+    # Native large circuit: real mzn2fzn must emit fzn_circuit(x) via the
+    # solver's fzn_circuit.mzn shadow, not the O(n^2) stdlib decomposition.
+    # Gecode also solves this natively, so the comparison is meaningful.
+    # Small circuit: -a enumerates all (n-1)! cycles exactly (n=5 -> 24).
+    corpus.append(("circuit5", "sat", '''include "circuit.mzn";
+array[1..5] of var 1..5: succ :: output_array([1..5]);
+constraint circuit(succ);
+solve satisfy;
+'''))
+    # Large circuit: pin enough arcs that exactly ONE Hamiltonian cycle
+    # remains, so -a terminates and both solvers must print the same one.
+    corpus.append(("circuit70_pinned", "sat", '''include "circuit.mzn";
+int: n = 70;
+array[1..n] of var 1..n: succ :: output_array([1..n]);
+constraint circuit(succ);
+constraint forall(i in 1..n-1)(succ[i] = i+1);
+solve satisfy;
+'''))
+
     return corpus
 
 def run_solver(mzn_bin, solver, model_path, env, temp_dir, extra_flags, timeout=60):

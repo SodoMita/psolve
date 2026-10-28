@@ -103,12 +103,16 @@ minizinc --solver psolve model.mzn
 ```
 
 The FlatZinc bridge (`src/fzn.c`) natively linearizes and solves:
-- **Real MiniZinc validation:** `share/minizinc/solvers/psolve.msc` (v1.8.0) +
+- **Real MiniZinc validation:** `share/minizinc/solvers/psolve.msc` (v1.9.0) +
   `share/minizinc/psolve/` route real `mzn2fzn` output to the native C
   handlers via file-name shadowing. `tools/mzn_setup.sh` fetches a MiniZinc
-  2.10.1 toolchain and `tools/mzn_real_diff.py` checks a 38-model corpus
-  against Gecode with exact `-a` solution-set equality (38/38, WRONG=0).
-  See [`docs/FLATZINC_COMPLETENESS_V36.md`](docs/FLATZINC_COMPLETENESS_V36.md).
+  2.10.1 toolchain and `tools/mzn_real_diff.py` checks a 43-model corpus
+  against Gecode with exact `-a` solution-set equality (43/43, WRONG=0).
+  Set decision variables (`var set of U`), variable-exponent `int_pow`, and a
+  native `circuit` with CP subtour elimination (n≤256) are covered by
+  dedicated brute-force verifiers wired into `test.sh`. See
+  [`docs/FLATZINC_COMPLETENESS_V36.md`](docs/FLATZINC_COMPLETENESS_V36.md) and
+  [`docs/FLATZINC_COMPLETENESS_V37.md`](docs/FLATZINC_COMPLETENESS_V37.md).
 - **Linear & Logic:** `int_lin_*`, `bool_lin_*`, `float_lin_*`, `bool_and/or/xor/not/clause`, `array_bool_and/or/xor`.
 - **Global Constraints:** `all_different`, `all_different_except_0`, `all_equal`, `increasing`, `decreasing`, `strictly_increasing`, `strictly_decreasing`, `lex_less`, `lex_lesseq` (and array comparisons `array_int_lq/lt`), `global_cardinality` (including `low_up` and `closed`), `bin_packing` (including `load` and `capa`), `disjunctive` (unary scheduling), `diffn` (2D non-overlapping rectangles), `inverse`, `member`, `sliding_sum`, `nvalue`, `table`, `circuit`, `subcircuit`, and Pritsker time-indexed `cumulative`.
 - **Extrema & Reification:** `int_abs`, `float_abs`, `int_min/max`, `float_min/max`, `array_*_minimum/maximum`, full reification (`*_reif`) and half-reification (`*_imp`).

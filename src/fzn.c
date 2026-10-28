@@ -377,7 +377,7 @@ static int parse_array2d(FZModel*m,const char*s,int*r1lo,int*r1hi,int*r2lo,int*r
 /* ------------------------------------------------------------------ */
 static FZDecl*add_decl(FZModel*m){
     if(m->ndecl>=m->cap_decl){m->cap_decl=m->cap_decl?m->cap_decl*2:16;m->decls=(FZDecl*)psolve_realloc((void**)&m->decls,(size_t)m->cap_decl*sizeof(FZDecl));}
-    FZDecl*d=&m->decls[m->ndecl++];memset(d,0,sizeof(*d));d->base_idx=-1;d->index_lo=1;return d;
+    FZDecl*d=&m->decls[m->ndecl++];memset(d,0,sizeof(*d));d->base_idx=-1;d->index_lo=1;d->set_bitbase=-1;return d;
 }
 FZDecl*find_decl(FZModel*m,const char*name){
     for(int i=0;i<m->ndecl;i++)if(m->decls[i].name&&strcmp(m->decls[i].name,name)==0)return &m->decls[i];
@@ -553,6 +553,62 @@ int fz_read(const char*path,FZModel*m)
                 }
                 /* optional 'var' before the type (array ... of var int) */
                 if(ti<nt&&is_kw(toks[ti].text,"var")){ is_var=1; d->is_var=1; ti++; }
+                /* `var set of D: s` / `array[...] of var set of int: x`.
+                   MiniZinc emits set decision variables for value_precede_chain
+                   over `var set of int`, regular_set, etc.  Represent the set
+                   as one bitmask integer over an explicit small universe. */
+                if(ti<nt&&toks[ti].kind==TK_IDENT&&is_kw(toks[ti].text,"set")){
+                    ti++;
+                    if(ti<nt&&toks[ti].kind==TK_IDENT&&is_kw(toks[ti].text,"of"))ti++;
+                    d->kind=FZ_K_SET; d->is_set=1; is_var=1; d->is_var=1;
+                    /* Universe: either `lo..hi` (two ints) or `{a,b,c}`.
+                       A bare `int` means unbounded -> decline honestly via
+                       set_card=0 (the caller then reports UNKNOWN). */
+                    long ulo=0,uhi=-1; long *uv=NULL; int un=0;
+                    if(ti<nt&&toks[ti].kind==TK_INT){
+                        ulo=toks[ti].ival; ti++;
+                        if(ti<nt&&toks[ti].kind==TK_SYM&&strcmp(toks[ti].text,"..")==0){
+                            ti++;
+                            if(ti<nt&&toks[ti].kind==TK_INT){uhi=toks[ti].ival;ti++;}
+                        } else { /* single literal like `set of 3` is not valid FlatZinc */ }
+                    } else if(ti<nt&&toks[ti].kind==TK_SYM&&strcmp(toks[ti].text,"{")==0){
+                        ti++; int cap=16; uv=(long*)psolve_malloc((size_t)cap*sizeof(long));
+                        while(ti<nt&&!(toks[ti].kind==TK_SYM&&strcmp(toks[ti].text,"}")==0)){
+                            if(toks[ti].kind==TK_INT){
+                                if(un>=cap){cap*=2;uv=(long*)psolve_realloc((void**)&uv,(size_t)cap*sizeof(long));}
+                                /* insert ascending, dedupe */
+                                int q=0;while(q<un&&uv[q]<toks[ti].ival)q++;
+                                if(q>=un||uv[q]!=toks[ti].ival){
+                                    memmove(uv+q+1,uv+q,(size_t)(un-q)*sizeof(long));uv[q]=toks[ti].ival;un++;
+                                }
+                            }
+                            ti++;
+                        }
+                        if(ti<nt)ti++;
+                    } else {
+                        /* `set of int` (no universe).  Consume the bare type
+                           keyword so the generic type-dispatch below does not
+                           overwrite FZ_K_SET with FZ_K_INT.  MiniZinc normally
+                           grounds these to a literal range; leave set_card=0
+                           so fz_solve declines instead of guessing a domain. */
+                        if(ti<nt&&toks[ti].kind==TK_IDENT&&is_kw(toks[ti].text,"int"))ti++;
+                    }
+                    if(un==0 && uhi>=ulo){
+                        long card=uhi-ulo+1;
+                        if(card>0&&card<=1048576){
+                            d->set_card=(int)card;
+                            d->set_univ=(long*)psolve_malloc((size_t)card*sizeof(long));
+                            for(long q=0;q<card;q++)d->set_univ[q]=ulo+q;
+                        }
+                    } else if(un>0&&un<=1048576){
+                        d->set_card=un; d->set_univ=uv; uv=NULL;
+                    }
+                    psolve_free(uv);
+                    /* Fall through: ti now points at ':' (or annotations).
+                       The numeric-domain shorthand below only triggers on a
+                       leading number token, so a set type cannot be mistaken
+                       for a var bound. */
+                }
                 if(ti<nt&&toks[ti].kind==TK_IDENT){
                     if(is_kw(toks[ti].text,"int"))d->kind=FZ_K_INT;
                     else if(is_kw(toks[ti].text,"float"))d->kind=FZ_K_FLOAT;
@@ -2531,6 +2587,56 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
         Lin xl; if(parse_lin(m,c->args[0],&xl)!=0) return -1;
         Lin rb;
         if(reified && parse_lin(m,c->args[2],&rb)!=0){lin_free(&xl);return -1;}
+        /* `set_in_reif(k, S, r)` where S is a `var set of U` decision var:
+           r is exactly the membership bit for k.  Detect a bare identifier
+           naming a set decl; a literal set never parses as an identifier. */
+        {
+            const char*sp=c->args[1];
+            while(*sp==' '||*sp=='\t')sp++;
+            char nm[256];int nk=0;
+            if(isalpha((unsigned char)*sp)||*sp=='_'){
+                while(nk<255&&is_ident_ch((unsigned char)*sp))nm[nk++]=*sp++;
+                nm[nk]=0;
+                while(*sp==' '||*sp=='\t')sp++;
+                if((*sp=='\0'||*sp==';')){
+                    FZDecl*sd=find_decl(m,nm);
+                    if(sd&&sd->is_set){
+                        if(!reified){ /* set_in(k,S): force the bit to 1 */
+                            if(xl.n!=0||!isfinite(xl.constant)||xl.constant!=rint(xl.constant)){
+                                lin_free(&xl);return 1;
+                            }
+                            long k=(long)llround(xl.constant);
+                            int idx=-1;
+                            for(int i=0;i<sd->set_card;i++)if(sd->set_univ[i]==k){idx=i;break;}
+                            if(idx<0||sd->set_bitbase<0){
+                                Lin nf;memset(&nf,0,sizeof(nf));b_put(b,'=',1.0,&nf);lin_free(&nf);
+                                lin_free(&xl);return 0;
+                            }
+                            Lin e;memset(&e,0,sizeof(e));lin_term(&e,sd->set_bitbase+idx,1.0);
+                            b_put(b,'=',1.0,&e);lin_free(&e);lin_free(&xl);return 0;
+                        }
+                        /* reified */
+                        int r;
+                        if(lin_unit_var(&rb,&r)!=0){lin_free(&xl);lin_free(&rb);return 1;}
+                        if(xl.n!=0||!isfinite(xl.constant)||xl.constant!=rint(xl.constant)){
+                            lin_free(&xl);lin_free(&rb);return 1;
+                        }
+                        long k=(long)llround(xl.constant);
+                        int idx=-1;
+                        for(int i=0;i<sd->set_card;i++)if(sd->set_univ[i]==k){idx=i;break;}
+                        Lin e;memset(&e,0,sizeof(e));lin_term(&e,r,1.0);
+                        if(idx<0||sd->set_bitbase<0){
+                            /* k outside universe: r = false */
+                            b_put(b,'=',0.0,&e);lin_free(&e);
+                        } else {
+                            lin_term(&e,sd->set_bitbase+idx,-1.0);
+                            b_put(b,'=',0.0,&e);lin_free(&e);
+                        }
+                        lin_free(&xl);lin_free(&rb);return 0;
+                    }
+                }
+            }
+        }
         int is_range=0; long rlo=0, rhi=0; long*vals=NULL; int nvals=0;
         if(fz_parse_int_set(c->args[1],FZ_MAX_SET_ENUM,&is_range,&rlo,&rhi,&vals,&nvals)!=0){
             lin_free(&xl); if(reified)lin_free(&rb); return 1;
@@ -2922,8 +3028,15 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
             for(int j=0;j<nx;j++)if(z[i*nx+j]>=0)lin_term(&eq,z[i*nx+j],-(double)(offset+j));
             b_put(b,'=',0.0,&eq);lin_free(&eq);
         }
+        /* MTZ order variables are INTEGER, not continuous floats: making them
+           integral lets the MIP branch on the rank and lets the big-M row
+           propagate (`z=1 -> ord_j >= ord_i+1`).  With float ranks the LP
+           relaxation could satisfy every subtour with fractional ranks, so
+           the branch-and-bound degenerated into explicit cycle elimination
+           and timed out beyond n~8.  Row: ord_i - ord_j + (n-1)*z <= n-2,
+           equivalent to z=1 -> ord_j >= ord_i + 1 (tight M = n-1). */
         int *ord=(int*)psolve_malloc((size_t)(nx-1)*sizeof(int));
-        for(int i=1;i<nx;i++)ord[i-1]=b_newvar_float(b,1.0,(double)(nx-1));
+        for(int i=1;i<nx;i++)ord[i-1]=b_newvar(b,1.0,(double)(nx-1));
         for(int i=1;i<nx;i++)for(int j=1;j<nx;j++)if(i!=j){
             Lin mtz;memset(&mtz,0,sizeof(mtz));lin_term(&mtz,ord[i-1],1.0);lin_term(&mtz,ord[j-1],-1.0);
             lin_term(&mtz,z[i*nx+j],(double)(nx-1));b_put(b,'<',(double)(nx-2),&mtz);lin_free(&mtz);
@@ -4773,6 +4886,27 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
     return 1;
 }
 
+/* Render a `var set of U` bitmask as a FlatZinc set literal.  MiniZinc's
+   dzn printer accepts both a contiguous range `a..b` and an explicit
+   enumeration `{a,b,c}`; use the range form when the members are
+   contiguous, matching what Gecode prints. */
+static void fz_print_set_value(const FZDecl*decl,double mask)
+{
+    (void)0; /* universe is carried by decl; no model-wide lookup needed */
+    long long bits=(long long)llround(mask);
+    int card=decl->set_card;
+    if(card<=0||!decl->set_univ){printf("{}");return;}
+    long *mem=(long*)psolve_malloc((size_t)card*sizeof(long));
+    int n=0;
+    for(int i=0;i<card;i++) if(bits&(1LL<<i)) mem[n++]=decl->set_univ[i];
+    if(n==0){printf("{}");psolve_free(mem);return;}
+    int contiguous=1;
+    for(int i=1;i<n;i++) if(mem[i]!=mem[i-1]+1){contiguous=0;break;}
+    if(contiguous&&n>1) printf("%ld..%ld",mem[0],mem[n-1]);
+    else {printf("{");for(int i=0;i<n;i++){if(i)printf(", ");printf("%ld",mem[i]);}printf("}");}
+    psolve_free(mem);
+}
+
 static void fz_print_value(FZKind kind,double value)
 {
     if(kind==FZ_K_FLOAT){
@@ -4812,10 +4946,33 @@ static void fz_print_one_solution(const FZModel*m,const double*x,int nvars)
         if(decl->is_array){
             int hi=decl->index_lo+decl->n-1;
             printf("%s = array1d(%d..%d, [",decl->name,decl->index_lo,hi);
-            for(int e=0;e<decl->n;e++){double v;if(e)printf(", ");if(fz_decl_val_at(decl,x,nvars,e,&v)!=0)v=0;fz_print_value(decl->kind,v);}
+            for(int e=0;e<decl->n;e++){
+                double v;if(e)printf(", ");if(fz_decl_val_at(decl,x,nvars,e,&v)!=0)v=0;
+                if(decl->kind==FZ_K_SET){
+                    /* An output array of sets is usually an ALIAS view over
+                       separately declared `var set of U` scalars.  Recover
+                       each element's universe from the aliased decl so the
+                       bitmask can be rendered. */
+                    const FZDecl*ud=decl;
+                    if(decl->is_alias&&decl->alias_idx){
+                        int av=decl->alias_idx[e];
+                        if(av>=0){
+                            for(int q=0;q<m->ndecl;q++){
+                                const FZDecl*cand=&m->decls[q];
+                                if(cand->is_set&&!cand->is_alias&&cand->base_idx==av&&
+                                   cand->set_card>0){ud=cand;break;}
+                            }
+                        }
+                    }
+                    fz_print_set_value(ud,v);
+                } else fz_print_value(decl->kind,v);
+            }
             printf("]);\n");
         } else {
-            printf("%s = ",decl->name);fz_print_value(decl->kind,first);printf(";\n");
+            printf("%s = ",decl->name);
+            if(decl->kind==FZ_K_SET)fz_print_set_value(decl,first);
+            else fz_print_value(decl->kind,first);
+            printf(";\n");
         }
     }
     printf("----------\n");
@@ -4979,6 +5136,31 @@ void fz_solve(const FZModel*m,FZSolution*sol)
         for(int i=0;i<decl->nset;i++) lin_term(&sum,bs[i],1.0);
         sum.constant=-1.0; b_put(&b,'=',0.0,&sum);
         lin_free(&eq);lin_free(&sum);psolve_free(bs);
+    }
+    /* ---- `var set of U: s` decision variables -------------------------
+       MiniZinc emits these for value_precede_chain over `var set of int`,
+       regular_set, etc.  Encode the set as ONE integer bitmask variable
+       (already allocated by the reader) pinned to |U| fresh 0/1 membership
+       bits:  mask = sum_i 2^i * bit_i.  set_in_reif(k,S,r) then just reads
+       bit_i (or pins r=false when k is outside U).  Exact, no big-M.
+       A universe wider than 20 bits is declined (2^20 masks). */
+    for(int d=0;d<m->ndecl;d++){FZDecl*decl=&m->decls[d];
+        if(!decl->is_set||!decl->is_var||decl->is_alias||decl->base_idx<0)continue;
+        if(decl->n!=1){unhandled=1;continue;}
+        if(decl->set_card<=0||decl->set_card>20){unhandled=1;continue;}
+        int card=decl->set_card;
+        int base=b.nvars;
+        for(int i=0;i<card;i++)b_newvar(&b,0.0,1.0);
+        Lin eq;memset(&eq,0,sizeof(eq));
+        lin_term(&eq,decl->base_idx,1.0);
+        double w=1.0;
+        for(int i=0;i<card;i++){lin_term(&eq,base+i,-w);w*=2.0;}
+        b_put(&b,'=',0.0,&eq);lin_free(&eq);
+        /* mask is integral and bounded by [0, 2^card-1] */
+        double maxmask=w-1.0;
+        b.lo[decl->base_idx]=0.0;b.haslo[decl->base_idx]=1;
+        b.hi[decl->base_idx]=maxmask;b.hashi[decl->base_idx]=1;
+        decl->set_bitbase=base;
     }
     for(FZConstr*c=m->constr;c;c=c->next){int r=handle_constraint((FZModel*)m,&b,c);if(r!=0)unhandled=1;}
     if(sol->all_solutions&&m->solve_kind==0){
@@ -5192,7 +5374,7 @@ void fz_print_solution(const FZModel*m,const FZSolution*sol)
 void fz_solution_free(FZSolution*sol){if(!sol)return;psolve_free(sol->x);memset(sol,0,sizeof(*sol));}
 void fz_model_free(FZModel*m){
     if(!m)return;
-    for(int i=0;i<m->ndecl;i++){FZDecl*d=&m->decls[i];psolve_free(d->name);psolve_free(d->alias_idx);psolve_free(d->alias_const);psolve_free(d->par);psolve_free(d->par_int);psolve_free(d->lo);psolve_free(d->hi);psolve_free(d->setvals);}
+    for(int i=0;i<m->ndecl;i++){FZDecl*d=&m->decls[i];psolve_free(d->name);psolve_free(d->alias_idx);psolve_free(d->alias_const);psolve_free(d->par);psolve_free(d->par_int);psolve_free(d->lo);psolve_free(d->hi);psolve_free(d->setvals);psolve_free(d->set_univ);}
     psolve_free(m->decls);
     FZConstr*c=m->constr;while(c){FZConstr*nx=c->next;for(int i=0;i<c->nargs;i++)psolve_free(c->args[i]);psolve_free(c->args);psolve_free(c->pred);psolve_free(c);c=nx;}
     psolve_free(m->objective.idx);psolve_free(m->objective.coef);psolve_free(m->file);

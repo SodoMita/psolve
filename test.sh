@@ -454,6 +454,14 @@ python3 tools/vpc_reif_verify.py || { echo "vpc_reif_verify: FAIL"; exit 1; }
 # solution-set equality on satisfy instances; exact optimum on optimize ones.
 echo -n "pow_var_verify (variable-exponent int_pow, vs brute force): "
 python3 tools/pow_var_verify.py 120 20261027 || { echo "pow_var_verify: FAIL"; exit 1; }
+# v3.7: set decision variables (`var set of U`) encoded as an exact bitmask
+# with |U| membership bits; full -a solution-set equality vs brute force.
+echo -n "set_var_verify (var set of int, vs brute force): "
+python3 tools/set_var_verify.py 80 20261028 || { echo "set_var_verify: FAIL"; exit 1; }
+# v3.7: native Hamiltonian circuit with CP subtour elimination; exact -a
+# solution-set equality for small n plus large-n (<=70) validity checks.
+echo -n "circuit_verify (native circuit, vs brute force): "
+python3 tools/circuit_verify.py 40 20261028 || { echo "circuit_verify: FAIL"; exit 1; }
 # v3.6: real MiniZinc 2.10.1 differential - compile a 38-model corpus with
 # the SHIPPED psolve.msc/mznlib and compare exact -a solution sets / optima
 # against Gecode.  This is the gate that caught the invalid 2D-array

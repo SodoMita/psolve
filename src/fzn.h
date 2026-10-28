@@ -26,7 +26,7 @@
 
 typedef enum {
     FZ_K_NONE = 0,
-    FZ_K_INT, FZ_K_FLOAT, FZ_K_BOOL
+    FZ_K_INT, FZ_K_FLOAT, FZ_K_BOOL, FZ_K_SET
 } FZKind;
 
 /* one declared name: either a parameter (fixed value / par array) or a
@@ -56,6 +56,12 @@ typedef struct {
     int   has_lo, has_hi;   /* any element has a bound */
     long  *setvals; int nset;  /* exact set domain (if gapped), for SOS1 */
     int is_alias;      /* var-array that aliases already-declared vars */
+    /* `var set of U: s` decisions.  The set is represented by ONE integer
+       solver variable holding a bitmask over the (small) universe U: bit i
+       is 1 iff universe[i] is a member.  set_univ[] lists U ascending;
+       set_card is its length.  A universe wider than 2^20 is declined. */
+    long  *set_univ; int set_card; int is_set;
+    int    set_bitbase;   /* first builder var of the |U| membership bits, -1 until built */
 } FZDecl;
 
 typedef struct {

@@ -2,7 +2,7 @@
   "id": "org.psolve.fznsolve",
   "name": "psolve",
   "description": "psolve exact & integer FlatZinc/CSP solver — LP/MIP + finite-domain CP engine for any FlatZinc",
-  "version": "1.8.0",
+  "version": "1.9.0",
   "mznlib": "../psolve",
   "executable": "fznsolve",
   "tags": ["mip", "cp", "int", "float", "linear", "par"],

@@ -67,7 +67,16 @@ int main(int argc,char**argv)
 
     {
         struct timespec t0,t1; clock_gettime(CLOCK_MONOTONIC,&t0);
-        if (fz_read((const char*)pathbuf, &m) != 0) { psolve_frame_pop(&ef); rc = 1; goto done; }
+        if (fz_read((const char*)pathbuf, &m) != 0) {
+            /* An unreadable/unsupported FlatZinc is NOT a solver failure and
+               must never be reported as one.  Exiting silently (the old
+               behaviour) leaves MiniZinc with no solution and no status line,
+               which looks like an empty SAT set.  Print the honest verdict on
+               stdout instead; the model is freed by fz_read on failure. */
+            printf("=====UNKNOWN=====\n");
+            fflush(stdout);
+            psolve_frame_pop(&ef); rc = 1; goto done;
+        }
         fz_solve(&m, &sol);
         /* roadmap 6.4: verdict-printing exits pass the unified evidence
            entry point.  Two FlatZinc lanes are checked here:
