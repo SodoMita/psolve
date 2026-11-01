@@ -433,6 +433,7 @@ python3 tools/cp_opt_verify.py 250 20260814 | sed 's/.*: //'
 
 echo "[8.25/8] FlatZinc strict/reified-int + float + table/circuit semantics..."
 python3 tools/fzn_semantics_test.py
+python3 tools/fzn_bool_diff.py
 echo -n "table_verify (randomized, vs brute force): "
 python3 tools/table_verify.py 250 20240607 | sed 's/.*: //'
 echo -n "extrema_verify (randomized, vs brute force): "

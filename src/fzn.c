@@ -1667,29 +1667,44 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
         if(parse_lin(m,c->args[0],&l1)!=0)return -1;
         if(parse_lin(m,c->args[1],&l2)!=0){lin_free(&l1);return -1;}
         if(parse_lin(m,c->args[2],&l3)!=0){lin_free(&l1);lin_free(&l2);return -1;}
-        /* result var r in l3 (coefficient 1 on some var) */
-        int r = l3.n==1 ? l3.idx[0] : -1;
-        int a = l1.n==1 ? l1.idx[0] : -1;
-        int be = l2.n==1 ? l2.idx[0] : -1;
-        if(r<0||a<0||be<0){lin_free(&l1);lin_free(&l2);lin_free(&l3);return -1;}
+        /* The convex-hull rows below are exact only for Boolean arguments.
+           Accept literals/parameter aliases and unit variables with integer
+           boxes contained in [0,1]; decline malformed expressions honestly. */
+        Lin *args[3]={&l1,&l2,&l3};
+        for(int i=0;i<3;i++){
+            Lin *x=args[i]; int v;
+            if(x->n==0){
+                if(x->constant!=0.0 && x->constant!=1.0){
+                    lin_free(&l1);lin_free(&l2);lin_free(&l3);return 1;
+                }
+            } else if(lin_unit_var(x,&v)!=0 || v<0 || v>=b->nvars ||
+                      !b->isint[v] || b->lo[v]<0.0 || b->hi[v]>1.0){
+                lin_free(&l1);lin_free(&l2);lin_free(&l3);return 1;
+            }
+        }
+        /* Substitute the entire linear forms, including constants.  lin_term
+           merges repeated indices, so aliases like xor(x,x,r) work too. */
+        Lin d1={0},d2={0},d3={0};
+        lin_into(&d1,&l3,1.0);lin_into(&d1,&l1,-1.0);
+        lin_into(&d2,&l3,1.0);lin_into(&d2,&l2,-1.0);
+        lin_into(&d3,&l3,1.0);lin_into(&d3,&l1,-1.0);lin_into(&d3,&l2,-1.0);
         if(strcmp(p,"bool_and")==0){
             /* r <= a, r <= b, r >= a+b-1 */
-            Lin d1;memset(&d1,0,sizeof(d1));lin_term(&d1,r,1.0);lin_term(&d1,a,-1.0);b_put(b,'<',0.0,&d1);
-            Lin d2;memset(&d2,0,sizeof(d2));lin_term(&d2,r,1.0);lin_term(&d2,be,-1.0);b_put(b,'<',0.0,&d2);
-            Lin d3;memset(&d3,0,sizeof(d3));lin_term(&d3,r,1.0);lin_term(&d3,a,-1.0);lin_term(&d3,be,-1.0);d3.constant=1.0;b_put(b,'>',0.0,&d3);
-            lin_free(&d1);lin_free(&d2);lin_free(&d3);
+            b_put(b,'<',0.0,&d1);b_put(b,'<',0.0,&d2);
+            b_put(b,'>',-1.0,&d3);
         } else if(strcmp(p,"bool_or")==0){
-            Lin d1;memset(&d1,0,sizeof(d1));lin_term(&d1,r,1.0);lin_term(&d1,a,-1.0);b_put(b,'>',0.0,&d1);
-            Lin d2;memset(&d2,0,sizeof(d2));lin_term(&d2,r,1.0);lin_term(&d2,be,-1.0);b_put(b,'>',0.0,&d2);
-            Lin d3;memset(&d3,0,sizeof(d3));lin_term(&d3,r,1.0);lin_term(&d3,a,-1.0);lin_term(&d3,be,-1.0);b_put(b,'<',0.0,&d3);
-            lin_free(&d1);lin_free(&d2);lin_free(&d3);
-        } else { /* xor: r=a XOR b */
-            Lin d1;memset(&d1,0,sizeof(d1));lin_term(&d1,r,1.0);lin_term(&d1,a,-1.0);lin_term(&d1,be,-1.0);b_put(b,'<',0.0,&d1);
-            Lin d2;memset(&d2,0,sizeof(d2));lin_term(&d2,r,1.0);lin_term(&d2,a,-1.0);lin_term(&d2,be,1.0);b_put(b,'>',0.0,&d2);
-            Lin d3;memset(&d3,0,sizeof(d3));lin_term(&d3,r,1.0);lin_term(&d3,a,1.0);lin_term(&d3,be,-1.0);b_put(b,'>',0.0,&d3);
-            Lin d4;memset(&d4,0,sizeof(d4));lin_term(&d4,r,1.0);lin_term(&d4,a,1.0);lin_term(&d4,be,1.0);d4.constant=2.0;b_put(b,'<',0.0,&d4);
-            lin_free(&d1);lin_free(&d2);lin_free(&d3);lin_free(&d4);
+            /* r >= a, r >= b, r <= a+b */
+            b_put(b,'>',0.0,&d1);b_put(b,'>',0.0,&d2);
+            b_put(b,'<',0.0,&d3);
+        } else {
+            /* r <= a+b; r >= a-b; r >= b-a; r+a+b <= 2 */
+            b_put(b,'<',0.0,&d3);
+            lin_into(&d1,&l2,1.0);b_put(b,'>',0.0,&d1);
+            lin_into(&d2,&l1,1.0);b_put(b,'>',0.0,&d2);
+            Lin d4={0};lin_into(&d4,&l3,1.0);lin_into(&d4,&l1,1.0);
+            lin_into(&d4,&l2,1.0);b_put(b,'<',2.0,&d4);lin_free(&d4);
         }
+        lin_free(&d1);lin_free(&d2);lin_free(&d3);
         lin_free(&l1);lin_free(&l2);lin_free(&l3);
         return 0;
     }
@@ -3827,6 +3842,7 @@ void fz_solve(const FZModel*m,FZSolution*sol)
     Builder b;memset(&b,0,sizeof(b));b.nvars=base_nv;b.varcap=base_nv?base_nv:16;
     b.lo=(double*)psolve_malloc((size_t)b.varcap*sizeof(double));b.hi=(double*)psolve_malloc((size_t)b.varcap*sizeof(double));
     b.haslo=(int*)psolve_calloc((size_t)b.varcap,sizeof(int));b.hashi=(int*)psolve_calloc((size_t)b.varcap,sizeof(int));
+    b.isint=(unsigned char*)psolve_calloc((size_t)b.varcap,sizeof(unsigned char));
     /* FlatZinc `var int/float` are unbounded by default; our LP solver needs
        finite bounds, so clamp undecorated variables to a big-M interval. */
     for(int i=0;i<base_nv;i++){b.lo[i]=-FZ_BIG_BOUND;b.hi[i]=FZ_BIG_BOUND;}
@@ -3835,6 +3851,7 @@ void fz_solve(const FZModel*m,FZSolution*sol)
         if(!decl->is_var||decl->base_idx<0)continue;
         if(decl->is_alias)continue;   /* alias elements get bounds from their own decls */
         for(int e=0;e<decl->n;e++){int vi=decl->base_idx+e;
+            b.isint[vi]=(decl->kind!=FZ_K_FLOAT);
             /* bool variables are implicitly 0..1 in FlatZinc */
             if(decl->kind==FZ_K_BOOL){ b.lo[vi]=0; b.hi[vi]=1; b.haslo[vi]=1; b.hashi[vi]=1; continue; }
             if(decl->has_lo){b.lo[vi]=decl->lo[0];b.haslo[vi]=1;}
