@@ -439,6 +439,13 @@ echo -n "extrema_verify (randomized, vs brute force): "
 python3 tools/extrema_verify.py 300 4242 | sed 's/.*: //'
 echo -n "divmod_verify (trunc-div/mod + pow + sets/among + edge regressions, vs brute force): "
 python3 tools/divmod_verify.py 200 20260808 | sed 's/.*: //'
+# Bilinear int_times(x,y,z) with two var operands (exact binary-decomposition +
+# McCormick binarization in the MIP bridge) and int_div/int_mod with a VARIABLE
+# divisor (a = b*q + r, b != 0, |r| <= |b|-1, sign(r) = sign(a) or r = 0).
+# Randomized differential vs brute force over both solver paths (pure-int CP
+# engine and the MIP bridge forced by a non-output float dummy), plus the
+# channel's acceptance pins.  Hard gate: rc matters.
+python3 tools/fzn_bilinear_verify.py 250 20261101 || { echo "fzn_bilinear_verify: FAIL"; exit 1; }
 
 # FlatZinc OUTPUT-layer round-trip (roadmap 6.7): re-parse every emitted
 # byte; each printed assignment must satisfy every constraint and stay in
