@@ -1536,6 +1536,157 @@ static int fz_parse_int_set(const char *set,int cap,int *is_range_out,long *rlo_
     return 0;
 }
 
+/* ------------------------------------------------------------------ */
+/* Exact bilinear product encoding (MIP bridge)                        */
+/*                                                                     */
+/* int_times(x,y,z) with two variable operands is bilinear.  We encode */
+/* z = x*y EXACTLY over finite integer domains by bit-decomposing one  */
+/* operand (vd = dlo + sum_j 2^j b_j, b_j binary) and binarizing each  */
+/* product w_j = vm*b_j with the McCormick envelope, which is exact at */
+/* b_j in {0,1} (every MIP leaf); hence every integer-feasible point  */
+/* of the encoding satisfies z = x*y exactly and every true triple    */
+/* extends to one.  Outside the exact-coefficient budget (bounds must  */
+/* be integral and within 2^53 so 2^j and the big-Ms are exact        */
+/* doubles) the handler declines and the model stays UNKNOWN.          */
+/* ------------------------------------------------------------------ */
+
+/* Is solver variable v an integer variable?  Model vars (v < m->nvars)
+   are classified through their declaration (Builder.isint is only
+   maintained for auxiliary vars created by b_newvar*). */
+static int fz_var_is_int(const FZModel*m,const Builder*b,int v)
+{
+    if(v<0)return 0;
+    if(v>=m->nvars) return b->isint ? (b->isint[v]!=0) : 1;
+    for(int d=0;d<m->ndecl;d++){FZDecl*dl=&m->decls[d];
+        if(!dl->is_var||dl->base_idx<0||dl->is_alias)continue;
+        if(v>=dl->base_idx&&v<dl->base_idx+dl->n) return dl->kind!=FZ_K_FLOAT;}
+    return 0;
+}
+
+/* Finite box within the exact-integer double range (TOLSHEET TOL-FZN-POWCAP). */
+static int times_bounded(const Builder*b,int v)
+{
+    if(v<0||v>=b->nvars)return 0;
+    double lo=b->lo[v],hi=b->hi[v];
+    return isfinite(lo)&&isfinite(hi)&&fabs(lo)<=0x1p53&&fabs(hi)<=0x1p53;  /* TOLSHEET TOL-FZN-POWCAP */
+}
+
+/* Can v be the bit-decomposed operand of an exact product?  Integer var
+   with finite, integral, exactly-representable bounds and a range whose
+   bit length stays inside the budget (2^j coefficients must be exact). */
+static int times_decomposable(const FZModel*m,const Builder*b,int v)
+{
+    if(!fz_var_is_int(m,b,v))return 0;
+    if(!times_bounded(b,v))return 0;
+    double lo=b->lo[v],hi=b->hi[v];
+    if(lo!=rint(lo)||hi!=rint(hi))return 0;
+    if(hi-lo>0x1p53)return 0;  /* TOLSHEET TOL-FZN-POWCAP */
+    return 1;
+}
+
+/* Encode vc = vm*vd exactly (see above).  Returns 0 on success, 1 to
+   decline (honest UNKNOWN).  vd is the decomposed operand and MUST be
+   times_decomposable(); vm may be any bounded var (float or int). */
+static int encode_product(Builder*b,const FZModel*m,int vm,int vd,int vc)
+{
+    if(!times_decomposable(m,b,vd))return 1;
+    if(!times_bounded(b,vm))return 1;
+    double dlo=b->lo[vd], dhi=b->hi[vd];
+    double mlo=b->lo[vm], mhi=b->hi[vm];
+    double R=dhi-dlo;
+    int B=0; for(double rr=R; rr>=1.0; rr/=2.0) B++;   /* bit length of R */
+    if(B==0){   /* vd fixed: vc = dlo*vm */
+        Lin d;memset(&d,0,sizeof(d));lin_term(&d,vc,1.0);lin_term(&d,vm,-dlo);
+        b_put(b,'=',0.0,&d);lin_free(&d);
+        return 0;
+    }
+    int *bj=(int*)psolve_malloc((size_t)B*sizeof(int));
+    int *wj=(int*)psolve_malloc((size_t)B*sizeof(int));
+    /* vd = dlo + sum_j 2^j b_j  (b_j binary; unique rep of vd-dlo in [0,R]) */
+    Lin dec;memset(&dec,0,sizeof(dec));lin_term(&dec,vd,1.0);dec.constant-=dlo;
+    for(int j=0;j<B;j++){ bj[j]=b_newvar(b,0.0,1.0); lin_term(&dec,bj[j],-(double)(1ULL<<j)); }
+    b_put(b,'=',0.0,&dec);lin_free(&dec);
+    double wlo=fmin(0.0,mlo), whi=fmax(0.0,mhi);
+    for(int j=0;j<B;j++){
+        wj[j]= fz_var_is_int(m,b,vm) ? b_newvar(b,wlo,whi) : b_newvar_float(b,wlo,whi);
+        /* McCormick envelope for w_j = vm*b_j; exact at b_j in {0,1}: */
+        Lin r1;memset(&r1,0,sizeof(r1));lin_term(&r1,wj[j],1.0);lin_term(&r1,vm,-1.0);lin_term(&r1,bj[j],-mhi);
+        b_put(b,'>',-mhi,&r1);lin_free(&r1);          /* w - vm - mhi*b >= -mhi */
+        Lin r2;memset(&r2,0,sizeof(r2));lin_term(&r2,wj[j],1.0);lin_term(&r2,vm,-1.0);lin_term(&r2,bj[j],-mlo);
+        b_put(b,'<',-mlo,&r2);lin_free(&r2);          /* w - vm - mlo*b <= -mlo */
+        Lin r3;memset(&r3,0,sizeof(r3));lin_term(&r3,wj[j],1.0);lin_term(&r3,bj[j],-mhi);
+        b_put(b,'<',0.0,&r3);lin_free(&r3);           /* w <= mhi*b */
+        Lin r4;memset(&r4,0,sizeof(r4));lin_term(&r4,wj[j],1.0);lin_term(&r4,bj[j],-mlo);
+        b_put(b,'>',0.0,&r4);lin_free(&r4);           /* w >= mlo*b */
+    }
+    /* vc = dlo*vm + sum_j 2^j w_j */
+    Lin res;memset(&res,0,sizeof(res));lin_term(&res,vc,1.0);lin_term(&res,vm,-dlo);
+    for(int j=0;j<B;j++) lin_term(&res,wj[j],-(double)(1ULL<<j));
+    b_put(b,'=',0.0,&res);lin_free(&res);
+    psolve_free(bj);psolve_free(wj);
+    return 0;
+}
+
+/* Exact truncating division / remainder with a VARIABLE divisor:
+   a = b*q + r, |r| <= |b|-1, sign(r) = sign(a) or r = 0, b != 0.
+   MiniZinc semantics (trunc toward zero, remainder keeps dividend's sign);
+   together these pin (q,r) uniquely for every (a,b), b != 0.  The bilinear
+   b*q goes through encode_product().  Returns 0 handled, 1 decline. */
+static int encode_divmod_var(Builder*b,const FZModel*m,int va,int vb,int vc,int is_div)
+{
+    if(!times_decomposable(m,b,vb))return 1;   /* divisor: finite integer domain */
+    if(!times_bounded(b,va))return 1;
+    double blo=b->lo[vb], bhi=b->hi[vb];
+    double alo=b->lo[va], ahi=b->hi[va];
+    double U=fmax(fabs(blo),fabs(bhi));
+    double maxa=fmax(fabs(alo),fabs(ahi));
+    if(U>0x1p52||maxa>0x1p52)return 1;          /* keep big-Ms exact (TOLSHEET TOL-FZN-POWCAP) */
+    double minabs=(blo<=0.0&&bhi>=0.0)?1.0:fmin(fabs(blo),fabs(bhi));  /* b != 0 */
+    double qlo=floor(-maxa/minabs)-1.0, qhi=ceil(maxa/minabs)+1.0;
+    if(!isfinite(qlo)||!isfinite(qhi)||fabs(qlo)>0x1p53||fabs(qhi)>0x1p53)return 1;  /* TOLSHEET TOL-FZN-POWCAP */
+    int q,r;
+    if(is_div){ q=vc; r=b_newvar(b,-(U-1.0),U-1.0); }       /* |r| <= |b|-1 <= U-1 */
+    else      { r=vc; q=b_newvar(b,qlo,qhi); }
+    if(!times_bounded(b,q))return 1;
+    /* product p = q*b over the boxes */
+    double c1=blo*qlo,c2=blo*qhi,c3=bhi*qlo,c4=bhi*qhi;
+    double plo=fmin(fmin(c1,c2),fmin(c3,c4)), phi=fmax(fmax(c1,c2),fmax(c3,c4));
+    if(!isfinite(plo)||!isfinite(phi)||fabs(plo)>0x1p53||fabs(phi)>0x1p53)return 1;  /* TOLSHEET TOL-FZN-POWCAP */
+    int prod=b_newvar(b,plo,phi);
+    if(encode_product(b,m,q,vb,prod)!=0)return 1;           /* decompose the divisor */
+    /* a = p + r */
+    Lin eq;memset(&eq,0,sizeof(eq));lin_term(&eq,va,1.0);lin_term(&eq,prod,-1.0);lin_term(&eq,r,-1.0);
+    b_put(b,'=',0.0,&eq);lin_free(&eq);
+    /* b != 0 (true disjunction; b pinned to 0 -> infeasible -> certified UNSAT) */
+    Lin lb;memset(&lb,0,sizeof(lb));lin_term(&lb,vb,1.0);
+    if(add_int_ne(b,&lb)!=0){lin_free(&lb);return 1;}
+    lin_free(&lb);
+    /* ab = |b| via binary sign flag pb <-> (b > 0) */
+    int ab=b_newvar(b,0.0,U);
+    int pb=b_newvar(b,0.0,1.0);
+    Lin lb2;memset(&lb2,0,sizeof(lb2));lin_term(&lb2,vb,1.0);
+    if(add_int_reif(b,&lb2,pb,4)!=0){lin_free(&lb2);return 1;}   /* pb <-> b > 0 */
+    lin_free(&lb2);
+    Lin a1;memset(&a1,0,sizeof(a1));lin_term(&a1,ab,1.0);lin_term(&a1,vb,-1.0);b_put(b,'>',0.0,&a1);lin_free(&a1);
+    Lin a2;memset(&a2,0,sizeof(a2));lin_term(&a2,ab,1.0);lin_term(&a2,vb,1.0);b_put(b,'>',0.0,&a2);lin_free(&a2);
+    Lin a3;memset(&a3,0,sizeof(a3));lin_term(&a3,ab,1.0);lin_term(&a3,vb,-1.0);lin_term(&a3,pb,2.0*U);b_put(b,'<',2.0*U,&a3);lin_free(&a3);
+    Lin a4;memset(&a4,0,sizeof(a4));lin_term(&a4,ab,1.0);lin_term(&a4,vb,1.0);lin_term(&a4,pb,-2.0*U);b_put(b,'<',0.0,&a4);lin_free(&a4);
+    /* |r| <= ab - 1 */
+    Lin s1;memset(&s1,0,sizeof(s1));lin_term(&s1,r,1.0);lin_term(&s1,ab,-1.0);b_put(b,'<',-1.0,&s1);lin_free(&s1);
+    Lin s2;memset(&s2,0,sizeof(s2));lin_term(&s2,r,-1.0);lin_term(&s2,ab,-1.0);b_put(b,'<',-1.0,&s2);lin_free(&s2);
+    /* sign(r) = sign(a) or r = 0:  r>0 -> a>=0 ; r<0 -> a<0 */
+    int na=b_newvar(b,0.0,1.0), rp=b_newvar(b,0.0,1.0), rn=b_newvar(b,0.0,1.0);
+    Lin la;memset(&la,0,sizeof(la));lin_term(&la,va,1.0);
+    Lin lr;memset(&lr,0,sizeof(lr));lin_term(&lr,r,1.0);
+    if(add_int_reif(b,&la,na,3)!=0||add_int_reif(b,&lr,rp,4)!=0||add_int_reif(b,&lr,rn,2)!=0){
+        lin_free(&la);lin_free(&lr);return 1;
+    }
+    lin_free(&la);lin_free(&lr);
+    Lin g1;memset(&g1,0,sizeof(g1));lin_term(&g1,na,1.0);lin_term(&g1,rp,-1.0);b_put(b,'>',0.0,&g1);lin_free(&g1);
+    Lin g2;memset(&g2,0,sizeof(g2));lin_term(&g2,na,1.0);lin_term(&g2,rn,1.0);b_put(b,'<',1.0,&g2);lin_free(&g2);
+    return 0;
+}
+
 /* dispatch: 0 handled, 1 unhandled, -1 malformed */
 static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
 {
@@ -1847,9 +1998,28 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
                 b_put(b,'>',0.0,&d3);lin_free(&d3);
                 lin_free(&l1);lin_free(&l2);lin_free(&l3);return 0;
             }
+            /* general variable (or affine) operands: exact product via
+               binary decomposition of the integral side with the smaller
+               range (encode_product); outside the exact-coefficient budget
+               this declines -> honest UNKNOWN, never a relaxed product. */
+            int is_flt=(strcmp(p,"float_times")==0);
+            int ma=lin_materialize(b,&l1,is_flt);
+            int mb=(ma>=0)?lin_materialize(b,&l2,is_flt):-1;
+            int mc=(ma>=0&&mb>=0)?lin_materialize(b,&l3,is_flt):-1;
+            if(ma>=0&&mb>=0&&mc>=0){
+                int da=times_decomposable(m,b,ma), db=times_decomposable(m,b,mb);
+                int rc=1;
+                if(da&&db){
+                    double ra=b->hi[ma]-b->lo[ma], rb=b->hi[mb]-b->lo[mb];
+                    rc=(ra<=rb)?encode_product(b,m,mb,ma,mc):encode_product(b,m,ma,mb,mc);
+                } else if(da) rc=encode_product(b,m,mb,ma,mc);
+                else if(db) rc=encode_product(b,m,ma,mb,mc);
+                lin_free(&l1);lin_free(&l2);lin_free(&l3);
+                return rc;
+            }
         }
         lin_free(&l1);lin_free(&l2);lin_free(&l3);
-        return 1;   /* bilinear -> unhandled */
+        return 1;   /* bilinear beyond the exact budget -> unhandled */
     }
     /* int_div / int_mod(a, k, c), for a non-zero constant divisor k.
        MiniZinc division truncates toward zero and the remainder has the sign
@@ -1903,6 +2073,17 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
                     handled=1;
                 }
             }
+        } else {
+            /* variable (or affine) divisor b: exact truncating division for
+               finite integer domains via encode_divmod_var (a = b*q + r with
+               b != 0, |r| <= |b|-1, sign(r) = sign(a) or r = 0).  Declines ->
+               honest UNKNOWN; a divisor pinned to 0 makes the constraint
+               false -> certified UNSAT inside the bridge box. */
+            int is_div2=(strcmp(p,"int_div")==0);
+            int va=lin_materialize(b,&l1,0);
+            int vb=(va>=0)?lin_materialize(b,&l2,0):-1;
+            int vc=(va>=0&&vb>=0)?lin_materialize(b,&l3,0):-1;
+            if(va>=0&&vb>=0&&vc>=0 && encode_divmod_var(b,m,va,vb,vc,is_div2)==0) handled=1;
         }
         lin_free(&l1);lin_free(&l2);lin_free(&l3);
         return handled?0:1;
