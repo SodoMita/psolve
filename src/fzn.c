@@ -1687,6 +1687,355 @@ static int encode_divmod_var(Builder*b,const FZModel*m,int va,int vb,int vc,int 
     return 0;
 }
 
+/* ---- Phase 11.2 wave 2: exact encodings for the stdlib globals that reach
+   FlatZinc as builtin calls (counting at_most/at_least/exactly, value
+   precedence, arg-min/arg-max, sort/arg_sort, sliding among, 2D element).
+   Every encoding below is exact over the integer lattice; anything outside
+   the stated caps returns 1 (honest UNHANDLED), never a truncated relax. ---- */
+
+/* b_i <-> (arr[i] == vl).  Returns 0 ok, 1 decline, -1 hard error. */
+static int fz_eq_sel(Builder*b,Lin*arr,int narr,Lin*vl,int**bs_out)
+{
+    int *bs=(int*)psolve_malloc((size_t)(narr>0?narr:1)*sizeof(int));
+    for(int i=0;i<narr;i++){
+        int bi=b_newvar(b,0.0,1.0);
+        bs[i]=bi;
+        Lin di;memset(&di,0,sizeof(di));
+        lin_into(&di,&arr[i],1.0);lin_into(&di,vl,-1.0);
+        int rr=add_int_reif(b,&di,bi,0);
+        lin_free(&di);
+        if(rr!=0){psolve_free(bs);return rr<0?-1:1;}
+    }
+    *bs_out=bs;return 0;
+}
+
+/* m_i <-> (arr[i] in set).  Ranges use two half-reified bounds AND-ed;
+   enumerations use per-value equality selectors OR-ed.  Par elements fold. */
+static int fz_in_sel(Builder*b,Lin*arr,int narr,int is_range,long rlo,long rhi,
+                     const long*vals,int nvals,int**bs_out)
+{
+    if(!is_range && narr>0 && nvals>65536/narr)return 1;   /* honest encoding cap */
+    int *bs=(int*)psolve_malloc((size_t)(narr>0?narr:1)*sizeof(int));
+    for(int i=0;i<narr;i++){
+        int bi=b_newvar(b,0.0,1.0);
+        bs[i]=bi;
+        if(arr[i].n==0){
+            double cv=arr[i].constant;
+            int in=0;
+            if(isfinite(cv)&&cv==rint(cv)&&fabs(cv)<=0x1p53){  /* TOLSHEET TOL-FZN-POWCAP */
+                long v=(long)rint(cv);
+                if(is_range) in=(v>=rlo&&v<=rhi);
+                else { for(int k=0;k<nvals;k++) if(vals[k]==v){in=1;break;} }
+            }
+            Lin pin;memset(&pin,0,sizeof(pin));lin_term(&pin,bi,1.0);
+            b_put(b,'=',in?1.0:0.0,&pin);lin_free(&pin);
+            continue;
+        }
+        if(is_range){
+            int t1=b_newvar(b,0.0,1.0),t2=b_newvar(b,0.0,1.0);
+            Lin d1;memset(&d1,0,sizeof(d1));lin_into(&d1,&arr[i],1.0);d1.constant-=(double)rhi;
+            Lin d2;memset(&d2,0,sizeof(d2));lin_into(&d2,&arr[i],-1.0);d2.constant+=(double)rlo;
+            int rr=add_int_reif(b,&d1,t1,1);          /* t1 <-> arr_i <= rhi */
+            if(rr==0) rr=add_int_reif(b,&d2,t2,1);   /* t2 <-> arr_i >= rlo */
+            lin_free(&d1);lin_free(&d2);
+            if(rr!=0){psolve_free(bs);return rr<0?-1:1;}
+            Lin c1;memset(&c1,0,sizeof(c1));lin_term(&c1,t1,1.0);lin_term(&c1,bi,-1.0);b_put(b,'>',0.0,&c1);lin_free(&c1);
+            Lin c2;memset(&c2,0,sizeof(c2));lin_term(&c2,t2,1.0);lin_term(&c2,bi,-1.0);b_put(b,'>',0.0,&c2);lin_free(&c2);
+            Lin c3;memset(&c3,0,sizeof(c3));lin_term(&c3,bi,1.0);lin_term(&c3,t1,-1.0);lin_term(&c3,t2,-1.0);b_put(b,'>',-1.0,&c3);lin_free(&c3);
+        } else {
+            if(nvals==0){
+                Lin pin;memset(&pin,0,sizeof(pin));lin_term(&pin,bi,1.0);b_put(b,'=',0.0,&pin);lin_free(&pin);
+                continue;
+            }
+            int *zs=(int*)psolve_malloc((size_t)nvals*sizeof(int));
+            int rr=0;
+            for(int k=0;k<nvals&&rr==0;k++){
+                zs[k]=b_newvar(b,0.0,1.0);
+                Lin d;memset(&d,0,sizeof(d));lin_into(&d,&arr[i],1.0);d.constant-=(double)vals[k];
+                rr=add_int_reif(b,&d,zs[k],0);lin_free(&d);
+                Lin g;memset(&g,0,sizeof(g));lin_term(&g,zs[k],1.0);lin_term(&g,bi,-1.0);b_put(b,'<',0.0,&g);lin_free(&g);
+            }
+            if(rr!=0){psolve_free(zs);psolve_free(bs);return rr<0?-1:1;}
+            Lin s;memset(&s,0,sizeof(s));lin_term(&s,bi,1.0);
+            for(int k=0;k<nvals;k++)lin_term(&s,zs[k],-1.0);
+            b_put(b,'<',0.0,&s);lin_free(&s);
+            psolve_free(zs);
+        }
+    }
+    *bs_out=bs;return 0;
+}
+
+/* value_precede(s, t, x): if any x_j == t then some i < j has x_i == s.
+   Exact linear encoding: for each j, sum_{i<j} [x_i==s] >= [x_j==t]. */
+static int fz_encode_precede(Builder*b,Lin*arr,int narr,long s,long t)
+{
+    if(narr<=0||narr>4096)return 1;
+    Lin sv;memset(&sv,0,sizeof(sv));sv.constant=(double)s;
+    Lin tv;memset(&tv,0,sizeof(tv));tv.constant=(double)t;
+    int *as=NULL,*bs=NULL;
+    int rr=fz_eq_sel(b,arr,narr,&sv,&as);
+    if(rr==0) rr=fz_eq_sel(b,arr,narr,&tv,&bs);
+    if(rr!=0){if(as)psolve_free(as);if(bs)psolve_free(bs);return rr<0?-1:1;}
+    for(int j=0;j<narr;j++){
+        Lin L;memset(&L,0,sizeof(L));
+        for(int i=0;i<j;i++)lin_term(&L,as[i],1.0);
+        lin_term(&L,bs[j],-1.0);
+        b_put(b,'>',0.0,&L);
+        lin_free(&L);
+    }
+    psolve_free(as);psolve_free(bs);
+    return 0;
+}
+
+/* i = least actual index (value k+offset) attaining the extremum of arr.
+   m is a fresh extremum variable; b_k <-> (arr[k]==m); e_k <-> (i==k+offset).
+   Least-index is enforced exactly: e_k => b_k and e_k => no b_j for j<k. */
+static int fz_encode_arg_extremum(Builder*b,Lin*arr,int narr,Lin*il,int ismax,double offset)
+{
+    if(narr<=0||narr>1024)return 1;
+    double ilo=LP_INF,ihi=-LP_INF;
+    for(int i=0;i<narr;i++){
+        double lo,hi;
+        if(lin_bounds(b,&arr[i],&lo,&hi)!=0)return 1;
+        if(lo<ilo)ilo=lo;
+        if(hi>ihi)ihi=hi;
+    }
+    if(!isfinite(ilo)||!isfinite(ihi))return 1;
+    int mv=b_newvar(b,ilo,ihi);
+    Lin ml;memset(&ml,0,sizeof(ml));lin_term(&ml,mv,1.0);
+    int *bs=NULL;
+    int rr=fz_eq_sel(b,arr,narr,&ml,&bs);
+    if(rr!=0){lin_free(&ml);return rr<0?-1:1;}
+    for(int i=0;i<narr;i++){
+        Lin d;memset(&d,0,sizeof(d));lin_into(&d,&ml,1.0);lin_into(&d,&arr[i],-1.0);
+        double dlo,dhi;
+        if(lin_bounds(b,&d,&dlo,&dhi)!=0){psolve_free(bs);lin_free(&ml);return 1;}
+        if(ismax){
+            b_put(b,'>',0.0,&d);                          /* m >= x_i */
+            double M=fmax(0.0,dhi);
+            lin_term(&d,bs[i],M);b_put(b,'<',M,&d);       /* b_i=1 -> m <= x_i */
+        } else {
+            b_put(b,'<',0.0,&d);                          /* m <= x_i */
+            double M=fmax(0.0,-dlo);
+            lin_term(&d,bs[i],-M);b_put(b,'>',-M,&d);     /* b_i=1 -> m >= x_i */
+        }
+        lin_free(&d);
+    }
+    {   /* at least one element attains m */
+        Lin s;memset(&s,0,sizeof(s));
+        for(int i=0;i<narr;i++)lin_term(&s,bs[i],1.0);
+        b_put(b,'>',0.0,&s);lin_free(&s);
+    }
+    int *es=(int*)psolve_malloc((size_t)narr*sizeof(int));
+    for(int k=0;k<narr;k++){
+        es[k]=b_newvar(b,0.0,1.0);
+        Lin d;memset(&d,0,sizeof(d));lin_into(&d,il,1.0);d.constant-=(double)(k+offset);
+        int rr2=add_int_reif(b,&d,es[k],0);
+        lin_free(&d);
+        if(rr2!=0){psolve_free(es);psolve_free(bs);lin_free(&ml);return rr2<0?-1:1;}
+    }
+    if(il->n==0){
+        double kd=il->constant-offset;
+        if(kd!=rint(kd)||fabs(kd)>0x1p53){psolve_free(es);psolve_free(bs);lin_free(&ml);return 1;}  /* TOLSHEET TOL-FZN-POWCAP */
+        long k0=(long)rint(kd);
+        if(k0<0||k0>=narr){
+            Lin nf;memset(&nf,0,sizeof(nf));b_put(b,'=',1.0,&nf);lin_free(&nf);   /* 0=1: infeasible */
+        } else {
+            Lin p1;memset(&p1,0,sizeof(p1));lin_term(&p1,bs[(int)k0],1.0);b_put(b,'=',1.0,&p1);lin_free(&p1);
+            for(long j=0;j<k0;j++){ Lin p0;memset(&p0,0,sizeof(p0));lin_term(&p0,bs[(int)j],1.0);b_put(b,'=',0.0,&p0);lin_free(&p0); }
+        }
+    } else {
+        Lin s;memset(&s,0,sizeof(s));
+        for(int k=0;k<narr;k++)lin_term(&s,es[k],1.0);
+        s.constant=-1.0;b_put(b,'=',0.0,&s);lin_free(&s);
+        Lin ie;memset(&ie,0,sizeof(ie));lin_into(&ie,il,1.0);ie.constant-=offset;
+        for(int k=0;k<narr;k++)lin_term(&ie,es[k],-(double)k);
+        b_put(b,'=',0.0,&ie);lin_free(&ie);
+    }
+    for(int k=0;k<narr;k++){
+        Lin c1;memset(&c1,0,sizeof(c1));lin_term(&c1,bs[k],1.0);lin_term(&c1,es[k],-1.0);
+        b_put(b,'>',0.0,&c1);lin_free(&c1);                 /* e_k -> b_k */
+        Lin c2;memset(&c2,0,sizeof(c2));
+        for(int j=0;j<k;j++)lin_term(&c2,bs[j],1.0);
+        lin_term(&c2,es[k],(double)k);
+        b_put(b,'<',(double)k,&c2);lin_free(&c2);           /* e_k -> sum_{j<k} b_j = 0 */
+    }
+    psolve_free(es);psolve_free(bs);lin_free(&ml);
+    return 0;
+}
+
+/* y = sort(x): y ascending AND a permutation of x via the exact selector
+   matrix b_{i,j} <-> (y_i == x_j) with doubly-stochastic sums. */
+static int fz_encode_sort(Builder*b,Lin*x,int n,Lin*y)
+{
+    if(n<=0||n>96)return 1;
+    for(int k=0;k+1<n;k++){
+        Lin d;memset(&d,0,sizeof(d));lin_into(&d,&y[k+1],1.0);lin_into(&d,&y[k],-1.0);
+        b_put(b,'>',0.0,&d);lin_free(&d);
+    }
+    int *bm=(int*)psolve_malloc((size_t)n*(size_t)n*sizeof(int));
+    for(int i=0;i<n;i++)for(int j=0;j<n;j++){
+        int bi=b_newvar(b,0.0,1.0);bm[i*n+j]=bi;
+        /* Half-reification b_{i,j} => (y_i == x_j): a full reification would
+           force b=1 for EVERY equal pair and break the permutation sums when
+           x has duplicate values.  The doubly-stochastic sums plus the
+           implications still force y = x_sigma exactly. */
+        Lin d;memset(&d,0,sizeof(d));lin_into(&d,&y[i],1.0);lin_into(&d,&x[j],-1.0);
+        int rr=add_int_imp(b,&d,bi,0);lin_free(&d);
+        if(rr!=0){psolve_free(bm);return rr<0?-1:1;}
+    }
+    for(int j=0;j<n;j++){
+        Lin s;memset(&s,0,sizeof(s));
+        for(int i=0;i<n;i++)lin_term(&s,bm[i*n+j],1.0);
+        s.constant=-1.0;b_put(b,'=',0.0,&s);lin_free(&s);
+    }
+    for(int i=0;i<n;i++){
+        Lin s;memset(&s,0,sizeof(s));
+        for(int j=0;j<n;j++)lin_term(&s,bm[i*n+j],1.0);
+        s.constant=-1.0;b_put(b,'=',0.0,&s);lin_free(&s);
+    }
+    for(int i=0;i<n;i++)for(int j=0;j<n;j++){
+        Lin d;memset(&d,0,sizeof(d));lin_into(&d,&y[i],1.0);lin_into(&d,&x[j],-1.0);
+        double dlo,dhi;
+        if(lin_bounds(b,&d,&dlo,&dhi)!=0){psolve_free(bm);return 1;}
+        double M=fmax(fabs(dlo),fabs(dhi));
+        int bi=bm[i*n+j];
+        Lin d1;memset(&d1,0,sizeof(d1));lin_into(&d1,&d,1.0);lin_term(&d1,bi,M);b_put(b,'<',M,&d1);lin_free(&d1);
+        Lin d2;memset(&d2,0,sizeof(d2));lin_into(&d2,&d,1.0);lin_term(&d2,bi,-M);b_put(b,'>',-M,&d2);lin_free(&d2);
+        lin_free(&d);
+    }
+    psolve_free(bm);
+    return 0;
+}
+
+/* p = arg_sort(x): p_i is the 1-based index of the i-th smallest element. */
+static int fz_encode_arg_sort(Builder*b,Lin*x,int n,Lin*pl)
+{
+    if(n<=0||n>96)return 1;
+    int *bm=(int*)psolve_malloc((size_t)n*(size_t)n*sizeof(int));
+    for(int i=0;i<n;i++)for(int j=0;j<n;j++){
+        int bi=b_newvar(b,0.0,1.0);bm[i*n+j]=bi;
+        Lin d;memset(&d,0,sizeof(d));lin_into(&d,&pl[i],1.0);d.constant-=(double)(j+1);
+        int rr=add_int_reif(b,&d,bi,0);lin_free(&d);
+        if(rr!=0){psolve_free(bm);return rr<0?-1:1;}
+    }
+    for(int i=0;i<n;i++){
+        Lin s;memset(&s,0,sizeof(s));
+        for(int j=0;j<n;j++)lin_term(&s,bm[i*n+j],1.0);
+        s.constant=-1.0;b_put(b,'=',0.0,&s);lin_free(&s);
+    }
+    for(int j=0;j<n;j++){
+        Lin s;memset(&s,0,sizeof(s));
+        for(int i=0;i<n;i++)lin_term(&s,bm[i*n+j],1.0);
+        s.constant=-1.0;b_put(b,'=',0.0,&s);lin_free(&s);
+    }
+    double xlo=LP_INF,xhi=-LP_INF;
+    for(int i=0;i<n;i++){
+        double lo,hi;
+        if(lin_bounds(b,&x[i],&lo,&hi)!=0){psolve_free(bm);return 1;}
+        if(lo<xlo)xlo=lo;
+        if(hi>xhi)xhi=hi;
+    }
+    if(!isfinite(xlo)||!isfinite(xhi)){psolve_free(bm);return 1;}
+    int *e=(int*)psolve_malloc((size_t)n*sizeof(int));
+    for(int i=0;i<n;i++)e[i]=b_newvar(b,xlo,xhi);
+    for(int i=0;i<n;i++)for(int j=0;j<n;j++){
+        Lin ei;memset(&ei,0,sizeof(ei));lin_term(&ei,e[i],1.0);
+        Lin d;memset(&d,0,sizeof(d));lin_into(&d,&ei,1.0);lin_into(&d,&x[j],-1.0);
+        lin_free(&ei);
+        double dlo,dhi;
+        if(lin_bounds(b,&d,&dlo,&dhi)!=0){psolve_free(e);psolve_free(bm);return 1;}
+        double M=fmax(fabs(dlo),fabs(dhi));
+        int bi=bm[i*n+j];
+        Lin d1;memset(&d1,0,sizeof(d1));lin_into(&d1,&d,1.0);lin_term(&d1,bi,M);b_put(b,'<',M,&d1);lin_free(&d1);
+        Lin d2;memset(&d2,0,sizeof(d2));lin_into(&d2,&d,1.0);lin_term(&d2,bi,-M);b_put(b,'>',-M,&d2);lin_free(&d2);
+        lin_free(&d);
+    }
+    for(int k=0;k+1<n;k++){
+        Lin ek,ek1;memset(&ek,0,sizeof(ek));lin_term(&ek,e[k],1.0);
+        memset(&ek1,0,sizeof(ek1));lin_term(&ek1,e[k+1],1.0);
+        Lin d;memset(&d,0,sizeof(d));lin_into(&d,&ek1,1.0);lin_into(&d,&ek,-1.0);
+        lin_free(&ek);lin_free(&ek1);
+        b_put(b,'>',0.0,&d);lin_free(&d);
+    }
+    psolve_free(e);psolve_free(bm);
+    return 0;
+}
+
+/* sliding among: every window of length seq has between low and up members
+   of the value set.  Exact window sums over membership selectors. */
+static int fz_encode_among_seq(Builder*b,Lin*arr,int narr,int is_range,long rlo,long rhi,
+                               const long*vals,int nvals,long seq,long low,long up)
+{
+    if(narr<=0||narr>4096)return 1;
+    if(seq<=0)return -1;
+    int *ms=NULL;
+    int rr=fz_in_sel(b,arr,narr,is_range,rlo,rhi,vals,nvals,&ms);
+    if(rr!=0)return rr<0?-1:1;
+    if(seq<=narr){
+        for(long k=0;k+seq<=narr;k++){
+            Lin W;memset(&W,0,sizeof(W));
+            for(long i=k;i<k+seq;i++)lin_term(&W,ms[(int)i],1.0);
+            b_put(b,'>',(double)low,&W);
+            b_put(b,'<',(double)up,&W);
+            lin_free(&W);
+        }
+    }
+    psolve_free(ms);
+    return 0;
+}
+
+/* element with a linear index: vl = arr[il + off] (1-based flat position).
+   Same exact SOS1 encoding as the 1D element handler. */
+static int fz_encode_element_lin(Builder*b,Lin*il,double off,Lin*arr,int narr,Lin*vl)
+{
+    if(narr<=0||narr>2048)return 1;
+    if(il->n==0){
+        double kd=il->constant+off;
+        if(kd!=rint(kd)||fabs(kd)>0x1p53)return 1;  /* TOLSHEET TOL-FZN-POWCAP */
+        long k=(long)rint(kd);
+        if(k<1||k>narr){
+            Lin nf;memset(&nf,0,sizeof(nf));b_put(b,'=',1.0,&nf);lin_free(&nf);  /* 0=1 */
+        } else {
+            Lin eq;memset(&eq,0,sizeof(eq));lin_into(&eq,vl,1.0);lin_into(&eq,&arr[(int)k-1],-1.0);
+            b_put(b,'=',0.0,&eq);lin_free(&eq);
+        }
+        return 0;
+    }
+    int *bs=(int*)psolve_malloc((size_t)narr*sizeof(int));
+    for(int i=0;i<narr;i++)bs[i]=b_newvar(b,0.0,1.0);
+    Lin s;memset(&s,0,sizeof(s));
+    for(int i=0;i<narr;i++)lin_term(&s,bs[i],1.0);
+    s.constant=-1.0;b_put(b,'=',0.0,&s);lin_free(&s);
+    Lin ie;memset(&ie,0,sizeof(ie));lin_into(&ie,il,1.0);ie.constant+=off;
+    for(int i=0;i<narr;i++)lin_term(&ie,bs[i],-(double)(i+1));
+    b_put(b,'=',0.0,&ie);lin_free(&ie);
+    for(int i=0;i<narr;i++){
+        Lin d;memset(&d,0,sizeof(d));lin_into(&d,vl,1.0);lin_into(&d,&arr[i],-1.0);
+        double dlo,dhi;
+        if(lin_bounds(b,&d,&dlo,&dhi)!=0){psolve_free(bs);return 1;}
+        double M=fmax(fabs(dlo),fabs(dhi));
+        Lin d1;memset(&d1,0,sizeof(d1));lin_into(&d1,&d,1.0);lin_term(&d1,bs[i],M);b_put(b,'<',M,&d1);lin_free(&d1);
+        Lin d2;memset(&d2,0,sizeof(d2));lin_into(&d2,&d,1.0);lin_term(&d2,bs[i],-M);b_put(b,'>',-M,&d2);lin_free(&d2);
+        lin_free(&d);
+    }
+    psolve_free(bs);
+    return 0;
+}
+
+/* parse a par integer literal argument; 0 ok, 1 decline, -1 malformed */
+static int fz_const_long(FZModel*m,const char*s,long*out)
+{
+    Lin l;
+    if(parse_lin(m,s,&l)!=0)return -1;
+    if(l.n!=0||!isfinite(l.constant)||l.constant!=rint(l.constant)||fabs(l.constant)>0x1p53){  /* TOLSHEET TOL-FZN-POWCAP */
+        lin_free(&l);return 1;
+    }
+    *out=(long)rint(l.constant);
+    lin_free(&l);
+    return 0;
+}
+
 /* dispatch: 0 handled, 1 unhandled, -1 malformed */
 static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
 {
@@ -2845,6 +3194,255 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
         }
         lin_free(&s);psolve_free(bs);free_lins(arr,narr);lin_free(&vl);lin_free(&nl);
         return 0;
+    }
+    /* ===== Phase 11.2 wave 2: stdlib globals that reach FlatZinc as builtins ===== */
+    /* at_most/at_least/exactly(n, x[], v) [+ _reif(n, x[], v, b)].
+       Exactly the count family with swapped leading argument. */
+    if(strcmp(p,"fzn_at_most_int")==0||strcmp(p,"at_most_int")==0||
+       strcmp(p,"fzn_at_least_int")==0||strcmp(p,"at_least_int")==0||
+       strcmp(p,"fzn_exactly_int")==0||strcmp(p,"exactly_int")==0||
+       strcmp(p,"fzn_at_most_int_reif")==0||strcmp(p,"fzn_at_least_int_reif")==0||
+       strcmp(p,"fzn_exactly_int_reif")==0){
+        int is_reif=strstr(p,"_reif")!=NULL;
+        int which=strstr(p,"at_most")!=NULL?0:(strstr(p,"at_least")!=NULL?1:2); /* 0:<= 1:>= 2:= */
+        if(c->nargs<(is_reif?4:3))return -1;
+        Lin nl;if(parse_lin(m,c->args[0],&nl)!=0)return -1;
+        Lin*arr;int narr;
+        if(parse_array(m,c->args[1],&arr,&narr)!=0){lin_free(&nl);return -1;}
+        Lin vl;if(parse_lin(m,c->args[2],&vl)!=0){lin_free(&nl);free_lins(arr,narr);return -1;}
+        int rb=-1;
+        if(is_reif){
+            Lin bl;
+            if(parse_lin(m,c->args[3],&bl)!=0){lin_free(&nl);lin_free(&vl);free_lins(arr,narr);return -1;}
+            int rr=lin_unit_var(&bl,&rb);lin_free(&bl);
+            if(rr!=0){lin_free(&nl);lin_free(&vl);free_lins(arr,narr);return 1;}
+        }
+        int *bs=NULL;
+        int rr=fz_eq_sel(b,arr,narr,&vl,&bs);
+        if(rr!=0){lin_free(&nl);lin_free(&vl);free_lins(arr,narr);return rr<0?-1:1;}
+        Lin s;memset(&s,0,sizeof(s));
+        for(int i=0;i<narr;i++)lin_term(&s,bs[i],1.0);
+        lin_into(&s,&nl,-1.0);
+        if(is_reif){
+            int wq=which==0?1:(which==1?3:0);
+            rr=add_int_reif(b,&s,rb,wq);
+            if(rr!=0){lin_free(&s);psolve_free(bs);lin_free(&nl);lin_free(&vl);free_lins(arr,narr);return rr<0?-1:1;}
+        } else {
+            if(which==0)b_put(b,'<',0.0,&s);
+            else if(which==1)b_put(b,'>',0.0,&s);
+            else b_put(b,'=',0.0,&s);
+        }
+        lin_free(&s);psolve_free(bs);lin_free(&nl);lin_free(&vl);free_lins(arr,narr);
+        return 0;
+    }
+    /* fzn_at_most1(x[], v) [+ _reif(x[], v, b)]: at most one x_i == v. */
+    if(strcmp(p,"fzn_at_most1")==0||strcmp(p,"at_most1")==0||strcmp(p,"fzn_at_most1_reif")==0){
+        int is_reif=strstr(p,"_reif")!=NULL;
+        if(c->nargs<(is_reif?3:2))return -1;
+        Lin*arr;int narr;
+        if(parse_array(m,c->args[0],&arr,&narr)!=0)return -1;
+        Lin vl;if(parse_lin(m,c->args[1],&vl)!=0){free_lins(arr,narr);return -1;}
+        int rb=-1;
+        if(is_reif){
+            Lin bl;
+            if(parse_lin(m,c->args[2],&bl)!=0){lin_free(&vl);free_lins(arr,narr);return -1;}
+            int rr=lin_unit_var(&bl,&rb);lin_free(&bl);
+            if(rr!=0){lin_free(&vl);free_lins(arr,narr);return 1;}
+        }
+        int *bs=NULL;
+        int rr=fz_eq_sel(b,arr,narr,&vl,&bs);
+        if(rr!=0){lin_free(&vl);free_lins(arr,narr);return rr<0?-1:1;}
+        Lin s;memset(&s,0,sizeof(s));
+        for(int i=0;i<narr;i++)lin_term(&s,bs[i],1.0);
+        s.constant=-1.0;
+        if(is_reif){
+            rr=add_int_reif(b,&s,rb,1);
+            if(rr!=0){lin_free(&s);psolve_free(bs);lin_free(&vl);free_lins(arr,narr);return rr<0?-1:1;}
+        } else {
+            b_put(b,'<',0.0,&s);
+        }
+        lin_free(&s);psolve_free(bs);lin_free(&vl);free_lins(arr,narr);
+        return 0;
+    }
+    /* gecode_precede(x, s, t) / fzn_value_precede_int(s, t, x) [+ _opt]:
+       value_precede(s, t, x).  Opt arrays lower to a 0 sentinel outside the
+       value domain, so the raw int encoding stays exact. */
+    if(strcmp(p,"gecode_precede")==0||strcmp(p,"fzn_value_precede_int")==0||
+       strcmp(p,"fzn_value_precede_int_opt")==0){
+        int gec=strncmp(p,"gecode_",7)==0;
+        int a_arr=gec?0:2, a_s=gec?1:0, a_t=gec?2:1;   /* gecode: (x,s,t); fzn: (s,t,x) */
+        if(c->nargs<3)return -1;
+        Lin*arr;int narr;
+        if(parse_array(m,c->args[a_arr],&arr,&narr)!=0)return -1;
+        long s,t;
+        int r1=fz_const_long(m,c->args[a_s],&s),r2=fz_const_long(m,c->args[a_t],&t);
+        if(r1!=0||r2!=0){free_lins(arr,narr);return (r1?r1:r2)<0?-1:1;}
+        int rr=fz_encode_precede(b,arr,narr,s,t);
+        free_lins(arr,narr);
+        return rr<0?-1:(rr?1:0);
+    }
+    /* fzn_value_precede_chain_int(T[], x[]): precede(T[k], T[k+1], x). */
+    if(strcmp(p,"fzn_value_precede_chain_int")==0||strcmp(p,"fzn_value_precede_chain_int_opt")==0){
+        if(c->nargs<2)return -1;
+        Lin*ch;int nch;
+        if(parse_array(m,c->args[0],&ch,&nch)!=0)return -1;
+        Lin*arr;int narr;
+        if(parse_array(m,c->args[1],&arr,&narr)!=0){free_lins(ch,nch);return -1;}
+        int rr=0;
+        for(int k=0;k<nch;k++)
+            if(ch[k].n!=0||ch[k].constant!=rint(ch[k].constant)||fabs(ch[k].constant)>0x1p53){rr=1;break;}  /* TOLSHEET TOL-FZN-POWCAP */
+        for(int k=0;k+1<nch&&rr==0;k++)
+            rr=fz_encode_precede(b,arr,narr,(long)rint(ch[k].constant),(long)rint(ch[k+1].constant));
+        free_lins(ch,nch);free_lins(arr,narr);
+        return rr<0?-1:(rr?1:0);
+    }
+    /* fzn_seq_precede_chain_int(x[]): precede(k, k+1, x) for k=1..n-1. */
+    if(strcmp(p,"fzn_seq_precede_chain_int")==0){
+        if(c->nargs<1)return -1;
+        Lin*arr;int narr;
+        if(parse_array(m,c->args[0],&arr,&narr)!=0)return -1;
+        int rr=0;
+        for(long k=1;k<narr&&rr==0;k++)rr=fz_encode_precede(b,arr,narr,k,k+1);
+        free_lins(arr,narr);
+        return rr<0?-1:(rr?1:0);
+    }
+    /* gecode_minimum/maximum_arg_int_offset(x, offset, i): i is the least
+       actual index attaining the extremum.  Plain fzn_* names are 1-based. */
+    if(strcmp(p,"gecode_minimum_arg_int_offset")==0||strcmp(p,"gecode_maximum_arg_int_offset")==0){
+        int ismax=strstr(p,"maximum")!=NULL;
+        if(c->nargs<3)return -1;
+        Lin*arr;int narr;
+        if(parse_array(m,c->args[0],&arr,&narr)!=0)return -1;
+        long off;int r0=fz_const_long(m,c->args[1],&off);
+        Lin il;int r1=parse_lin(m,c->args[2],&il);
+        if(r0!=0||r1!=0){if(r1==0)lin_free(&il);free_lins(arr,narr);return (r0?r0:r1)<0?-1:1;}
+        int rr=fz_encode_arg_extremum(b,arr,narr,&il,ismax,(double)off);
+        lin_free(&il);free_lins(arr,narr);
+        return rr<0?-1:(rr?1:0);
+    }
+    if(strcmp(p,"fzn_minimum_arg_int")==0||strcmp(p,"fzn_maximum_arg_int")==0||
+       strcmp(p,"fzn_arg_min_int")==0||strcmp(p,"fzn_arg_max_int")==0||
+       strcmp(p,"minimum_arg_int")==0||strcmp(p,"maximum_arg_int")==0||
+       strcmp(p,"fzn_minimum_arg_bool")==0||strcmp(p,"fzn_maximum_arg_bool")==0||
+       strcmp(p,"fzn_arg_min_bool")==0||strcmp(p,"fzn_arg_max_bool")==0||
+       strcmp(p,"minimum_arg_bool")==0||strcmp(p,"maximum_arg_bool")==0){
+        int ismax=strstr(p,"max")!=NULL;
+        if(c->nargs<2)return -1;
+        Lin*arr;int narr;
+        if(parse_array(m,c->args[0],&arr,&narr)!=0)return -1;
+        Lin il;if(parse_lin(m,c->args[1],&il)!=0){free_lins(arr,narr);return -1;}
+        int rr=fz_encode_arg_extremum(b,arr,narr,&il,ismax,1.0);
+        lin_free(&il);free_lins(arr,narr);
+        return rr<0?-1:(rr?1:0);
+    }
+    /* fzn_sort(x, y): y is the ascending permutation of x. */
+    if(strcmp(p,"fzn_sort")==0||strcmp(p,"sort_int")==0){
+        if(c->nargs<2)return -1;
+        Lin*x;int nx;
+        if(parse_array(m,c->args[0],&x,&nx)!=0)return -1;
+        Lin*y;int ny;
+        if(parse_array(m,c->args[1],&y,&ny)!=0){free_lins(x,nx);return -1;}
+        if(nx!=ny){free_lins(x,nx);free_lins(y,ny);return -1;}
+        int rr=fz_encode_sort(b,x,nx,y);
+        free_lins(x,nx);free_lins(y,ny);
+        return rr<0?-1:(rr?1:0);
+    }
+    /* fzn_arg_sort_int(x, p): p is the sorting permutation (1-based). */
+    if(strcmp(p,"fzn_arg_sort_int")==0||strcmp(p,"arg_sort_int")==0){
+        if(c->nargs<2)return -1;
+        Lin*x;int nx;
+        if(parse_array(m,c->args[0],&x,&nx)!=0)return -1;
+        Lin*pl;int np;
+        if(parse_array(m,c->args[1],&pl,&np)!=0){free_lins(x,nx);return -1;}
+        if(nx!=np){free_lins(x,nx);free_lins(pl,np);return -1;}
+        int rr=fz_encode_arg_sort(b,x,nx,pl);
+        free_lins(x,nx);free_lins(pl,np);
+        return rr<0?-1:(rr?1:0);
+    }
+    /* sliding among: gecode_among_seq_int(x, S, seq, low, up) and
+       gecode_among_seq_bool(x, b, seq, low, up); fzn_sliding_among_int/bool
+       use (low, up, seq, x, S|b). */
+    if(strcmp(p,"gecode_among_seq_int")==0||strcmp(p,"fzn_sliding_among_int")==0||
+       strcmp(p,"gecode_among_seq_bool")==0||strcmp(p,"fzn_sliding_among_bool")==0){
+        int gec=strncmp(p,"gecode_",7)==0;
+        int isb=strstr(p,"bool")!=NULL;
+        int a_arr;
+        long seq,low,up,bstore=0;
+        const char*setarg=NULL;
+        if(gec){
+            int r;
+            if(c->nargs<5)return -1;
+            a_arr=0;
+            if((r=fz_const_long(m,c->args[2],&seq))!=0)return r<0?-1:1;
+            if((r=fz_const_long(m,c->args[3],&low))!=0)return r<0?-1:1;
+            if((r=fz_const_long(m,c->args[4],&up))!=0)return r<0?-1:1;
+            setarg=c->args[1];
+        } else {
+            int r;
+            if(c->nargs<5)return -1;
+            if((r=fz_const_long(m,c->args[0],&low))!=0)return r<0?-1:1;
+            if((r=fz_const_long(m,c->args[1],&up))!=0)return r<0?-1:1;
+            if((r=fz_const_long(m,c->args[2],&seq))!=0)return r<0?-1:1;
+            a_arr=3;
+            setarg=c->args[4];
+        }
+        Lin*arr;int narr;
+        if(parse_array(m,c->args[a_arr],&arr,&narr)!=0)return -1;
+        int is_range=0;long rlo=0,rhi=0;long*vals=NULL;int nvals=0;
+        if(isb){
+            long bv;
+            int rbv=fz_const_long(m,setarg,&bv);
+            if(rbv!=0){free_lins(arr,narr);return rbv<0?-1:1;}
+            bstore=bv;   /* single-value "set" */
+            vals=&bstore;nvals=1;
+        } else {
+            if(fz_parse_int_set(setarg,FZ_MAX_SET_ENUM,&is_range,&rlo,&rhi,&vals,&nvals)!=0){
+                free_lins(arr,narr);return 1;
+            }
+            if(is_range&&rlo<=rhi&&rhi-rlo+1>FZ_MAX_SET_ENUM){
+                free_lins(arr,narr);return 1;   /* honest cap, no truncation */
+            }
+            if(is_range&&rlo<=rhi){
+                nvals=(int)(rhi-rlo+1);
+                vals=(long*)psolve_malloc((size_t)nvals*sizeof(long));
+                for(long v=rlo;v<=rhi;v++)vals[(int)(v-rlo)]=v;
+            }
+        }
+        int rr=fz_encode_among_seq(b,arr,narr,is_range,rlo,rhi,vals,nvals,seq,low,up);
+        if(vals&&!isb)psolve_free(vals);
+        free_lins(arr,narr);
+        return rr<0?-1:(rr?1:0);
+    }
+    /* gecode_int_element2d(i, j, x_flat, S1, S2, c): c = x[i, j] over the
+       row-major flattened array; both index sets must be ranges. */
+    if(strcmp(p,"gecode_int_element2d")==0||strcmp(p,"array_var_int_element2d")==0||
+       strcmp(p,"array_int_element2d")==0){
+        if(c->nargs<6)return -1;
+        Lin i1,i2;
+        if(parse_lin(m,c->args[0],&i1)!=0)return -1;
+        if(parse_lin(m,c->args[1],&i2)!=0){lin_free(&i1);return -1;}
+        Lin*arr;int narr;
+        if(parse_array(m,c->args[2],&arr,&narr)!=0){lin_free(&i1);lin_free(&i2);return -1;}
+        int isr1=0,isr2=0;long l1=0,h1=0,l2=0,h2=0;long*v1=NULL,*v2=NULL;int nv1=0,nv2=0;
+        int r1=fz_parse_int_set(c->args[3],FZ_MAX_SET_ENUM,&isr1,&l1,&h1,&v1,&nv1);
+        int r2=fz_parse_int_set(c->args[4],FZ_MAX_SET_ENUM,&isr2,&l2,&h2,&v2,&nv2);
+        Lin vl;int r3=parse_lin(m,c->args[5],&vl);
+        if(r1!=0||r2!=0||r3!=0||!isr1||!isr2){
+            if(v1)psolve_free(v1);
+            if(v2)psolve_free(v2);
+            lin_free(&i1);lin_free(&i2);if(r3==0)lin_free(&vl);free_lins(arr,narr);
+            return 1;   /* enumerated index sets: honest decline */
+        }
+        if(v1)psolve_free(v1);
+        if(v2)psolve_free(v2);
+        long w2=h2-l2+1;
+        /* flat 1-based position = i1*w2 + i2 + (1 - l1*w2 - l2) */
+        Lin il;memset(&il,0,sizeof(il));
+        lin_into(&il,&i1,(double)w2);lin_into(&il,&i2,1.0);
+        double off=1.0-(double)l1*(double)w2-(double)l2;
+        int rr=fz_encode_element_lin(b,&il,off,arr,narr,&vl);
+        lin_free(&il);lin_free(&i1);lin_free(&i2);lin_free(&vl);free_lins(arr,narr);
+        return rr<0?-1:(rr?1:0);
     }
     /* among(n, x[], V) / fzn_among(n, x[], V): exactly n of x take values in set V. */
     if(strcmp(p,"among")==0||strcmp(p,"fzn_among")==0||strcmp(p,"among_eq")==0){
