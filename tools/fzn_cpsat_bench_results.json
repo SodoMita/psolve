@@ -1,0 +1,2466 @@
+[
+ {
+  "model": "abs",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0013
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0117
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.009
+  }
+ },
+ {
+  "model": "abs",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0013
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0124
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0087
+  }
+ },
+ {
+  "model": "all_equal_demo",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0013
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.012
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0089
+  }
+ },
+ {
+  "model": "all_equal_demo",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0015
+  },
+  "cp-sat": {
+   "st": "?",
+   "t": 0.0114
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0087
+  }
+ },
+ {
+  "model": "alldiff",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0014
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0138
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0088
+  }
+ },
+ {
+  "model": "alldiff",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0015
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0153
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0095
+  }
+ },
+ {
+  "model": "alldiff_demo",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0015
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.015
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.009
+  }
+ },
+ {
+  "model": "alldiff_demo",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0012
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0115
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0083
+  }
+ },
+ {
+  "model": "alldiff_except_0_demo",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0014
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0131
+  },
+  "gecode": {
+   "st": "?",
+   "t": 0.0087
+  }
+ },
+ {
+  "model": "alldiff_except_0_demo",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0026
+  },
+  "cp-sat": {
+   "st": "?",
+   "t": 0.0117
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0087
+  }
+ },
+ {
+  "model": "assignment",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0015
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0133
+  },
+  "gecode": {
+   "st": "?",
+   "t": 0.0085
+  }
+ },
+ {
+  "model": "assignment",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0015
+  },
+  "cp-sat": {
+   "st": "?",
+   "t": 0.0117
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0091
+  }
+ },
+ {
+  "model": "bin_packing_demo",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0025
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0129
+  },
+  "gecode": {
+   "st": "?",
+   "t": 0.0088
+  }
+ },
+ {
+  "model": "bin_packing_demo",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0025
+  },
+  "cp-sat": {
+   "st": "?",
+   "t": 0.012
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0088
+  }
+ },
+ {
+  "model": "bin_packing_load_demo",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.002
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0131
+  },
+  "gecode": {
+   "st": "?",
+   "t": 0.0079
+  }
+ },
+ {
+  "model": "bin_packing_load_demo",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0019
+  },
+  "cp-sat": {
+   "st": "?",
+   "t": 0.012
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0092
+  }
+ },
+ {
+  "model": "blending",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0015
+  },
+  "cp-sat": {
+   "st": "?",
+   "t": 0.0111
+  },
+  "gecode": {
+   "st": "TIMEOUT",
+   "t": 10.0103
+  }
+ },
+ {
+  "model": "blending",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0016
+  },
+  "cp-sat": {
+   "st": "?",
+   "t": 0.0117
+  },
+  "gecode": {
+   "st": "TIMEOUT",
+   "t": 10.0112
+  }
+ },
+ {
+  "model": "bool_and_sat",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0012
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0112
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0082
+  }
+ },
+ {
+  "model": "bool_and_sat",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0013
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0122
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0085
+  }
+ },
+ {
+  "model": "bridge_scheduling",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0014
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0126
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0086
+  }
+ },
+ {
+  "model": "bridge_scheduling",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0014
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0125
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0082
+  }
+ },
+ {
+  "model": "circuit",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0013
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0133
+  },
+  "gecode": {
+   "st": "?",
+   "t": 0.0084
+  }
+ },
+ {
+  "model": "circuit",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0014
+  },
+  "cp-sat": {
+   "st": "?",
+   "t": 0.011
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0083
+  }
+ },
+ {
+  "model": "circuit_demo",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0014
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0133
+  },
+  "gecode": {
+   "st": "?",
+   "t": 0.0081
+  }
+ },
+ {
+  "model": "circuit_demo",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0013
+  },
+  "cp-sat": {
+   "st": "?",
+   "t": 0.0109
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.008
+  }
+ },
+ {
+  "model": "count",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0014
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0113
+  },
+  "gecode": {
+   "st": "?",
+   "t": 0.0076
+  }
+ },
+ {
+  "model": "count",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0014
+  },
+  "cp-sat": {
+   "st": "?",
+   "t": 0.0097
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0076
+  }
+ },
+ {
+  "model": "cumulative_demo",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0014
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.011
+  },
+  "gecode": {
+   "st": "?",
+   "t": 0.0078
+  }
+ },
+ {
+  "model": "cumulative_demo",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0016
+  },
+  "cp-sat": {
+   "st": "?",
+   "t": 0.0109
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0081
+  }
+ },
+ {
+  "model": "cumulative_opt",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.004
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0138
+  },
+  "gecode": {
+   "st": "?",
+   "t": 0.0082
+  }
+ },
+ {
+  "model": "cumulative_opt",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.004
+  },
+  "cp-sat": {
+   "st": "?",
+   "t": 0.0109
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.008
+  }
+ },
+ {
+  "model": "cutting_stock",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0017
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0137
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0077
+  }
+ },
+ {
+  "model": "cutting_stock",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0016
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0127
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0082
+  }
+ },
+ {
+  "model": "decreasing_demo",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0015
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.013
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0088
+  }
+ },
+ {
+  "model": "decreasing_demo",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0014
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0126
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.009
+  }
+ },
+ {
+  "model": "diet",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0012
+  },
+  "cp-sat": {
+   "st": "?",
+   "t": 0.0093
+  },
+  "gecode": {
+   "st": "TIMEOUT",
+   "t": 10.0252
+  }
+ },
+ {
+  "model": "diet",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0013
+  },
+  "cp-sat": {
+   "st": "?",
+   "t": 0.0096
+  },
+  "gecode": {
+   "st": "TIMEOUT",
+   "t": 10.0191
+  }
+ },
+ {
+  "model": "diffn_demo",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0015
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0152
+  },
+  "gecode": {
+   "st": "?",
+   "t": 0.0116
+  }
+ },
+ {
+  "model": "diffn_demo",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0016
+  },
+  "cp-sat": {
+   "st": "?",
+   "t": 0.012
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0093
+  }
+ },
+ {
+  "model": "disjunctive_demo",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0013
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0111
+  },
+  "gecode": {
+   "st": "?",
+   "t": 0.0074
+  }
+ },
+ {
+  "model": "disjunctive_demo",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0015
+  },
+  "cp-sat": {
+   "st": "?",
+   "t": 0.0118
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.009
+  }
+ },
+ {
+  "model": "element",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0013
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0121
+  },
+  "gecode": {
+   "st": "?",
+   "t": 0.0084
+  }
+ },
+ {
+  "model": "element",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0012
+  },
+  "cp-sat": {
+   "st": "?",
+   "t": 0.0105
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0076
+  }
+ },
+ {
+  "model": "enum_permutations_3",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0013
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0115
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0077
+  }
+ },
+ {
+  "model": "enum_permutations_3",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0016
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.014
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0087
+  }
+ },
+ {
+  "model": "enum_queens_4",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0013
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0111
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0077
+  }
+ },
+ {
+  "model": "enum_queens_4",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0014
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0125
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0086
+  }
+ },
+ {
+  "model": "enum_subsets",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0014
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.012
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0076
+  }
+ },
+ {
+  "model": "enum_subsets",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0015
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0119
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0088
+  }
+ },
+ {
+  "model": "eq_linear",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0015
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0127
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0097
+  }
+ },
+ {
+  "model": "eq_linear",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0014
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0135
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0093
+  }
+ },
+ {
+  "model": "facility_loc",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.002
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0139
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.009
+  }
+ },
+ {
+  "model": "facility_loc",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0014
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0116
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0086
+  }
+ },
+ {
+  "model": "float_lin",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0016
+  },
+  "cp-sat": {
+   "st": "?",
+   "t": 0.0121
+  },
+  "gecode": {
+   "st": "TIMEOUT",
+   "t": 10.009
+  }
+ },
+ {
+  "model": "float_lin",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0016
+  },
+  "cp-sat": {
+   "st": "?",
+   "t": 0.0123
+  },
+  "gecode": {
+   "st": "TIMEOUT",
+   "t": 10.0116
+  }
+ },
+ {
+  "model": "flowshop_3x3",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.002
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0142
+  },
+  "gecode": {
+   "st": "?",
+   "t": 0.0096
+  }
+ },
+ {
+  "model": "flowshop_3x3",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0017
+  },
+  "cp-sat": {
+   "st": "?",
+   "t": 0.0122
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0086
+  }
+ },
+ {
+  "model": "global_cardinality_demo",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0014
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0139
+  },
+  "gecode": {
+   "st": "?",
+   "t": 0.0091
+  }
+ },
+ {
+  "model": "global_cardinality_demo",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0022
+  },
+  "cp-sat": {
+   "st": "?",
+   "t": 0.0167
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0094
+  }
+ },
+ {
+  "model": "global_cardinality_low_up_demo",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0013
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0134
+  },
+  "gecode": {
+   "st": "?",
+   "t": 0.0081
+  }
+ },
+ {
+  "model": "global_cardinality_low_up_demo",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0012
+  },
+  "cp-sat": {
+   "st": "?",
+   "t": 0.01
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0073
+  }
+ },
+ {
+  "model": "golomb_ruler_4",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0023
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.017
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0078
+  }
+ },
+ {
+  "model": "golomb_ruler_4",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0024
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0171
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0087
+  }
+ },
+ {
+  "model": "graph_coloring",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0012
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0112
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0076
+  }
+ },
+ {
+  "model": "graph_coloring",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0013
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0127
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0077
+  }
+ },
+ {
+  "model": "increasing_demo",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0012
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0109
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0071
+  }
+ },
+ {
+  "model": "increasing_demo",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0014
+  },
+  "cp-sat": {
+   "st": "?",
+   "t": 0.0109
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0077
+  }
+ },
+ {
+  "model": "inverse_demo",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0015
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0115
+  },
+  "gecode": {
+   "st": "?",
+   "t": 0.008
+  }
+ },
+ {
+  "model": "inverse_demo",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0014
+  },
+  "cp-sat": {
+   "st": "?",
+   "t": 0.011
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.008
+  }
+ },
+ {
+  "model": "jobshop_3x3",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0017
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0131
+  },
+  "gecode": {
+   "st": "?",
+   "t": 0.0082
+  }
+ },
+ {
+  "model": "jobshop_3x3",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0019
+  },
+  "cp-sat": {
+   "st": "?",
+   "t": 0.0131
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0086
+  }
+ },
+ {
+  "model": "knap_lin",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0018
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0134
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0086
+  }
+ },
+ {
+  "model": "knap_lin",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0015
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.013
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0084
+  }
+ },
+ {
+  "model": "knap_unbounded",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0014
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0127
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0083
+  }
+ },
+ {
+  "model": "knap_unbounded",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0016
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0128
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0087
+  }
+ },
+ {
+  "model": "latin_square_4",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0015
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0157
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0077
+  }
+ },
+ {
+  "model": "latin_square_4",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0013
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0135
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0088
+  }
+ },
+ {
+  "model": "lex_less_demo",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0017
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0128
+  },
+  "gecode": {
+   "st": "?",
+   "t": 0.0095
+  }
+ },
+ {
+  "model": "lex_less_demo",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0017
+  },
+  "cp-sat": {
+   "st": "?",
+   "t": 0.0113
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0075
+  }
+ },
+ {
+  "model": "lex_lesseq_demo",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0014
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0117
+  },
+  "gecode": {
+   "st": "?",
+   "t": 0.0066
+  }
+ },
+ {
+  "model": "lex_lesseq_demo",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0018
+  },
+  "cp-sat": {
+   "st": "?",
+   "t": 0.0117
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.008
+  }
+ },
+ {
+  "model": "lin_ge",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0017
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0143
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0087
+  }
+ },
+ {
+  "model": "lin_ge",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0017
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0132
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0102
+  }
+ },
+ {
+  "model": "lin_ne",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0015
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0129
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0083
+  }
+ },
+ {
+  "model": "lin_ne",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0014
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0128
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0087
+  }
+ },
+ {
+  "model": "magic_square_3",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0016
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0157
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0082
+  }
+ },
+ {
+  "model": "magic_square_3",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0016
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0154
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0079
+  }
+ },
+ {
+  "model": "magic_square_4",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0052
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0295
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.008
+  }
+ },
+ {
+  "model": "magic_square_4",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0051
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0289
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.008
+  }
+ },
+ {
+  "model": "max2",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0013
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0108
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.007
+  }
+ },
+ {
+  "model": "max2",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0012
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0106
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0067
+  }
+ },
+ {
+  "model": "member_demo",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0013
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0119
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0118
+  }
+ },
+ {
+  "model": "member_demo",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0015
+  },
+  "cp-sat": {
+   "st": "?",
+   "t": 0.0112
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0074
+  }
+ },
+ {
+  "model": "mix_prod",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0013
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0108
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0071
+  }
+ },
+ {
+  "model": "mix_prod",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0014
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0124
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0077
+  }
+ },
+ {
+  "model": "network_flow",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0016
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0132
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0086
+  }
+ },
+ {
+  "model": "network_flow",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0015
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0138
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0081
+  }
+ },
+ {
+  "model": "not_eq",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0015
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0124
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0083
+  }
+ },
+ {
+  "model": "not_eq",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0014
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0122
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.008
+  }
+ },
+ {
+  "model": "nqueens_4",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0015
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0126
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0079
+  }
+ },
+ {
+  "model": "nqueens_4",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0016
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0137
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0083
+  }
+ },
+ {
+  "model": "nqueens_8",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.004
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.019
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0088
+  }
+ },
+ {
+  "model": "nqueens_8",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0044
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0194
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0091
+  }
+ },
+ {
+  "model": "nvalue_demo",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0025
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0121
+  },
+  "gecode": {
+   "st": "?",
+   "t": 0.0087
+  }
+ },
+ {
+  "model": "nvalue_demo",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0027
+  },
+  "cp-sat": {
+   "st": "?",
+   "t": 0.0119
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0081
+  }
+ },
+ {
+  "model": "open_shop_3x3",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0017
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0146
+  },
+  "gecode": {
+   "st": "?",
+   "t": 0.0083
+  }
+ },
+ {
+  "model": "open_shop_3x3",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0014
+  },
+  "cp-sat": {
+   "st": "?",
+   "t": 0.01
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0084
+  }
+ },
+ {
+  "model": "portfolio",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0016
+  },
+  "cp-sat": {
+   "st": "?",
+   "t": 0.0125
+  },
+  "gecode": {
+   "st": "TIMEOUT",
+   "t": 10.0089
+  }
+ },
+ {
+  "model": "portfolio",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0017
+  },
+  "cp-sat": {
+   "st": "?",
+   "t": 0.0119
+  },
+  "gecode": {
+   "st": "TIMEOUT",
+   "t": 10.0115
+  }
+ },
+ {
+  "model": "prod3",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0015
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0147
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0094
+  }
+ },
+ {
+  "model": "prod3",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0014
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0147
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0086
+  }
+ },
+ {
+  "model": "prodplan",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0014
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0158
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0087
+  }
+ },
+ {
+  "model": "prodplan",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0014
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0133
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0089
+  }
+ },
+ {
+  "model": "reif_eq",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0014
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0129
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0087
+  }
+ },
+ {
+  "model": "reif_eq",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0015
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0175
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0126
+  }
+ },
+ {
+  "model": "send_more_money",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0014
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0127
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0082
+  }
+ },
+ {
+  "model": "send_more_money",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0015
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.013
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0083
+  }
+ },
+ {
+  "model": "setdom",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0014
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0126
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0082
+  }
+ },
+ {
+  "model": "setdom",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0014
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0123
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0083
+  }
+ },
+ {
+  "model": "sliding_sum_demo",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0017
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0149
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0091
+  }
+ },
+ {
+  "model": "sliding_sum_demo",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0022
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0138
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0084
+  }
+ },
+ {
+  "model": "strictly_increasing_demo",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0013
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0123
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.008
+  }
+ },
+ {
+  "model": "strictly_increasing_demo",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0014
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0121
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0079
+  }
+ },
+ {
+  "model": "subcircuit_demo",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0014
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0131
+  },
+  "gecode": {
+   "st": "?",
+   "t": 0.008
+  }
+ },
+ {
+  "model": "subcircuit_demo",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0017
+  },
+  "cp-sat": {
+   "st": "?",
+   "t": 0.0118
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0084
+  }
+ },
+ {
+  "model": "sudoku_4x4",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0015
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0128
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0086
+  }
+ },
+ {
+  "model": "sudoku_4x4",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0015
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0125
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0087
+  }
+ },
+ {
+  "model": "sudoku_9x9",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0021
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0133
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0083
+  }
+ },
+ {
+  "model": "sudoku_9x9",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0018
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0129
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0085
+  }
+ },
+ {
+  "model": "table",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0015
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0123
+  },
+  "gecode": {
+   "st": "?",
+   "t": 0.0082
+  }
+ },
+ {
+  "model": "table",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0014
+  },
+  "cp-sat": {
+   "st": "?",
+   "t": 0.0114
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0074
+  }
+ },
+ {
+  "model": "table_demo",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0013
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0101
+  },
+  "gecode": {
+   "st": "?",
+   "t": 0.0065
+  }
+ },
+ {
+  "model": "table_demo",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0015
+  },
+  "cp-sat": {
+   "st": "?",
+   "t": 0.0114
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0081
+  }
+ },
+ {
+  "model": "transport",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0014
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0148
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0082
+  }
+ },
+ {
+  "model": "transport",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0014
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0152
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0089
+  }
+ },
+ {
+  "model": "tsp_5",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0017
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0185
+  },
+  "gecode": {
+   "st": "?",
+   "t": 0.0082
+  }
+ },
+ {
+  "model": "tsp_5",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0019
+  },
+  "cp-sat": {
+   "st": "?",
+   "t": 0.0123
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0091
+  }
+ },
+ {
+  "model": "unbounded_product",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0021
+  },
+  "cp-sat": {
+   "st": "TIMEOUT",
+   "t": 10.0096
+  },
+  "gecode": {
+   "st": "TIMEOUT",
+   "t": 10.0112
+  }
+ },
+ {
+  "model": "unbounded_product",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0022
+  },
+  "cp-sat": {
+   "st": "TIMEOUT",
+   "t": 10.0187
+  },
+  "gecode": {
+   "st": "TIMEOUT",
+   "t": 10.0126
+  }
+ },
+ {
+  "model": "unsat_bin_packing",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "UNSAT",
+   "t": 0.0016
+  },
+  "cp-sat": {
+   "st": "UNSAT",
+   "t": 0.0127
+  },
+  "gecode": {
+   "st": "?",
+   "t": 0.0095
+  }
+ },
+ {
+  "model": "unsat_bin_packing",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "UNSAT",
+   "t": 0.0017
+  },
+  "cp-sat": {
+   "st": "?",
+   "t": 0.0128
+  },
+  "gecode": {
+   "st": "UNSAT",
+   "t": 0.0088
+  }
+ },
+ {
+  "model": "unsat_bounds",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "UNSAT",
+   "t": 0.0017
+  },
+  "cp-sat": {
+   "st": "UNSAT",
+   "t": 0.0123
+  },
+  "gecode": {
+   "st": "UNSAT",
+   "t": 0.0087
+  }
+ },
+ {
+  "model": "unsat_bounds",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "UNSAT",
+   "t": 0.0014
+  },
+  "cp-sat": {
+   "st": "UNSAT",
+   "t": 0.0119
+  },
+  "gecode": {
+   "st": "UNSAT",
+   "t": 0.0096
+  }
+ },
+ {
+  "model": "unsat_cumulative",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "UNSAT",
+   "t": 0.0013
+  },
+  "cp-sat": {
+   "st": "UNSAT",
+   "t": 0.0121
+  },
+  "gecode": {
+   "st": "?",
+   "t": 0.0088
+  }
+ },
+ {
+  "model": "unsat_cumulative",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "UNSAT",
+   "t": 0.0014
+  },
+  "cp-sat": {
+   "st": "?",
+   "t": 0.0121
+  },
+  "gecode": {
+   "st": "UNSAT",
+   "t": 0.0086
+  }
+ },
+ {
+  "model": "unsat_knapsack",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "UNSAT",
+   "t": 0.0014
+  },
+  "cp-sat": {
+   "st": "UNSAT",
+   "t": 0.0122
+  },
+  "gecode": {
+   "st": "UNSAT",
+   "t": 0.0087
+  }
+ },
+ {
+  "model": "unsat_knapsack",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "UNSAT",
+   "t": 0.0014
+  },
+  "cp-sat": {
+   "st": "UNSAT",
+   "t": 0.012
+  },
+  "gecode": {
+   "st": "UNSAT",
+   "t": 0.0078
+  }
+ },
+ {
+  "model": "unsat_pigeonhole",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "UNSAT",
+   "t": 0.0015
+  },
+  "cp-sat": {
+   "st": "UNSAT",
+   "t": 0.0102
+  },
+  "gecode": {
+   "st": "UNSAT",
+   "t": 0.0076
+  }
+ },
+ {
+  "model": "unsat_pigeonhole",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "UNSAT",
+   "t": 0.0015
+  },
+  "cp-sat": {
+   "st": "UNSAT",
+   "t": 0.0124
+  },
+  "gecode": {
+   "st": "UNSAT",
+   "t": 0.0108
+  }
+ },
+ {
+  "model": "unsat_sudoku",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "UNSAT",
+   "t": 0.0021
+  },
+  "cp-sat": {
+   "st": "UNSAT",
+   "t": 0.01
+  },
+  "gecode": {
+   "st": "UNSAT",
+   "t": 0.0076
+  }
+ },
+ {
+  "model": "unsat_sudoku",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "UNSAT",
+   "t": 0.0024
+  },
+  "cp-sat": {
+   "st": "UNSAT",
+   "t": 0.0119
+  },
+  "gecode": {
+   "st": "UNSAT",
+   "t": 0.0083
+  }
+ },
+ {
+  "model": "zebra",
+  "solver_lib": "cp-sat",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0014
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.0114
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.008
+  }
+ },
+ {
+  "model": "zebra",
+  "solver_lib": "gecode",
+  "fznsolve": {
+   "st": "SAT",
+   "t": 0.0014
+  },
+  "cp-sat": {
+   "st": "SAT",
+   "t": 0.013
+  },
+  "gecode": {
+   "st": "SAT",
+   "t": 0.0085
+  }
+ }
+]
