@@ -448,6 +448,19 @@ python3 tools/divmod_verify.py 200 20260808 | sed 's/.*: //'
 # channel's acceptance pins.  Hard gate: rc matters.
 python3 tools/fzn_bilinear_verify.py 250 20261101 || { echo "fzn_bilinear_verify: FAIL"; exit 1; }
 
+# Phase 11.2 wave 2: the stdlib globals that reach FlatZinc as builtins and
+# were previously UNHANDLED (counting at_most/at_least/exactly/at_most1,
+# value-precede family, arg-min/max, sort/arg_sort, sliding among,
+# gecode_int_element2d).  Randomized differential vs brute force with exact
+# solution-set equality on -a, single-run verdict/witness checks, a sort
+# optimize check, pins, and MiniZinc-compiled end-to-end -a solution-set
+# equality vs the bundled fzn-gecode oracle.  Hard gate: rc matters.
+python3 tools/fzn_globals_verify.py 20 20261102 || { echo "fzn_globals_verify: FAIL"; exit 1; }
+
+# cp-sat (ortools_*) parity batch: differential verifier against the bundled
+# fzn-cp-sat oracle + brute force (solution-set equality, UNKNOWN = failure)
+LD_LIBRARY_PATH="${MZ_LIB:-/home/user/mz/lib}" python3 tools/fzn_cpsat_verify.py 8 20261104 || { echo "fzn_cpsat_verify: FAIL"; exit 1; }
+
 # FlatZinc OUTPUT-layer round-trip (roadmap 6.7): re-parse every emitted
 # byte; each printed assignment must satisfy every constraint and stay in
 # its declared domain (int: exact Fractions; float: scaled 1e-6 LP

@@ -323,7 +323,7 @@ hand-written input with deliberate sub-width perturbations observes it.
 | TOL-FZN-DIVGUARD | fzn.c:1986 | 1e-15 | D | divisor |const| < tol ⇒ decline (near-0 division normalizes nothing honestly) |
 | TOL-FZN-CUMUL | fzn.c:2791, 2810 | 1e-9 | D | `cumulative` duration/resource args must be near-integer; else decline |
 | TOL-FZN-BOUNDINIT | fzn.c:2215, 2752, 2796, 3358, 3419 | ±1e18 | S | min/max accumulator initializers across the bounds-scan paths (send(bounds|disjunctive|cumulative); sentinels, never compared against data for equality — a model constant wider than 1e18 ends in the honest-decline lattice guards, not here) |
-| TOL-FZN-POWCAP | fzn.c:1866, 1870, 1933, 1944, 1963, 2101, 2690 | 0x1p53 | D | exact-integer mantissa-width cap on folded values (pow / related exact folds); past it ⇒ decline to UNKNOWN, never round |
+| TOL-FZN-POWCAP | fzn.c:1571, 1583, 1725, 1839, 1866, 1870, 1933, 1944, 1963, 1995, 2031, 2101, 2690, 3293 | 0x1p53 | D | exact-integer mantissa-width cap on folded values (pow / related exact folds incl. the Phase-11.2 wave-2 selector caps); past it ⇒ decline to UNKNOWN, never round |
 | TOL-FZN-FARKAS | fzn.c:3990 | 1e-6 | V | boxcert margin arg for fznsolve's Farkas re-verify (see TOL-LP-FARKAS) |
 | TOL-FZN-SHAKY | fzn.c:3996 | 5e-7 = ½·1e-6 | V | fznsolve's own exposure frontier on an uncertified UNSAT ⇒ honest downgrade (same family as TOL-LP-SHAKY) |
 | TOL-FZN-MIPGAP | fzn.c:3951 | 1e-4 | V | default `mip_gap` for the fznsolve MIP route (see TOL-MIP-GAP) |
