@@ -197,6 +197,8 @@ typedef struct {
     CPT   *terms;
     int    nset; long long *setvals;
     CPT   *arr_terms;  /* element array entries (CPT, const or var) */
+    CPT   *terms2;     /* spare operand array (cumulative resources, diffn dims...) */
+    CPT   *terms3;     /* spare operand array (cumulative bound, diffn heights...) */
     void  *aux;        /* per-kind solver state (orbit family: FZOrbit digest) */
     int    aux_owned;  /* 1 when this record owns aux; 0 = shared digest borrow */
 } CPCR;
@@ -226,6 +228,18 @@ typedef struct {
 #define CPK_DISJ 21   /* no-overlap tasks: arr_terms[i]=start s_i, terms[i]=duration d_i; n=nset=#tasks */
 #define CPK_GCC 22    /* global_cardinality: arr_terms=x (nset=N), setvals=cover (rhs=K), terms[0]=closed, terms[1..K]=counts; n=1+K */
 #define CPK_GCCLU 23  /* low_up variant: terms[1..K]=lbound, terms[K+1..2K]=ubound; n=1+2K */
+#define CPK_COUNTEQ 24 /* c = #{x[i]==y}: arr_terms=x (nset=N), terms[0]=y, terms[1]=c; n=2 */
+#define CPK_NVALUE 25  /* n = #distinct values in x: terms[0]=n, arr_terms=x (nset=N); n=1 */
+#define CPK_ALLEQ 26   /* all x equal: arr_terms=x; n=nset=N */
+#define CPK_CHAIN 27   /* x[1]<=x[2]<=...: arr_terms=x; n=nset=N */
+#define CPK_MEMBER 28  /* y in {x[i]}: arr_terms=x (nset=N), terms[0]=y; n=1 */
+#define CPK_TABLE 29   /* tuple (x[0..W-1]) in table t: arr_terms=x (nset=W), setvals=t flat (rhs=|t|), n=W */
+#define CPK_INVERSE 30 /* invf[f[i]-bf]=i+bi: arr_terms=f (nset=n), terms=invf (n=n), lvars[0]=bf, lvars[1]=bi */
+#define CPK_BINPACK 31 /* sum w_i [bin_i==k] <= c forall k: arr_terms=bin (nset=n), setvals=w (n=n), rhs=c */
+#define CPK_BINPACKL 32/* load[k] = sum w_i [bin_i==k+lo]: arr_terms=bin (nset=n), terms=load (n=nl), setvals=w (rhs=nw), lvars[0]=lo,lvars[1]=hi */
+#define CPK_CUM 33     /* cumulative(s,d,r,b): arr_terms=s, terms=d, terms2=r (n=nset=n), terms3=[b] */
+#define CPK_DIFFN 34   /* 2D no-overlap boxes: arr_terms=x, terms=y, terms2=w, terms3=h; n=nset=n */
+#define CPK_LEX 35     /* lex_less/lesseq(x,y): arr_terms=x, terms=y, n=nset=len; rhs=1 if strict */
 /* the functional-graph constraint family sharing one FZOrbit digest */
 static int fg_kind(int k){ return k==CPK_ORBIT||k==CPK_ORBITTR||k==CPK_ORBITCL||k==CPK_ONCYCLE||k==CPK_ORBITCAP; }
 
@@ -911,6 +925,419 @@ static int cp_prop_gcc(CP*cp,CPCR*r,int lowup){
     return 0;
 }
 
+static void cp_count_bounds(CP*cp,CPT*x,int N,int64_t v,int*lo,int*hi){
+    int l=0,h=0;
+    for(int i=0;i<N;i++){
+        if(x[i].isc){ if(x[i].c==v){l++;h++;} }
+        else if(cp_fixed(cp,x[i].v)){ if(cp->vals[x[i].v][0]==v){l++;h++;} }
+        else if(cp_dom_has(cp,x[i].v,v)) h++;
+    }
+    *lo=l; *hi=h;
+}
+
+/* c = #{x[i] == y} */
+static int cp_prop_counteq(CP*cp,CPCR*r){
+    CPT*X=r->arr_terms; int N=r->nset;
+    CPT*Y=&r->terms[0]; CPT*C=&r->terms[1];
+    int64_t yv=0; int yF=cp_term_value(cp,Y,&yv);
+    if(yF){
+        int lo,hi; cp_count_bounds(cp,X,N,yv,&lo,&hi);
+        if(C->isc){ if(C->c<lo||C->c>hi) return 1; }
+        else if(cp_intersect(cp,C->v,lo,hi)) return 1;
+        int64_t k=0; int kF=cp_term_value(cp,C,&k);
+        if(kF){
+            if(k==(int64_t)lo) for(int i=0;i<N;i++) if(!X[i].isc&&!cp_fixed(cp,X[i].v)&&cp_dom_has(cp,X[i].v,yv)){ if(cp_remove_val(cp,X[i].v,yv)) return 1; }
+            if(k==(int64_t)hi) for(int i=0;i<N;i++) if(!X[i].isc&&!cp_fixed(cp,X[i].v)&&cp_dom_has(cp,X[i].v,yv)){ if(cp_intersect(cp,X[i].v,yv,yv)) return 1; }
+        }
+    } else {
+        /* y is unrestricted (count_eq does NOT require y in {x}): only the
+           count is bounded: 0 <= c <= N */
+        if(C->isc){ if(C->c<0||C->c>N) return 1; }
+        else if(cp_intersect(cp,C->v,0,N)) return 1;
+    }
+    return 0;
+}
+
+/* n = number of distinct values among x */
+static int cp_prop_nvalue(CP*cp,CPCR*r){
+    CPT*X=r->arr_terms; int N=r->nset; CPT*Nt=&r->terms[0];
+    /* forced: distinct values taken by fixed vars; possible: distinct values in any dom */
+    int64_t *fv=NULL,*pv=NULL; int nf=0,np_=0,capf=0,capp=0;
+    int exact=1;
+    for(int i=0;i<N;i++){
+        if(X[i].isc||cp_fixed(cp,X[i].v)){
+            int64_t v=X[i].isc?X[i].c:cp->vals[X[i].v][0];
+            int seen=0; for(int k=0;k<nf;k++) if(fv[k]==v){seen=1;break;}
+            if(!seen){ if(nf>=capf){capf=capf?capf*2:8;fv=(int64_t*)psolve_realloc((void**)&fv,(size_t)capf*sizeof(int64_t));} fv[nf++]=v; }
+        }
+        if(!X[i].isc && !(cp->bounded[X[i].v]&&cp->nvals[X[i].v]<=CP_MAXVALS)) exact=0;
+    }
+    int64_t plo=INT64_MAX,phi=INT64_MIN;
+    for(int i=0;i<N;i++){
+        if(X[i].isc){ int64_t v=X[i].c; int seen=0; for(int k=0;k<np_;k++) if(pv[k]==v){seen=1;break;} if(!seen){ if(np_>=capp){capp=capp?capp*2:8;pv=(int64_t*)psolve_realloc((void**)&pv,(size_t)capp*sizeof(int64_t));} pv[np_++]=v; } }
+        else if(cp->bounded[X[i].v]&&cp->nvals[X[i].v]<=CP_MAXVALS){
+            for(int k=0;k<cp->nvals[X[i].v];k++){ int64_t v=cp->vals[X[i].v][k]; int seen=0; for(int q=0;q<np_;q++) if(pv[q]==v){seen=1;break;} if(!seen){ if(np_>=capp){capp=capp?capp*2:8;pv=(int64_t*)psolve_realloc((void**)&pv,(size_t)capp*sizeof(int64_t));} pv[np_++]=v; } }
+        } else { int64_t a=cp_dmin(cp,X[i].v),b=cp_dmax(cp,X[i].v); if(a<plo)plo=a; if(b>phi)phi=b; exact=0; }
+    }
+    int64_t lo=nf, hi = exact? (int64_t)np_ : (phi>=plo? phi-plo+1 : 0);
+    /* hi must also count interval-only vars conservatively: union approx = exact pv set plus interval ranges; over-approx via pv count + interval size is sound only if disjoint... use max(np_, interval size) as sound upper? not sound in general; use np_ + (phi-plo+1) as safe upper */
+    if(!exact) hi = (int64_t)np_ + (phi>=plo? phi-plo+1 : 0);
+    if(Nt->isc){ if(Nt->c<lo||Nt->c>hi){ psolve_free(fv); psolve_free(pv); return 1; } }
+    else if(cp_intersect(cp,Nt->v,lo,hi)){ psolve_free(fv); psolve_free(pv); return 1; }
+    int64_t k=0; int kF=cp_term_value(cp,Nt,&k);
+    if(kF&&exact){
+        if(k==(int64_t)nf){ /* every free var must take a forced value */
+            for(int i=0;i<N;i++) if(!X[i].isc&&!cp_fixed(cp,X[i].v)){
+                for(int q=0;q<cp->nvals[X[i].v];q++){ int64_t v=cp->vals[X[i].v][q]; int ok=0; for(int t=0;t<nf;t++) if(fv[t]==v){ok=1;break;} if(!ok){ if(cp_remove_val(cp,X[i].v,v)){ psolve_free(fv); psolve_free(pv); return 1; } } }
+            }
+        }
+        if(k==(int64_t)np_){ /* every possible value must be taken */
+            for(int q=0;q<np_;q++){ int64_t v=pv[q]; int cnt=0,last=-1;
+                for(int i=0;i<N;i++){ if(X[i].isc){ if(X[i].c==v){cnt++;} } else if(cp_dom_has(cp,X[i].v,v)){ cnt++; last=i; } }
+                if(cnt==0){ psolve_free(fv); psolve_free(pv); return 1; }
+                if(cnt==1&&last>=0&&!cp_fixed(cp,X[last].v)){ if(cp_intersect(cp,X[last].v,v,v)){ psolve_free(fv); psolve_free(pv); return 1; } }
+            }
+        }
+    }
+    psolve_free(fv); psolve_free(pv);
+    return 0;
+}
+
+/* all x equal */
+static int cp_prop_alleq(CP*cp,CPCR*r){
+    CPT*X=r->arr_terms; int N=r->n;
+    int64_t lo=INT64_MIN,hi=INT64_MAX;
+    for(int i=0;i<N;i++){
+        int64_t a,b;
+        if(X[i].isc){a=b=X[i].c;} else {a=cp_dmin(cp,X[i].v);b=cp_dmax(cp,X[i].v);}
+        if(a>lo) lo=a;
+        if(b<hi) hi=b;
+        if(lo>hi) return 1;
+    }
+    for(int i=0;i<N;i++) if(!X[i].isc){ if(cp_intersect(cp,X[i].v,lo,hi)) return 1; }
+    return 0;
+}
+
+/* x[1] <= x[2] <= ... */
+static int cp_prop_chain(CP*cp,CPCR*r){
+    CPT*X=r->arr_terms; int N=r->n;
+    for(int i=1;i<N;i++){
+        int64_t a,b,c,d;
+        if(X[i-1].isc){a=b=X[i-1].c;}else{a=cp_dmin(cp,X[i-1].v);b=cp_dmax(cp,X[i-1].v);}
+        if(X[i].isc){c=d=X[i].c;}else{c=cp_dmin(cp,X[i].v);d=cp_dmax(cp,X[i].v);}
+        if(a>d) return 1;                                   /* x_{i-1} > x_i impossible */
+        if(!X[i].isc && a>c){ if(cp_intersect(cp,X[i].v,a,d)) return 1; }      /* x_i.lo >= x_{i-1}.lo */
+        if(!X[i-1].isc && b>d){ if(cp_intersect(cp,X[i-1].v,a,d)) return 1; }  /* x_{i-1}.hi <= x_i.hi */
+    }
+    return 0;
+}
+
+/* y in {x[1..N]} */
+static int cp_prop_member(CP*cp,CPCR*r){
+    CPT*X=r->arr_terms; int N=r->nset; CPT*Y=&r->terms[0];
+    int64_t yv=0; int yF=cp_term_value(cp,Y,&yv);
+    if(yF){
+        int cnt=0,last=-1;
+        for(int i=0;i<N;i++){ if(X[i].isc){ if(X[i].c==yv) cnt++; } else if(cp_dom_has(cp,X[i].v,yv)){ cnt++; last=i; } }
+        if(cnt==0) return 1;
+        if(cnt==1&&last>=0&&!cp_fixed(cp,X[last].v)){ if(cp_intersect(cp,X[last].v,yv,yv)) return 1; }
+    } else {
+        /* if all x determined, y must equal one of them */
+        int allfix=1; long long *sv=NULL; int sn=0,cap=0;
+        for(int i=0;i<N;i++){
+            if(X[i].isc||cp_fixed(cp,X[i].v)){
+                long long v=X[i].isc?(long long)X[i].c:(long long)cp->vals[X[i].v][0];
+                if(sn>=cap){cap=cap?cap*2:8;sv=(long long*)psolve_realloc((void**)&sv,(size_t)cap*sizeof(long long));}
+                sv[sn++]=v;
+            } else allfix=0;
+        }
+        if(allfix){ int r=cp_prop_setin(cp,Y,sv,sn); psolve_free(sv); return r==1?1:0; }
+        psolve_free(sv);
+        int64_t lo=INT64_MAX,hi=INT64_MIN;
+        for(int i=0;i<N;i++){ int64_t a,b; if(X[i].isc){a=b=X[i].c;}else{a=cp_dmin(cp,X[i].v);b=cp_dmax(cp,X[i].v);} if(a<lo)lo=a; if(b>hi)hi=b; }
+        if(cp_intersect(cp,Y->v,lo,hi)) return 1;
+    }
+    return 0;
+}
+
+/* table: allowed tuples are rows of t (width W). Prune x_j values that no
+   compatible row supports. */
+static int cp_prop_table(CP*cp,CPCR*r){
+    int W=r->n; long long*T=r->setvals; int Tn=(int)r->rhs; int R=Tn/W;
+    if(Tn%W) return 1;
+    CPT*X=r->arr_terms;
+    for(int j=0;j<W;j++){
+        if(X[j].isc) continue;
+        if(!(cp->bounded[X[j].v]&&cp->nvals[X[j].v]<=CP_MAXVALS)) continue;
+        int64_t *keep=NULL; int nk=0,cap=0;
+        for(int q=0;q<cp->nvals[X[j].v];q++){
+            int64_t v=cp->vals[X[j].v][q];
+            for(int row=0;row<R;row++){
+                if(T[(size_t)row*W+j]!=v) continue;
+                int ok=1;
+                for(int k=0;k<W&&ok;k++){
+                    if(k==j) continue;
+                    int64_t tv=T[(size_t)row*W+k]; int hit=0;
+                    if(X[k].isc){ if(X[k].c==tv) hit=1; }
+                    else if(cp_dom_has(cp,X[k].v,tv)) hit=1;
+                    if(!hit) ok=0;
+                }
+                if(ok){ if(nk>=cap){cap=cap?cap*2:8;keep=(int64_t*)psolve_realloc((void**)&keep,(size_t)cap*sizeof(int64_t));} keep[nk++]=v; break; }
+            }
+        }
+        if(nk==0){ psolve_free(keep); return 1; }
+        if(nk<cp->nvals[X[j].v]){
+            int svr=cp_set_vals(cp,X[j].v,keep,nk); psolve_free(keep);
+            if(svr<0) return -1;
+            if(svr) return 1;
+        } else psolve_free(keep);
+    }
+    /* no compatible row at all -> fail */
+    for(int row=0;row<R;row++){
+        int ok=1;
+        for(int k=0;k<W&&ok;k++){
+            int64_t tv=T[(size_t)row*W+k]; int hit=0;
+            if(X[k].isc){ if(X[k].c==tv) hit=1; } else if(cp_dom_has(cp,X[k].v,tv)) hit=1;
+            if(!hit) ok=0;
+        }
+        if(ok) return 0;
+    }
+    return R==0?1:0;
+}
+
+/* inverse: invf[f[i]-bf] == i+bi  for all i (indices must be in range) */
+static int cp_prop_inverse(CP*cp,CPCR*r){
+    int n=r->n; CPT*F=r->arr_terms; CPT*G=r->terms;
+    long bf=r->lvars[0], bi=r->lvars[1];
+    for(int i=0;i<n;i++){
+        /* f_i = v  =>  G[v-bf] = i+bi */
+        if(F[i].isc||cp_fixed(cp,F[i].v)){
+            int64_t v=F[i].isc?F[i].c:cp->vals[F[i].v][0];
+            if(v-bf<0||v-bf>=n) return 1;
+            int g=(int)(v-bf);
+            if(G[g].isc){ if(G[g].c!=i+bi) return 1; }
+            else if(cp_intersect(cp,G[g].v,i+bi,i+bi)) return 1;
+        } else {
+            /* f_i may only take values v with G[v-bf] able to equal i+bi */
+            if(cp->bounded[F[i].v]&&cp->nvals[F[i].v]<=CP_MAXVALS){
+                int64_t *keep=NULL; int nk=0,cap=0;
+                for(int q=0;q<cp->nvals[F[i].v];q++){
+                    int64_t v=cp->vals[F[i].v][q];
+                    if(v-bf<0||v-bf>=n) continue;
+                    int g=(int)(v-bf); int hit=0;
+                    if(G[g].isc){ if(G[g].c==i+bi) hit=1; }
+                    else if(cp_dom_has(cp,G[g].v,i+bi)) hit=1;
+                    if(hit){ if(nk>=cap){cap=cap?cap*2:8;keep=(int64_t*)psolve_realloc((void**)&keep,(size_t)cap*sizeof(int64_t));} keep[nk++]=v; }
+                }
+                if(nk==0){ psolve_free(keep); return 1; }
+                if(nk<cp->nvals[F[i].v]){ int svr=cp_set_vals(cp,F[i].v,keep,nk); psolve_free(keep); if(svr<0) return -1; if(svr) return 1; }
+                else psolve_free(keep);
+            } else {
+                if(cp_intersect(cp,F[i].v,bf,bf+n-1)) return 1;
+            }
+        }
+        /* G[g] = w  =>  F[w-bi] = g+bf */
+        if(G[i].isc||cp_fixed(cp,G[i].v)){
+            int64_t w=G[i].isc?G[i].c:cp->vals[G[i].v][0];
+            if(w-bi<0||w-bi>=n) return 1;
+            int f=(int)(w-bi);
+            if(F[f].isc){ if(F[f].c!=i+bf) return 1; }
+            else if(cp_intersect(cp,F[f].v,i+bf,i+bf)) return 1;
+        }
+    }
+    return 0;
+}
+
+/* bin_packing(c, bin, w): for each value k, sum of w_i with bin_i==k <= c */
+static int cp_prop_binpack(CP*cp,CPCR*r){
+    int n=r->nset; CPT*B=r->arr_terms; long long*W=r->setvals; int64_t c=r->rhs;
+    /* collect candidate bin values */
+    int64_t *ks=NULL; int nk=0,cap=0;
+    for(int i=0;i<n;i++){
+        if(B[i].isc){ int seen=0; for(int q=0;q<nk;q++) if(ks[q]==B[i].c){seen=1;break;} if(!seen){ if(nk>=cap){cap=cap?cap*2:8;ks=(int64_t*)psolve_realloc((void**)&ks,(size_t)cap*sizeof(int64_t));} ks[nk++]=B[i].c; } }
+        else if(cp->bounded[B[i].v]&&cp->nvals[B[i].v]<=CP_MAXVALS){
+            for(int q=0;q<cp->nvals[B[i].v];q++){ int64_t v=cp->vals[B[i].v][q]; int seen=0; for(int t=0;t<nk;t++) if(ks[t]==v){seen=1;break;} if(!seen){ if(nk>=cap){cap=cap?cap*2:8;ks=(int64_t*)psolve_realloc((void**)&ks,(size_t)cap*sizeof(int64_t));} ks[nk++]=v; } }
+        } else {
+            /* unbounded/interval domain: fall back to interval check per value lazily; use [lo,hi] candidates via bounds only */
+        }
+    }
+    int rc=0;
+    for(int q=0;q<nk&&!rc;q++){
+        int64_t k=ks[q]; int64_t forced=0;
+        for(int i=0;i<n;i++){
+            if(B[i].isc){ if(B[i].c==k) forced+=W[i]; }
+            else if(cp_fixed(cp,B[i].v)){ if(cp->vals[B[i].v][0]==k) forced+=W[i]; }
+        }
+        if(forced>c){ rc=1; break; }
+        for(int i=0;i<n;i++){
+            if(B[i].isc) continue;
+            if(cp_fixed(cp,B[i].v)) continue;
+            if(cp_dom_has(cp,B[i].v,k)){
+                if(forced+W[i]>c){ if(cp_remove_val(cp,B[i].v,k)){ rc=1; break; } }
+            }
+        }
+    }
+    psolve_free(ks);
+    return rc;
+}
+
+/* bin_packing_load: load[k] = sum w_i [bin_i == k] for k in [lo..hi] */
+static int cp_prop_binpackl(CP*cp,CPCR*r){
+    int n=r->nset; CPT*B=r->arr_terms; long long*W=r->setvals; int nw=(int)r->rhs;
+    int nl=r->n; CPT*L=r->terms;
+    long lo=r->lvars[0];
+    if(nw!=n) return 1;
+    for(int k=0;k<nl;k++){
+        int64_t kval=lo+k;
+        int64_t forced=0;
+        for(int i=0;i<n;i++){
+            if(B[i].isc){ if(B[i].c==kval) forced+=W[i]; }
+            else if(cp_fixed(cp,B[i].v)){ if(cp->vals[B[i].v][0]==kval) forced+=W[i]; }
+        }
+        int64_t poss=forced;
+        for(int i=0;i<n;i++){
+            if(B[i].isc||cp_fixed(cp,B[i].v)) continue;
+            if(cp_dom_has(cp,B[i].v,kval)) poss+=W[i];
+        }
+        CPT*Lk=&L[k];
+        if(Lk->isc){ if(Lk->c<forced||Lk->c>poss) return 1; }
+        else if(cp_intersect(cp,Lk->v,forced,poss)) return 1;
+        int64_t lv=0; int lF=cp_term_value(cp,Lk,&lv);
+        if(lF){
+            if(lv==forced) for(int i=0;i<n;i++) if(!B[i].isc&&!cp_fixed(cp,B[i].v)&&cp_dom_has(cp,B[i].v,kval)){ if(cp_remove_val(cp,B[i].v,kval)) return 1; }
+            if(lv==poss) for(int i=0;i<n;i++) if(!B[i].isc&&!cp_fixed(cp,B[i].v)&&cp_dom_has(cp,B[i].v,kval)){ if(cp_intersect(cp,B[i].v,kval,kval)) return 1; }
+        }
+    }
+    return 0;
+}
+
+/* cumulative: tasks (s_i,d_i) with usage r_i share capacity b.  Sound rules:
+   pairwise, if r_i+r_j > b (at their max) the two cannot overlap (disj-style);
+   energy: sum r_i.lo*d_i.lo <= b.hi * span. */
+static int cp_prop_cum(CP*cp,CPCR*r){
+    int n=r->n;
+    CPT*S=r->arr_terms, *D=r->terms, *R=r->terms2, *B=&r->terms3[0];
+    int64_t bhi = B->isc?B->c:cp_dmax(cp,B->v);
+    for(int i=0;i<n;i++) for(int j=i+1;j<n;j++){
+        int64_t ri = R[i].isc?R[i].c:cp_dmax(cp,R[i].v);
+        int64_t rj = R[j].isc?R[j].c:cp_dmax(cp,R[j].v);
+        if(ri+rj<=bhi) continue;   /* may share */
+        int64_t dilo0 = D[i].isc?D[i].c:cp_dmin(cp,D[i].v);
+        int64_t djlo0 = D[j].isc?D[j].c:cp_dmin(cp,D[j].v);
+        if(dilo0==0||djlo0==0) continue;  /* a possibly-zero-duration task occupies no time: no conflict */
+        /* cannot overlap: s_i+d_i<=s_j or s_j+d_j<=s_i */
+        CPT*Si=&S[i]; CPT*Sj=&S[j]; CPT*Di=&D[i]; CPT*Dj=&D[j];
+        int64_t silo,sihi,dilo,dihi,sjlo,sjhi,djlo,djhi;
+        if(Si->isc){silo=sihi=Si->c;}else{silo=cp_dmin(cp,Si->v);sihi=cp_dmax(cp,Si->v);}
+        if(Di->isc){dilo=dihi=Di->c;}else{dilo=cp_dmin(cp,Di->v);dihi=cp_dmax(cp,Di->v);}
+        if(Sj->isc){sjlo=sjhi=Sj->c;}else{sjlo=cp_dmin(cp,Sj->v);sjhi=cp_dmax(cp,Sj->v);}
+        if(Dj->isc){djlo=djhi=Dj->c;}else{djlo=cp_dmin(cp,Dj->v);djhi=cp_dmax(cp,Dj->v);}
+        int i_before=(silo+dilo<=sjhi), j_before=(sjlo+djlo<=sihi);
+        if(!i_before && !j_before) return 1;
+        if(!i_before){
+            if(!Sj->isc && cp_intersect(cp,Sj->v,sjlo,sihi-djlo)) return 1;
+            if(!Dj->isc && cp_intersect(cp,Dj->v,djlo,sihi-sjlo)) return 1;
+            if(!Si->isc && cp_intersect(cp,Si->v,sjlo+djlo,sihi)) return 1;
+            if(Si->isc && Si->c<sjlo+djlo) return 1;
+        }
+        if(!j_before){
+            if(!Si->isc && cp_intersect(cp,Si->v,silo,sjhi-dilo)) return 1;
+            if(!Di->isc && cp_intersect(cp,Di->v,dilo,sjhi-silo)) return 1;
+            if(!Sj->isc && cp_intersect(cp,Sj->v,silo+dilo,sjhi)) return 1;
+            if(Sj->isc && Sj->c<silo+dilo) return 1;
+        }
+    }
+    /* energy bound */
+    __int128 need=0; int64_t smin=INT64_MAX, smaxend=INT64_MIN;
+    for(int i=0;i<n;i++){
+        int64_t rl = R[i].isc?R[i].c:cp_dmin(cp,R[i].v);
+        int64_t dl = D[i].isc?D[i].c:cp_dmin(cp,D[i].v);
+        need += (__int128)rl*dl;
+        int64_t s0 = S[i].isc?S[i].c:cp_dmin(cp,S[i].v);
+        int64_t s1 = S[i].isc?S[i].c:cp_dmax(cp,S[i].v);
+        int64_t d1 = D[i].isc?D[i].c:cp_dmax(cp,D[i].v);
+        if(s0<smin) smin=s0;
+        if(s1+d1>smaxend) smaxend=s1+d1;
+    }
+    if(smaxend>smin){
+        __int128 cap=(__int128)bhi*(smaxend-smin);
+        if(need>cap) return 1;
+    }
+    return 0;
+}
+
+/* 2D no-overlap: boxes (x_i,y_i,w_i,h_i) pairwise non-overlapping */
+static int cp_prop_diffn(CP*cp,CPCR*r){
+    int n=r->n;
+    CPT*X=r->arr_terms, *Y=r->terms, *W=r->terms2, *H=r->terms3;
+    for(int i=0;i<n;i++) for(int j=i+1;j<n;j++){
+        int64_t xlo_i,xhi_i,wlo_i,whi_i, ylo_i,yhi_i,hlo_i,hhi_i;
+        int64_t xlo_j,xhi_j,wlo_j,whi_j, ylo_j,yhi_j,hlo_j,hhi_j;
+        #define DOMS(A,Alo,Ahi) { if((A)->isc){Alo=Ahi=(A)->c;}else{Alo=cp_dmin(cp,(A)->v);Ahi=cp_dmax(cp,(A)->v);} }
+        DOMS(&X[i],xlo_i,xhi_i) DOMS(&W[i],wlo_i,whi_i) DOMS(&Y[i],ylo_i,yhi_i) DOMS(&H[i],hlo_i,hhi_i)
+        DOMS(&X[j],xlo_j,xhi_j) DOMS(&W[j],wlo_j,whi_j) DOMS(&Y[j],ylo_j,yhi_j) DOMS(&H[j],hlo_j,hhi_j)
+        /* must overlap in dim d iff neither separation order is possible */
+        int sep_ij_x = (xlo_i + wlo_i <= xhi_j);   /* i left of j possible */
+        int sep_ji_x = (xlo_j + wlo_j <= xhi_i);
+        int sep_ij_y = (ylo_i + hlo_i <= yhi_j);
+        int sep_ji_y = (ylo_j + hlo_j <= yhi_i);
+        int mux = !(sep_ij_x||sep_ji_x);   /* must overlap in x */
+        int muy = !(sep_ij_y||sep_ji_y);
+        if(mux&&muy) return 1;
+        if(mux){ /* must separate in y */
+            if(!sep_ij_y && !sep_ji_y) return 1;
+            if(!sep_ij_y){ if(!Y[j].isc && cp_intersect(cp,Y[j].v,ylo_j,yhi_i-hlo_j)) return 1;
+                           if(!H[j].isc && cp_intersect(cp,H[j].v,hlo_j,yhi_i-ylo_j)) return 1;
+                           if(!Y[i].isc && cp_intersect(cp,Y[i].v,ylo_j+hlo_j,yhi_i)) return 1;
+                           if(Y[i].isc && Y[i].c < ylo_j+hlo_j) return 1; }
+            if(!sep_ji_y){ if(!Y[i].isc && cp_intersect(cp,Y[i].v,ylo_i,yhi_j-hlo_i)) return 1;
+                           if(!H[i].isc && cp_intersect(cp,H[i].v,hlo_i,yhi_j-ylo_i)) return 1;
+                           if(!Y[j].isc && cp_intersect(cp,Y[j].v,ylo_i+hlo_i,yhi_j)) return 1;
+                           if(Y[j].isc && Y[j].c < ylo_i+hlo_i) return 1; }
+        }
+        if(muy){ /* must separate in x */
+            if(!sep_ij_x && !sep_ji_x) return 1;
+            if(!sep_ij_x){ if(!X[j].isc && cp_intersect(cp,X[j].v,xlo_j,xhi_i-wlo_j)) return 1;
+                           if(!W[j].isc && cp_intersect(cp,W[j].v,wlo_j,xhi_i-xlo_j)) return 1;
+                           if(!X[i].isc && cp_intersect(cp,X[i].v,xlo_j+wlo_j,xhi_i)) return 1;
+                           if(X[i].isc && X[i].c < xlo_j+wlo_j) return 1; }
+            if(!sep_ji_x){ if(!X[i].isc && cp_intersect(cp,X[i].v,xlo_i,xhi_j-wlo_i)) return 1;
+                           if(!W[i].isc && cp_intersect(cp,W[i].v,wlo_i,xhi_j-xlo_i)) return 1;
+                           if(!X[j].isc && cp_intersect(cp,X[j].v,xlo_i+wlo_i,xhi_j)) return 1;
+                           if(X[j].isc && X[j].c < xlo_i+wlo_i) return 1; }
+        }
+    }
+    return 0;
+}
+
+/* lex_less / lex_lesseq on arrays x,y */
+static int cp_prop_lex(CP*cp,CPCR*r){
+    int n=r->n; int strict=(r->rhs!=0);
+    CPT*X=r->arr_terms, *Y=r->terms;
+    for(int i=0;i<n;i++){
+        int64_t xv,yv; int xF=cp_term_value(cp,&X[i],&xv), yF=cp_term_value(cp,&Y[i],&yv);
+        if(xF&&yF){
+            if(xv<yv) return 0;      /* decided: x < y lexicographically */
+            if(xv>yv) return 1;
+            continue;                /* equal, next position */
+        }
+        /* all previous positions fixed equal: need x_i <= y_i */
+        int64_t xlo,xhi,ylo,yhi;
+        if(X[i].isc){xlo=xhi=X[i].c;}else{xlo=cp_dmin(cp,X[i].v);xhi=cp_dmax(cp,X[i].v);}
+        if(Y[i].isc){ylo=yhi=Y[i].c;}else{ylo=cp_dmin(cp,Y[i].v);yhi=cp_dmax(cp,Y[i].v);}
+        if(!X[i].isc && xhi>yhi){ if(cp_intersect(cp,X[i].v,xlo,yhi)) return 1; }
+        if(!Y[i].isc && ylo<xlo){ if(cp_intersect(cp,Y[i].v,xlo,yhi)) return 1; }
+        if(xlo<yhi){ /* can be strictly less here -> decided */ return 0; }
+        /* x_i >= y_i always: need equality at i and continue */
+        int64_t lo2=xlo>ylo?xlo:ylo, hi2=xhi<yhi?xhi:yhi;
+        if(lo2>hi2) return 1;
+        if(!X[i].isc && cp_intersect(cp,X[i].v,lo2,hi2)) return 1;
+        if(!Y[i].isc && cp_intersect(cp,Y[i].v,lo2,hi2)) return 1;
+        if(X[i].isc&&Y[i].isc){ if(X[i].c!=Y[i].c) return 1; }
+    }
+    return strict?1:0;   /* all equal */
+}
+
 /* ------------------------------------------------------------------ */
 /* bool_clause(pos[], neg[]): at least one pos true OR one neg false.  */
 /* pos bools in lvars (must be 1), neg bools in terms[].v (must be 0).  */
@@ -1407,6 +1834,41 @@ static int cr_uses_var(const CPCR*r,int v){
         for(int i=0;i<r->n;i++) if(!r->terms[i].isc&&r->terms[i].v==v) return 1;
         for(int i=0;i<r->nset;i++) if(!r->arr_terms[i].isc&&r->arr_terms[i].v==v) return 1;
         return 0;
+    case CPK_COUNTEQ: case CPK_MEMBER:
+        if(!r->terms[0].isc&&r->terms[0].v==v) return 1;
+        if(r->kind==CPK_COUNTEQ&&!r->terms[1].isc&&r->terms[1].v==v) return 1;
+        for(int i=0;i<r->nset;i++) if(!r->arr_terms[i].isc&&r->arr_terms[i].v==v) return 1;
+        return 0;
+    case CPK_NVALUE:
+        if(!r->terms[0].isc&&r->terms[0].v==v) return 1;
+        for(int i=0;i<r->nset;i++) if(!r->arr_terms[i].isc&&r->arr_terms[i].v==v) return 1;
+        return 0;
+    case CPK_ALLEQ: case CPK_CHAIN:
+        for(int i=0;i<r->n;i++) if(!r->arr_terms[i].isc&&r->arr_terms[i].v==v) return 1;
+        return 0;
+    case CPK_TABLE:
+        for(int i=0;i<r->nset;i++) if(!r->arr_terms[i].isc&&r->arr_terms[i].v==v) return 1;
+        return 0;
+    case CPK_INVERSE:
+        for(int i=0;i<r->n;i++){ if(!r->arr_terms[i].isc&&r->arr_terms[i].v==v) return 1; if(!r->terms[i].isc&&r->terms[i].v==v) return 1; }
+        return 0;
+    case CPK_BINPACK:
+        for(int i=0;i<r->nset;i++) if(!r->arr_terms[i].isc&&r->arr_terms[i].v==v) return 1;
+        return 0;
+    case CPK_BINPACKL:
+        for(int i=0;i<r->nset;i++) if(!r->arr_terms[i].isc&&r->arr_terms[i].v==v) return 1;
+        for(int i=0;i<r->n;i++) if(!r->terms[i].isc&&r->terms[i].v==v) return 1;
+        return 0;
+    case CPK_CUM:
+        for(int i=0;i<r->n;i++){ if(!r->arr_terms[i].isc&&r->arr_terms[i].v==v) return 1; if(!r->terms[i].isc&&r->terms[i].v==v) return 1; if(!r->terms2[i].isc&&r->terms2[i].v==v) return 1; }
+        if(!r->terms3[0].isc&&r->terms3[0].v==v) return 1;
+        return 0;
+    case CPK_DIFFN:
+        for(int i=0;i<r->n;i++){ if(!r->arr_terms[i].isc&&r->arr_terms[i].v==v) return 1; if(!r->terms[i].isc&&r->terms[i].v==v) return 1; if(!r->terms2[i].isc&&r->terms2[i].v==v) return 1; if(!r->terms3[i].isc&&r->terms3[i].v==v) return 1; }
+        return 0;
+    case CPK_LEX:
+        for(int i=0;i<r->n;i++){ if(!r->arr_terms[i].isc&&r->arr_terms[i].v==v) return 1; if(!r->terms[i].isc&&r->terms[i].v==v) return 1; }
+        return 0;
     default: /* LIN-counted terms layouts + the orbit family */
         for(int i=0;i<r->n;i++) if(!r->terms[i].isc&&r->terms[i].v==v) return 1;
         return 0;
@@ -1442,6 +1904,41 @@ static void cr_mark_vars(const CPCR*r,unsigned char*referenced){
     case CPK_GCC: case CPK_GCCLU:
         for(int i=0;i<r->n;i++) if(!r->terms[i].isc) referenced[r->terms[i].v]=1;
         for(int i=0;i<r->nset;i++) if(!r->arr_terms[i].isc) referenced[r->arr_terms[i].v]=1;
+        return;
+    case CPK_COUNTEQ: case CPK_MEMBER:
+        if(!r->terms[0].isc) referenced[r->terms[0].v]=1;
+        if(r->kind==CPK_COUNTEQ&&!r->terms[1].isc) referenced[r->terms[1].v]=1;
+        for(int i=0;i<r->nset;i++) if(!r->arr_terms[i].isc) referenced[r->arr_terms[i].v]=1;
+        return;
+    case CPK_NVALUE:
+        if(!r->terms[0].isc) referenced[r->terms[0].v]=1;
+        for(int i=0;i<r->nset;i++) if(!r->arr_terms[i].isc) referenced[r->arr_terms[i].v]=1;
+        return;
+    case CPK_ALLEQ: case CPK_CHAIN:
+        for(int i=0;i<r->n;i++) if(!r->arr_terms[i].isc) referenced[r->arr_terms[i].v]=1;
+        return;
+    case CPK_TABLE:
+        for(int i=0;i<r->nset;i++) if(!r->arr_terms[i].isc) referenced[r->arr_terms[i].v]=1;
+        return;
+    case CPK_INVERSE:
+        for(int i=0;i<r->n;i++){ if(!r->arr_terms[i].isc) referenced[r->arr_terms[i].v]=1; if(!r->terms[i].isc) referenced[r->terms[i].v]=1; }
+        return;
+    case CPK_BINPACK:
+        for(int i=0;i<r->nset;i++) if(!r->arr_terms[i].isc) referenced[r->arr_terms[i].v]=1;
+        return;
+    case CPK_BINPACKL:
+        for(int i=0;i<r->nset;i++) if(!r->arr_terms[i].isc) referenced[r->arr_terms[i].v]=1;
+        for(int i=0;i<r->n;i++) if(!r->terms[i].isc) referenced[r->terms[i].v]=1;
+        return;
+    case CPK_CUM:
+        for(int i=0;i<r->n;i++){ if(!r->arr_terms[i].isc) referenced[r->arr_terms[i].v]=1; if(!r->terms[i].isc) referenced[r->terms[i].v]=1; if(!r->terms2[i].isc) referenced[r->terms2[i].v]=1; }
+        if(!r->terms3[0].isc) referenced[r->terms3[0].v]=1;
+        return;
+    case CPK_DIFFN:
+        for(int i=0;i<r->n;i++){ if(!r->arr_terms[i].isc) referenced[r->arr_terms[i].v]=1; if(!r->terms[i].isc) referenced[r->terms[i].v]=1; if(!r->terms2[i].isc) referenced[r->terms2[i].v]=1; if(!r->terms3[i].isc) referenced[r->terms3[i].v]=1; }
+        return;
+    case CPK_LEX:
+        for(int i=0;i<r->n;i++){ if(!r->arr_terms[i].isc) referenced[r->arr_terms[i].v]=1; if(!r->terms[i].isc) referenced[r->terms[i].v]=1; }
         return;
     default:
         for(int i=0;i<r->n;i++) if(!r->terms[i].isc) referenced[r->terms[i].v]=1;
@@ -1706,7 +2203,7 @@ static void fz_presolve_orbit(FZModel*m,CPCR*cr,int*nc_io,unsigned char*referenc
         for(i=0;i<nc;i++){
             if(dead[i]){
                 psolve_free(cr[i].lvars); psolve_free(cr[i].lcoef); psolve_free(cr[i].terms);
-                psolve_free(cr[i].setvals); psolve_free(cr[i].arr_terms);
+                psolve_free(cr[i].setvals); psolve_free(cr[i].arr_terms);psolve_free(cr[i].terms2);psolve_free(cr[i].terms3);
                 continue;
             }
             if(w!=i) cr[w]=cr[i];
@@ -1970,7 +2467,7 @@ static int cp_parse(FZModel*m,CPCR**out_cr,int*out_n,unsigned char*referenced,in
             free_lins(arr,narr);
             if(!bad){ if(cp_term_from_lin(&il,&rec.terms[0])!=0) bad=1; if(cp_term_from_lin(&vl,&rec.terms[1])!=0) bad=1; }
             lin_free(&il);lin_free(&vl);
-            if(bad){ psolve_free(rec.terms); psolve_free(rec.arr_terms); ok=0; break; }
+            if(bad){ psolve_free(rec.terms); psolve_free(rec.arr_terms);psolve_free(rec.terms2);psolve_free(rec.terms3); ok=0; break; }
             if(!rec.terms[0].isc) referenced[rec.terms[0].v]=1;
             if(!rec.terms[1].isc) referenced[rec.terms[1].v]=1;
             rec.lvars=(int*)psolve_malloc(sizeof(int)); rec.lvars[0]=(int)offset; /* store offset */
@@ -2011,7 +2508,7 @@ static int cp_parse(FZModel*m,CPCR**out_cr,int*out_n,unsigned char*referenced,in
                 if(!rec.terms[i].isc) referenced[rec.terms[i].v]=1;
             }
             free_lins(sa,ns); free_lins(da,nd);
-            if(bad){ psolve_free(rec.arr_terms); psolve_free(rec.terms); ok=0; break; }
+            if(bad){ psolve_free(rec.arr_terms);psolve_free(rec.terms2);psolve_free(rec.terms3); psolve_free(rec.terms); ok=0; break; }
             motivating=1;
         }
         /* ---------- global_cardinality (ortools + fzn forms) ---------- */
@@ -2043,11 +2540,12 @@ static int cp_parse(FZModel*m,CPCR**out_cr,int*out_n,unsigned char*referenced,in
                 for(int c2=0;c2<K&&!bad;c2++){ if(cp_term_from_lin(&ka[c2],&rec.terms[1+c2])!=0){bad=1;break;} if(!rec.terms[1+c2].isc) referenced[rec.terms[1+c2].v]=1; }
             }
             free_lins(xa,nx); free_lins(ca,K); free_lins(ka,nk);
-            if(bad){ if(rec.setvals)psolve_free(rec.setvals); if(rec.arr_terms)psolve_free(rec.arr_terms); if(rec.terms)psolve_free(rec.terms); memset(&rec,0,sizeof(rec)); ok=0; break; }
+            if(bad){ if(rec.setvals)psolve_free(rec.setvals); if(rec.arr_terms)psolve_free(rec.arr_terms);psolve_free(rec.terms2);psolve_free(rec.terms3); if(rec.terms)psolve_free(rec.terms); memset(&rec,0,sizeof(rec)); ok=0; break; }
             if(!closed.isc) referenced[closed.v]=1;
             motivating=1;
         }
-        else if(strcmp(p,"ortools_global_cardinality_low_up")==0||strcmp(p,"fzn_global_cardinality_low_up")==0){
+        else if(strcmp(p,"ortools_global_cardinality_low_up")==0||strcmp(p,"fzn_global_cardinality_low_up")==0||
+                strcmp(p,"fzn_global_cardinality_low_up_closed")==0){
             /* (x, cover, lbound, ubound[, closed]) */
             int nargs=c->nargs;
             int has_closed=(nargs>=5);
@@ -2058,9 +2556,10 @@ static int cp_parse(FZModel*m,CPCR**out_cr,int*out_n,unsigned char*referenced,in
             Lin*ua;int nu; if(parse_array(m,c->args[3],&ua,&nu)!=0){free_lins(xa,nx);free_lins(ca,K);free_lins(la,nl);ok=0;break;}
             if(nx<1||K<1||nl!=K||nu!=K){free_lins(xa,nx);free_lins(ca,K);free_lins(la,nl);free_lins(ua,nu);ok=0;break;}
             Lin cl; CPT closed; int bad=0;
+            int forced_closed=(strcmp(p,"fzn_global_cardinality_low_up_closed")==0);
             if(has_closed){ if(parse_lin(m,c->args[4],&cl)!=0){free_lins(xa,nx);free_lins(ca,K);free_lins(la,nl);free_lins(ua,nu);ok=0;break;}
                 if(cp_term_from_lin(&cl,&closed)!=0){lin_free(&cl);bad=1;} else lin_free(&cl); }
-            else { closed.isc=1; closed.c=0; closed.v=-1; }
+            else { closed.isc=1; closed.c=(forced_closed?1:0); closed.v=-1; }
             if(!bad){
                 rec.kind=CPK_GCCLU; rec.rhs=K; rec.n=1+2*K; rec.nset=nx;
                 rec.setvals=(long long*)psolve_malloc((size_t)K*sizeof(long long));
@@ -2076,8 +2575,280 @@ static int cp_parse(FZModel*m,CPCR**out_cr,int*out_n,unsigned char*referenced,in
                 for(int c2=0;c2<K&&!bad;c2++){ if(cp_term_from_lin(&ua[c2],&rec.terms[1+K+c2])!=0){bad=1;break;} if(!rec.terms[1+K+c2].isc) referenced[rec.terms[1+K+c2].v]=1; }
             }
             free_lins(xa,nx); free_lins(ca,K); free_lins(la,nl); free_lins(ua,nu);
-            if(bad){ if(rec.setvals)psolve_free(rec.setvals); if(rec.arr_terms)psolve_free(rec.arr_terms); if(rec.terms)psolve_free(rec.terms); memset(&rec,0,sizeof(rec)); ok=0; break; }
+            if(bad){ if(rec.setvals)psolve_free(rec.setvals); if(rec.arr_terms)psolve_free(rec.arr_terms);psolve_free(rec.terms2);psolve_free(rec.terms3); if(rec.terms)psolve_free(rec.terms); memset(&rec,0,sizeof(rec)); ok=0; break; }
             if(!closed.isc) referenced[closed.v]=1;
+            motivating=1;
+        }
+        /* ---------- count_eq / nvalue / all_equal / increasing / member ---------- */
+        else if(cp_pred_is(p,"count_eq")||strcmp(p,"ortools_count_eq")==0||strcmp(p,"ortools_count_eq_cst")==0){
+            if(c->nargs<3){ok=0;break;}
+            Lin*xa;int nx; if(parse_array(m,c->args[0],&xa,&nx)!=0){ok=0;break;}
+            if(nx<1){free_lins(xa,nx);ok=0;break;}
+            if(parse_lin(m,c->args[1],&l1)!=0){free_lins(xa,nx);ok=0;break;}
+            if(parse_lin(m,c->args[2],&l2)!=0){lin_free(&l1);free_lins(xa,nx);ok=0;break;}
+            rec.kind=CPK_COUNTEQ; rec.n=2; rec.nset=nx;
+            rec.terms=(CPT*)psolve_calloc(2,sizeof(CPT));
+            rec.arr_terms=(CPT*)psolve_calloc((size_t)nx,sizeof(CPT));
+            int bad=0;
+            if(cp_term_from_lin(&l1,&rec.terms[0])!=0) bad=1;
+            if(cp_term_from_lin(&l2,&rec.terms[1])!=0) bad=1;
+            for(int i=0;i<nx&&!bad;i++){ if(cp_term_from_lin(&xa[i],&rec.arr_terms[i])!=0){bad=1;break;} if(!rec.arr_terms[i].isc) referenced[rec.arr_terms[i].v]=1; }
+            lin_free(&l1); lin_free(&l2); free_lins(xa,nx);
+            if(bad){ psolve_free(rec.terms); psolve_free(rec.arr_terms); ok=0; break; }
+            if(!rec.terms[0].isc) referenced[rec.terms[0].v]=1;
+            if(!rec.terms[1].isc) referenced[rec.terms[1].v]=1;
+            motivating=1;
+        }
+        else if(cp_pred_is(p,"nvalue")||strcmp(p,"ortools_nvalue")==0){
+            if(c->nargs<2){ok=0;break;}
+            if(parse_lin(m,c->args[0],&l1)!=0){ok=0;break;}
+            Lin*xa;int nx; if(parse_array(m,c->args[1],&xa,&nx)!=0){lin_free(&l1);ok=0;break;}
+            if(nx<1){lin_free(&l1);free_lins(xa,nx);ok=0;break;}
+            rec.kind=CPK_NVALUE; rec.n=1; rec.nset=nx;
+            rec.terms=(CPT*)psolve_calloc(1,sizeof(CPT));
+            rec.arr_terms=(CPT*)psolve_calloc((size_t)nx,sizeof(CPT));
+            int bad=0;
+            if(cp_term_from_lin(&l1,&rec.terms[0])!=0) bad=1;
+            for(int i=0;i<nx&&!bad;i++){ if(cp_term_from_lin(&xa[i],&rec.arr_terms[i])!=0){bad=1;break;} if(!rec.arr_terms[i].isc) referenced[rec.arr_terms[i].v]=1; }
+            lin_free(&l1); free_lins(xa,nx);
+            if(bad){ psolve_free(rec.terms); psolve_free(rec.arr_terms); ok=0; break; }
+            if(!rec.terms[0].isc) referenced[rec.terms[0].v]=1;
+            motivating=1;
+        }
+        else if(cp_pred_is(p,"all_equal_int")||cp_pred_is(p,"all_equal")){
+            if(c->nargs<1){ok=0;break;}
+            Lin*xa;int nx; if(parse_array(m,c->args[0],&xa,&nx)!=0){ok=0;break;}
+            if(nx<1){free_lins(xa,nx);ok=0;break;}
+            rec.kind=CPK_ALLEQ; rec.n=nx; rec.nset=nx;
+            rec.arr_terms=(CPT*)psolve_calloc((size_t)nx,sizeof(CPT));
+            int bad=0;
+            for(int i=0;i<nx;i++){ if(cp_term_from_lin(&xa[i],&rec.arr_terms[i])!=0){bad=1;break;} if(!rec.arr_terms[i].isc) referenced[rec.arr_terms[i].v]=1; }
+            free_lins(xa,nx);
+            if(bad){ psolve_free(rec.arr_terms); ok=0; break; }
+            motivating=1;
+        }
+        else if(cp_pred_is(p,"increasing_int")||cp_pred_is(p,"increasing")){
+            if(c->nargs<1){ok=0;break;}
+            Lin*xa;int nx; if(parse_array(m,c->args[0],&xa,&nx)!=0){ok=0;break;}
+            if(nx<1){free_lins(xa,nx);ok=0;break;}
+            rec.kind=CPK_CHAIN; rec.n=nx; rec.nset=nx;
+            rec.arr_terms=(CPT*)psolve_calloc((size_t)nx,sizeof(CPT));
+            int bad=0;
+            for(int i=0;i<nx;i++){ if(cp_term_from_lin(&xa[i],&rec.arr_terms[i])!=0){bad=1;break;} if(!rec.arr_terms[i].isc) referenced[rec.arr_terms[i].v]=1; }
+            free_lins(xa,nx);
+            if(bad){ psolve_free(rec.arr_terms); ok=0; break; }
+            motivating=1;
+        }
+        else if(cp_pred_is(p,"member_int")||cp_pred_is(p,"member")){
+            if(c->nargs<2){ok=0;break;}
+            Lin*xa;int nx; if(parse_array(m,c->args[0],&xa,&nx)!=0){ok=0;break;}
+            if(nx<1){free_lins(xa,nx);ok=0;break;}
+            if(parse_lin(m,c->args[1],&l1)!=0){free_lins(xa,nx);ok=0;break;}
+            rec.kind=CPK_MEMBER; rec.n=1; rec.nset=nx;
+            rec.terms=(CPT*)psolve_calloc(1,sizeof(CPT));
+            rec.arr_terms=(CPT*)psolve_calloc((size_t)nx,sizeof(CPT));
+            int bad=0;
+            for(int i=0;i<nx&&!bad;i++){ if(cp_term_from_lin(&xa[i],&rec.arr_terms[i])!=0){bad=1;break;} if(!rec.arr_terms[i].isc) referenced[rec.arr_terms[i].v]=1; }
+            if(cp_term_from_lin(&l1,&rec.terms[0])!=0) bad=1;
+            lin_free(&l1); free_lins(xa,nx);
+            if(bad){ psolve_free(rec.terms); psolve_free(rec.arr_terms); ok=0; break; }
+            if(!rec.terms[0].isc) referenced[rec.terms[0].v]=1;
+            motivating=1;
+        }
+        /* ---------- table / inverse / bin_packing ---------- */
+        else if(strcmp(p,"ortools_table_int")==0||strcmp(p,"gecode_table_int")==0||cp_pred_is(p,"table_int")){
+            if(c->nargs<2){ok=0;break;}
+            Lin*xa;int nx; if(parse_array(m,c->args[0],&xa,&nx)!=0){ok=0;break;}
+            Lin*ta;int nt; if(parse_array(m,c->args[1],&ta,&nt)!=0){free_lins(xa,nx);ok=0;break;}
+            if(nx<1||nt<1||nt%nx!=0){free_lins(xa,nx);free_lins(ta,nt);ok=0;break;}
+            rec.kind=CPK_TABLE; rec.n=nx; rec.nset=nx; rec.rhs=nt;
+            rec.setvals=(long long*)psolve_malloc((size_t)nt*sizeof(long long));
+            rec.arr_terms=(CPT*)psolve_calloc((size_t)nx,sizeof(CPT));
+            int bad=0;
+            for(int i=0;i<nt&&!bad;i++){
+                if(ta[i].n!=0||!isfinite(ta[i].constant)||ta[i].constant!=rint(ta[i].constant)||fabs(ta[i].constant)>=(double)CP_BIG){bad=1;break;}
+                rec.setvals[i]=(long long)llround(ta[i].constant);
+            }
+            for(int i=0;i<nx&&!bad;i++){ if(cp_term_from_lin(&xa[i],&rec.arr_terms[i])!=0){bad=1;break;} if(!rec.arr_terms[i].isc) referenced[rec.arr_terms[i].v]=1; }
+            free_lins(xa,nx); free_lins(ta,nt);
+            if(bad){ psolve_free(rec.setvals); psolve_free(rec.arr_terms); ok=0; break; }
+            motivating=1;
+        }
+        else if(strcmp(p,"ortools_inverse")==0||strcmp(p,"inverse_offsets")==0||cp_pred_is(p,"inverse")){
+            /* ortools_inverse(f, invf, base_f, base_invf); inverse_offsets(f, foff, invf, invfoff) */
+            int is_off=(strcmp(p,"inverse_offsets")==0);
+            int na=is_off?4:4;
+            if(c->nargs<na){ok=0;break;}
+            int fa=is_off?0:0, ia=is_off?2:1, ba=is_off?1:2, bb=is_off?3:3;
+            Lin*fa_ ;int nf; if(parse_array(m,c->args[fa],&fa_,&nf)!=0){ok=0;break;}
+            Lin*ia_ ;int ni; if(parse_array(m,c->args[ia],&ia_,&ni)!=0){free_lins(fa_,nf);ok=0;break;}
+            Lin bla,blb;
+            if(parse_lin(m,c->args[ba],&bla)!=0){free_lins(fa_,nf);free_lins(ia_,ni);ok=0;break;}
+            if(parse_lin(m,c->args[bb],&blb)!=0){lin_free(&bla);free_lins(fa_,nf);free_lins(ia_,ni);ok=0;break;}
+            long bfa=0,bfb=0; int bad=0;
+            if(bla.n!=0||!isfinite(bla.constant)||bla.constant!=rint(bla.constant)||fabs(bla.constant)>=(double)CP_BIG) bad=1;
+            else bfa=(long)llround(bla.constant);
+            if(!bad&&(blb.n!=0||!isfinite(blb.constant)||blb.constant!=rint(blb.constant)||fabs(blb.constant)>=(double)CP_BIG)) bad=1;
+            else if(!bad) bfb=(long)llround(blb.constant);
+            lin_free(&bla); lin_free(&blb);
+            if(nf<1||nf!=ni||bad){free_lins(fa_,nf);free_lins(ia_,ni);ok=0;break;}
+            rec.kind=CPK_INVERSE; rec.n=nf; rec.nset=nf;
+            rec.lvars=(int*)psolve_malloc(2*sizeof(int)); rec.lvars[0]=(int)bfa; rec.lvars[1]=(int)bfb;
+            rec.arr_terms=(CPT*)psolve_calloc((size_t)nf,sizeof(CPT));
+            rec.terms=(CPT*)psolve_calloc((size_t)nf,sizeof(CPT));
+            for(int i=0;i<nf&&!bad;i++){
+                if(cp_term_from_lin(&fa_[i],&rec.arr_terms[i])!=0){bad=1;break;}
+                if(cp_term_from_lin(&ia_[i],&rec.terms[i])!=0){bad=1;break;}
+                if(!rec.arr_terms[i].isc) referenced[rec.arr_terms[i].v]=1;
+                if(!rec.terms[i].isc) referenced[rec.terms[i].v]=1;
+            }
+            free_lins(fa_,nf); free_lins(ia_,ni);
+            if(bad){ psolve_free(rec.lvars); psolve_free(rec.arr_terms); psolve_free(rec.terms); ok=0; break; }
+            motivating=1;
+        }
+        else if(strcmp(p,"ortools_bin_packing")==0||cp_pred_is(p,"bin_packing")){
+            /* (c, bin, w) */
+            if(c->nargs<3){ok=0;break;}
+            if(parse_lin(m,c->args[0],&l1)!=0){ok=0;break;}
+            Lin*ba;int nb; if(parse_array(m,c->args[1],&ba,&nb)!=0){lin_free(&l1);ok=0;break;}
+            Lin*wa;int nw; if(parse_array(m,c->args[2],&wa,&nw)!=0){lin_free(&l1);free_lins(ba,nb);ok=0;break;}
+            if(nb<1||nw!=nb||l1.n!=0||!isfinite(l1.constant)||l1.constant!=rint(l1.constant)||fabs(l1.constant)>=(double)CP_BIG){lin_free(&l1);free_lins(ba,nb);free_lins(wa,nw);ok=0;break;}
+            long long capc=(long long)llround(l1.constant); lin_free(&l1);
+            rec.kind=CPK_BINPACK; rec.nset=nb; rec.rhs=capc;
+            rec.setvals=(long long*)psolve_malloc((size_t)nb*sizeof(long long));
+            rec.arr_terms=(CPT*)psolve_calloc((size_t)nb,sizeof(CPT));
+            int bad=0;
+            for(int i=0;i<nb&&!bad;i++){
+                if(wa[i].n!=0||!isfinite(wa[i].constant)||wa[i].constant!=rint(wa[i].constant)||fabs(wa[i].constant)>=(double)CP_BIG){bad=1;break;}
+                rec.setvals[i]=(long long)llround(wa[i].constant);
+            }
+            for(int i=0;i<nb&&!bad;i++){ if(cp_term_from_lin(&ba[i],&rec.arr_terms[i])!=0){bad=1;break;} if(!rec.arr_terms[i].isc) referenced[rec.arr_terms[i].v]=1; }
+            free_lins(ba,nb); free_lins(wa,nw);
+            if(bad){ psolve_free(rec.setvals); psolve_free(rec.arr_terms); ok=0; break; }
+            motivating=1;
+        }
+        else if(strcmp(p,"ortools_bin_packing_load")==0||strcmp(p,"gecode_bin_packing_load")==0){
+            /* ortools: (load, bin, load_set, w); gecode: (l, bin, w, minIndex) */
+            int is_gec=(strcmp(p,"gecode_bin_packing_load")==0);
+            if(c->nargs<4){ok=0;break;}
+            Lin*la;int nl; if(parse_array(m,c->args[0],&la,&nl)!=0){ok=0;break;}
+            Lin*ba;int nb; if(parse_array(m,c->args[1],&ba,&nb)!=0){free_lins(la,nl);ok=0;break;}
+            Lin*wa;int nw; int setarg, warg;
+            if(is_gec){ warg=2; setarg=3; } else { setarg=2; warg=3; }
+            if(parse_array(m,c->args[warg],&wa,&nw)!=0){free_lins(la,nl);free_lins(ba,nb);ok=0;break;}
+            if(nl<1||nb<1||nw!=nb){free_lins(la,nl);free_lins(ba,nb);free_lins(wa,nw);ok=0;break;}
+            long llo=0,lhi=0; int bad=0;
+            if(is_gec){
+                if(parse_lin(m,c->args[setarg],&l1)!=0){free_lins(la,nl);free_lins(ba,nb);free_lins(wa,nw);ok=0;break;}
+                if(l1.n!=0||!isfinite(l1.constant)||l1.constant!=rint(l1.constant)||fabs(l1.constant)>=(double)CP_BIG){lin_free(&l1);bad=1;}
+                else { llo=(long)llround(l1.constant); lhi=llo+nl-1; }
+                lin_free(&l1);
+            } else {
+                int isr=0; long rlo=0,rhi=0; long *vals=NULL; int nvals=0;
+                if(fz_parse_int_set(c->args[setarg],4096,&isr,&rlo,&rhi,&vals,&nvals)!=0){free_lins(la,nl);free_lins(ba,nb);free_lins(wa,nw);ok=0;break;}
+                if(isr&&rhi>=rlo){ llo=rlo; lhi=rhi; }
+                else if(!isr&&nvals==nl){ /* vals must be exactly nl consecutive? just take min..min+nl-1 only if matches; else bail */ llo=vals[0]; lhi=vals[nvals-1]; if(lhi-llo+1!=nl) bad=1; }
+                else bad=1;
+                if(vals) psolve_free(vals);
+            }
+            if(!bad){
+                rec.kind=CPK_BINPACKL; rec.n=nl; rec.nset=nb; rec.rhs=nw;
+                rec.lvars=(int*)psolve_malloc(2*sizeof(int)); rec.lvars[0]=(int)llo; rec.lvars[1]=(int)lhi;
+                rec.setvals=(long long*)psolve_malloc((size_t)nb*sizeof(long long));
+                rec.terms=(CPT*)psolve_calloc((size_t)nl,sizeof(CPT));
+                rec.arr_terms=(CPT*)psolve_calloc((size_t)nb,sizeof(CPT));
+                for(int i=0;i<nb&&!bad;i++){
+                    if(wa[i].n!=0||!isfinite(wa[i].constant)||wa[i].constant!=rint(wa[i].constant)||fabs(wa[i].constant)>=(double)CP_BIG){bad=1;break;}
+                    rec.setvals[i]=(long long)llround(wa[i].constant);
+                }
+                for(int i=0;i<nl&&!bad;i++){ if(cp_term_from_lin(&la[i],&rec.terms[i])!=0){bad=1;break;} if(!rec.terms[i].isc) referenced[rec.terms[i].v]=1; }
+                for(int i=0;i<nb&&!bad;i++){ if(cp_term_from_lin(&ba[i],&rec.arr_terms[i])!=0){bad=1;break;} if(!rec.arr_terms[i].isc) referenced[rec.arr_terms[i].v]=1; }
+            }
+            free_lins(la,nl); free_lins(ba,nb); free_lins(wa,nw);
+            if(bad){ if(rec.lvars)psolve_free(rec.lvars); if(rec.setvals)psolve_free(rec.setvals); if(rec.terms)psolve_free(rec.terms); if(rec.arr_terms)psolve_free(rec.arr_terms); memset(&rec,0,sizeof(rec)); ok=0; break; }
+            motivating=1;
+        }
+        /* ---------- cumulative / diffn / nooverlap / lex ---------- */
+        else if(cp_pred_is(p,"cumulative")||strcmp(p,"gecode_cumulatives")==0||strcmp(p,"fzn_cumulative")==0){
+            if(c->nargs<4){ok=0;break;}
+            Lin*sa;int ns; if(parse_array(m,c->args[0],&sa,&ns)!=0){ok=0;break;}
+            Lin*da;int nd; if(parse_array(m,c->args[1],&da,&nd)!=0){free_lins(sa,ns);ok=0;break;}
+            Lin*ra;int nr; if(parse_array(m,c->args[2],&ra,&nr)!=0){free_lins(sa,ns);free_lins(da,nd);ok=0;break;}
+            if(parse_lin(m,c->args[3],&l1)!=0){free_lins(sa,ns);free_lins(da,nd);free_lins(ra,nr);ok=0;break;}
+            if(ns<1||ns!=nd||ns!=nr){lin_free(&l1);free_lins(sa,ns);free_lins(da,nd);free_lins(ra,nr);ok=0;break;}
+            rec.kind=CPK_CUM; rec.n=ns; rec.nset=ns;
+            rec.arr_terms=(CPT*)psolve_calloc((size_t)ns,sizeof(CPT));
+            rec.terms=(CPT*)psolve_calloc((size_t)ns,sizeof(CPT));
+            rec.terms2=(CPT*)psolve_calloc((size_t)ns,sizeof(CPT));
+            rec.terms3=(CPT*)psolve_calloc(1,sizeof(CPT));
+            int bad=0;
+            for(int i=0;i<ns&&!bad;i++){
+                if(cp_term_from_lin(&sa[i],&rec.arr_terms[i])!=0){bad=1;break;}
+                if(cp_term_from_lin(&da[i],&rec.terms[i])!=0){bad=1;break;}
+                if(cp_term_from_lin(&ra[i],&rec.terms2[i])!=0){bad=1;break;}
+                if(!rec.arr_terms[i].isc) referenced[rec.arr_terms[i].v]=1;
+                if(!rec.terms[i].isc) referenced[rec.terms[i].v]=1;
+                if(!rec.terms2[i].isc) referenced[rec.terms2[i].v]=1;
+            }
+            if(cp_term_from_lin(&l1,&rec.terms3[0])!=0) bad=1;
+            lin_free(&l1); free_lins(sa,ns); free_lins(da,nd); free_lins(ra,nr);
+            if(bad){ psolve_free(rec.arr_terms); psolve_free(rec.terms); psolve_free(rec.terms2); psolve_free(rec.terms3); ok=0; break; }
+            if(!rec.terms3[0].isc) referenced[rec.terms3[0].v]=1;
+            motivating=1;
+        }
+        else if(strcmp(p,"fzn_diffn")==0||strcmp(p,"gecode_nooverlap")==0){
+            /* fzn_diffn(x,y,dx,dy); gecode_nooverlap(x,w,y,h) */
+            int is_no=(strcmp(p,"gecode_nooverlap")==0);
+            if(c->nargs<4){ok=0;break;}
+            int a0=0, a1=is_no?2:1, a2=is_no?1:2, a3=3;
+            Lin*xa;int nx; if(parse_array(m,c->args[a0],&xa,&nx)!=0){ok=0;break;}
+            Lin*ya;int ny; if(parse_array(m,c->args[a1],&ya,&ny)!=0){free_lins(xa,nx);ok=0;break;}
+            Lin*wa;int nw2; if(parse_array(m,c->args[a2],&wa,&nw2)!=0){free_lins(xa,nx);free_lins(ya,ny);ok=0;break;}
+            Lin*ha;int nh; if(parse_array(m,c->args[a3],&ha,&nh)!=0){free_lins(xa,nx);free_lins(ya,ny);free_lins(wa,nw2);ok=0;break;}
+            if(nx<1||nx!=ny||nx!=nw2||nx!=nh){free_lins(xa,nx);free_lins(ya,ny);free_lins(wa,nw2);free_lins(ha,nh);ok=0;break;}
+            rec.kind=CPK_DIFFN; rec.n=nx; rec.nset=nx;
+            rec.arr_terms=(CPT*)psolve_calloc((size_t)nx,sizeof(CPT));
+            rec.terms=(CPT*)psolve_calloc((size_t)nx,sizeof(CPT));
+            rec.terms2=(CPT*)psolve_calloc((size_t)nx,sizeof(CPT));
+            rec.terms3=(CPT*)psolve_calloc((size_t)nx,sizeof(CPT));
+            int bad=0;
+            for(int i=0;i<nx&&!bad;i++){
+                if(cp_term_from_lin(&xa[i],&rec.arr_terms[i])!=0){bad=1;break;}
+                if(cp_term_from_lin(&ya[i],&rec.terms[i])!=0){bad=1;break;}
+                if(cp_term_from_lin(&wa[i],&rec.terms2[i])!=0){bad=1;break;}
+                if(cp_term_from_lin(&ha[i],&rec.terms3[i])!=0){bad=1;break;}
+                if(!rec.arr_terms[i].isc) referenced[rec.arr_terms[i].v]=1;
+                if(!rec.terms[i].isc) referenced[rec.terms[i].v]=1;
+                if(!rec.terms2[i].isc) referenced[rec.terms2[i].v]=1;
+                if(!rec.terms3[i].isc) referenced[rec.terms3[i].v]=1;
+            }
+            free_lins(xa,nx); free_lins(ya,ny); free_lins(wa,nw2); free_lins(ha,nh);
+            if(bad){ psolve_free(rec.arr_terms); psolve_free(rec.terms); psolve_free(rec.terms2); psolve_free(rec.terms3); ok=0; break; }
+            motivating=1;
+        }
+        else if(cp_pred_is(p,"lex_less_int")||cp_pred_is(p,"lex_lesseq_int")||strcmp(p,"ortools_lex_less_int")==0||
+                strcmp(p,"ortools_lex_lesseq_int")==0||strcmp(p,"array_int_lt")==0||strcmp(p,"array_int_lq")==0||
+                cp_pred_is(p,"lex_less_bool")||cp_pred_is(p,"lex_lesseq_bool")||strcmp(p,"array_bool_lt")==0||strcmp(p,"array_bool_lq")==0){
+            int strict = (strstr(p,"less_int")==strstr(p,"lesseq_int")?0:0); /* placeholder, set below */
+            strict = (strcmp(p,"array_int_lt")==0||strcmp(p,"array_bool_lt")==0||
+                      strcmp(p,"ortools_lex_less_int")==0||strcmp(p,"ortools_lex_less_bool")==0||
+                      cp_pred_is(p,"lex_less_int")||cp_pred_is(p,"lex_less_bool"))?1:0;
+            if(c->nargs<2){ok=0;break;}
+            Lin*xa;int nx; if(parse_array(m,c->args[0],&xa,&nx)!=0){ok=0;break;}
+            Lin*ya;int ny; if(parse_array(m,c->args[1],&ya,&ny)!=0){free_lins(xa,nx);ok=0;break;}
+            if(nx<1||nx!=ny){free_lins(xa,nx);free_lins(ya,ny);ok=0;break;}
+            rec.kind=CPK_LEX; rec.n=nx; rec.nset=nx; rec.rhs=strict;
+            rec.arr_terms=(CPT*)psolve_calloc((size_t)nx,sizeof(CPT));
+            rec.terms=(CPT*)psolve_calloc((size_t)nx,sizeof(CPT));
+            int bad=0;
+            for(int i=0;i<nx&&!bad;i++){
+                if(cp_term_from_lin(&xa[i],&rec.arr_terms[i])!=0){bad=1;break;}
+                if(cp_term_from_lin(&ya[i],&rec.terms[i])!=0){bad=1;break;}
+                if(!rec.arr_terms[i].isc) referenced[rec.arr_terms[i].v]=1;
+                if(!rec.terms[i].isc) referenced[rec.terms[i].v]=1;
+            }
+            free_lins(xa,nx); free_lins(ya,ny);
+            if(bad){ psolve_free(rec.arr_terms); psolve_free(rec.terms); ok=0; break; }
             motivating=1;
         }
         /* ---------- array_int_minimum / array_int_maximum ---------- */
@@ -2099,7 +2870,7 @@ static int cp_parse(FZModel*m,CPCR**out_cr,int*out_n,unsigned char*referenced,in
                 if(!rec.arr_terms[i].isc) referenced[rec.arr_terms[i].v]=1;
             }
             free_lins(arr,narr);
-            if(bad){ psolve_free(rec.arr_terms); psolve_free(rec.terms); ok=0; break; }
+            if(bad){ psolve_free(rec.arr_terms);psolve_free(rec.terms2);psolve_free(rec.terms3); psolve_free(rec.terms); ok=0; break; }
             if(!M.isc) referenced[M.v]=1;
             motivating=1;
         }
@@ -2399,8 +3170,8 @@ static int cp_parse(FZModel*m,CPCR**out_cr,int*out_n,unsigned char*referenced,in
         if(nc>=cap){ cap*=2; cr=(CPCR*)psolve_realloc((void**)&cr,(size_t)cap*sizeof(CPCR)); }
         cr[nc++]=rec;
     }
-    if(!ok){ for(int i=0;i<nc;i++){ cp_cr_aux_free(&cr[i]); psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);} psolve_free(cr); return -1; }
-    if(!motivating){ for(int i=0;i<nc;i++){ cp_cr_aux_free(&cr[i]); psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);} psolve_free(cr); return -2; }
+    if(!ok){ for(int i=0;i<nc;i++){ cp_cr_aux_free(&cr[i]); psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);psolve_free(cr[i].terms2);psolve_free(cr[i].terms3);} psolve_free(cr); return -1; }
+    if(!motivating){ for(int i=0;i<nc;i++){ cp_cr_aux_free(&cr[i]); psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);psolve_free(cr[i].terms2);psolve_free(cr[i].terms3);} psolve_free(cr); return -2; }
     /* structure recovery: rewrite bounded-horizon orbit chains (exact) */
     fz_presolve_orbit(m,cr,&nc,referenced);
     /* recompute `referenced` from the surviving records: the brancher must
@@ -2522,6 +3293,18 @@ static int cp_propagate(CP*cp,CPCR*cr,int nc){
                 case CPK_DISJ: r=cp_prop_disj(cp,&cr[i]); break;
                 case CPK_GCC: r=cp_prop_gcc(cp,&cr[i],0); break;
                 case CPK_GCCLU: r=cp_prop_gcc(cp,&cr[i],1); break;
+                case CPK_COUNTEQ: r=cp_prop_counteq(cp,&cr[i]); break;
+                case CPK_NVALUE: r=cp_prop_nvalue(cp,&cr[i]); break;
+                case CPK_ALLEQ: r=cp_prop_alleq(cp,&cr[i]); break;
+                case CPK_CHAIN: r=cp_prop_chain(cp,&cr[i]); break;
+                case CPK_MEMBER: r=cp_prop_member(cp,&cr[i]); break;
+                case CPK_TABLE: r=cp_prop_table(cp,&cr[i]); break;
+                case CPK_INVERSE: r=cp_prop_inverse(cp,&cr[i]); break;
+                case CPK_BINPACK: r=cp_prop_binpack(cp,&cr[i]); break;
+                case CPK_BINPACKL: r=cp_prop_binpackl(cp,&cr[i]); break;
+                case CPK_CUM: r=cp_prop_cum(cp,&cr[i]); break;
+                case CPK_DIFFN: r=cp_prop_diffn(cp,&cr[i]); break;
+                case CPK_LEX: r=cp_prop_lex(cp,&cr[i]); break;
                 case CPK_CLAUSE: r=cp_prop_clause(cp,&cr[i]); break;
                 case CPK_MINMAX: r=cp_prop_minmax(cp,&cr[i]); break;
                 case CPK_ORBIT: r=cp_prop_orbit(cp,&cr[i]); break;
@@ -2608,6 +3391,97 @@ static int cp_verify(const CP*cp,CPCR*cr,int nc,const double*outx){
                     for(int c=0;c<K;c++) if(r->setvals[c]==xv){ok=1;break;}
                     if(!ok) return 0; }
             }
+        }
+        else if(r->kind==CPK_COUNTEQ){
+            int64_t yv=cp_term_out(&r->terms[0],outx), cv=cp_term_out(&r->terms[1],outx); int act=0;
+            for(int i=0;i<r->nset;i++) if(cp_term_out(&r->arr_terms[i],outx)==yv) act++;
+            if(act!=cv) return 0;
+        }
+        else if(r->kind==CPK_NVALUE){
+            int64_t nv=cp_term_out(&r->terms[0],outx); int act=0;
+            for(int i=0;i<r->nset;i++){ int64_t v=cp_term_out(&r->arr_terms[i],outx); int dup=0;
+                for(int j=0;j<i;j++) if(cp_term_out(&r->arr_terms[j],outx)==v){dup=1;break;}
+                if(!dup) act++; }
+            if(act!=nv) return 0;
+        }
+        else if(r->kind==CPK_ALLEQ){
+            int64_t v0=cp_term_out(&r->arr_terms[0],outx);
+            for(int i=1;i<r->n;i++) if(cp_term_out(&r->arr_terms[i],outx)!=v0) return 0;
+        }
+        else if(r->kind==CPK_CHAIN){
+            for(int i=1;i<r->n;i++) if(cp_term_out(&r->arr_terms[i-1],outx)>cp_term_out(&r->arr_terms[i],outx)) return 0;
+        }
+        else if(r->kind==CPK_MEMBER){
+            int64_t yv=cp_term_out(&r->terms[0],outx); int ok=0;
+            for(int i=0;i<r->nset;i++) if(cp_term_out(&r->arr_terms[i],outx)==yv){ok=1;break;}
+            if(!ok) return 0;
+        }
+        else if(r->kind==CPK_TABLE){
+            int W=r->n; long long*T=r->setvals; int R=(int)r->rhs/W; int ok=0;
+            for(int row=0;row<R&&!ok;row++){
+                int m=1;
+                for(int k=0;k<W;k++) if(cp_term_out(&r->arr_terms[k],outx)!=T[(size_t)row*W+k]){m=0;break;}
+                if(m) ok=1;
+            }
+            if(!ok) return 0;
+        }
+        else if(r->kind==CPK_INVERSE){
+            int n=r->n; long bf=r->lvars[0], bi=r->lvars[1];
+            for(int i=0;i<n;i++){
+                int64_t fv=cp_term_out(&r->arr_terms[i],outx);
+                if(fv-bf<0||fv-bf>=n) return 0;
+                if(cp_term_out(&r->terms[(int)(fv-bf)],outx)!=i+bi) return 0;
+            }
+        }
+        else if(r->kind==CPK_BINPACK){
+            int n=r->nset; long long*W=r->setvals; int64_t c=r->rhs;
+            int64_t *ks=NULL; int nk=0,cap=0;
+            for(int i=0;i<n;i++){ int64_t k=cp_term_out(&r->arr_terms[i],outx); int seen=0; for(int q=0;q<nk;q++) if(ks[q]==k){seen=1;break;} if(!seen){ if(nk>=cap){cap=cap?cap*2:8;ks=(int64_t*)psolve_realloc((void**)&ks,(size_t)cap*sizeof(int64_t));} ks[nk++]=k; } }
+            int bad2=0;
+            for(int q=0;q<nk;q++){ int64_t s=0; for(int i=0;i<n;i++) if(cp_term_out(&r->arr_terms[i],outx)==ks[q]) s+=W[i]; if(s>c){bad2=1;break;} }
+            psolve_free(ks);
+            if(bad2) return 0;
+        }
+        else if(r->kind==CPK_BINPACKL){
+            int n=r->nset; long long*W=r->setvals; long lo=r->lvars[0];
+            for(int k=0;k<r->n;k++){
+                int64_t kval=lo+k, s=0;
+                for(int i=0;i<n;i++) if(cp_term_out(&r->arr_terms[i],outx)==kval) s+=W[i];
+                if(s!=cp_term_out(&r->terms[k],outx)) return 0;
+            }
+        }
+        else if(r->kind==CPK_CUM){
+            int n=r->n; CPT*S=r->arr_terms,*D=r->terms,*R=r->terms2;
+            int64_t b=cp_term_out(&r->terms3[0],outx);
+            /* exact: at every task start time, sum of active usages <= b */
+            for(int i=0;i<n;i++){
+                int64_t t=cp_term_out(&S[i],outx); int64_t sum=0;
+                for(int j=0;j<n;j++){
+                    int64_t sj=cp_term_out(&S[j],outx), dj=cp_term_out(&D[j],outx);
+                    if(sj<=t && t<sj+dj) sum+=cp_term_out(&R[j],outx);
+                }
+                if(sum>b) return 0;
+            }
+        }
+        else if(r->kind==CPK_DIFFN){
+            int n=r->n; CPT*X=r->arr_terms,*Y=r->terms,*W=r->terms2,*H=r->terms3;
+            for(int i=0;i<n;i++) for(int j=i+1;j<n;j++){
+                int64_t xi=cp_term_out(&X[i],outx), yi=cp_term_out(&Y[i],outx), wi=cp_term_out(&W[i],outx), hi=cp_term_out(&H[i],outx);
+                int64_t xj=cp_term_out(&X[j],outx), yj=cp_term_out(&Y[j],outx), wj=cp_term_out(&W[j],outx), hj=cp_term_out(&H[j],outx);
+                int ox = (xi < xj+wj && xj < xi+wi);
+                int oy = (yi < yj+hj && yj < yi+hi);
+                if(ox&&oy) return 0;
+            }
+        }
+        else if(r->kind==CPK_LEX){
+            int n=r->n; int strict=(r->rhs!=0);
+            int cmp=0;
+            for(int i=0;i<n;i++){
+                int64_t xv=cp_term_out(&r->arr_terms[i],outx), yv=cp_term_out(&r->terms[i],outx);
+                if(xv<yv){cmp=-1;break;} if(xv>yv){cmp=1;break;}
+            }
+            int ok = strict? (cmp<0) : (cmp<=0);
+            if(!ok) return 0;
         }
         else if(r->kind==CPK_ORBIT){
             FZOrbit*o=(FZOrbit*)r->aux;
@@ -2938,7 +3812,7 @@ static int fz_cp_try(const FZModel*m,FZSolution*sol){
         int combinatorial=0;
         for(int i=0;i<nc;i++) if(cr[i].kind!=CPK_LIN){ combinatorial=1; break; }
         if(!combinatorial){
-            for(int i=0;i<nc;i++){ cp_cr_aux_free(&cr[i]); psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);} psolve_free(cr);
+            for(int i=0;i<nc;i++){ cp_cr_aux_free(&cr[i]); psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);psolve_free(cr[i].terms2);psolve_free(cr[i].terms3);} psolve_free(cr);
             psolve_free(referenced); psolve_free(optcoef); psolve_free(opt.bestx); return 0;
         }
         for(int i=0;i<m->objective.n;i++) referenced[m->objective.idx[i]]=1;
@@ -3004,7 +3878,7 @@ static int fz_cp_try(const FZModel*m,FZSolution*sol){
                 int64_t dlo= decl->has_lo?(int64_t)llround(decl->lo[0]):INT64_MIN;
                 int64_t dhi= decl->has_hi?(int64_t)llround(decl->hi[0]):INT64_MAX;
                 if(dlo>dhi){
-                    cp_free(&cp); for(int i=0;i<nc;i++){ cp_cr_aux_free(&cr[i]); psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);} psolve_free(cr); psolve_free(referenced); psolve_free(searchme); psolve_free(opt.bestx); psolve_free(optcoef);
+                    cp_free(&cp); for(int i=0;i<nc;i++){ cp_cr_aux_free(&cr[i]); psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);psolve_free(cr[i].terms2);psolve_free(cr[i].terms3);} psolve_free(cr); psolve_free(referenced); psolve_free(searchme); psolve_free(opt.bestx); psolve_free(optcoef);
                     sol->status=1; sol->nvars=nv; sol->nodes=0; return 1;
                 }
                 continue;
@@ -3019,7 +3893,7 @@ static int fz_cp_try(const FZModel*m,FZSolution*sol){
                        var {1..70000-as-set} pins).  Decline to the exact MIP
                        bridge instead, which represents the domain
                        symbolically. */
-                    cp_free(&cp); for(int i=0;i<nc;i++){ cp_cr_aux_free(&cr[i]); psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);} psolve_free(cr); psolve_free(referenced); psolve_free(searchme); psolve_free(opt.bestx); psolve_free(optcoef);
+                    cp_free(&cp); for(int i=0;i<nc;i++){ cp_cr_aux_free(&cr[i]); psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);psolve_free(cr[i].terms2);psolve_free(cr[i].terms3);} psolve_free(cr); psolve_free(referenced); psolve_free(searchme); psolve_free(opt.bestx); psolve_free(optcoef);
                     return 0;
                 }
                 continue;
@@ -3027,7 +3901,7 @@ static int fz_cp_try(const FZModel*m,FZSolution*sol){
             if(decl->has_lo){ int64_t lo=(int64_t)llround(decl->lo[0]); if(cp.lo[v]<lo)cp.lo[v]=lo; }
             if(decl->has_hi){ int64_t hi=(int64_t)llround(decl->hi[0]); if(cp.hi[v]>hi)cp.hi[v]=hi; }
             if(cp_intersect(&cp,v,cp.lo[v],cp.hi[v])){ /* empty initial domain -> UNSAT */
-                cp_free(&cp); for(int i=0;i<nc;i++){ cp_cr_aux_free(&cr[i]); psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);} psolve_free(cr); psolve_free(referenced); psolve_free(searchme); psolve_free(opt.bestx); psolve_free(optcoef);
+                cp_free(&cp); for(int i=0;i<nc;i++){ cp_cr_aux_free(&cr[i]); psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);psolve_free(cr[i].terms2);psolve_free(cr[i].terms3);} psolve_free(cr); psolve_free(referenced); psolve_free(searchme); psolve_free(opt.bestx); psolve_free(optcoef);
                 sol->status=1; sol->nvars=nv; sol->nodes=0; return 1;
             }
         }
@@ -3037,8 +3911,8 @@ static int fz_cp_try(const FZModel*m,FZSolution*sol){
        x*x*x*y*y = 100000 with unbounded x,y), bound the whole product chain
        to the divisors of that constant so search is finite and correct. */
     int bd=cp_bound_diophantine(&cp,cr,nc);
-    if(bd==1){ cp_free(&cp); for(int i=0;i<nc;i++){ cp_cr_aux_free(&cr[i]); psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);} psolve_free(cr); psolve_free(referenced); psolve_free(searchme); psolve_free(opt.bestx); psolve_free(optcoef); sol->status=1; sol->nvars=nv; return 1; }
-    if(bd==-1){ cp_free(&cp); for(int i=0;i<nc;i++){ cp_cr_aux_free(&cr[i]); psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);} psolve_free(cr); psolve_free(referenced); psolve_free(searchme); psolve_free(opt.bestx); psolve_free(optcoef); return 0; }
+    if(bd==1){ cp_free(&cp); for(int i=0;i<nc;i++){ cp_cr_aux_free(&cr[i]); psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);psolve_free(cr[i].terms2);psolve_free(cr[i].terms3);} psolve_free(cr); psolve_free(referenced); psolve_free(searchme); psolve_free(opt.bestx); psolve_free(optcoef); sol->status=1; sol->nvars=nv; return 1; }
+    if(bd==-1){ cp_free(&cp); for(int i=0;i<nc;i++){ cp_cr_aux_free(&cr[i]); psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);psolve_free(cr[i].terms2);psolve_free(cr[i].terms3);} psolve_free(cr); psolve_free(referenced); psolve_free(searchme); psolve_free(opt.bestx); psolve_free(optcoef); return 0; }
 
     double *outx=sol->x; /* sized nv */
 
@@ -3109,7 +3983,7 @@ static int fz_cp_try(const FZModel*m,FZSolution*sol){
     else { handled=0; } /* fallback: node cap (rr==4) or uncertifiable (rr==-1) */
 
     cp_free(&cp);
-    for(int i=0;i<nc;i++){ cp_cr_aux_free(&cr[i]); psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);} psolve_free(cr);
+    for(int i=0;i<nc;i++){ cp_cr_aux_free(&cr[i]); psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);psolve_free(cr[i].terms2);psolve_free(cr[i].terms3);} psolve_free(cr);
     psolve_free(referenced); psolve_free(searchme);
     psolve_free(opt.bestx); psolve_free(optcoef);
     if(!handled) return 0;
