@@ -190,3 +190,94 @@ minizinc --solver psolve examples/mzn/knap_lin.mzn
 # Run the NLP vs Fixed-Point Trigonometry comparison
 python3 tools/nlp_vs_fixedpoint_trig.py
 ```
+
+---
+
+## 5. Phase 11.2 wave 2: stdlib globals that reach FlatZinc as builtins (2026-11-02)
+
+Mechanical audit (MiniZinc 2.9.5 stdlib inventory vs the handled set extracted
+from `src/fzn.c`/`src/fz_cp.inc`) plus compiled-model sweeps found these
+builtin predicate names reaching `.fzn` with no handler (all returned
+`=====UNKNOWN=====`).  All are now encoded exactly in the MIP bridge
+(`handle_constraint`, helpers `fz_eq_sel` / `fz_in_sel` / `fz_encode_precede` /
+`fz_encode_arg_extremum` / `fz_encode_sort` / `fz_encode_arg_sort` /
+`fz_encode_among_seq` / `fz_encode_element_lin`):
+
+1. **Counting (`fzn_at_most_int`, `fzn_at_least_int`, `fzn_exactly_int`,
+   `fzn_at_most1`, + `_reif` variants):** selectors $b_i \leftrightarrow (x_i = v)$
+   via `add_int_reif`, then $\sum b_i \;\{<=, >=, =\}\; n$; reif forms reify the
+   count relation itself (`which` 1/3/0).
+2. **Value precedence (`gecode_precede(x,s,t)`, `fzn_value_precede_int(_opt)(s,t,x)`,
+   `fzn_value_precede_chain_int(T,x)`, `fzn_seq_precede_chain_int(x)`):**
+   semantics "if any $x_j = t$ then some $i<j$ has $x_i = s$" is exactly the
+   linear family $\sum_{i<j} [x_i{=}s] \ge [x_j{=}t]$ per position $j$.
+   Opt arrays lower to a 0 sentinel outside the value domain, so the raw int
+   encoding stays exact.  Chains expand to per-pair precede constraints.
+3. **Arg-extremum (`gecode_minimum/maximum_arg_int_offset(x,off,i)`,
+   `fzn_minimum/maximum_arg_int`, `fzn_arg_min/max_int`, bool variants):**
+   fresh extremum var $m$ ($m \le x_i$ resp. $\ge$, plus big-M selector rows
+   forcing $m = x_i$ for some $i$), $b_k \leftrightarrow (x_k = m)$,
+   $e_k \leftrightarrow (i = k+off)$, $\sum e_k = 1$, $i = off + \sum k e_k$,
+   $e_k \Rightarrow b_k$ and $e_k \Rightarrow \sum_{j<k} b_j = 0$ — the least
+   index wins ties, matching MiniZinc `arg_min`/`arg_max`.
+4. **Sort (`fzn_sort(x,y)`, `fzn_arg_sort_int(x,p)`):** $y$ ascending plus a
+   doubly-stochastic selector matrix $b_{i,j} \Rightarrow (y_i = x_j)$
+   (half-reified on purpose: full reification would force $b=1$ for every
+   equal pair and break the sums on duplicate values); `arg_sort` links
+   $e_i = x_{p_i}$ through the permutation matrix and requires $e$ sorted.
+   Cap $n \le 96$, else honest UNKNOWN.
+5. **Sliding among (`gecode_among_seq_int(x,S,seq,low,up)`,
+   `gecode_among_seq_bool`, `fzn_sliding_among_int/bool(low,up,seq,x,S|b)`):**
+   membership selectors $m_i \leftrightarrow (x_i \in S)$ (two half-reified
+   bounds for ranges, per-value OR for enumerations, par elements folded),
+   then per window $k$: $low \le \sum_{i=k}^{k+seq-1} m_i \le up$.
+6. **2D element (`gecode_int_element2d(i,j,x,S1,S2,c)`):** both index sets must
+   be ranges; the flat 1-based position is the linear form
+   $i \cdot w_2 + j + (1 - lo_1 w_2 - lo_2)$ fed into the exact SOS1 element
+   encoding.  Enumerated index sets decline honestly.
+
+Everything outside the stated caps returns 1 (honest `=====UNKNOWN=====`),
+never a truncated relaxation.  Differential coverage:
+`tools/fzn_globals_verify.py` (brute-force solution-set equality on direct
+`.fzn` instances for every family + MiniZinc-compiled end-to-end `-a`
+solution-set equality vs the bundled `fzn-gecode` oracle; hard-gated in
+`test.sh`).
+
+## 6. Phase cp-sat parity: ortools_* builtins emitted by `--solver cp-sat` (2026-11-04)
+
+Compiling probe models with `minizinc -c --solver cp-sat` shows the cp-sat
+solver library lowers stdlib globals to `ortools_*` FlatZinc builtins (and
+keeps native `fzn_all_different_int` / `fzn_all_disjoint` / `fzn_cumulative`
+etc.).  A 43-model sweep (`t_*`/`u_*`/`v_*` corpora) initially left 15 models
+`=====UNKNOWN=====`; all are now encoded in `handle_constraint`:
+
+- **Aliases onto existing exact encoders** (same arg shapes after reordering):
+  `ortools_circuit/subcircuit(x, base)`, `ortools_inverse(f, invf, base_f,
+  base_invf)`, `ortools_lex_less/lesseq_int/bool`, `ortools_nvalue`,
+  `ortools_count_eq/count_eq_cst`, `ortools_global_cardinality(_low_up)`
+  (trailing `closed` bool arg), `ortools_table_int/bool`,
+  `ortools_precede_chain_int`, `ortools_array_*_element` (flat position
+  `idx - min(index_set_of_x) + 1`, matching fzn-cp-sat).
+- **`fzn_cumulative` upgrades:** var capacity (time rows become
+  `sum(r*z) - b <= 0`) and var/pinned-only durations & heights via the new
+  general time-indexed encoder `fz_encode_cumulative_gen` (also serves
+  `ortools_cumulative_opt(o,s,d,r,b)` with per-task occurrence gating
+  `a_{i,t} <-> o_i & s_i<=t & t<s_i+d_i`, incl. product linearization
+  `w = r_i * a_{i,t}` for var heights).
+- **New encodings:** `ortools_disjunctive_strict_opt` (pairwise big-M with
+  occurrence big-Ms; cp-sat constrains ALL occurring pairs, incl. d=0),
+  `ortools_network_flow(_cost)` (pure linear balance rows, out−in per node,
+  plus linear weighted cost), `ortools_regular` (DFA: per-position symbol
+  selectors `xs_{t,s} <-> (x_t = s)` for symbols 1..S, state bools with
+  `b_{t+1,q'} = sum of c_{t,q,s}` transition conjunctions, dead transitions
+  forbidden, accepting-state sum = 1), `ortools_arg_max_int/bool`
+  (`z = min_index + |multiplier| * pos0`, pos0 = 0-based LEAST extremum
+  position — pinned empirically against fzn-cp-sat), `ortools_bin_packing`
+  /`_capa`/`_load` (assignment selector matrix over the bin value set).
+- Every size cap (n, span, n*span, product bounds) declines honestly
+  (`return 1` → `=====UNKNOWN=====`), never truncates.
+
+Differential coverage: `tools/fzn_cpsat_verify.py` — direct `.fzn` instances
+for all 19 families, brute-force solution-set equality in Python AND
+`-a` solution-set equality vs the bundled `fzn-cp-sat` oracle (UNKNOWN is a
+failure); hard-gated in `test.sh` (`fzn_cpsat_verify.py 8 20261104`).
