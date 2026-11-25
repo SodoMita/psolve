@@ -281,3 +281,26 @@ Differential coverage: `tools/fzn_cpsat_verify.py` — direct `.fzn` instances
 for all 19 families, brute-force solution-set equality in Python AND
 `-a` solution-set equality vs the bundled `fzn-cp-sat` oracle (UNKNOWN is a
 failure); hard-gated in `test.sh` (`fzn_cpsat_verify.py 8 20261104`).
+
+### Source cross-check (OR-Tools CP-SAT)
+
+The semantics above were cross-read against the upstream CP-SAT implementation
+before being mirrored in `src/fz_cp.inc` / `src/fzn.c`:
+
+- `ortools/sat/all_different.cc` — maximum matching plus residual-graph SCC
+  filtering (Hall-set explanation).  This is the reference for the
+  matching-based `cp_prop_alldiff` filtering used by `CPK_CIRCUIT` as well as
+  `fzn_all_different_int`.
+- `ortools/sat/circuit.cc` — successor literals are constrained to be a
+  permutation, then partial paths/circuits are traversed to eliminate
+  subtours and to enforce node coverage.  `CPK_CIRCUIT` follows the same
+  two-stage shape (Régin alldiff, then sound subtour elimination); the
+  `multiple_subcircuit_through_zero` variant is what `subcircuit` maps to.
+- `ortools/sat/cp_constraints.cc` — enforcement-literal discipline for
+  reified/half-reified constraints.  `CPK_IMP` only propagates while its
+  Boolean guard is true (or forced true), never in the relaxed direction.
+
+Source reading pins the *shape* of each rule; every rule is nevertheless
+accepted only after exhaustive small-domain differential checks against brute
+force and the bundled FlatZinc oracles, since a propagator may never delete a
+value that occurs in a solution.
