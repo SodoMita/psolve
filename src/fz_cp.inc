@@ -375,68 +375,126 @@ static int cp_prop_alldiff(CP*cp,CPT*terms,int n){
                 int c=0; for(int i=0;i<n;i++) if(!terms[i].isc && cp->bounded[terms[i].v] && cp->nvals[terms[i].v]>1) fvv[c++]=terms[i].v;
                 int64_t *vs=NULL; int vc=0,vcap=0;
                 for(int r=0;r<nfree;r++){ int v=fvv[r]; for(int k=0;k<cp->nvals[v];k++){ int64_t val=cp->vals[v][k]; int dup=0; for(int q=0;q<vc;q++) if(vs[q]==val){dup=1;break;} if(!dup){ if(vc>=vcap){vcap=vcap?vcap*2:64;vs=(int64_t*)psolve_realloc((void**)&vs,(size_t)vcap*sizeof(int64_t));} vs[vc++]=val; } } }
-                if(vc==0){ psolve_free(fvv); psolve_free(vs); continue; }
-                ADJ *adj=(ADJ*)psolve_calloc((size_t)nfree,sizeof(ADJ));
+                ADJ *adj=NULL; int *matchR=NULL, *matchL=NULL;
+                int *deg=NULL,*off=NULL,*cur=NULL,*to=NULL;
+                int *disc=NULL,*low=NULL,*comp=NULL,*onstk=NULL,*stkv=NULL,*fv=NULL,*fe=NULL;
+                if(vc==0) goto ad_done;
+                adj=(ADJ*)psolve_calloc((size_t)nfree,sizeof(ADJ));
                 for(int r=0;r<nfree;r++){
                     int v=fvv[r]; int cap2=0; int *tmp=NULL; int tn=0;
                     for(int k=0;k<vc;k++) if(cp_contains(cp,v,vs[k])){ if(tn>=cap2){cap2=cap2?cap2*2:8;tmp=(int*)psolve_realloc((void**)&tmp,(size_t)cap2*sizeof(int));} tmp[tn++]=k; }
                     adj[r].col=tmp; adj[r].n=tn;
                 }
-                int *matchR=(int*)psolve_malloc((size_t)(vc?vc:1)*sizeof(int)); for(int k=0;k<vc;k++) matchR[k]=-1;
+                matchR=(int*)psolve_malloc((size_t)(vc?vc:1)*sizeof(int)); for(int k=0;k<vc;k++) matchR[k]=-1;
+                matchL=(int*)psolve_calloc((size_t)(nfree?nfree:1),sizeof(int)); for(int k=0;k<nfree;k++) matchL[k]=-1;
                 int matches=0;
                 for(int r=0;r<nfree;r++){
                     int *seen=(int*)psolve_calloc((size_t)(vc?vc:1),sizeof(int));
                     if(cp_aug(r,matchR,seen,adj,vc)) matches++;
                     psolve_free(seen);
                 }
-                if(matches<nfree){ /* Hall violated -> UNSAT */
-                    for(int r=0;r<nfree;r++) psolve_free(adj[r].col);
-                    psolve_free(adj); psolve_free(matchR); psolve_free(fvv); psolve_free(vs);
-                    return 1;
-                }
-                /* Value removal: a value val in dom(fvv[r]) is removable iff the edge
-                   (r,val) is in NO maximum matching, i.e. forcing (r,val) leaves no
-                   perfect matching.  Cheap for the small all_different constraints in
-                   FlatZinc CSPs. */
-                for(int r=0;r<nfree;r++){
-                    int v=fvv[r];
-                    for(int k=0;k<adj[r].n;k++){
-                        int c=adj[r].col[k];
-                        if(matchR[c]==r) continue; /* matched edge is in this matching; keep */
-                        int64_t val=vs[c];
-                        ADJ *adj2=(ADJ*)psolve_calloc((size_t)nfree,sizeof(ADJ));
-                        for(int r2=0;r2<nfree;r2++){
-                            int v2=fvv[r2]; int *tmp=NULL; int tn=0,cap2=0;
-                            for(int c2=0;c2<vc;c2++){
-                                /* force (r,c): var r may only take value c */
-                                if(r2==r && c2!=c) continue;
-                                if(cp_contains(cp,v2,vs[c2])){ if(tn>=cap2){cap2=cap2?cap2*2:8;tmp=(int*)psolve_realloc((void**)&tmp,(size_t)cap2*sizeof(int));} tmp[tn++]=c2; }
+                if(matches<nfree) goto ad_fail;   /* Hall violated -> UNSAT */
+                for(int col=0;col<vc;col++) if(matchR[col]>=0) matchL[matchR[col]]=col;
+
+                /* Régin arc consistency in O(E+V) instead of one fresh maximum
+                   matching per edge.  Build the residual graph of THIS maximum
+                   matching: an unmatched (var,value) edge points var->value, a
+                   matched edge points value->var; unmatched values go through a
+                   dummy node when there are more values than variables.  An
+                   edge (r,c) can belong to some maximum matching iff r and the
+                   value node c lie in the same strongly connected component.
+                   Same construction as ortools/sat/all_different.cc. */
+                long nedges=0;
+                for(int r=0;r<nfree;r++) nedges+=adj[r].n;
+                int dummy=-1;
+                if(nfree<vc){ dummy=nfree+vc; nedges+=(long)(vc-nfree)+nfree; }
+                int V=nfree+vc+(dummy>=0?1:0);
+                if(nedges>0 && nedges<=INT_MAX/2 && V>0){
+                    deg=(int*)psolve_calloc((size_t)V,sizeof(int));
+                    off=(int*)psolve_calloc((size_t)V+1,sizeof(int));
+                    cur=(int*)psolve_malloc((size_t)V*sizeof(int));
+                    to=(int*)psolve_malloc((size_t)nedges*sizeof(int));
+                    for(int r=0;r<nfree;r++) for(int k=0;k<adj[r].n;k++){
+                        int col=adj[r].col[k];
+                        if(matchL[r]==col) deg[nfree+col]++; else deg[r]++;
+                    }
+                    if(dummy>=0){
+                        for(int col=0;col<vc;col++) if(matchR[col]<0) deg[nfree+col]++;
+                        for(int r=0;r<nfree;r++) deg[dummy]++;
+                    }
+                    for(int v=0;v<V;v++) off[v+1]=off[v]+deg[v];
+                    if(off[V]!=(int)nedges) goto ad_fail;  /* defensive: counts must agree */
+                    memcpy(cur,off,(size_t)V*sizeof(int));
+                    for(int r=0;r<nfree;r++) for(int k=0;k<adj[r].n;k++){
+                        int col=adj[r].col[k];
+                        if(matchL[r]==col) to[cur[nfree+col]++]=r;
+                        else to[cur[r]++]=nfree+col;
+                    }
+                    if(dummy>=0){
+                        for(int col=0;col<vc;col++) if(matchR[col]<0) to[cur[nfree+col]++]=dummy;
+                        for(int r=0;r<nfree;r++) to[cur[dummy]++]=r;
+                    }
+                    /* iterative Tarjan SCC */
+                    disc=(int*)psolve_calloc((size_t)V,sizeof(int));
+                    low=(int*)psolve_malloc((size_t)V*sizeof(int));
+                    comp=(int*)psolve_malloc((size_t)V*sizeof(int));
+                    onstk=(int*)psolve_calloc((size_t)V,sizeof(int));
+                    stkv=(int*)psolve_malloc((size_t)V*sizeof(int));
+                    fv=(int*)psolve_malloc((size_t)V*sizeof(int));
+                    fe=(int*)psolve_malloc((size_t)V*sizeof(int));
+                    int timer=0,ncomp=0,top=0,sp=0;
+                    for(int s=0;s<V;s++){
+                        if(disc[s]) continue;
+                        disc[s]=low[s]=++timer; onstk[s]=1; stkv[top++]=s;
+                        fv[sp]=s; fe[sp]=off[s]; sp++;
+                        while(sp>0){
+                            int v=fv[sp-1];
+                            if(fe[sp-1]<off[v+1]){
+                                int w=to[fe[sp-1]++];
+                                if(!disc[w]){
+                                    disc[w]=low[w]=++timer; onstk[w]=1; stkv[top++]=w;
+                                    fv[sp]=w; fe[sp]=off[w]; sp++;
+                                } else if(onstk[w] && disc[w]<low[v]) low[v]=disc[w];
+                            } else {
+                                sp--;
+                                if(sp>0){ int p=fv[sp-1]; if(low[v]<low[p]) low[p]=low[v]; }
+                                if(low[v]==disc[v]){
+                                    int w;
+                                    do{ w=stkv[--top]; onstk[w]=0; comp[w]=ncomp; }while(w!=v);
+                                    ncomp++;
+                                }
                             }
-                            adj2[r2].col=tmp; adj2[r2].n=tn;
-                        }
-                        int *mR=(int*)psolve_malloc((size_t)(vc?vc:1)*sizeof(int));
-                        for(int z=0;z<vc;z++) mR[z]=-1;
-                        int m2=0;
-                        for(int r2=0;r2<nfree;r2++){
-                            int *seen2=(int*)psolve_calloc((size_t)(vc?vc:1),sizeof(int));
-                            if(cp_aug(r2,mR,seen2,adj2,vc)) m2++;
-                            psolve_free(seen2);
-                        }
-                        int removable=(m2<nfree); /* forcing (r,c) breaks every matching */
-                        for(int r2=0;r2<nfree;r2++) psolve_free(adj2[r2].col);
-                        psolve_free(adj2); psolve_free(mR);
-                        if(removable){
-                            if(cp_remove_val(cp,v,val)){
-                                for(int r=0;r<nfree;r++) psolve_free(adj[r].col);
-                                psolve_free(adj); psolve_free(matchR); psolve_free(fvv); psolve_free(vs);
-                                return 1;
-                            }
-                            changed=1;
                         }
                     }
+                    long mut0=cp->mutations;
+                    for(int r=0;r<nfree;r++){
+                        int v=fvv[r];
+                        for(int k=0;k<adj[r].n;k++){
+                            int col=adj[r].col[k];
+                            if(matchL[r]==col) continue;
+                            if(comp[r]!=comp[nfree+col]){
+                                if(cp_remove_val(cp,v,vs[col])) goto ad_fail;
+                            }
+                        }
+                    }
+                    if(cp->mutations!=mut0) changed=1;
                 }
-                for(int r=0;r<nfree;r++) psolve_free(adj[r].col);
-                psolve_free(adj); psolve_free(matchR); psolve_free(fvv); psolve_free(vs);
+ad_done:
+                for(int r2=0;r2<nfree;r2++) psolve_free(adj?adj[r2].col:NULL);
+                psolve_free(adj); psolve_free(matchR); psolve_free(matchL);
+                psolve_free(deg); psolve_free(off); psolve_free(cur); psolve_free(to);
+                psolve_free(disc); psolve_free(low); psolve_free(comp); psolve_free(onstk);
+                psolve_free(stkv); psolve_free(fv); psolve_free(fe);
+                psolve_free(fvv); psolve_free(vs);
+                continue;
+ad_fail:
+                for(int r2=0;r2<nfree;r2++) psolve_free(adj?adj[r2].col:NULL);
+                psolve_free(adj); psolve_free(matchR); psolve_free(matchL);
+                psolve_free(deg); psolve_free(off); psolve_free(cur); psolve_free(to);
+                psolve_free(disc); psolve_free(low); psolve_free(comp); psolve_free(onstk);
+                psolve_free(stkv); psolve_free(fv); psolve_free(fe);
+                psolve_free(fvv); psolve_free(vs);
+                return 1;
             }
         }
     }

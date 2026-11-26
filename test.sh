@@ -430,6 +430,9 @@ echo -n "cumulative_verify (randomized, vs brute force): "
 python3 tools/cumulative_verify.py 200 777 | sed 's/.*: //'
 echo -n "cp_opt_verify (CP B&B + MIP bridge optimization, vs brute force, both paths): "
 python3 tools/cp_opt_verify.py 250 20260814 | sed 's/.*: //'
+# Régin all_different filtering via residual SCCs: -a solution sets must stay
+# exactly equal to brute force (no valid value may be filtered).
+python3 tools/alldiff_scc_verify.py 200 271828 || { echo "alldiff_scc_verify: FAIL"; exit 1; }
 
 echo "[8.25/8] FlatZinc strict/reified-int + float + table/circuit semantics..."
 python3 tools/fzn_semantics_test.py

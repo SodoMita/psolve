@@ -304,3 +304,42 @@ Source reading pins the *shape* of each rule; every rule is nevertheless
 accepted only after exhaustive small-domain differential checks against brute
 force and the bundled FlatZinc oracles, since a propagator may never delete a
 value that occurs in a solution.
+
+---
+
+## 7. Régin all-different filtering in O(E+V) (2026-11-26)
+
+The first CP parity pass shipped a correct but expensive `cp_prop_alldiff`:
+after one maximum matching it re-built the bipartite graph and recomputed a
+*fresh* maximum matching for every candidate edge `(x_i, v)` to decide whether
+`v` can be removed from `x_i`.  That is O(E · n · vc) work per fixpoint pass.
+
+`ortools/sat/all_different.cc` instead computes a single residual graph from
+the maximum matching and filters with strongly connected components:
+
+- unmatched edge `(i, v)` → arc `var_i → value_v`;
+- matched edge `(i, v)` → arc `value_v → var_i`;
+- unmatched values reach a dummy node when `#values > #variables`, and the
+  dummy reaches every variable;
+- `(i, v)` belongs to *some* maximum matching iff `i` and `value_v` are in the
+  same SCC.  All other non-matched edges can be removed.
+
+`src/fz_cp.inc` now follows that construction (iterative Tarjan, no recursion),
+so a propagation pass costs O(E+V).  Measured on `all_different_int` over
+`n` variables with domains `1..n+1` (single solve, same machine, old = base
+binary before this change, new = this tree):
+
+| n | old | new | speedup |
+|---:|---:|---:|---:|
+| 20 | 18.7 ms | 1.8 ms | 10× |
+| 40 | 553 ms | 2.9 ms | 190× |
+| 60 | 4.79 s | 6.0 ms | 800× |
+| 80 | 22.7 s | 15.4 ms | 1470× |
+| 120 | >120 s (timeout) | 50 ms | >2400× |
+
+Semantics are locked by `tools/alldiff_scc_verify.py` (hard-gated in
+`test.sh`): `-a` solution sets must equal a Python brute-force oracle on
+random small domains, with and without extra `int_lin_ne` rows.  A run of 200
+instances is clean (`OK=200 WRONG=0`), as are 1200 old-vs-new status-parity
+models.  `tools/alldiff_scc_verify.py --bench` reproduces the timing table;
+set `ALDIFF_REF` to a reference binary to print its column too.
