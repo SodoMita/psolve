@@ -4714,6 +4714,320 @@ static long long cp_shop_greedy(CPShop*S,int rule,int rcl,unsigned *state){
     return rc_ok ? curmax : -1;
 }
 
+/* ---- critical-block local search on the disjunctive graph ----------------
+   The serial SGS enumerates active schedules, but a handful of dispatch rules
+   -- even restarted through a restricted candidate list -- still land several
+   percent above the optimum on the jobshops that are too large to prove.  The
+   standard way to close that gap is the critical-block neighbourhood: from a
+   feasible schedule derive the machine orders (a total order per machine,
+   since the tasks on it are mutually exclusive), re-time the graph by longest
+   paths, and swap the boundary operations of every critical block.  Steepest
+   descent over that neighbourhood, restarted by random perturbations (an
+   iterated local search).
+
+   Preconditions, all checked in cp_ls_init: every task runs on exactly one
+   resource, and on each resource every pair of tasks needs more than the
+   capacity together, i.e. the resource really is a machine.  Anything else
+   (cumulative resources, multi-machine tasks) declines and keeps the SGS
+   incumbent.  The result is an ordinary semi-active schedule: feasible for
+   the extracted structure by construction, and still handed to cp_verify
+   before it is reported as an incumbent. */
+typedef struct CPLS_Tag{
+    CPShop *S;
+    int mach[CP_SHOP_MAXT];             /* resource of a task, -1 = none */
+    int mfirst[CP_SHOP_MAXR];
+    int mprev[CP_SHOP_MAXT], mnext[CP_SHOP_MAXT];
+    int *psucc;                         /* precedence successors, flat */
+    int poff[CP_SHOP_MAXT+1];
+    int indeg[CP_SHOP_MAXT], topo[CP_SHOP_MAXT];
+    long long hs[CP_SHOP_MAXT];         /* heads of the current orders */
+    long long tmp[CP_SHOP_MAXT];        /* scratch heads for a trial move */
+    long long besths[CP_SHOP_MAXT];
+    long long keep[CP_SHOP_MAXT];       /* heads of the best order inside a phase */
+    int *tabu;                          /* n*n iteration stamps for reversed moves */
+    long long evals, evalcap;
+    unsigned state;
+} CPLS;
+
+static void cp_ls_free(CPLS*L){
+    if(L->psucc) psolve_free(L->psucc);
+    if(L->tabu) psolve_free(L->tabu);
+    L->psucc=NULL; L->tabu=NULL;
+}
+
+static int cp_ls_init(CPLS*L,CPShop*S){
+    memset(L,0,sizeof(*L));
+    L->S=S;
+    int n=S->ntask;
+    for(int i=0;i<n;i++) L->mach[i]=-1;
+    for(int i=0;i<n;i++){
+        if(S->ndem[i]!=1) return 0;                 /* multi-resource task */
+        int r=S->demr[i][0];
+        if(r<0||r>=S->nres||S->dema[i][0]<=0) return 0;
+        L->mach[i]=r;
+    }
+    for(int r=0;r<S->nres;r++){
+        for(int i=0;i<n;i++){
+            if(L->mach[i]!=r) continue;
+            for(int j=i+1;j<n;j++){
+                if(L->mach[j]!=r) continue;
+                if(S->dema[i][0]+S->dema[j][0]<=S->rcap[r]) return 0;  /* cumulative */
+            }
+        }
+    }
+    /* precedence successor offsets */
+    int cnt[CP_SHOP_MAXT]; memset(cnt,0,sizeof(cnt));
+    for(int v=0;v<n;v++) for(int q=0;q<S->npred[v];q++){
+        int u=S->pred[v][q];
+        if(u>=0&&u<n) cnt[u]++;
+    }
+    int total=0;
+    for(int u=0;u<n;u++){ L->poff[u]=total; total+=cnt[u]; }
+    L->poff[n]=total;
+    L->psucc=(int*)psolve_malloc((size_t)(total?total:1)*sizeof(int));
+    L->tabu=(int*)psolve_calloc((size_t)n*(size_t)n,sizeof(int));
+    int cur[CP_SHOP_MAXT];
+    for(int u=0;u<n;u++) cur[u]=L->poff[u];
+    for(int v=0;v<n;v++) for(int q=0;q<S->npred[v];q++){
+        int u=S->pred[v][q];
+        if(u>=0&&u<n) L->psucc[cur[u]++]=v;
+    }
+    return 1;
+}
+
+/* machine orders from a start-time vector (semi-active schedule) */
+static void cp_ls_order(CPLS*L,const long long*start){
+    CPShop*S=L->S;
+    int n=S->ntask;
+    unsigned char used[CP_SHOP_MAXT];
+    for(int i=0;i<n;i++){ L->mprev[i]=L->mnext[i]=-1; used[i]=0; }
+    for(int r=0;r<S->nres;r++){
+        L->mfirst[r]=-1;
+        int prev=-1;
+        for(;;){
+            int best=-1;
+            for(int i=0;i<n;i++){
+                if(used[i]||L->mach[i]!=r) continue;
+                if(best<0||start[i]<start[best]||(start[i]==start[best]&&i<best)) best=i;
+            }
+            if(best<0) break;
+            used[best]=1;
+            if(prev<0) L->mfirst[r]=best;
+            else { L->mnext[prev]=best; L->mprev[best]=prev; }
+            prev=best;
+        }
+    }
+}
+
+/* longest paths through the current machine orders; -1 = cycle */
+static long long cp_ls_eval(CPLS*L,long long*hs){
+    CPShop*S=L->S;
+    int n=S->ntask;
+    int *q=L->topo;
+    int qh=0,qt=0;
+    for(int i=0;i<n;i++){
+        hs[i]=S->est[i];
+        L->indeg[i]=S->npred[i]+(L->mprev[i]>=0?1:0);
+        if(!L->indeg[i]) q[qt++]=i;
+    }
+    int seen=0;
+    while(qh<qt){
+        int u=q[qh++]; seen++;
+        long long hu=hs[u]+S->dur[u];
+        for(int k=L->poff[u];k<L->poff[u+1];k++){
+            int v=L->psucc[k];
+            if(hs[v]<hu) hs[v]=hu;
+            if(--L->indeg[v]==0) q[qt++]=v;
+        }
+        int v=L->mnext[u];
+        if(v>=0){
+            if(hs[v]<hu) hs[v]=hu;
+            if(--L->indeg[v]==0) q[qt++]=v;
+        }
+    }
+    if(seen<n) return -1;
+    long long mk=0;
+    for(int i=0;i<n;i++){ long long e=hs[i]+S->dur[i]; if(e>mk) mk=e; }
+    return mk;
+}
+
+/* swap two adjacent operations on their machine */
+static void cp_ls_swap(CPLS*L,int u,int v){
+    int pu=L->mprev[u], nv=L->mnext[v], r=L->mach[u];
+    if(pu>=0) L->mnext[pu]=v; else L->mfirst[r]=v;
+    L->mprev[v]=pu;
+    L->mnext[v]=u; L->mprev[u]=v; L->mnext[u]=nv;
+    if(nv>=0) L->mprev[nv]=u;
+}
+
+/* critical blocks of the current heads, reduced to their machine-order ends:
+   blocks[] holds pairs (first,last) and returns the number of blocks */
+static int cp_ls_blocks(CPLS*L,int*blocks){
+    CPShop*S=L->S;
+    int n=S->ntask;
+    long long mk=0;
+    for(int i=0;i<n;i++){ long long e=L->hs[i]+S->dur[i]; if(e>mk) mk=e; }
+    int cur=-1;
+    for(int i=0;i<n;i++) if(L->hs[i]+S->dur[i]==mk){ cur=i; break; }
+    int nb=0, first=-1, last=-1;
+    while(cur>=0){
+        int p=-1, mach=0;
+        int mp=L->mprev[cur];
+        if(mp>=0&&L->hs[mp]+S->dur[mp]==L->hs[cur]){ p=mp; mach=1; }
+        else for(int q=0;q<S->npred[cur];q++){
+            int u=S->pred[cur][q];
+            if(u>=0&&u<n&&L->hs[u]+S->dur[u]==L->hs[cur]){ p=u; mach=0; break; }
+        }
+        if(mach){
+            if(last<0) last=cur;
+            first=p;
+        } else {
+            if(last>=0&&nb<CP_SHOP_MAXT){ blocks[2*nb]=first; blocks[2*nb+1]=last; nb++; }
+            first=last=-1;
+        }
+        cur=p;
+    }
+    if(last>=0&&nb<CP_SHOP_MAXT){ blocks[2*nb]=first; blocks[2*nb+1]=last; nb++; }
+    return nb;
+}
+
+/* Tabu search over the critical-block neighbourhood.  A plain steepest
+   descent stalls on the first plateau: swapping two operations of a critical
+   block very often leaves the makespan unchanged, and refusing those moves
+   strands the search a few percent above the optimum (8x8: 76 vs 75, 10x10:
+   96 vs 92).  The standard fix is to take the best move available -- equal or
+   worse included -- and forbid its reverse for a short tenure, with the usual
+   aspiration (a move that beats the best schedule is never forbidden). */
+static long long cp_ls_tabu(CPLS*L,long long*hs){
+    int n=L->S->ntask;
+    long long cur=cp_ls_eval(L,hs);
+    if(cur<0) return -1;
+    long long bmk=cur;
+    memcpy(L->keep,hs,(size_t)n*sizeof(long long));
+    /* the width of one tabu phase matters more than the total budget: a few
+       hundred non-improving iterations (i.e. a real walk over the plateaus)
+       is what reaches 75/92-shaped answers, and it also pays for itself by
+       tightening the incumbent the branch and bound prunes with */
+    int tenure=6, iter=0, stale=0, maxstale=40+4*n;
+    for(;;){
+        if(L->evals>=L->evalcap) break;
+        int blocks[2*CP_SHOP_MAXT];
+        int nb=cp_ls_blocks(L,blocks);
+        long long bestv=LLONG_MAX; int bu=-1, bv=-1;
+        for(int b=0;b<nb;b++){
+            int lo=blocks[2*b], hi=blocks[2*b+1];
+            int cand[8]; int nc=0;
+            /* the two boundary pairs inside the block, then the two moves that
+               push the block outwards (Nowicki-Smutnicki N5) */
+            if(L->mprev[hi]>=0){ cand[2*nc]=L->mprev[hi]; cand[2*nc+1]=hi; nc++; }
+            if(L->mnext[lo]>=0){ cand[2*nc]=lo; cand[2*nc+1]=L->mnext[lo]; nc++; }
+            if(L->mprev[lo]>=0){ cand[2*nc]=L->mprev[lo]; cand[2*nc+1]=lo; nc++; }
+            if(L->mnext[hi]>=0){ cand[2*nc]=hi; cand[2*nc+1]=L->mnext[hi]; nc++; }
+            for(int c=0;c<nc;c++){
+                int u=cand[2*c], v=cand[2*c+1];
+                if(u<0||v<0||L->mach[u]!=L->mach[v]||L->mnext[u]!=v) continue;
+                /* forbidden unless it beats the best schedule (aspiration) */
+                int forb=L->tabu[u*n+v]>iter;
+                if(L->evals>=L->evalcap) break;
+                cp_ls_swap(L,u,v); L->evals++;
+                long long t=cp_ls_eval(L,L->tmp);   /* trial heads, hs untouched */
+                cp_ls_swap(L,v,u);                  /* u and v changed places: undo reversed */
+                if(t<0) continue;
+                if(forb&&t>=bmk) continue;
+                if(t<bestv||(t==bestv&&bu>=0&&((L->state>>11)&1))){
+                    bestv=t; bu=u; bv=v;
+                }
+            }
+        }
+        if(bu<0) break;
+        cp_ls_swap(L,bu,bv);
+        L->tabu[bv*n+bu]=iter+tenure;               /* forbid the reverse move */
+        cur=cp_ls_eval(L,hs);
+        if(cur<0) break;
+        if(cur<bmk){
+            bmk=cur; stale=0;
+            memcpy(L->keep,hs,(size_t)n*sizeof(long long));   /* the heads that scored bmk */
+        }
+        else if(++stale>maxstale) break;
+        L->state=L->state*1103515245u+12345u;
+        iter++;
+    }
+    /* hand back the schedule that actually scored bmk, not whatever order the
+       phase happened to stop in: the two differ, and reporting the wrong one
+       makes the incumbent fail cp_verify (the makespan row is checked) */
+    memcpy(hs,L->keep,(size_t)n*sizeof(long long));
+    return bmk;
+}
+
+/* iterated local search from the given starts; overwrites start[] with the
+   best schedule found and returns its makespan (-1 = not applicable) */
+static long long cp_ls_pass(CPLS*L,long long*start,unsigned seed,long long evcap){
+    CPShop*S=L->S;
+    int n=S->ntask;
+    L->state=seed;
+    L->evals=0;
+    L->evalcap=evcap;
+    long long *scratch=(long long*)psolve_malloc((size_t)n*sizeof(long long));
+    cp_ls_order(L,start);
+    long long mk=cp_ls_eval(L,L->hs);
+    long long bmk=mk;
+    if(mk>=0) memcpy(L->besths,L->hs,(size_t)n*sizeof(long long));
+    int rounds=0;
+    while(mk>=0&&L->evals<L->evalcap&&rounds<40){
+        mk=cp_ls_tabu(L,L->hs);
+        if(mk>=0&&mk<bmk){ bmk=mk; memcpy(L->besths,L->hs,(size_t)n*sizeof(long long)); }
+        if(L->evals>=L->evalcap) break;
+        /* restart from the best schedule so far, kicked by one random adjacent
+           swap inside a random machine: the elite restart keeps the phase in a
+           promising basin, the kick gives the tabu walk a new entry point */
+        cp_ls_order(L,L->besths);
+        cp_ls_eval(L,L->hs);
+        for(int tries=0;tries<24;tries++){
+            L->state=L->state*1103515245u+12345u;
+            int r=(int)((L->state>>8)%(unsigned)S->nres);
+            int cnt=0;
+            for(int i=0;i<n;i++) if(L->mach[i]==r) cnt++;
+            if(cnt<2) continue;
+            L->state=L->state*1103515245u+12345u;
+            int k=(int)((L->state>>8)%(unsigned)(cnt-1));
+            int u=L->mfirst[r];
+            for(int q=0;q<k&&u>=0;q++) u=L->mnext[u];
+            if(u<0) continue;
+            int v=L->mnext[u];
+            if(v<0) continue;
+            cp_ls_swap(L,u,v); L->evals++;
+            long long t=cp_ls_eval(L,scratch);
+            if(t<0){ cp_ls_swap(L,v,u); cp_ls_eval(L,L->hs); }   /* cycle: undo (reversed) */
+            else { memcpy(L->hs,scratch,(size_t)n*sizeof(long long)); break; }
+        }
+        rounds++;
+        mk=cp_ls_eval(L,L->hs);
+    }
+    if(bmk>=0) memcpy(start,L->besths,(size_t)n*sizeof(long long));
+    psolve_free(scratch);
+    return bmk;
+}
+
+/* three independent passes with different seeds: the tabu walk is randomized,
+   and on the 8x8/10x10 jobshops the spread between seeds is 1-2 makespans, so
+   the best of three is measurably better than one long run from one seed */
+static long long cp_ls_run(CPShop*S,long long*start){
+    CPLS*L=(CPLS*)psolve_malloc(sizeof(CPLS));
+    if(!L) return -1;
+    if(!cp_ls_init(L,S)){ cp_ls_free(L); psolve_free(L); return -1; }
+    int n=S->ntask;
+    long long evcap=2000+40*(long long)n*(long long)n;
+    static const unsigned seeds[3]={2463534242u,1234567891u,362436069u};
+    long long bmk=-1;
+    for(int pass=0;pass<3;pass++){
+        long long v=cp_ls_pass(L,start,seeds[pass],evcap/3);
+        if(v>=0&&(bmk<0||v<bmk)) bmk=v;
+    }
+    cp_ls_free(L);
+    psolve_free(L);
+    return bmk;
+}
+
 static void cp_shop_rec(CPShop*S,int depth,long long curmax){
     if(S->aborted) return;
     if(++S->nodes>S->nodecap){ S->aborted=1; return; }
@@ -4996,6 +5310,19 @@ static int cp_shop_apply(CP*cp,CPCR*cr,int nc,CPOptCtx*opt,double*outx,long*node
         if(bestmk<S->best){ S->best=bestmk; memcpy(S->beststart,keep,(size_t)S->ntask*sizeof(long long)); }
         for(int i=0;i<S->ntask;i++){ S->placed[i]=0; S->start[i]=0; }
         for(int r=0;r<S->nres;r++) memset(S->load[r],0,(size_t)S->horizon*sizeof(int));
+    }
+    /* the dispatch rules land a few percent above the optimum; a critical-block
+       descent on the disjunctive graph closes most of that, and a tight
+       incumbent is exactly what lets the branch and bound prune.  Restricted
+       to models with precedence (jobshop shape): without it the SGS already
+       produces near-optimal active schedules. */
+    if(S->npred_total>0){
+        memcpy(S->start,S->beststart,(size_t)S->ntask*sizeof(long long));
+        long long v=cp_ls_run(S,S->start);
+        if(v>=0&&v<S->best){
+            S->best=v;
+            memcpy(S->beststart,S->start,(size_t)S->ntask*sizeof(long long));
+        }
     }
     if(S->npred_total>0){ S->deadline=0.02; clock_gettime(CLOCK_MONOTONIC,&S->t_start); }
     cp_shop_rec(S,0,0);

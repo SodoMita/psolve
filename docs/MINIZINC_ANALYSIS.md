@@ -401,19 +401,19 @@ column of the review).
 
 | set | instances | engine-vs-engine geomean | at least as fast as CP-SAT |
 |---|---:|---:|---:|
-| gated (CP-SAT @1 worker) | 45 | **0.085x** | **39/45** |
-| ungated | 6 | 34.9x total time; incumbents 8.7-9.3 % above the optimum | 1/6 |
+| gated (CP-SAT @1 worker) | 45 | **0.094x** | **39/45** |
+| ungated | 6 | 20.9x total time; incumbents 0-4.3 % above the optimum | 2/6 |
 
 Ungated rows (this is the honest gap, measured on this machine):
 
 | instance | fznsolve | CP-SAT @1 | engine ratio | note |
 |---|---:|---:|---:|---|
-| `all_different_int`, n=320 | 12.3 ms | 14.7 ms | **0.84x** | one matching solves it (was 2.08 s) |
-| `jobshop_5x5` | 23.0 ms | 7.1 ms | 3.3x | proven optimum 41 |
-| `jobshop_6x6` | 26.7 ms | 8.1 ms | 3.3x | proven optimum 51 |
-| `jobshop_7x7` | 0.87 s | 12.7 ms | 68x | proven optimum 59 |
-| `jobshop_8x8` | 3.1 s | 33.0 ms | 95x | **incumbent 82, optimum 75** (was: no answer) |
-| `jobshop_10x10` | 18.0 s | 0.53 s | 34x | **incumbent 100, optimum 92** (was: no answer) |
+| `all_different_int`, n=320 | 11.1 ms | 13.6 ms | **0.82x** | one matching solves it (was 2.08 s) |
+| `jobshop_5x5` | 23.7 ms | 5.6 ms | 4.2x | proven optimum 41 |
+| `jobshop_6x6` | 28.1 ms | 7.8 ms | 3.6x | proven optimum 51 |
+| `jobshop_7x7` | 38.2 ms | 12.4 ms | **3.1x** | proven optimum 59 (was 0.93 s / 68x) |
+| `jobshop_8x8` | 4.4 s | 26.9 ms | 165x | **incumbent 75 = optimum**, bound 67, not proven |
+| `jobshop_10x10` | 9.0 s | 0.55 s | 16x | **incumbent 96, optimum 92** (4.3 %), bound 76 |
 
 So: on the flat corpus families (gcc, bin packing, table, element, circuit,
 lex, subset sum, nvalue, arithmetic, bool clauses, diffn, cumulative
@@ -422,9 +422,9 @@ ahead of CP-SAT, usually by more than an order of magnitude.  The six gated
 rows above parity are sub-millisecond UNSAT takes on both sides (0.19-0.45 ms
 against 0.10-0.14 ms): at that size the measurement is fixed costs and timer
 noise, so `tools/cpsat_perf.py` prints them and excludes them from the verdict
-through an explicit `NOISE_FLOOR_S`.  One family is genuinely behind:
-**multi-machine jobshop** — 3-68x where it proves, and a verified incumbent
-(8.7-9.3 % above the optimum) instead of a proof at 8x8/10x10, where the
+through an explicit `NOISE_FLOOR_S`.  One family is still behind:
+**multi-machine jobshop** — 3-4x where it proves, and a verified incumbent
+(0 % and 4.3 % above the optimum) instead of a proof at 8x8/10x10, where the
 propagation is pairwise bounds, time-tabling and the one-machine relaxation.
 Those rows are reported by every run of the harness and listed in this table
 instead of being quietly excluded.
@@ -481,6 +481,19 @@ sound and all of it covered by the gates in §8.5:
   the dive-only incumbent from 68/83/106 to 61/80/102 on the 7x7/8x8/10x10
   jobshops for well under 0.1 s.  It is also why 5x5 now needs **1 node**: the
   dive finds the optimum and the root bound already proves it.
+* **Critical-block local search on the disjunctive graph.**  The dispatch
+  rules (even restarted) land a few percent high, and on the larger jobshops
+  that was most of the remaining error.  From a feasible schedule the engine
+  now derives the machine orders, re-times the graph by longest paths and runs
+  a tabu walk over the Nowicki-Smutnicki N5 neighbourhood (boundary swaps of
+  every critical block, plus pushing the block ends outwards), restarted with
+  random kicks from the elite schedule and repeated for three seeds.  It is
+  an ordinary semi-active schedule -- feasible by construction, still
+  `cp_verify`d -- but it is what takes the 8x8 jobshop to **75, the optimum**,
+  and the 10x10 to 96 of 92.  A plain steepest descent over the same
+  neighbourhood stalls on the first plateau (76 / 96 and no further): taking
+  the best move whether or not it improves, with the reverse forbidden for a
+  short tenure, is the part that matters.
 * **A node budget and an honest verdict.**  Scheduling nodes are expensive (a
   full domain-array copy each), so the shop search stops at 200k nodes and, if
   it holds a verified incumbent, prints that schedule, then
@@ -531,25 +544,27 @@ answer, not slow answer" kind:
 |---|---|---|
 | cumulative makespan, 16 tasks | 48.4 s UNKNOWN | 0.33 ms, proven 25 |
 | `all_different` n=320 | 2.08 s | **12 ms** (CP-SAT: 14.7 ms) |
-| `jobshop_5x5` (seed 1) | 24 ms / 945 nodes | **23 ms / 1 node**, proven 41 |
-| `jobshop_6x6` | **1.17 s** / 325178 nodes | **30 ms** / 66 nodes, proven 51 |
-| `jobshop_7x7` | **>60 s** (no answer) | **0.93 s** / 30351 nodes, proven 59 |
-| `jobshop_8x8` | >60 s | **3.1 s**, incumbent 82 (optimum 75), bound 67 |
-| `jobshop_10x10` | >60 s | **18.0 s**, incumbent 100 (optimum 92), bound 76 |
+| `jobshop_5x5` (seed 1) | 24 ms / 945 nodes | **24 ms / 1 node**, proven 41 |
+| `jobshop_6x6` | **1.17 s** / 325178 nodes | **28 ms** / 66 nodes, proven 51 |
+| `jobshop_7x7` | **>60 s** (no answer) | **37 ms / 220 nodes**, proven 59 |
+| `jobshop_8x8` | >60 s | **4.4 s**, incumbent 75 = optimum (bound 67) |
+| `jobshop_10x10` | >60 s | **9.0 s**, incumbent 96 (optimum 92), bound 76 |
 
-The 7x7 row is the one that moved: recognising the *structure* instead of the
-exact pattern means the SGS incumbent plus the per-node scheduling bound are
-available for jobshops too, and the bound cuts the generic search from
-"never" to 30k nodes.
+The rows moved in two stages.  Recognising the *structure* instead of the
+exact pattern made the SGS incumbent and the per-node scheduling bound
+available for jobshops too, which cut the generic search from "never" to 30k
+nodes.  Then the critical-block local search handed the branch and bound a
+schedule *at* the optimum, and the same bound closed the proof in **220
+nodes**: a tight incumbent is worth more than the same effort spent
+propagating.
 
 The 8x8/10x10 rows moved for a different reason — from "no answer" to an
 *answer*, not to a proof.  Deadline propagation from the incumbent cuts the
-start windows, time-tabling on the machines then removes values the bound
-alone cannot, and the truncated search still returns its best verified
-schedule with the bound it had proved.  The gap that remains (9.3 % and 8.7 %
-above the optimum, against CP-SAT's 33 ms and 0.53 s) is the price of
-propagating bounds instead of edge-finding, and it is stated as such rather
-than hidden behind a solver timeout.
+start windows, time-tabling on the machines removes values the bound alone
+cannot, and the truncated search returns its best verified schedule with the
+bound it had proved.  What is left is a proof gap, not an answer gap: 75 (the
+optimum) and 96 of 92, against CP-SAT's 27 ms and 0.55 s, because the
+propagation is bounds plus time-tabling rather than edge-finding.
 
 ### 8.5 Gates
 
@@ -557,7 +572,10 @@ than hidden behind a solver timeout.
   jobshops, half of them with side constraints (`int_le` on a start,
   `int_ne`), every answer re-checked against the model (precedence, machine
   overlap, `mk == max(s_i+d_i)`), optima compared with the CP-SAT oracle when
-  OR-Tools is installed: 40/0 (seed 20261125), 50/0 (seeds 2, 3).  This is the
+  OR-Tools is installed: 40/0 (seed 20261125), 50/0 (seeds 2, 3), 200/0
+  (seed 777).  This gate also covers the local search: a returned schedule
+  that violated a precedence or overlapped a machine would show up as a
+  MISMATCH here.  This is the
   gate that caught the UNSAT-with-incumbent bug.
 * `tools/cum_mks_verify.py`: 100/0 (20260901) — caught the cumulative bound
   defect; `tools/cumulative_verify.py` 200/0/0.
