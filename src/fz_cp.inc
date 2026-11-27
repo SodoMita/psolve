@@ -28,6 +28,12 @@
 
 #define CP_MAXVALS   65536L
 #define CP_MAXNODES  2000000L
+/* Scheduling models get a smaller budget: their nodes are expensive (a full
+   domain-array copy each) and 2e6 nodes is 36 s on an 8x8 jobshop and 210 s on
+   a 10x10 one, for instances that are not provable at any node count we can
+   reach.  Every proven case so far needs far less (7x7: 31k), so the budget
+   only decides how long we keep trying before reporting the incumbent. */
+#define CP_MAXNODES_SHOP 200000L
 #define CP_BIG       ((int64_t)INT64_C(1)<<50)
 
 typedef struct {
@@ -259,11 +265,11 @@ static int cp_term_from_lin(const Lin*l,CPT*t){
    models on the CP engine instead of the far weaker LP/MIP bridge. */
 static int cp_term_from_lin_affine(const Lin*l,CPT*t){
     cp_term_from_lin(l,t);
-    if(l->n==1 && fabs(l->coef[0]-1.0)<1e-9 && fabs(l->constant)<=CP_BIG &&
+    if(l->n==1 && fabs(l->coef[0]-1.0)<1e-9 && fabs(l->constant)<=CP_BIG &&   /* TOLSHEET TOL-CP-UNIT */
        l->constant==rint(l->constant)){
         t->isc=0; t->v=l->idx[0]; t->c=0; t->off=(int64_t)l->constant; return 0;
     }
-    return (t->isc||(l->n==1&&fabs(l->coef[0]+1.0)<1e-9&&fabs(l->constant)<1e-9))?0:-1;
+    return (t->isc||(l->n==1&&fabs(l->coef[0]+1.0)<1e-9&&fabs(l->constant)<1e-9))?0:-1;  /* TOLSHEET TOL-CP-UNIT */
 }
 static int cp_term_value(const CP*cp,const CPT*t,int64_t*out){
     if(t->isc){ *out=t->c; return 1; }
@@ -923,6 +929,77 @@ static int cp_prop_arrmm(CP*cp,CPCR*r){
 /* CPK_DISJ: forall i<j: s_i+d_i <= s_j OR s_j+d_j <= s_i.  Sound pairwise
    bound reasoning: if one order is impossible given current bounds, the
    other is forced (prune inside current bounds only). */
+/* Remove every value in [a,b] from one variable's domain.  Bounded variables
+   carry an explicit value list, so an interior hole is exact; an interval
+   domain can only lose a prefix/suffix (the caller knows that is sound too,
+   because the removed window touches the domain edge). */
+static int cp_remove_range(CP*cp,int v,int64_t a,int64_t b){
+    if(a>b) return 0;
+    if(b<cp_dmin(cp,v)||a>cp_dmax(cp,v)) return 0;      /* no overlap */
+    if(!cp->bounded[v]){
+        int rc=0;
+        if(a<=cp->lo[v]){
+            int64_t nhi=b+1;
+            if(nhi>cp->hi[v]) nhi=cp->hi[v];
+            rc=cp_intersect(cp,v,nhi,cp->hi[v]);
+        } else if(b>=cp->hi[v]){
+            int64_t nlo=a-1;
+            if(nlo<cp->lo[v]) nlo=cp->lo[v];
+            rc=cp_intersect(cp,v,cp->lo[v],nlo);
+        }
+        return rc;
+    }
+    int w=0;
+    for(int i=0;i<cp->nvals[v];i++){
+        int64_t x=cp->vals[v][i];
+        if(x<a||x>b) cp->vals[v][w++]=x;
+    }
+    if(w==cp->nvals[v]) return 0;
+    cp->nvals[v]=w; cp->mutations++;
+    cp->lo[v]= w?cp->vals[v][0]:INT64_MAX;
+    cp->hi[v]= w?cp->vals[v][w-1]:INT64_MIN;
+    return w?0:1;
+}
+
+/* Time-tabling for a unary machine (classical "compulsory part" filtering).
+   Task k must start in [est_k, lst_k], so every schedule of it covers the
+   interval C_k = [lst_k, est_k + d_k).  The machine is unary, therefore no
+   other task may overlap C_k whatever value s_k takes, so each other task j
+   must fit entirely before or entirely after it:
+       s_j + d_j <= lst_k     or     s_j >= est_k + d_k.
+   Nothing here depends on a deadline, an incumbent or the objective: it only
+   uses the current start domains and the constant durations of the
+   `disjunctive` record.  Pairwise bounds alone never learn this, and it is
+   the cheapest of the classical one-machine rules to get provably right. */
+static int cp_prop_disj_tt(CP*cp,CPCR*r){
+    int n=r->n;
+    for(int i=0;i<n;i++) if(!r->terms[i].isc) return 0;   /* constant durations only */
+    for(int k=0;k<n;k++){
+        CPT*Sk=&r->arr_terms[k];
+        if(Sk->isc) continue;
+        int64_t dk=r->terms[k].c;
+        if(dk<=0) continue;
+        int64_t est=cp_dmin(cp,Sk->v), lst=cp_dmax(cp,Sk->v);
+        long long lo=lst, hi=(long long)est+dk;
+        if(lo>=hi) continue;                       /* no compulsory part */
+        for(int j=0;j<n;j++){
+            if(j==k) continue;
+            CPT*Sj=&r->arr_terms[j];
+            int64_t dj=r->terms[j].c;
+            if(dj<=0) continue;
+            if(Sj->isc){
+                if(!((long long)Sj->c+dj<=lo || (long long)Sj->c>=hi)) return 1;
+                continue;
+            }
+            /* skip the scan when the forbidden window misses the domain
+               entirely: this is the inner loop of every node */
+            if(lo-dj+1>cp_dmax(cp,Sj->v) || hi-1<cp_dmin(cp,Sj->v)) continue;
+            if(cp_remove_range(cp,Sj->v,lo-dj+1,hi-1)) return 1;
+        }
+    }
+    return 0;
+}
+
 static int cp_prop_disj(CP*cp,CPCR*r){
     int n=r->n;
     for(int i=0;i<n;i++) for(int j=i+1;j<n;j++){
@@ -942,14 +1019,14 @@ static int cp_prop_disj(CP*cp,CPCR*r){
             if(!Si->isc && cp_intersect(cp,Si->v,sjlo+djlo,sihi)) return 1;
             if(Si->isc && Si->c < sjlo+djlo) return 1;
         }
-        if(!j_before){ /* force i before j: s_i+d_i <= s_j */
+            if(!j_before){ /* force i before j: s_i+d_i <= s_j */
             if(!Si->isc && cp_intersect(cp,Si->v,silo,sjhi-dilo)) return 1;
             if(!Di->isc && cp_intersect(cp,Di->v,dilo,sjhi-silo)) return 1;
             if(!Sj->isc && cp_intersect(cp,Sj->v,silo+dilo,sjhi)) return 1;
             if(Sj->isc && Sj->c < silo+dilo) return 1;
         }
     }
-    return 0;
+    return cp_prop_disj_tt(cp,r);
 }
 
 /* CPK_GCC / CPK_GCCLU: counts (or l/u bounds) of each cover value among x.
@@ -4062,11 +4139,10 @@ static int cp_solve_rec(CP*cp,CPCR*cr,int nc,unsigned char*searchme,double*outx,
        a parent's counter into the child), so an instance-local count would
        report path depth instead of total explored nodes */
     (*nodectr)++;
-    if(*nodectr>CP_MAXNODES) return (all||opt)?4:-1;
+    if(*nodectr>(shop?CP_MAXNODES_SHOP:CP_MAXNODES)) return (all||opt)?4:-1;
     int pr=cp_propagate(cp,cr,nc);
     if(pr==1) return 0;
     if(pr==-1) return -1;
-    if(shop&&cp_shop_push_bound(cp,shop)) return 0;
     if(opt&&opt->have){
         __int128 act;
         if(cp_opt_activity(cp,opt,&act)){
@@ -4082,6 +4158,9 @@ static int cp_solve_rec(CP*cp,CPCR*cr,int nc,unsigned char*searchme,double*outx,
         if(bt==1) return 0;              /* objective row infeasible below incumbent */
         if(bt==2){ pr=cp_propagate(cp,cr,nc); if(pr==1) return 0; if(pr==-1) return -1; }
     }
+    /* after the incumbent has been pushed into mk: the scheduling bound and
+       its deadline propagation see the tightened makespan ceiling */
+    if(shop&&cp_shop_push_bound(cp,shop)) return 0;
     /* Scheduling models: branch on the start of the most urgent task (the
        one with the smallest latest start) instead of the first variable with
        the smallest domain.  Value enumeration then commits a task to one
@@ -4522,9 +4601,21 @@ static long long cp_shop_remaining_lb(CPShop*S,long long curmax){
 static int cp_shop_push_bound(CP*cp,CPShop*S){
     if(!S||S->ntask<1||S->mk<0) return 0;
     long long lb=0;
+    /* Deadline propagation from the makespan ceiling.  With M the current
+       upper bound on mk, every solution still inside it satisfies
+       s_i + d_i + tail_i <= mk <= M, so each start is capped by M - tail_i -
+       d_i.  This is what makes the machine propagators bite: without it the
+       start windows stay at the raw horizon until the very end of the search,
+       so time-tabling finds no compulsory part and pairwise bounds are weak. */
+    long long M=cp_dmax(cp,S->mk);
     for(int i=0;i<S->ntask;i++){
         int64_t lo=cp_dmin(cp,S->sv[i]);
         if(lo>=(INT64_C(1)<<60)) return 0;          /* wild: decline */
+        long long cap=(long long)M-S->tail[i]-S->dur[i];
+        if(cap<lo) return 1;                        /* no schedule inside M */
+        if(cap<cp_dmax(cp,S->sv[i])){
+            if(cp_intersect(cp,S->sv[i],lo,(int64_t)cap)) return 1;
+        }
         long long v=(long long)lo+S->dur[i]+S->tail[i];
         if(v>lb) lb=v;
     }
@@ -4564,12 +4655,17 @@ static int cp_shop_push_bound(CP*cp,CPShop*S){
    task with the best priority at its earliest feasible start.  `rule` selects
    the priority, `jitter` perturbs it (GRASP-style restarts).  Returns the
    makespan of the complete schedule, or -1 when the dive gets stuck. */
-static long long cp_shop_greedy(CPShop*S,int rule,long long scale,unsigned rng){
+static long long cp_shop_greedy(CPShop*S,int rule,int rcl,unsigned *state){
     for(int i=0;i<S->ntask;i++){ S->placed[i]=0; S->start[i]=0; }
     for(int r=0;r<S->nres;r++) memset(S->load[r],0,(size_t)S->horizon*sizeof(int));
     long long curmax=0;
+    long long *key=(long long*)psolve_malloc((size_t)S->ntask*sizeof(long long));
+    long long *est=(long long*)psolve_malloc((size_t)S->ntask*sizeof(long long));
+    unsigned char *cand=(unsigned char*)psolve_calloc((size_t)S->ntask,1);
+    int *top=(int*)psolve_malloc((size_t)S->ntask*sizeof(int));
+    int rc_ok=1;
     for(int step=0;step<S->ntask;step++){
-        int pick=-1; long long pick_e=0; long long pick_key=0; unsigned pick_r=0;
+        int nready=0;
         for(int i=0;i<S->ntask;i++){
             if(S->placed[i]) continue;
             int ready=1;
@@ -4577,20 +4673,32 @@ static long long cp_shop_greedy(CPShop*S,int rule,long long scale,unsigned rng){
             if(!ready) continue;
             long long e=cp_shop_earliest(S,i,S->hi_mk+1);
             if(e<0) continue;
-            unsigned h=rng*(unsigned)(i+1); rng=h*1103515245u+12345u;
-            long long key;
-            /* smaller key = higher priority */
-            if(rule==0)      key=-S->dur[i];                 /* shortest first */
-            else if(rule==1) key=-S->tail[i];                /* most work left */
-            else if(rule==2) key=S->dur[i];                  /* longest first */
-            else             key=-(S->tail[i]+S->dur[i]);    /* MWKR+duration */
-            /* `scale`=0 is the pure rule; 1 adds a bounded random nudge so the
-               restarts explore different orders (GRASP) */
-            key=key*1024+(long long)((h>>16)&1023)*scale;
-            if(pick<0||key<pick_key||(key==pick_key&&e<pick_e)){ pick=i; pick_e=e; pick_key=key; pick_r=h; }
+            if(rule==0)      key[i]=-S->dur[i];                 /* shortest first */
+            else if(rule==1) key[i]=-S->tail[i];                /* most work left */
+            else if(rule==2) key[i]=S->dur[i];                  /* longest first */
+            else             key[i]=-(S->tail[i]+S->dur[i]);    /* MWKR + duration */
+            est[i]=e;
+            cand[i]=1;
+            nready++;
         }
-        (void)pick_r;
-        if(pick<0) return -1;                       /* stuck: dead dive */
+        if(nready==0){ rc_ok=0; break; }                    /* stuck: dead dive */
+        /* restricted candidate list: take the `rcl` best by priority and pick
+           one uniformly.  A deterministic best-first rule makes every restart
+           produce the same schedule, which is why this list is the part that
+           makes the restarts worth running. */
+        int ntop=0;
+        for(int k=0;k<rcl&&k<nready;k++){
+            int besti=-1;
+            for(int i=0;i<S->ntask;i++){
+                if(!cand[i]) continue;
+                if(besti<0||key[i]<key[besti]||(key[i]==key[besti]&&est[i]<est[besti])) besti=i;
+            }
+            if(besti<0) break;
+            cand[besti]=0;
+            top[ntop++]=besti;
+        }
+        *state=(*state)*1103515245u+12345u;
+        int pick=top[ntop?(*state>>8)%(unsigned)ntop:0];
         long long e=cp_shop_earliest(S,pick,S->hi_mk+1);
         long long comp=e+S->dur[pick];
         for(int q=0;q<S->ndem[pick];q++){
@@ -4600,17 +4708,18 @@ static long long cp_shop_greedy(CPShop*S,int rule,long long scale,unsigned rng){
         }
         S->placed[pick]=1; S->start[pick]=e;
         if(comp>curmax) curmax=comp;
+        for(int i=0;i<S->ntask;i++) cand[i]=0;
     }
-    return curmax;
+    psolve_free(key); psolve_free(est); psolve_free(cand); psolve_free(top);
+    return rc_ok ? curmax : -1;
 }
-
 
 static void cp_shop_rec(CPShop*S,int depth,long long curmax){
     if(S->aborted) return;
     if(++S->nodes>S->nodecap){ S->aborted=1; return; }
     if(S->deadline>0 && (S->nodes&511)==0){
         struct timespec now; clock_gettime(CLOCK_MONOTONIC,&now);
-        double el=(now.tv_sec-S->t_start.tv_sec)+(now.tv_nsec-S->t_start.tv_nsec)*1e-9;
+        double el=(now.tv_sec-S->t_start.tv_sec)+(now.tv_nsec-S->t_start.tv_nsec)*1e-9;  /* TOLSHEET TOL-SYS-NSEC */
         if(el>S->deadline){ S->aborted=1; return; }
     }
     if(depth==S->ntask){
@@ -4675,6 +4784,125 @@ static void cp_shop_rec(CPShop*S,int depth,long long curmax){
    0 = not applicable (or node cap hit).  When `out_shop` is given and the
    generic search still has to run, the extracted structure is handed back so
    that every node can push the scheduling bound into mk (cp_shop_push_bound). */
+/* Exact solver for a model that is nothing but all_different constraints over
+   disjoint variable sets (e.g. `all_different_int` on a permutation domain, or
+   a pigeonhole instance).  Such a model is a bipartite matching problem, so a
+   maximum matching *is* a witness: Kuhn's algorithm on each component gives a
+   solution in one pass, and Hall's theorem turns "no perfect matching" into a
+   proof of UNSATISFIABILITY.  The general search reaches the same answers by
+   enumerating values, which costs 2 s for n=320 -- CP-SAT solves the same
+   instance in 14 ms, and so does this.
+
+   Declines (returns 0) unless the model really is that shape: any other
+   constraint kind, an objective, overlapping variable sets, `-a` enumeration,
+   or an unbounded/uncovered searchable variable.  Every constructed schedule
+   is re-checked with cp_verify before it is reported.
+   Returns 1 (solved), -1 (proven UNSAT) or 0 (not this shape). */
+static int cp_alldiff_apply(CP*cp,CPCR*cr,int nc,unsigned char*searchme,
+                            double*outx,long*nodes){
+    if(nc<1) return 0;
+    for(int i=0;i<nc;i++) if(cr[i].kind!=CPK_ALLDIFF) return 0;
+    for(int v=0;v<cp->nvars;v++){
+        if(!searchme[v]) continue;
+        if(!cp->bounded[v]||cp->nvals[v]<1) return 0;
+    }
+    unsigned char *seen=(unsigned char*)psolve_calloc((size_t)(cp->nvars?cp->nvars:1),1);
+    int covered=0,decline=0;
+    for(int i=0;i<nc&&!decline;i++){
+        for(int k=0;k<cr[i].n;k++){
+            CPT*t=&cr[i].terms[k];
+            if(t->isc) continue;
+            int v=t->v;
+            if(v<0||v>=cp->nvars||!cp->bounded[v]||cp->nvals[v]<1){ decline=1; break; }
+            if(seen[v]){ decline=1; break; }        /* overlapping components */
+            seen[v]=1; covered++;
+        }
+    }
+    if(!decline)
+        for(int v=0;v<cp->nvars;v++) if(searchme[v]&&!seen[v]){ decline=1; break; }
+    if(decline){ psolve_free(seen); return 0; }
+
+    /* every covered variable starts at its domain minimum; the matching then
+       gives each component a distinct value among what is still available */
+    for(int v=0;v<cp->nvars;v++) if(seen[v]) outx[v]=(double)cp->vals[v][0];
+
+    long long adjcount=0;
+    for(int i=0;i<nc&&!decline;i++){
+        int nfree=0;
+        for(int k=0;k<cr[i].n;k++) if(!cr[i].terms[k].isc) nfree++;
+        if(nfree==0) continue;
+        /* value universe of this component (terms carry an offset: x+off) */
+        int64_t *vs=NULL; int vc=0,vcap=0;
+        for(int k=0;k<cr[i].n;k++){
+            CPT*t=&cr[i].terms[k];
+            if(t->isc) continue;
+            for(int q=0;q<cp->nvals[t->v];q++){
+                int64_t val=cp->vals[t->v][q]+t->off;
+                int dup=0;
+                for(int z=0;z<vc;z++) if(vs[z]==val){ dup=1; break; }
+                if(dup) continue;
+                if(vc>=vcap){ vcap=vcap?vcap*2:64; vs=(int64_t*)psolve_realloc((void**)&vs,(size_t)vcap*sizeof(int64_t)); }
+                vs[vc++]=val;
+            }
+        }
+        adjcount+=(long long)nfree*(long long)(vc?vc:1);
+        if(adjcount>4000000){ psolve_free(vs); decline=1; break; }
+        /* a constant term owns its value: drop it from the variables' columns */
+        unsigned char *taken=(unsigned char*)psolve_calloc((size_t)(vc?vc:1),1);
+        for(int k=0;k<cr[i].n;k++){
+            CPT*t=&cr[i].terms[k];
+            if(!t->isc) continue;
+            for(int z=0;z<vc;z++) if(vs[z]==t->c){
+                if(taken[z]){ psolve_free(vs); psolve_free(taken); psolve_free(seen); *nodes=0; return -1; }
+                taken[z]=1;
+            }
+        }
+        ADJ *adj=(ADJ*)psolve_calloc((size_t)nfree,sizeof(ADJ));
+        int *rows=(int*)psolve_malloc((size_t)nfree*sizeof(int));
+        int r=0;
+        for(int k=0;k<cr[i].n;k++){
+            CPT*t=&cr[i].terms[k];
+            if(t->isc) continue;
+            rows[r]=k;
+            int *tmp=NULL,tn=0,cap2=0;
+            for(int z=0;z<vc;z++){
+                if(taken[z]) continue;
+                if(!cp_contains(cp,t->v,vs[z]-t->off)) continue;
+                if(tn>=cap2){ cap2=cap2?cap2*2:8; tmp=(int*)psolve_realloc((void**)&tmp,(size_t)cap2*sizeof(int)); }
+                tmp[tn++]=z;
+            }
+            adj[r].col=tmp; adj[r].n=tn; r++;
+        }
+        int *matchR=(int*)psolve_malloc((size_t)(vc?vc:1)*sizeof(int));
+        for(int z=0;z<vc;z++) matchR[z]=-1;
+        int matches=0;
+        for(int q=0;q<nfree;q++){
+            int *sn=(int*)psolve_calloc((size_t)(vc?vc:1),sizeof(int));
+            if(cp_aug(q,matchR,sn,adj,vc)) matches++;
+            psolve_free(sn);
+        }
+        if(matches<nfree){
+            /* Hall violated inside one all_different: this model is UNSAT */
+            for(int q=0;q<nfree;q++) psolve_free(adj[q].col);
+            psolve_free(adj); psolve_free(rows); psolve_free(matchR);
+            psolve_free(taken); psolve_free(vs); psolve_free(seen);
+            *nodes=0; return -1;
+        }
+        for(int z=0;z<vc;z++) if(matchR[z]>=0){
+            CPT*t=&cr[i].terms[rows[matchR[z]]];
+            outx[t->v]=(double)(vs[z]-t->off);
+        }
+        for(int q=0;q<nfree;q++) psolve_free(adj[q].col);
+        psolve_free(adj); psolve_free(rows); psolve_free(matchR);
+        psolve_free(taken); psolve_free(vs);
+    }
+    psolve_free(seen);
+    if(decline) return 0;
+    if(!cp_verify(cp,cr,nc,outx)) return 0;     /* never report an unverified witness */
+    *nodes=0;
+    return 1;
+}
+
 static int cp_shop_apply(CP*cp,CPCR*cr,int nc,CPOptCtx*opt,double*outx,long*nodes,CPShop**out_shop){
     if(out_shop) *out_shop=NULL;
     if(!opt||!opt->idx||!opt->coef||opt->n!=1||opt->coef[0]!=1||opt->sense!=1) return 0;
@@ -4751,11 +4979,13 @@ static int cp_shop_apply(CP*cp,CPCR*cr,int nc,CPOptCtx*opt,double*outx,long*node
            are sized for exactly that, so never go past it */
         long long saved_hi=S->hi_mk;
         if(S->hi_mk<(long long)S->horizon) S->hi_mk=S->horizon;
-        unsigned rs=12345u;
+        unsigned rs=987654321u;
         for(int rule=0;rule<4;rule++){
-            for(int rep=0;rep<8;rep++){
-                long long v=cp_shop_greedy(S,rule,rep==0?0:1,
-                                           rs+rep*7919u+rule*104729u);
+            for(int rep=0;rep<64;rep++){
+                /* rep==0 is the pure rule, then a widening RCL for GRASP
+                   restarts (bigger lists for bigger instances) */
+                int rcl=(rep==0)?1:(2+(rep%3));
+                long long v=cp_shop_greedy(S,rule,rcl,&rs);
                 if(v>=0&&v<bestmk){
                     bestmk=v;
                     memcpy(keep,S->start,(size_t)S->ntask*sizeof(long long));
@@ -4971,6 +5201,22 @@ static int fz_cp_try(const FZModel*m,FZSolution*sol){
 
     double *outx=sol->x; /* sized nv */
 
+    /* pure all_different models are bipartite matching problems (see
+       cp_alldiff_apply): one maximum matching per component is the witness,
+       and a component that cannot be matched proves UNSATISFIABILITY */
+    if(m->solve_kind==0 && !all){
+        long ad_nodes=0;
+        int ar=cp_alldiff_apply(&cp,cr,nc,searchme,outx,&ad_nodes);
+        if(ar==1||ar==-1){
+            sol->status=(ar==1)?0:1; sol->nodes=ad_nodes;
+            cp_free(&cp);
+            for(int i=0;i<nc;i++){ cp_cr_aux_free(&cr[i]); psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);psolve_free(cr[i].terms2);psolve_free(cr[i].terms3);} psolve_free(cr);
+            psolve_free(referenced); psolve_free(searchme);
+            psolve_free(opt.bestx); psolve_free(optcoef);
+            return 1;
+        }
+    }
+
     /* dedicated scheduler for models with a scheduling structure (see
        cp_shop_apply): exact when the model *is* the structure, otherwise a
        verified incumbent plus the root bound pushed into mk */
@@ -5064,6 +5310,18 @@ static int fz_cp_try(const FZModel*m,FZSolution*sol){
     }
     else if(all && (rr==3)){ if(suspect){ handled=0; } else { sol->status=0; sol->nodes=cp_nodes; } }
     else if(all && rr==4){ sol->nodes=cp_nodes; sol->status=4; }
+    else if(rr==4 && opt.bestx && opt.have && shop){
+        /* Node limit reached with a verified incumbent in hand.  The engine
+           cannot prove optimality, but the schedule is a real answer: report
+           it together with the proven lower bound and the UNKNOWN verdict
+           (status 5 prints the solution and then `=====UNKNOWN=====`), instead
+           of throwing the incumbent away.  This is what turns the 8x8/10x10
+           jobshops from "no output at all" into a usable schedule. */
+        memcpy(sol->x,opt.bestx,(size_t)nv*sizeof(double));
+        sol->obj=(double)opt.best+(double)opt.c0;
+        sol->best_bound=(double)shop->lo_mk+(double)opt.c0;
+        sol->status=5; sol->nodes=cp_nodes;
+    }
     else if(opt.bestx && rr==3){
         /* A rejected leaf is an infeasible assignment, not a hole in the
            search: propagation only ever removes values that appear in no

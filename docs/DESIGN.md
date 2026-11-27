@@ -332,7 +332,7 @@ hand-written input with deliberate sub-width perturbations observes it.
 
 | ID | site | value | class | direction |
 |---|---|---|---|---|
-| TOL-CP-UNIT | fz_cp.inc:222, 223 | 1e-9 | R | unit-term recognition (±1 coef, 0 const) in `cp_term_from_lin`; a miss makes the *constraint* decline to the honest path — a widened accept only fires on flattener-exact data |
+| TOL-CP-UNIT | fz_cp.inc:222, 223; `cp_term_from_lin_affine` (`fz_cp.inc`, the `1*x+k` accept) | 1e-9 | R | unit-term recognition (±1 coef, 0 const) in `cp_term_from_lin`; a miss makes the *constraint* decline to the honest path — a widened accept only fires on flattener-exact data |
 
 The CP engine is otherwise integer-exact: domain stores are `int64` sets
 and the propagators (incl. the functional-graph family) compare exactly.
@@ -360,7 +360,7 @@ oversight.
 
 | ID | site | value | class | why it is not a tolerance |
 |---|---|---|---|---|
-| TOL-SYS-NSEC | main.c:109 | 1e9 | — | nanosecond→second unit conversion for wall-clock reporting; steers no verdict, bound, or branch |
+| TOL-SYS-NSEC | main.c:109; `cp_shop_rec` (`fz_cp.inc`, wall-clock deadline check) | 1e9 | — | nanosecond→second unit conversion for wall-clock reporting; steers no verdict, bound, or branch |
 
 ### 8.9 Unified evidence objects (verdict certificates) — `src/cert.c`, `src/cert.h`, wiring in `src/main.c`
 

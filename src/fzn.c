@@ -5460,6 +5460,12 @@ void fz_print_solution(const FZModel*m,const FZSolution*sol)
             fz_print_one_solution(m,sol->x,sol->nvars);
             if(m->solve_kind!=0) printf("==========\n");
         } else if(sol->status==1)printf("=====UNSATISFIABLE=====\n");
+        else if(sol->status==5){
+            /* a verified incumbent without an optimality proof: print it, then
+               the honest verdict (what a time/node limited solver emits) */
+            fz_print_one_solution(m,sol->x,sol->nvars);
+            printf("=====UNKNOWN=====\n");
+        }
         else printf("=====UNKNOWN=====\n");
     }
 }

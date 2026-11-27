@@ -82,6 +82,127 @@ def solutions(out, n):
     return got
 
 
+def gen_pure(rng):
+    """Pure all_different model: nothing but disjoint all_different components.
+
+    This is the shape `cp_alldiff_apply` solves as a bipartite matching (one
+    Kuhn run per component gives the witness, Hall gives the UNSAT proof), so
+    it is generated separately: single component, several disjoint components,
+    constant members, and a pigeonhole case that must come back UNSAT.
+    """
+    ncomp = rng.choice([1, 1, 2, 3])
+    lines, doms, comps = [], [], []
+    nxt = 0
+    for _ in range(ncomp):
+        n = rng.randint(2, 4)
+        lo = rng.randint(0, 2)
+        hi = lo + rng.randint(1, 4)
+        comp = []
+        for _ in range(n):
+            lines.append(f"var {lo}..{hi}: v{nxt} :: output_var;")
+            doms.append((lo, hi))
+            comp.append(nxt)
+            nxt += 1
+        consts = []
+        if rng.random() < 0.3:
+            consts = [rng.randint(lo, hi) for _ in range(rng.randint(1, 2))]
+        args = [f"v{i}" for i in comp] + [str(c) for c in consts]
+        rng.shuffle(args)
+        lines.append("constraint all_different_int([" + ",".join(args) + "]);")
+        comps.append((comp, consts))
+    if rng.random() < 0.25:                    # pigeonhole: more vars than values
+        n = rng.randint(3, 5)
+        hi = n - 2
+        comp = []
+        for _ in range(n):
+            lines.append(f"var 0..{hi}: v{nxt} :: output_var;")
+            doms.append((0, hi))
+            comp.append(nxt)
+            nxt += 1
+        lines.append("constraint all_different_int([" +
+                     ",".join(f"v{i}" for i in comp) + "]);")
+        comps.append((comp, []))
+    lines.append("solve satisfy;")
+    return "\n".join(lines) + "\n", doms, comps, [f"v{i}" for i in range(nxt)]
+
+
+def solve_one(text, timeout=60):
+    out = solve(text, (), timeout=timeout)
+    if "=====UNSATISFIABLE=====" in out:
+        return "UNSAT", {}
+    vals = {}
+    for block in out.split("----------"):
+        for line in block.splitlines():
+            line = line.strip().rstrip(";")
+            if "=" in line and line.split("=")[0].strip().startswith("v"):
+                k, v = line.split("=", 1)
+                try:
+                    vals[k.strip()] = int(v.strip())
+                except ValueError:
+                    pass
+    return ("SAT" if vals else "UNKNOWN"), vals
+
+
+def verify_match(n, seed):
+    """Differential test of the pure-matching path (no `-a`), vs brute force."""
+    rng = random.Random(seed)
+    ok = wrong = 0
+    for _ in range(n):
+        text, doms, comps, names = gen_pure(rng)
+        st, vals = solve_one(text)
+        witness = None
+        for t in itertools.product(*[range(lo, hi + 1) for lo, hi in doms]):
+            good = True
+            for comp, consts in comps:
+                seen = set(consts)
+                if len(seen) != len(consts):
+                    good = False
+                    break
+                for i in comp:
+                    if t[i] in seen:
+                        good = False
+                        break
+                    seen.add(t[i])
+                if not good:
+                    break
+            if good:
+                witness = t
+                break
+        exp = "SAT" if witness is not None else "UNSAT"
+        bad = None
+        if st != exp:
+            bad = f"verdict {st} vs {exp}"
+        elif st == "SAT":
+            got = [vals.get(nm) for nm in names]
+            if any(v is None for v in got):
+                bad = "incomplete assignment"
+            else:
+                for comp, consts in comps:
+                    seen = set(consts)
+                    if len(seen) != len(consts):
+                        bad = "duplicate constants"
+                        break
+                    for i in comp:
+                        if got[i] in seen:
+                            bad = "all_different violated in the witness"
+                            break
+                        seen.add(got[i])
+                    if bad:
+                        break
+                if not bad:
+                    for i, (lo, hi) in enumerate(doms):
+                        if not (lo <= got[i] <= hi):
+                            bad = "value outside its domain"
+                            break
+        if bad:
+            wrong += 1
+            print("MATCH MISMATCH:", bad, "\n", text, file=sys.stderr)
+        else:
+            ok += 1
+    print(f"alldiff_match_verify: OK={ok} WRONG={wrong} (N={n}, seed={seed})")
+    return ok, wrong
+
+
 def verify(n, seed):
     rng = random.Random(seed)
     ok = wrong = 0
@@ -99,7 +220,9 @@ def verify(n, seed):
         else:
             ok += 1
     print(f"alldiff_scc_verify: OK={ok} WRONG={wrong} (N={n}, seed={seed})")
-    return 0 if wrong == 0 else 1
+    mok, mwrong = verify_match(max(20, n // 2), seed + 1)
+    print(f"alldiff_scc_verify: total OK={ok + mok} WRONG={wrong + mwrong}")
+    return 0 if wrong == 0 and mwrong == 0 else 1
 
 
 def bench():

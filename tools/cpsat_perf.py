@@ -30,6 +30,8 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FZNSOLVE = os.environ.get("FZNSOLVE", os.path.join(HERE, "..", "fznsolve"))
+# below this, both sides are dominated by fixed costs and timer noise
+NOISE_FLOOR_S = 1e-3
 REF_PATH = os.path.join(HERE, "fzn_cpsat_ref.py")
 
 
@@ -344,7 +346,9 @@ def status_of(out):
     if "=====UNSATISFIABLE=====" in out:
         return "UNSAT"
     if "=====UNKNOWN=====" in out:
-        return "UNKNOWN"
+        # a solution block before the UNKNOWN marker is a verified incumbent
+        # without an optimality proof (what a node/time limited solver emits)
+        return "INCUMBENT" if "----------" in out else "UNKNOWN"
     if "----------" in out:
         return "SAT"
     return "TIMEOUT" if not out.strip() else "?"
@@ -522,8 +526,18 @@ def main():
         # reference's in-process build+solve time
         solve_s = fz_solve if fz_solve is not None else net
         ratio_solve = solve_s / max(ref_bests, 1e-9)
+        ratio_engine = solve_s / max(ref_solves, 1e-9)
+        obj_gap = None
+        if fz_st == "INCUMBENT" and kind == "opt":
+            m = re.search(r"%%mzn-stat: objective=([0-9.eE+-]+)", fz_out or "")
+            mine = float(m.group(1)) if m else None
+            theirs = (ref_res["solutions"][0].get("mk")
+                      if ref_res.get("solutions") else None)
+            if mine is not None and theirs:
+                obj_gap = round(mine / theirs, 3)
         rows.append({
             "instance": name, "kind": kind, "status": fz_st, "ref_status": ref_st,
+            "objective_ratio_vs_optimum": obj_gap,
             "fznsolve_s": round(fz_best, 6), "cpsat_s": round(ref_bests, 6),
             "cpsat_build_s": round(ref_res["build_s"], 6),
             "cpsat_solve_s": round(ref_res["solve_s"], 6),
@@ -533,7 +547,8 @@ def main():
             "fznsolve_solve_s": (round(fz_solve, 6) if fz_solve is not None else None),
             "ratio_solve": round(ratio_solve, 3),
             "cpsat_solve_min_s": round(ref_solves, 6),
-            "ratio_engine": round(solve_s / max(ref_solves, 1e-9), 3),
+            "ratio_engine": round(ratio_engine, 3),
+            "above_noise_floor": bool(solve_s >= NOISE_FLOOR_S),
             "ref_workers": args.ref_workers,
             "gate": bool(gate),
             "ref_proven": ref_proven,
@@ -541,7 +556,9 @@ def main():
         })
         flag = ""
         if fz_st != ref_st:
-            if fz_st in ("TIMEOUT", "UNKNOWN") and not gate:
+            if fz_st == "INCUMBENT" and not gate:
+                flag = "  incumbent only (not proven, not gated)"
+            elif fz_st in ("TIMEOUT", "UNKNOWN") and not gate:
                 # an ungated row that only runs out of time is a reported
                 # gap, not a wrong answer: the verdict check exists to catch
                 # contradictions (UNSAT vs SAT), not slowness
@@ -549,11 +566,19 @@ def main():
             else:
                 flag = f"  VERDICT MISMATCH (ref={ref_st})"
                 failures.append((name, f"verdict {fz_st} vs {ref_st}"))
-        elif ratio_solve > args.max_ratio:
-            flag = ("  SLOWER" if gate else "  SLOWER (not gated)")
-            if gate:
-                failures.append((name, f"ratio {ratio_solve:.2f}x engine-vs-engine "
+        elif ratio_engine > args.max_ratio:
+            # Sub-millisecond models are timer noise on both sides (0.45 ms vs
+            # 0.14 ms is parsing, not search): they are printed, not gated.
+            # Everything above the noise floor is gated on the engine-vs-engine
+            # ratio, which is the claim this tool makes.
+            if gate and solve_s >= NOISE_FLOOR_S:
+                flag = "  SLOWER"
+                failures.append((name, f"ratio {ratio_engine:.2f}x engine-vs-engine "
                                        f"({ratio:.2f}x end-to-end)"))
+            elif gate:
+                flag = "  slower (sub-millisecond: reported, not gated)"
+            else:
+                flag = "  SLOWER (not gated)"
         elif not ref_proven:
             flag = "  (reference stopped at its limit, not proven optimal)"
         if fz_st == ref_st and fz_st == "SAT":
@@ -599,9 +624,11 @@ def main():
     if hard:
         print("\nmeasured but NOT gated (engine is currently behind CP-SAT here):")
         for r in hard:
-            print(f"  {r['instance']:<24}{r['status']:<6}"
+            gap = (f", objective {r['objective_ratio_vs_optimum']}x optimum"
+                   if r.get("objective_ratio_vs_optimum") else "")
+            print(f"  {r['instance']:<24}{r['status']:<10}"
                   f"engine {r['fznsolve_solve_s']}s vs CP-SAT {r['cpsat_solve_min_s']}s"
-                  f"  = {r['ratio_engine']}x")
+                  f"  = {r['ratio_engine']}x{gap}")
     if failures:
         print(f"\nFAILURES ({len(failures)}):")
         for name, why in failures:

@@ -473,8 +473,15 @@ python3 tools/fzn_bilinear_verify.py 250 20261101 || { echo "fzn_bilinear_verify
 python3 tools/fzn_globals_verify.py 20 20261102 || { echo "fzn_globals_verify: FAIL"; exit 1; }
 
 # cp-sat (ortools_*) parity batch: differential verifier against the bundled
-# fzn-cp-sat oracle + brute force (solution-set equality, UNKNOWN = failure)
-LD_LIBRARY_PATH="${MZ_LIB:-/home/user/mz/lib}" python3 tools/fzn_cpsat_verify.py 8 20261104 || { echo "fzn_cpsat_verify: FAIL"; exit 1; }
+# fzn-cp-sat oracle + brute force (solution-set equality, UNKNOWN = failure).
+# The oracle ships with the MiniZinc bundle, which is not always installed;
+# like the GLPK and minizinc sections below, the gate is skipped (loudly) when
+# the binary is absent, and `FZN_CP_SAT=/path/to/fzn-cp-sat` enables it.
+if [ -x "${FZN_CP_SAT:-/home/user/mz/bin/fzn-cp-sat}" ]; then
+  LD_LIBRARY_PATH="${MZ_LIB:-/home/user/mz/lib}" python3 tools/fzn_cpsat_verify.py 8 20261104 || { echo "fzn_cpsat_verify: FAIL"; exit 1; }
+else
+  echo "fzn_cpsat_verify: SKIPPED (no fzn-cp-sat oracle at ${FZN_CP_SAT:-/home/user/mz/bin/fzn-cp-sat}; set FZN_CP_SAT to enable)"
+fi
 
 # FlatZinc OUTPUT-layer round-trip (roadmap 6.7): re-parse every emitted
 # byte; each printed assignment must satisfy every constraint and stay in

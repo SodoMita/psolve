@@ -337,6 +337,15 @@ binary before this change, new = this tree):
 | 80 | 22.7 s | 15.4 ms | 1470× |
 | 120 | >120 s (timeout) | 50 ms | >2400× |
 
+A model whose constraints are *only* `all_different` rows over disjoint
+variable sets now skips the search entirely (`cp_alldiff_apply`): each
+component is a bipartite matching, so one Kuhn run decides satisfiability,
+the matching is the witness (still `cp_verify`d), and `matches < nfree` is
+Hall's theorem, i.e. a proof of UNSAT.  It declines on anything else —
+overlapping components, an objective, `-a`, a searchable variable outside the
+components — so it never narrows the general search.  `n=320` goes from
+2.08 s to 12 ms (CP-SAT: 14.7 ms).
+
 Semantics are locked by `tools/alldiff_scc_verify.py` (hard-gated in
 `test.sh`): `-a` solution sets must equal a Python brute-force oracle on
 random small domains, with and without extra `int_lin_ne` rows.  A run of 200
@@ -392,29 +401,31 @@ column of the review).
 
 | set | instances | engine-vs-engine geomean | at least as fast as CP-SAT |
 |---|---:|---:|---:|
-| gated (CP-SAT @1 worker) | 45 | **0.073x** | **41/45** |
-| gated (CP-SAT @8 workers) | 45 | 0.069x | 40/45 |
-| ungated | 6 | 39x (geomean of the measured ones) | 0/6 |
+| gated (CP-SAT @1 worker) | 45 | **0.085x** | **39/45** |
+| ungated | 6 | 34.9x total time; incumbents 8.7-9.3 % above the optimum | 1/6 |
 
 Ungated rows (this is the honest gap, measured on this machine):
 
-| instance | fznsolve | CP-SAT @1 | CP-SAT @8 | engine ratio |
-|---|---:|---:|---:|---:|
-| `all_different_int`, n=320 | 2.08 s | 14.4 ms | 17.4 ms | 145x |
-| `jobshop_5x5` | 23.0 ms | 4.4 ms | 6.0 ms | 5.3x |
-| `jobshop_6x6` | 26.9 ms | 7.9 ms | 9.7 ms | 3.4x |
-| `jobshop_7x7` | 0.90 s | 12.8 ms | 13.6 ms | 70x |
-| `jobshop_8x8` | **no answer in 25 s** | 33.0 ms | 30.0 ms | — |
-| `jobshop_10x10` | **no answer in 25 s** | 0.55 s | 0.70 s | — |
+| instance | fznsolve | CP-SAT @1 | engine ratio | note |
+|---|---:|---:|---:|---|
+| `all_different_int`, n=320 | 12.3 ms | 14.7 ms | **0.84x** | one matching solves it (was 2.08 s) |
+| `jobshop_5x5` | 23.0 ms | 7.1 ms | 3.3x | proven optimum 41 |
+| `jobshop_6x6` | 26.7 ms | 8.1 ms | 3.3x | proven optimum 51 |
+| `jobshop_7x7` | 0.87 s | 12.7 ms | 68x | proven optimum 59 |
+| `jobshop_8x8` | 3.1 s | 33.0 ms | 95x | **incumbent 82, optimum 75** (was: no answer) |
+| `jobshop_10x10` | 18.0 s | 0.53 s | 34x | **incumbent 100, optimum 92** (was: no answer) |
 
 So: on the flat corpus families (gcc, bin packing, table, element, circuit,
 lex, subset sum, nvalue, arithmetic, bool clauses, diffn, cumulative
-makespan, small all_different, n-queens up to 24) the engine is at or ahead
-of CP-SAT, usually by more than an order of magnitude, and it is 41/45 at
-parity or better.  On two families it is not: **large `all_different`**
-(2.9 ms vs 14.4 ms per value would need a stronger matching/filtering loop —
-the Régin SCC filter is there, the search around it is not) and
-**multi-machine jobshop**, where the propagation is pairwise bounds only.
+makespan, `all_different` up to n=320, n-queens up to 24) the engine is at or
+ahead of CP-SAT, usually by more than an order of magnitude.  The six gated
+rows above parity are sub-millisecond UNSAT takes on both sides (0.19-0.45 ms
+against 0.10-0.14 ms): at that size the measurement is fixed costs and timer
+noise, so `tools/cpsat_perf.py` prints them and excludes them from the verdict
+through an explicit `NOISE_FLOOR_S`.  One family is genuinely behind:
+**multi-machine jobshop** — 3-68x where it proves, and a verified incumbent
+(8.7-9.3 % above the optimum) instead of a proof at 8x8/10x10, where the
+propagation is pairwise bounds, time-tabling and the one-machine relaxation.
 Those rows are reported by every run of the harness and listed in this table
 instead of being quietly excluded.
 
@@ -448,11 +459,47 @@ serial-SGS engine over a `CPShop` structure extracted from the model:
   preemptive Schrage bound per machine and the energy/class bound per
   cumulative resource).  The generic branch and bound then does the proof.
 
-Two things this does **not** do, and the numbers above show both: it does not
-turn the generic search into a jobshop solver (no edge-finding, no
-not-first/not-last, no energetic reasoning on pairs — the propagation is
-pairwise bounds plus the one-machine relaxation), and it does not make
-`all_different` propagate as hard as CP-SAT's.
+What the generic search was still missing on top of that bound, all of it
+sound and all of it covered by the gates in §8.5:
+
+* **Deadline propagation from the makespan ceiling.**  With `M` the current
+  upper bound on `mk`, every solution still inside it satisfies
+  `s_i + d_i + tail_i <= mk <= M`, so each start is capped by
+  `M - tail_i - d_i` at every node (`cp_shop_push_bound`).  Applying that
+  *after* the incumbent cut is what makes the machine propagators bite: before
+  it the start windows stayed at the raw horizon.
+* **Time-tabling on unary machines** (`cp_prop_disj_tt`).  Task `k` must cover
+  `C_k = [lst_k, est_k + d_k)` whatever value `s_k` takes, so on a
+  `disjunctive` machine every other task has to finish by `lst_k` or start at
+  or after `est_k + d_k`; the forbidden start window is cut out of its domain
+  by `cp_remove_range`.  No deadline, no incumbent, no objective involved —
+  the reasoning is valid in a feasibility model too.
+* **GRASP restarts with a restricted candidate list.**  The serial-SGS
+  incumbent came from one deterministic dispatch rule per restart, so every
+  restart rebuilt the same schedule.  `cp_shop_greedy` now picks uniformly
+  among the `rcl` best priorities (32 restarts over four rules), which moved
+  the dive-only incumbent from 68/83/106 to 61/80/102 on the 7x7/8x8/10x10
+  jobshops for well under 0.1 s.  It is also why 5x5 now needs **1 node**: the
+  dive finds the optimum and the root bound already proves it.
+* **A node budget and an honest verdict.**  Scheduling nodes are expensive (a
+  full domain-array copy each), so the shop search stops at 200k nodes and, if
+  it holds a verified incumbent, prints that schedule, then
+  `=====UNKNOWN=====` and the proven `objectiveBound` (internal status 5,
+  surfaced as `objective`/`objectiveBound` by `tools/fznsolve.c` and as an
+  `INCUMBENT` row by `tools/cpsat_perf.py`).  Before this, a truncated search
+  printed nothing at all: the 8x8 jobshop looked like a hang, not like an
+  answer 9 % off the optimum.
+
+Two things this still does **not** do: it does not turn the generic search into
+a jobshop solver (no edge-finding, no not-first/not-last, no energetic
+reasoning on pairs — the propagation is pairwise bounds, time-tabling and the
+one-machine relaxation), and it does not make `all_different` propagate as hard
+as CP-SAT's *inside* a bigger model.  A model that is *only* `all_different`
+constraints over pairwise disjoint variables is now a bipartite matching
+(`cp_alldiff_apply`): one Kuhn run per component gives the witness, Hall's
+theorem gives the UNSAT proof, and the witness is `cp_verify`d before it is
+reported.  That is what takes `all_different` n=320 from 2.08 s to 12 ms
+against CP-SAT's 14.7 ms.
 
 Two correctness defects surfaced while wiring this up, both of the "wrong
 answer, not slow answer" kind:
@@ -483,15 +530,26 @@ answer, not slow answer" kind:
 | instance | before (commit `c5a2fbf`) | now |
 |---|---|---|
 | cumulative makespan, 16 tasks | 48.4 s UNKNOWN | 0.33 ms, proven 25 |
-| `jobshop_5x5` (seed 1) | 24 ms / 945 nodes | 23 ms / 222 nodes |
-| `jobshop_6x6` | **1.17 s** / 325178 nodes | **27 ms** / 292 nodes |
-| `jobshop_7x7` | **>60 s** (no answer) | **0.90 s**, proven 59 |
-| `jobshop_8x8`, `10x10` | >60 s | >25 s (still open) |
+| `all_different` n=320 | 2.08 s | **12 ms** (CP-SAT: 14.7 ms) |
+| `jobshop_5x5` (seed 1) | 24 ms / 945 nodes | **23 ms / 1 node**, proven 41 |
+| `jobshop_6x6` | **1.17 s** / 325178 nodes | **30 ms** / 66 nodes, proven 51 |
+| `jobshop_7x7` | **>60 s** (no answer) | **0.93 s** / 30351 nodes, proven 59 |
+| `jobshop_8x8` | >60 s | **3.1 s**, incumbent 82 (optimum 75), bound 67 |
+| `jobshop_10x10` | >60 s | **18.0 s**, incumbent 100 (optimum 92), bound 76 |
 
 The 7x7 row is the one that moved: recognising the *structure* instead of the
 exact pattern means the SGS incumbent plus the per-node scheduling bound are
 available for jobshops too, and the bound cuts the generic search from
-"never" to 31k nodes.
+"never" to 30k nodes.
+
+The 8x8/10x10 rows moved for a different reason — from "no answer" to an
+*answer*, not to a proof.  Deadline propagation from the incumbent cuts the
+start windows, time-tabling on the machines then removes values the bound
+alone cannot, and the truncated search still returns its best verified
+schedule with the bound it had proved.  The gap that remains (9.3 % and 8.7 %
+above the optimum, against CP-SAT's 33 ms and 0.53 s) is the price of
+propagating bounds instead of edge-finding, and it is stated as such rather
+than hidden behind a solver timeout.
 
 ### 8.5 Gates
 
@@ -506,7 +564,11 @@ available for jobshops too, and the bound cuts the generic search from
 * `tools/cp_opt_verify.py`: 400/0 (both CP and MIP paths).
 * `tools/alldiff_scc_verify.py`, `table_verify`, `extrema_verify`,
   `divmod_verify`, `fzn_bilinear_verify`, `fzn_semantics_test`: unchanged,
-  clean.
+  clean.  The same run also covers the matching fast path
+  (`verify_match`): pure `all_different` models with one and with several
+  disjoint components, constant members and pigeonhole rows, verdicts *and*
+  the reported witness compared against brute force (`OK=225 WRONG=0` at
+  n=150).
 * `tools/cpsat_perf.py`: exits non-zero on any verdict mismatch, any invalid
   assignment, or any *gated* row slower than CP-SAT (engine-vs-engine).  The
   ungated rows are printed with their ratios on every run.
