@@ -12,6 +12,8 @@ the MIP bridge in src/fzn.c (handle_constraint):
   sliding      gecode_among_seq_int(x,S,seq,low,up), gecode_among_seq_bool,
                fzn_sliding_among_int/bool(low,up,seq,x,S|b)
   2D element   gecode_int_element2d(i,j,x,S1,S2,c)
+  lex/array    lex_greater(x,y), lex_greatereq(x,y) (argument-swapped
+               lex_less/lex_lesseq), array_bool_not(x,y)
 
 Two independent oracles:
   1. brute force over the declared domains with the exact MiniZinc semantics
@@ -355,8 +357,38 @@ def gen_element2d(rng):
     return Inst(model(decls, cons), names, doms, check)
 
 
+def gen_lex_greater(rng):
+    """lex_greater / lex_greatereq: added as argument-swapped lex_less /
+    lex_lesseq.  Python's list comparison is lexicographic, so the oracle is a
+    one-liner -- which is exactly why this family is worth pinning: the whole
+    risk is in the argument order."""
+    ln = rng.randint(1, 4)
+    form = rng.choice(["greater", "greatereq"])
+    decls = [varray("x", ln, 1, 3), varray("y", ln, 1, 3)]
+    cons = [f"lex_{form}(x, y)"]
+    doms = {"x": arr_domain(ln, 1, 3), "y": arr_domain(ln, 1, 3)}
+    if form == "greater":
+        check = lambda a: list(a["x"]) > list(a["y"])
+    else:
+        check = lambda a: list(a["x"]) >= list(a["y"])
+    return Inst(model(decls, cons), ["x", "y"], doms, check)
+
+
+def gen_array_bool_not(rng):
+    """array_bool_not(x,y): y[i] = not x[i].  The relation is symmetric in the
+    two arrays, so both argument orders must give the same solution set."""
+    ln = rng.randint(1, 4)
+    decls = [varray("x", ln, 0, 1), varray("y", ln, 0, 1)]
+    flip = rng.random() < 0.5
+    cons = [f"array_bool_not({'y, x' if flip else 'x, y'})"]
+    doms = {"x": arr_domain(ln, 0, 1), "y": arr_domain(ln, 0, 1)}
+    return Inst(model(decls, cons), ["x", "y"], doms,
+                lambda a: all(xv + yv == 1 for xv, yv in zip(a["x"], a["y"])))
+
+
 GENS = [gen_count, gen_at_most1, gen_precede, gen_arg_extremum,
-        gen_sort, gen_arg_sort, gen_among_seq, gen_element2d]
+        gen_sort, gen_arg_sort, gen_among_seq, gen_element2d,
+        gen_lex_greater, gen_array_bool_not]
 
 
 # ------------------------------------------------------------------ pins

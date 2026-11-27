@@ -510,3 +510,37 @@ available for jobshops too, and the bound cuts the generic search from
 * `tools/cpsat_perf.py`: exits non-zero on any verdict mismatch, any invalid
   assignment, or any *gated* row slower than CP-SAT (engine-vs-engine).  The
   ungated rows are printed with their ratios on every run.
+
+## 9. FlatZinc API gaps closed (and still open)
+
+A mechanical inventory (every string literal in `src/fzn.c` / `src/fz_cp.inc`
+compared against the builtin names MiniZinc emits) found these closed gaps;
+they are encoded exactly, never relaxed:
+
+| predicate | where | encoding |
+|---|---|---|
+| `lex_greater(x,y)`, `lex_greatereq(x,y)` | MIP bridge **and** CP engine | `lex_less(y,x)` / `lex_lesseq(y,x)`: the arrays are swapped, the shared lex encoding (prefix-equality selectors + strict/non-strict last difference) is reused |
+| `array_bool_not(x,y)` | MIP bridge | one row `x_i + y_i = 1` per element; the relation is symmetric in its two arrays, so the argument order is not a risk |
+
+Gate: `tools/fzn_globals_verify.py` grew `gen_lex_greater` (both strictness
+forms, lengths 1–4) and `gen_array_bool_not` (both argument orders) — the
+verifier compares the **solution sets** with brute force, not just the
+verdict, so a swapped argument or an inverted element fails:
+`OK=314 WRONG=0 UNKNOWN=0 (seed 20261125, N=30)`; hard-gated in `test.sh`.
+
+Still unhandled, and honestly so (each returns `=====UNKNOWN=====`, never a
+truncated relaxation):
+
+* `regular` — automaton constraints need layered-state propagation (or an
+  auxiliary state chain); a decomposition is possible but is not in yet;
+* `all_different_except(x,v)`, `value_precede(s,t,x)` (bare names — the
+  `fzn_*`/`gecode_*` forms the MiniZinc libraries actually emit are handled),
+  `arg_max`/`arg_min` (bare names);
+* `float_floor`, `float_ceil`, `float_round`, `float2int`, `float_sqrt`: the
+  rounding ones are *strict* inequalities (`y <= x < y+1`) and a MIP row cannot
+  express the strict side exactly, so they are declined rather than
+  epsilon-relaxed;
+* `span`, `diffn_k`, `int_set_channel`, `element_set`, `array_set_element`,
+  `mzn_div`/`mzn_mod`/`mzn_max`/`mzn_min` (semantics differ between MiniZinc
+  versions; guessing them would be worse than UNKNOWN), and the `ortools_*`
+  variants of the same.

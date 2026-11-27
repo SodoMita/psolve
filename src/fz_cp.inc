@@ -3189,17 +3189,24 @@ static int cp_parse(FZModel*m,CPCR**out_cr,int*out_n,unsigned char*referenced,in
             motivating=1;
         }
         else if(cp_pred_is(p,"lex_less_int")||cp_pred_is(p,"lex_lesseq_int")||
-                cp_pred_is(p,"lex_less")||cp_pred_is(p,"lex_lesseq")||strcmp(p,"ortools_lex_less_int")==0||
+                cp_pred_is(p,"lex_greater_int")||cp_pred_is(p,"lex_greatereq_int")||
+                cp_pred_is(p,"lex_less")||cp_pred_is(p,"lex_lesseq")||
+                cp_pred_is(p,"lex_greater")||cp_pred_is(p,"lex_greatereq")||strcmp(p,"ortools_lex_less_int")==0||
                 strcmp(p,"ortools_lex_lesseq_int")==0||strcmp(p,"array_int_lt")==0||strcmp(p,"array_int_lq")==0||
                 cp_pred_is(p,"lex_less_bool")||cp_pred_is(p,"lex_lesseq_bool")||strcmp(p,"array_bool_lt")==0||strcmp(p,"array_bool_lq")==0){
-            int strict = (strstr(p,"less_int")==strstr(p,"lesseq_int")?0:0); /* placeholder, set below */
-            strict = (strcmp(p,"array_int_lt")==0||strcmp(p,"array_bool_lt")==0||
-                      strcmp(p,"ortools_lex_less_int")==0||strcmp(p,"ortools_lex_less_bool")==0||
-                      cp_pred_is(p,"lex_less_int")||cp_pred_is(p,"lex_less_bool")||
-                      cp_pred_is(p,"lex_less"))?1:0;
+            /* lex_greater(x,y) is lex_less(y,x); the arrays are swapped below
+               and the strictness follows the name after the swap */
+            int greater = (strstr(p,"greater")!=NULL);
+            int strict;
+            strict = greater ? (strstr(p,"greatereq")==NULL)
+                             : ((strcmp(p,"array_int_lt")==0||strcmp(p,"array_bool_lt")==0||
+                                 strcmp(p,"ortools_lex_less_int")==0||strcmp(p,"ortools_lex_less_bool")==0||
+                                 cp_pred_is(p,"lex_less_int")||cp_pred_is(p,"lex_less_bool")||
+                                 cp_pred_is(p,"lex_less"))?1:0);
             if(c->nargs<2){ok=0;break;}
             Lin*xa;int nx; if(parse_array(m,c->args[0],&xa,&nx)!=0){ok=0;break;}
             Lin*ya;int ny; if(parse_array(m,c->args[1],&ya,&ny)!=0){free_lins(xa,nx);ok=0;break;}
+            if(greater){ Lin*t=xa;xa=ya;ya=t; int tn=nx;nx=ny;ny=tn; }
             if(nx<1||nx!=ny){free_lins(xa,nx);free_lins(ya,ny);ok=0;break;}
             rec.kind=CPK_LEX; rec.n=nx; rec.nset=nx; rec.rhs=strict;
             rec.arr_terms=(CPT*)psolve_calloc((size_t)nx,sizeof(CPT));

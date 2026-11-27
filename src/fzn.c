@@ -2256,6 +2256,24 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
         lin_free(&l1);lin_free(&l2);lin_free(&dd);
         return 0;
     }
+    /* array_bool_not(x,y): y[i] <-> not x[i] elementwise.  The relation is
+       symmetric in the two arrays (both are boolean and x[i]+y[i]=1), so the
+       argument order never changes the meaning. */
+    if(strcmp(p,"array_bool_not")==0||strcmp(p,"fzn_array_bool_not")==0){
+        if(c->nargs<2)return -1;
+        Lin*xs;int nx; Lin*ys;int ny;
+        if(parse_array(m,c->args[0],&xs,&nx)!=0)return -1;
+        if(parse_array(m,c->args[1],&ys,&ny)!=0){free_lins(xs,nx);return -1;}
+        if(nx!=ny){ free_lins(xs,nx);free_lins(ys,ny);return -1; }
+        for(int i=0;i<nx;i++){
+            Lin dd;memset(&dd,0,sizeof(dd));
+            lin_into(&dd,&xs[i],1.0);lin_into(&dd,&ys[i],1.0);
+            b_put(b,'=',1.0,&dd);
+            lin_free(&dd);
+        }
+        free_lins(xs,nx);free_lins(ys,ny);
+        return 0;
+    }
     if(strcmp(p,"int_plus")==0||strcmp(p,"float_plus")==0||strcmp(p,"int_minus")==0||strcmp(p,"float_minus")==0){
         int minus=(strcmp(p,"int_minus")==0||strcmp(p,"float_minus")==0);
         if(c->nargs<3)return -1;
@@ -4267,7 +4285,10 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
     }
     /* Lexicographical comparison between arrays x and y:
        lex_less(x, y), lex_lesseq(x, y), array_int_lt(x, y), array_int_lq(x, y), etc. */
-    if(strcmp(p,"lex_less")==0||strcmp(p,"lex_less_int")==0||strcmp(p,"fzn_lex_less_int")==0||
+    if(strcmp(p,"lex_greater")==0||strcmp(p,"lex_greater_int")==0||
+       strcmp(p,"fzn_lex_greater_int")==0||strcmp(p,"lex_greatereq")==0||
+       strcmp(p,"lex_greatereq_int")==0||strcmp(p,"fzn_lex_greatereq_int")==0||
+       strcmp(p,"lex_less")==0||strcmp(p,"lex_less_int")==0||strcmp(p,"fzn_lex_less_int")==0||
        strcmp(p,"array_int_lt")==0||strcmp(p,"lex_less_bool")==0||strcmp(p,"fzn_lex_less_bool")==0||
        strcmp(p,"array_bool_lt")==0||strcmp(p,"ortools_lex_less_int")==0||strcmp(p,"ortools_lex_less_bool")==0||
        strcmp(p,"lex_lesseq")==0||strcmp(p,"lex_lesseq_int")==0||strcmp(p,"fzn_lex_lesseq_int")==0||
@@ -4277,7 +4298,13 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
         Lin*xs;int nx; Lin*ys;int ny;
         if(parse_array(m,c->args[0],&xs,&nx)!=0)return -1;
         if(parse_array(m,c->args[1],&ys,&ny)!=0){free_lins(xs,nx);return -1;}
-        int is_strict = (strstr(p,"less")!=NULL && strstr(p,"lesseq")==NULL) || (strstr(p,"_lt")!=NULL);
+        /* lex_greater(x,y) is lex_less(y,x) (and lex_greatereq likewise), so
+           the pair is swapped and the rest of the encoding is shared. */
+        int swapped = (strstr(p,"greater")!=NULL);
+        if(swapped){ Lin*t=xs;xs=ys;ys=t; int tn=nx;nx=ny;ny=tn; }
+        int is_strict = swapped
+            ? (strstr(p,"greatereq")==NULL)
+            : ((strstr(p,"less")!=NULL && strstr(p,"lesseq")==NULL) || (strstr(p,"_lt")!=NULL));
         int n = (nx < ny) ? nx : ny;
         if(n == 0){
             int sat = is_strict ? (nx < ny) : (nx <= ny);
