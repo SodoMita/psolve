@@ -10,6 +10,7 @@
 #include <ctype.h>
 #include <limits.h>
 #include <stdint.h>
+#include <time.h>
 
 /* ------------------------------------------------------------------ */
 /* Lexer                                                               */

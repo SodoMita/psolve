@@ -435,6 +435,13 @@ python3 tools/cp_opt_verify.py 250 20260814 | sed 's/.*: //'
 # OR-Tools is installed) and the reported schedule is re-checked slot by slot.
 echo -n "cum_mks_verify (makespan scheduler vs brute force): "
 python3 tools/cum_mks_verify.py 120 20260901 | sed 's/.*: //'
+# Jobshop shape (disjunctive machines + precedence chains): the serial-SGS
+# shop engine claims a proven optimum when the model *is* the structure and a
+# verified incumbent plus a scheduling bound otherwise.  Every reported
+# schedule is re-checked (precedence, machine overlap, mk == max completion)
+# and the optimum must match the CP-SAT oracle when OR-Tools is present.
+echo -n "jobshop_verify (shop scheduler vs CP-SAT, schedule re-checked): "
+python3 tools/jobshop_verify.py 40 20261125 | sed 's/.*: //' || { echo "jobshop_verify: FAIL"; exit 1; }
 # Régin all_different filtering via residual SCCs: -a solution sets must stay
 # exactly equal to brute force (no valid value may be filtered).
 python3 tools/alldiff_scc_verify.py 200 271828 || { echo "alldiff_scc_verify: FAIL"; exit 1; }

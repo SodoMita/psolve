@@ -52,16 +52,22 @@ def fz_vars(prefix, doms, ann="output_var"):
 def corpus():
     inst = []
 
-    def add(name, text, kind="sat"):
-        inst.append((name, text, kind))
+    # `gate=True` rows decide the exit status; `gate=False` rows are measured
+    # and reported (verdicts are still checked) but are excluded from the
+    # pass/fail decision because the engine is currently behind CP-SAT on
+    # them.  Keeping them in the corpus is the point: an honest table has to
+    # show where the gap is, not only where the win is.
+    def add(name, text, kind="sat", gate=True, reps=None, timeout=None):
+        inst.append((name, text, kind, gate, reps, timeout))
 
     # --- all_different ----------------------------------------------------
-    for n in (10, 20, 40, 80):
+    for n in (10, 20, 40, 80, 320):
         decls = fz_vars("x", [(1, n + 1)] * n)
         add(f"alldiff_sat_{n}",
             "".join(d + "\n" for d in decls) +
             "constraint all_different_int([" + ",".join(f"x{i}" for i in range(n)) + "]);\n"
-            "solve satisfy;\n")
+            "solve satisfy;\n",
+            gate=(n < 320))
     for n in (9, 19, 39):
         decls = fz_vars("x", [(1, n)] * (n + 1))
         add(f"alldiff_pigeonhole_{n}",
@@ -170,6 +176,20 @@ def corpus():
     add("jobshop_3x3",
         "".join(d + "\n" for d in decls) + "\n".join(cons) + "\nsolve minimize mk;\n",
         kind="opt")
+
+    # --- job-shop, multi machine (the reviewer's family) ------------------
+    # Same generator (and seed) as tools/gen_jobshop.py, so the rows here are
+    # the instances quoted in docs/MINIZINC_ANALYSIS.md section 8.  5x5/6x6 are
+    # within a few times CP-SAT, 7x7 is ~60x behind and 8x8/10x10 are not
+    # solved at all -- those rows are measured and reported but not gated.
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location("gen_jobshop", os.path.join(HERE, "gen_jobshop.py"))
+    _gj = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_gj)
+    for jobs, machines_n in ((5, 5), (6, 6), (7, 7), (8, 8), (10, 10)):
+        text, _route = _gj.gen(jobs, machines_n, 1)
+        add(f"jobshop_{jobs}x{machines_n}", text, kind="opt", gate=False,
+            reps=(1 if jobs >= 7 else None), timeout=(25.0 if jobs >= 7 else None))
 
     # --- global_cardinality ----------------------------------------------
     for n in (12, 24, 40):
@@ -327,7 +347,7 @@ def status_of(out):
         return "UNKNOWN"
     if "----------" in out:
         return "SAT"
-    return "?"
+    return "TIMEOUT" if not out.strip() else "?"
 
 
 def solution_values(out):
@@ -420,6 +440,10 @@ def main():
                     help="reps used to measure the process floor of fznsolve "
                          "(a trivial model) so solve times can be compared "
                          "like for like: CP-SAT numbers are in-process")
+    ap.add_argument("--ref-workers", type=int, default=1,
+                    help="search workers for the CP-SAT reference (default 1, "
+                         "matching `fzn-cp-sat -p 1`; the engine is single "
+                         "threaded, so >1 is a bonus for the reference)")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -449,19 +473,21 @@ def main():
     print(f"{'instance':<24}{'st':<6}{'fznsolve':>11}{'solve':>10}{'cp-sat':>11}"
           f"{'ratio':>8}{'solve ratio':>12}  {'cpsat build':>12}{'cpsat solve':>13}")
     print("-" * 100)
-    for name, text, kind in inst:
+    for name, text, kind, gate, ireps, itimeout in inst:
+        reps = ireps or args.reps
+        timeout = itimeout or args.timeout
         path = os.path.join(tmp, f"{name}.fzn")
         with open(path, "w") as fh:
             fh.write(text)
         fz_best = None
         fz_out = None
-        for _ in range(args.reps):
+        for _ in range(reps):
             t0 = __import__("time").perf_counter()
             try:
                 p = subprocess.run([FZNSOLVE, "-s", path], capture_output=True, text=True,
-                                   timeout=args.timeout)
+                                   timeout=timeout)
             except subprocess.TimeoutExpired:
-                fz_best = args.timeout
+                fz_best = timeout
                 fz_out = ""
                 break
             dt = __import__("time").perf_counter() - t0
@@ -471,10 +497,13 @@ def main():
         fz_solve = solve_time_of(fz_out or "")
         try:
             ref_bests = None
+            ref_solves = None
             ref_res = None
-            for _ in range(args.reps):
-                res = ref.run(path, workers=1, time_limit=args.timeout)
+            for _ in range(reps):
+                res = ref.run(path, workers=args.ref_workers, time_limit=timeout)
                 ref_bests = res["total_s"] if ref_bests is None else min(ref_bests, res["total_s"])
+                ref_solves = (res["solve_s"] if ref_solves is None
+                              else min(ref_solves, res["solve_s"]))
                 ref_res = res
         except Exception as exc:                      # noqa: BLE001
             print(f"{name:<24}reference oracle failed: {exc}")
@@ -503,17 +532,28 @@ def main():
             "ratio_net": round(ratio_net, 3),
             "fznsolve_solve_s": (round(fz_solve, 6) if fz_solve is not None else None),
             "ratio_solve": round(ratio_solve, 3),
+            "cpsat_solve_min_s": round(ref_solves, 6),
+            "ratio_engine": round(solve_s / max(ref_solves, 1e-9), 3),
+            "ref_workers": args.ref_workers,
+            "gate": bool(gate),
             "ref_proven": ref_proven,
             "startup_floor_s": round(floor_s, 6),
         })
         flag = ""
         if fz_st != ref_st:
-            flag = f"  VERDICT MISMATCH (ref={ref_st})"
-            failures.append((name, f"verdict {fz_st} vs {ref_st}"))
+            if fz_st in ("TIMEOUT", "UNKNOWN") and not gate:
+                # an ungated row that only runs out of time is a reported
+                # gap, not a wrong answer: the verdict check exists to catch
+                # contradictions (UNSAT vs SAT), not slowness
+                flag = f"  no answer within {timeout:.0f}s (ref={ref_st}, not gated)"
+            else:
+                flag = f"  VERDICT MISMATCH (ref={ref_st})"
+                failures.append((name, f"verdict {fz_st} vs {ref_st}"))
         elif ratio_solve > args.max_ratio:
-            flag = "  SLOWER"
-            failures.append((name, f"ratio {ratio_solve:.2f}x solve-only "
-                                   f"({ratio:.2f}x end-to-end)"))
+            flag = ("  SLOWER" if gate else "  SLOWER (not gated)")
+            if gate:
+                failures.append((name, f"ratio {ratio_solve:.2f}x engine-vs-engine "
+                                       f"({ratio:.2f}x end-to-end)"))
         elif not ref_proven:
             flag = "  (reference stopped at its limit, not proven optimal)"
         if fz_st == ref_st and fz_st == "SAT":
@@ -531,29 +571,37 @@ def main():
             print("   ", text.replace("\n", " ")[:160])
 
     print("-" * 100)
-    ratios = [r["ratio"] for r in rows]
-    if ratios:
+    gated = [r for r in rows if r["gate"]]
+    hard = [r for r in rows if not r["gate"]]
+    if gated:
+        ratios = [r["ratio"] for r in gated]
+        nr = [r["ratio_engine"] for r in gated]
         geo = math.exp(sum(math.log(max(r, 1e-9)) for r in ratios) / len(ratios))
-        print(f"instances={len(rows)} geomean ratio={geo:.2f}x "
-              f"median={statistics.median(ratios):.2f}x max={max(ratios):.2f}x "
-              f"min={min(ratios):.2f}x")
-        tot_fz = sum(r["fznsolve_s"] for r in rows)
-        tot_ref = sum(r["cpsat_s"] for r in rows)
-        print(f"total time: fznsolve={tot_fz * 1000:.1f}ms cp-sat={tot_ref * 1000:.1f}ms "
+        gn = math.exp(sum(math.log(max(r, 1e-9)) for r in nr) / len(nr))
+        print(f"GATED instances={len(gated)} "
+              f"engine-vs-engine geomean={gn:.3f}x median={statistics.median(nr):.3f}x "
+              f"max={max(nr):.2f}x min={min(nr):.3f}x "
+              f"(end-to-end geomean={geo:.3f}x)")
+        tot_fz = sum(r["fznsolve_s"] for r in gated)
+        tot_ref = sum(r["cpsat_s"] for r in gated)
+        print(f"gated total: fznsolve={tot_fz * 1000:.1f}ms cp-sat={tot_ref * 1000:.1f}ms "
               f"({tot_fz / tot_ref:.2f}x)  [end-to-end, includes the "
               f"{floor_s * 1000:.2f}ms process floor per run]")
-        nr = [r["ratio_solve"] for r in rows]
-        gn = math.exp(sum(math.log(max(r, 1e-9)) for r in nr) / len(nr))
-        tot_net = sum(r["fznsolve_solve_s"] if r["fznsolve_solve_s"] is not None
-                      else r["net_s"] for r in rows)
-        print(f"solve-only (own solveTime, excludes process startup): geomean={gn:.2f}x "
-              f"median={statistics.median(nr):.2f}x max={max(nr):.2f}x "
-              f"min={min(nr):.2f}x")
-        print(f"solve-only total: fznsolve={tot_net * 1000:.1f}ms "
-              f"cp-sat={tot_ref * 1000:.1f}ms ({tot_net / tot_ref:.2f}x)")
         faster = sum(1 for r in nr if r <= 1.0)
-        print(f"instances at least as fast as CP-SAT: {faster}/{len(nr)} "
-              f"(solve-only); {sum(1 for r in ratios if r <= 1.0)}/{len(ratios)} end-to-end")
+        print(f"gated instances at least as fast as CP-SAT: {faster}/{len(nr)} "
+              f"(engine-vs-engine, CP-SAT workers={args.ref_workers})")
+    if hard:
+        tot_fz = sum(r["fznsolve_s"] for r in hard)
+        tot_ref = sum(r["cpsat_s"] for r in hard)
+        print(f"UNGATED instances={len(hard)} "
+              f"total: fznsolve={tot_fz * 1000:.1f}ms cp-sat={tot_ref * 1000:.1f}ms "
+              f"({tot_fz / max(tot_ref, 1e-9):.2f}x)")
+    if hard:
+        print("\nmeasured but NOT gated (engine is currently behind CP-SAT here):")
+        for r in hard:
+            print(f"  {r['instance']:<24}{r['status']:<6}"
+                  f"engine {r['fznsolve_solve_s']}s vs CP-SAT {r['cpsat_solve_min_s']}s"
+                  f"  = {r['ratio_engine']}x")
     if failures:
         print(f"\nFAILURES ({len(failures)}):")
         for name, why in failures:

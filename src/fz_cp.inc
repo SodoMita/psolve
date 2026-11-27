@@ -3998,9 +3998,58 @@ static int cp_opt_bb_tighten(CP*cp,const CPOptCtx*opt){
  * When `all` is set, each complete assignment is emitted via on_solution and
  * search continues (backtracks) to find the next distinct one.
  */
+#define CP_SHOP_MAXT 128
+#define CP_SHOP_MAXR 24
+#define CP_SHOP_MAXD 4
+
+typedef struct CPShopTag{
+    int ntask;
+    int sv[CP_SHOP_MAXT];
+    long long dur[CP_SHOP_MAXT];
+    long long est[CP_SHOP_MAXT], lst[CP_SHOP_MAXT], tail[CP_SHOP_MAXT];
+    int ndem[CP_SHOP_MAXT];
+    int demr[CP_SHOP_MAXT][CP_SHOP_MAXD];
+    long long dema[CP_SHOP_MAXT][CP_SHOP_MAXD];
+    int nres;
+    long long rcap[CP_SHOP_MAXR];
+    int *load[CP_SHOP_MAXR];
+    int npred[CP_SHOP_MAXT];
+    int *pred[CP_SHOP_MAXT];            /* one flat block, row per task */
+    int *predblk;
+    long long horizon, lo_mk, hi_mk, best;
+    long long *start, *beststart;
+    unsigned char *placed;
+    long long nodes, nodecap;
+    double deadline;                    /* wall-clock budget (0 = none) */
+    struct timespec t_start;
+    int aborted;
+    int mk;
+    int pure;                           /* model is exactly the pattern */
+    int npred_total;
+} CPShop;
+
+static int cp_shop_push_bound(CP*cp,CPShop*S);
+
+/* Variable order for scheduling models: take the unfixed searchable
+   variable with the smallest *index*, i.e. declaration order (the placement
+   order of the tasks), and leave `mk` to the end.  Everything else is
+   scheduling territory: a smallest-domain scan picks `mk` as soon as the
+   incumbent cuts it down and degenerates into makespan enumeration (7x7
+   jobshop: 0.9 s -> does not finish), and picking the most constrained
+   *start* is just as bad.  Committing one job's route before moving on is
+   what makes the disjunctive propagation bite. */
+static int cp_shop_pick_var(CP*cp,CPShop*S,unsigned char*searchme){
+    for(int v=0;v<cp->nvars;v++){
+        if(!searchme[v]||v==S->mk) continue;
+        if(!cp->bounded[v]||cp_fixed(cp,v)) continue;
+        for(int i=0;i<S->ntask;i++) if(S->sv[i]==v) return v;
+    }
+    return -1;
+}
+
 static int cp_solve_rec(CP*cp,CPCR*cr,int nc,unsigned char*searchme,double*outx,int depth,
                         int all,void(*on_solution)(const double*,double,void*),void*ud,
-                        CPOptCtx*opt,long*nodectr,int*suspect){
+                        CPOptCtx*opt,long*nodectr,int*suspect,CPShop*shop){
     /* search nodes are counted on the caller-owned counter, not on the CP
        instance: the recursion works on per-branch copies (cp_copy duplicates
        a parent's counter into the child), so an instance-local count would
@@ -4010,6 +4059,7 @@ static int cp_solve_rec(CP*cp,CPCR*cr,int nc,unsigned char*searchme,double*outx,
     int pr=cp_propagate(cp,cr,nc);
     if(pr==1) return 0;
     if(pr==-1) return -1;
+    if(shop&&cp_shop_push_bound(cp,shop)) return 0;
     if(opt&&opt->have){
         __int128 act;
         if(cp_opt_activity(cp,opt,&act)){
@@ -4025,8 +4075,16 @@ static int cp_solve_rec(CP*cp,CPCR*cr,int nc,unsigned char*searchme,double*outx,
         if(bt==1) return 0;              /* objective row infeasible below incumbent */
         if(bt==2){ pr=cp_propagate(cp,cr,nc); if(pr==1) return 0; if(pr==-1) return -1; }
     }
+    /* Scheduling models: branch on the start of the most urgent task (the
+       one with the smallest latest start) instead of the first variable with
+       the smallest domain.  Value enumeration then commits a task to one
+       start and, on backtracking, only learns "not this value" -- for a
+       jobshop that explodes (6x6 jobshop: 3e5 nodes).  Below, the selected
+       start is instead split as `s = lo` / `s in (lo, hi]`, which keeps the
+       delay information and lets the disjunctive propagation bite. */
     int best=-1,bestsz=INT_MAX;
-    for(int v=0;v<cp->nvars;v++){
+    if(shop) best=cp_shop_pick_var(cp,shop,searchme);
+    if(best<0) for(int v=0;v<cp->nvars;v++){    /* MRV fallback */
         if(!searchme[v]) continue;     /* non-search vars (unconstrained AND
                                           non-output) cannot affect a leaf
                                           and are never printed: branching on
@@ -4076,7 +4134,7 @@ static int cp_solve_rec(CP*cp,CPCR*cr,int nc,unsigned char*searchme,double*outx,
     for(int i=0;i<nvals;i++){
         CP br; cp_copy(&br,cp);
         cp_assign(&br,best,vals[i]);
-        int rr=cp_solve_rec(&br,cr,nc,searchme,outx,depth+1,all,on_solution,ud,opt,nodectr,suspect);
+        int rr=cp_solve_rec(&br,cr,nc,searchme,outx,depth+1,all,on_solution,ud,opt,nodectr,suspect,shop);
         cp_free(&br);
         if(rr==2) return 2;   /* single-mode solution found */
         if(rr==4) return 4;   /* all/opt-mode node limit: search incomplete */
@@ -4127,220 +4185,617 @@ static int cp_bound_diophantine(CP*cp,CPCR*cr,int nc){
 }
 
 /* ------------------------------------------------------------------ */
-/* Makespan/cumulative scheduling: dedicated serial-SGS branch-and-     */
-/* bound.                                                               */
+/* Scheduling: generalised serial-SGS branch and bound.                 */
 /*                                                                      */
-/* The generic DFS branches on start *values*, which is hopeless for    */
-/* "minimize makespan over cumulative tasks": on a 16-task instance it  */
-/* needs 4e5 nodes to find one schedule and cannot refute a single      */
-/* makespan value at all (that is what CP-SAT's scheduling propagators  */
-/* are for).  For the exact MiniZinc makespan pattern                */
-/*     minimize mk,  cumulative(s,d,r,b),  s_i + d_i <= mk  (all i)     */
-/* we instead enumerate *active* schedules: take the tasks one at a     */
-/* time and place each at its earliest feasible start given the ones    */
-/* already placed.  Serial SGS is a classical exact scheme -- the set   */
-/* of active schedules it generates always contains an optimal one --   */
-/* so branch-and-bound over the placement order proves optimality, and  */
-/* the first dive yields an incumbent immediately.                      */
+/* Branching on start *values* is hopeless for scheduling models: on a  */
+/* 6x6 jobshop the generic branch and bound needs 7.5k nodes (5.7k of   */
+/* them before the first schedule) and a 16-task cumulative instance    */
+/* could not refute a single makespan value at all.  For models that    */
+/* carry a scheduling structure -- `disjunctive`/`cumulative` over      */
+/* constant durations plus `s_i + d_i <= mk` rows -- we instead          */
+/* enumerate *active* schedules: take the tasks one at a time (in a      */
+/* precedence-feasible order) and place each at its earliest feasible    */
+/* start given the ones already placed.  Serial SGS is a classical exact */
+/* scheme: the set of active schedules it generates always contains an   */
+/* optimal one (Kolisch 1996, for the precedence-constrained case too),  */
+/* so branch and bound over the placement order proves optimality, and   */
+/* the first dive yields an incumbent immediately.                       */
 /*                                                                      */
-/* Anything that does not match the pattern exactly is declined (the    */
-/* generic CP search takes over), and the constructed schedule is       */
-/* re-verified with cp_verify before it is reported.                    */
+/* Two uses:                                                             */
+/*   * model == exactly the scheduling shape -> the search is the answer  */
+/*     (proven optimum, re-verified with cp_verify before reporting);     */
+/*   * model has extra constraints (side rows, other globals) -> the      */
+/*     search is only an *incumbent generator*: its schedule is verified  */
+/*     against the whole model and, if it holds, seeds the generic branch */
+/*     and bound, which still has to prove optimality itself.             */
+/* In both cases the extracted structure also yields a root lower bound   */
+/* (critical path + per-machine preemptive Schrage + the cumulative class */
+/* bound) that is pushed into mk's domain, so the generic search keeps    */
+/* the strong bound even when it cannot use the SGS search itself.        */
 /* ------------------------------------------------------------------ */
-typedef struct{
-    int n;
-    const long long *dur,*res;
-    long long cap;
-    long long *est,*lst;      /* per task start window */
-    long long hi_mk;          /* largest makespan still worth exploring */
-    long long lo_mk;          /* proven lower bound on the makespan */
-    int *load;                /* load[t] over [0,hi_mk) */
-    unsigned char *placed;
-    long long *start,*beststart;
-    long long best;           /* incumbent makespan (hi_mk+1 = none yet) */
-    long long nodes,nodecap;
-    int aborted;
-    long long *early;         /* scratch: earliest feasible start per task */
-    long long early_best;     /* incumbent the cached early[] values belong to */
-    int *ord;                 /* scratch: candidate order */
-} MKSP;
 
-/* earliest t in [est_i, min(lst_i, best-d_i)] whose window fits; -1 if none.
-   A blocked slot u makes every start <= u infeasible, so the scan jumps. */
-static long long mks_earliest(MKSP*P,int i,long long lim){
-    long long d=P->dur[i], r=P->res[i];
-    long long tmax=P->lst[i];
-    if(P->hi_mk-d<tmax) tmax=P->hi_mk-d;
-    if(lim-1-d<tmax) tmax=lim-1-d;
-    for(long long t=P->est[i]; t<=tmax; t++){
-        int fit=1;
-        for(long long u=t;u<t+d;u++){
-            if(P->load[u]+r>P->cap){ fit=0; t=u; break; }
+
+/* Preemptive Schrage value of 1|r_j, pmtn|Lmax: a lower bound on the
+   non-preemptive 1|r_j, q_j|Cmax of the same jobs (heads r, durations p,
+   tails q).  Every preemptive schedule is also an upper bound on what any
+   non-preemptive schedule can shave off, so this is admissible. */
+static long long cp_schrage_lb(const long long*r,const long long*p,const long long*q,int n){
+    if(n<=0||n>CP_SHOP_MAXT) return 0;
+    long long rem[CP_SHOP_MAXT];
+    unsigned char done[CP_SHOP_MAXT];
+    for(int i=0;i<n;i++){ rem[i]=p[i]; done[i]=0; }
+    long long t=0, best=0;
+    for(;;){
+        int pick=-1;
+        for(int i=0;i<n;i++){
+            if(done[i]||rem[i]<=0) continue;
+            if(r[i]<=t && (pick<0||q[i]>q[pick])) pick=i;
         }
-        if(fit) return t;
+        if(pick<0){
+            long long nt=LLONG_MAX;
+            for(int i=0;i<n;i++) if(!done[i]&&rem[i]>0&&r[i]>t&&r[i]<nt) nt=r[i];
+            if(nt==LLONG_MAX) break;
+            t=nt; continue;
+        }
+        long long nt=LLONG_MAX;
+        for(int i=0;i<n;i++) if(!done[i]&&rem[i]>0&&r[i]>t&&r[i]<nt) nt=r[i];
+        long long run=rem[pick];
+        if(nt!=LLONG_MAX && nt-t<run) run=nt-t;
+        if(run<=0) run=1;                       /* never stall */
+        t+=run; rem[pick]-=run;
+        if(rem[pick]<=0){ done[pick]=1; long long v=t+q[pick]; if(v>best) best=v; }
+    }
+    return best;
+}
+
+static void cp_shop_free(CPShop*S){
+    for(int r=0;r<S->nres;r++) psolve_free(S->load[r]);
+    psolve_free(S->predblk);   /* S->pred[i] are rows inside this block */
+    psolve_free(S->start);
+    psolve_free(S->beststart); psolve_free(S->placed);
+    memset(S,0,sizeof(*S));
+}
+
+static int cp_shop_find_task(CPShop*S,int v){
+    for(int i=0;i<S->ntask;i++) if(S->sv[i]==v) return i;
+    return -1;
+}
+
+/* Build the scheduling structure from the parsed constraints.  Returns 1 when
+   a usable structure (>=1 resource, constant durations, a makespan variable
+   that bounds every task) was found; S->pure says whether the model is
+   *exactly* that structure. */
+static int cp_shop_extract(CP*cp,CPCR*cr,int nc,CPShop*S,int mk){
+    memset(S,0,sizeof(*S));
+    S->mk=mk; S->pure=1;
+    S->predblk=(int*)psolve_calloc((size_t)CP_SHOP_MAXT*(size_t)CP_SHOP_MAXT,sizeof(int));
+    for(int i=0;i<CP_SHOP_MAXT;i++) S->pred[i]=S->predblk+(size_t)i*CP_SHOP_MAXT;
+    unsigned char *row_used=(unsigned char*)psolve_calloc((size_t)(nc?nc:1),1);
+    long long extra_lo=LLONG_MIN, extra_hi=LLONG_MAX;
+    int ok=1;
+    for(int i=0;i<nc&&ok;i++){
+        int kind=cr[i].kind;
+        if(kind!=CPK_DISJ&&kind!=CPK_CUM){ if(kind!=CPK_LIN) S->pure=0; continue; }
+        CPCR*C=&cr[i];
+        if(!C->arr_terms||!C->terms){ ok=0; break; }
+        long long cap=1;
+        if(kind==CPK_CUM){
+            if(!C->terms3||!C->terms3[0].isc){ ok=0; break; }
+            cap=C->terms3[0].c;
+            if(cap<=0){ ok=0; break; }
+        }
+        if(S->nres>=CP_SHOP_MAXR){ ok=0; break; }
+        int rid=S->nres++;
+        S->rcap[rid]=cap;
+        for(int t=0;t<C->n;t++){
+            if(!C->terms[t].isc){ ok=0; break; }
+            long long d=C->terms[t].c;
+            if(d<0){ ok=0; break; }
+            long long dem=1;
+            if(kind==CPK_CUM){
+                if(!C->terms2||!C->terms2[t].isc){ ok=0; break; }
+                dem=C->terms2[t].c;
+                if(dem<0||dem>cap){ ok=0; break; }
+            }
+            CPT*St=&C->arr_terms[t];
+            if(St->isc||St->off){ ok=0; break; }
+            int v=St->v;
+            if(v<0||v>=cp->nvars||!cp->bounded[v]){ ok=0; break; }
+            int ti=cp_shop_find_task(S,v);
+            if(ti<0){
+                if(S->ntask>=CP_SHOP_MAXT){ ok=0; break; }
+                ti=S->ntask++;
+                S->sv[ti]=v; S->dur[ti]=d;
+            } else if(S->dur[ti]!=d){ ok=0; break; }
+            int k=S->ndem[ti];
+            int dup=0;
+            for(int q=0;q<k;q++) if(S->demr[ti][q]==rid){ dup=1; S->dema[ti][q]+=dem; }
+            if(!dup){
+                if(k>=CP_SHOP_MAXD){ ok=0; break; }
+                S->demr[ti][k]=rid; S->dema[ti][k]=dem; S->ndem[ti]=k+1;
+            }
+        }
+    }
+    if(!ok||S->ntask<1||S->nres<1){ cp_shop_free(S); psolve_free(row_used); return 0; }
+    /* classify the linear rows */
+    for(int j=0;j<nc;j++){
+        if(cr[j].kind!=CPK_LIN) continue;
+        if(j==nc) continue;
+        CPCR*L=&cr[j];
+        if(!L->lvars||!L->lcoef){ S->pure=0; continue; }
+        if(L->n==1&&L->lvars[0]==mk){
+            long long c=L->lcoef[0], rh=L->rhs; int rel=L->rel;
+            if(c==0){ S->pure=0; continue; }
+            if(c<0){ if(c==LLONG_MIN||rh==LLONG_MIN){ S->pure=0; continue; }
+                     c=-c; rh=-rh; rel=(rel==1)?2:(rel==2)?1:(rel==3)?4:(rel==4)?3:rel; }
+            long long dq=rh/c, dr=rh%c; if(dr<0){ dr+=c; dq--; }
+            long long cq=dq+((dr>0)?1:0);
+            if(rel==0||rel==1){ if(dq<extra_hi) extra_hi=dq; }
+            if(rel==0||rel==2){ if(cq>extra_lo) extra_lo=cq; }
+            if(rel==3){ if(cq-1<extra_hi) extra_hi=cq-1; }
+            if(rel==4){ if(dq+1>extra_lo) extra_lo=dq+1; }
+            continue;
+        }
+        if(L->rel!=1||L->n!=2){ S->pure=0; continue; }
+        int a=L->lvars[0], b=L->lvars[1];
+        long long ca=L->lcoef[0], cb=L->lcoef[1];
+        int ta=cp_shop_find_task(S,a), tb=cp_shop_find_task(S,b);
+        /* s_i + d_i <= mk : the makespan row of task i */
+        if(ca==1&&cb==-1&&b==mk&&ta>=0&&L->rhs==-S->dur[ta]){ row_used[j]=1; continue; }
+        /* s_i + d_i <= s_j : a precedence edge i -> j */
+        if(ca==1&&cb==-1&&ta>=0&&tb>=0&&L->rhs==-S->dur[ta]){
+            if(S->npred[tb]>=CP_SHOP_MAXT){ S->pure=0; continue; }
+            int dup=0;
+            for(int q=0;q<S->npred[tb];q++) if(S->pred[tb][q]==ta) dup=1;
+            if(!dup) S->pred[tb][S->npred[tb]++]=ta;
+            row_used[j]=1; continue;
+        }
+        S->pure=0;
+    }
+    /* the structure must be complete for an exact solve: every task needs its
+       makespan row, and every row must be explained by the structure */
+    for(int i=0;i<S->ntask;i++){
+        int found=0;
+        for(int j=0;j<nc;j++){
+            if(!row_used[j]||cr[j].kind!=CPK_LIN) continue;
+            CPCR*L=&cr[j];
+            if(L->n==2&&L->lcoef[0]==1&&L->lcoef[1]==-1&&L->lvars[0]==S->sv[i]&&
+               L->lvars[1]==mk&&L->rhs==-S->dur[i]) found=1;
+        }
+        if(!found) S->pure=0;
+    }
+    /* horizon / windows */
+    S->hi_mk=cp->hi[mk];
+    S->lo_mk=cp->lo[mk];
+    if(extra_hi<LLONG_MAX&&extra_hi<S->hi_mk) S->hi_mk=extra_hi;
+    if(extra_lo>LLONG_MIN&&extra_lo>S->lo_mk) S->lo_mk=extra_lo;
+    long long hmax=0;
+    for(int i=0;i<S->ntask;i++){
+        S->est[i]=(long long)cp->lo[S->sv[i]];
+        S->lst[i]=(long long)cp->hi[S->sv[i]];
+        if(S->lst[i]+S->dur[i]>hmax) hmax=S->lst[i]+S->dur[i];
+    }
+    if(S->hi_mk<0) S->hi_mk=hmax;
+    if(S->hi_mk>hmax&&hmax>0) S->hi_mk=hmax;      /* never explore past the windows */
+    S->horizon=S->hi_mk+1;
+    if(S->horizon<=0||S->horizon>2000000||(S->hi_mk-S->lo_mk)>2000000){
+        cp_shop_free(S); psolve_free(row_used); return 0;
+    }
+    /* acyclic precedence + tails (longest remaining path) */
+    int *indeg=(int*)psolve_calloc((size_t)S->ntask,sizeof(int));
+    int *succ_n=(int*)psolve_calloc((size_t)S->ntask,sizeof(int));
+    int (*succ)[CP_SHOP_MAXT]=(int(*)[CP_SHOP_MAXT])psolve_calloc((size_t)S->ntask,(size_t)CP_SHOP_MAXT*sizeof(int));
+    for(int j=0;j<S->ntask;j++) for(int q=0;q<S->npred[j];q++){ succ[S->pred[j][q]][succ_n[S->pred[j][q]]++]=j; indeg[j]++; }
+    int *order=(int*)psolve_malloc((size_t)S->ntask*sizeof(int));
+    int nord=0, bad=0;
+    int *stack=(int*)psolve_malloc((size_t)S->ntask*sizeof(int));
+    int sp=0;
+    for(int j=0;j<S->ntask;j++) if(indeg[j]==0) stack[sp++]=j;
+    while(sp>0){
+        int i=stack[--sp];
+        order[nord++]=i;
+        for(int q=0;q<succ_n[i];q++){ int j=succ[i][q]; if(--indeg[j]==0) stack[sp++]=j; }
+    }
+    if(nord!=S->ntask) bad=1;                       /* cycle: not a DAG */
+    for(int i=0;i<S->ntask;i++) S->tail[i]=0;
+    if(!bad){
+        for(int t=nord-1;t>=0;t--){
+            int i=order[t];
+            long long tl=0;
+            for(int q=0;q<succ_n[i];q++){ int j=succ[i][q]; long long v=S->dur[j]+S->tail[j]; if(v>tl) tl=v; }
+            S->tail[i]=tl;
+        }
+    }
+    psolve_free(indeg); psolve_free(succ_n); psolve_free(succ); psolve_free(order); psolve_free(stack);
+    psolve_free(row_used);
+    if(bad){ cp_shop_free(S); return 0; }
+    S->npred_total=0;
+    for(int i=0;i<S->ntask;i++) S->npred_total+=S->npred[i];
+    for(int r=0;r<S->nres;r++) S->load[r]=(int*)psolve_calloc((size_t)S->horizon,sizeof(int));
+    S->start=(long long*)psolve_malloc((size_t)S->ntask*sizeof(long long));
+    S->beststart=(long long*)psolve_malloc((size_t)S->ntask*sizeof(long long));
+    S->placed=(unsigned char*)psolve_calloc((size_t)S->ntask,1);
+    for(int i=0;i<S->ntask;i++){ S->start[i]=0; S->beststart[i]=0; }
+    S->best=S->hi_mk+1;
+    return 1;
+}
+
+/* earliest t at which task i fits (precedence + every resource), or -1 */
+static long long cp_shop_earliest(CPShop*S,int i,long long lim){
+    long long d=S->dur[i];
+    long long e=S->est[i];
+    for(int q=0;q<S->npred[i];q++){
+        int p=S->pred[i][q];
+        if(!S->placed[p]) continue;                  /* unknown: ignore (SGS
+                                                        order keeps preds first) */
+        long long v=S->start[p]+S->dur[p];
+        if(v>e) e=v;
+    }
+    long long tmax=S->lst[i];
+    if(S->hi_mk-d<tmax) tmax=S->hi_mk-d;
+    if(lim-1-d<tmax) tmax=lim-1-d;
+    for(long long t=e;t<=tmax;t++){
+        long long jump=-1;
+        for(int k=0;k<S->ndem[i];k++){
+            int r=S->demr[i][k]; long long a=S->dema[i][k];
+            if(a<=0) continue;
+            for(long long u=t;u<t+d;u++){
+                if((long long)S->load[r][u]+a>S->rcap[r]){
+                    /* every start <= u contains u in its window */
+                    if(u>jump) jump=u;
+                    break;
+                }
+            }
+        }
+        if(jump<0) return t;
+        t=jump;
     }
     return -1;
 }
 
-static void mks_rec(MKSP*P,int depth,long long curmax){
-    if(P->aborted) return;
-    if(++P->nodes>P->nodecap){ P->aborted=1; return; }
-    if(depth==P->n){
-        if(curmax<P->best){ P->best=curmax; memcpy(P->beststart,P->start,(size_t)P->n*sizeof(long long)); }
+/* lower bound on the makespan of the unplaced tasks (sound: releases and
+   precedence are only ever postponed, tails never shrink) */
+static long long cp_shop_remaining_lb(CPShop*S,long long curmax){
+    long long lb=curmax;
+    int n=0;
+    for(int i=0;i<S->ntask;i++){
+        if(S->placed[i]) continue;
+        long long e=S->est[i];
+        for(int k=0;k<S->npred[i];k++){
+            int pp=S->pred[i][k];
+            if(S->placed[pp]){ long long v=S->start[pp]+S->dur[pp]; if(v>e) e=v; }
+        }
+        long long v=e+S->dur[i]+S->tail[i];
+        if(v>lb) lb=v;
+        n++;
+    }
+    /* per-resource preemptive Schrage (exact for capacity 1; for capacity >1
+       scaling the demands down to one unit keeps it a relaxation) */
+    if(n>0){
+        for(int rr2=0;rr2<S->nres;rr2++){
+            long long r2[CP_SHOP_MAXT], p2[CP_SHOP_MAXT], q2[CP_SHOP_MAXT];
+            int m=0;
+            int cnt=0;
+            for(int i=0;i<S->ntask;i++) if(!S->placed[i]) cnt++;
+            if(cnt>CP_SHOP_MAXT) continue;
+            long long mina=LLONG_MAX;
+            for(int i=0;i<S->ntask;i++){
+                if(S->placed[i]) continue;
+                for(int k=0;k<S->ndem[i];k++) if(S->demr[i][k]==rr2&&S->dema[i][k]>0&&S->dema[i][k]<mina) mina=S->dema[i][k];
+            }
+            (void)mina;
+            for(int i=0;i<S->ntask;i++){
+                if(S->placed[i]) continue;
+                long long a=0;
+                for(int k=0;k<S->ndem[i];k++) if(S->demr[i][k]==rr2) a=S->dema[i][k];
+                if(a<=0) continue;
+                /* capacity-scaled duration: ceil(d*a/cap) time units of the
+                   machine at full width -- a relaxation of "a units wide for
+                   d time units" whenever a <= cap */
+                long long pd=(a>=S->rcap[rr2])?S->dur[i]
+                              :(S->dur[i]*a+S->rcap[rr2]-1)/S->rcap[rr2];
+                r2[m]=S->est[i];
+                for(int k=0;k<S->npred[i];k++){
+                    int pp=S->pred[i][k];
+                    if(S->placed[pp]){ long long v=S->start[pp]+S->dur[pp]; if(v>r2[m]) r2[m]=v; }
+                }
+                p2[m]=pd; q2[m]=S->tail[i]; m++;
+            }
+            if(m>0){ long long v=cp_schrage_lb(r2,p2,q2,m); if(v>lb) lb=v; }
+        }
+    }
+    return lb;
+}
+
+/* Push the scheduling lower bound computed from the CURRENT domains into the
+   makespan variable.  Every ingredient is admissible at every search node:
+   a task cannot start before its domain minimum, tails are longest paths in
+   the (static) precedence graph, and the per-resource value is the preemptive
+   Schrage relaxation.  Returns 1 if mk became empty (node is infeasible). */
+static int cp_shop_push_bound(CP*cp,CPShop*S){
+    if(!S||S->ntask<1||S->mk<0) return 0;
+    long long lb=0;
+    for(int i=0;i<S->ntask;i++){
+        int64_t lo=cp_dmin(cp,S->sv[i]);
+        if(lo>=(INT64_C(1)<<60)) return 0;          /* wild: decline */
+        long long v=(long long)lo+S->dur[i]+S->tail[i];
+        if(v>lb) lb=v;
+    }
+    for(int r=0;r<S->nres;r++){
+        long long rr2[CP_SHOP_MAXT], pp[CP_SHOP_MAXT], qq[CP_SHOP_MAXT];
+        long long dl[CP_SHOP_MAXT], rl[CP_SHOP_MAXT];
+        int m=0, m2=0, excl=1;
+        long long t0r=LLONG_MAX;
+        for(int i=0;i<S->ntask;i++){
+            long long a=0;
+            for(int k=0;k<S->ndem[i];k++) if(S->demr[i][k]==r) a=S->dema[i][k];
+            if(a<=0) continue;
+            int64_t lo=cp_dmin(cp,S->sv[i]);
+            if(lo>=(INT64_C(1)<<60)) return 0;      /* wild: decline */
+            rr2[m]=(long long)lo; pp[m]=S->dur[i]; qq[m]=S->tail[i];
+            dl[m2]=S->dur[i]; rl[m2]=a;
+            if((long long)lo<t0r) t0r=(long long)lo;
+            for(int j=0;j<m;j++) if(a+rl[j]<=S->rcap[r]) excl=0;
+            m++; m2++;
+        }
+        if(m==0) continue;
+        if(t0r==LLONG_MAX) t0r=0;
+        if(excl){
+            long long v=cp_schrage_lb(rr2,pp,qq,m);
+            if(v>lb) lb=v;
+        } else if(S->rcap[r]>1 && m<=CP_MKS_MAXN){
+            long long v=t0r+cp_cum_mk_lb(dl,rl,m,S->rcap[r],t0r);
+            if(v>lb) lb=v;
+        }
+    }
+    if(lb<=cp->lo[S->mk]) return 0;
+    return cp_intersect(cp,S->mk,lb,cp->hi[S->mk]);
+}
+
+
+/* One greedy (no backtracking) serial-SGS dive: repeatedly place the available
+   task with the best priority at its earliest feasible start.  `rule` selects
+   the priority, `jitter` perturbs it (GRASP-style restarts).  Returns the
+   makespan of the complete schedule, or -1 when the dive gets stuck. */
+static long long cp_shop_greedy(CPShop*S,int rule,long long scale,unsigned rng){
+    for(int i=0;i<S->ntask;i++){ S->placed[i]=0; S->start[i]=0; }
+    for(int r=0;r<S->nres;r++) memset(S->load[r],0,(size_t)S->horizon*sizeof(int));
+    long long curmax=0;
+    for(int step=0;step<S->ntask;step++){
+        int pick=-1; long long pick_e=0; long long pick_key=0; unsigned pick_r=0;
+        for(int i=0;i<S->ntask;i++){
+            if(S->placed[i]) continue;
+            int ready=1;
+            for(int q=0;q<S->npred[i];q++) if(!S->placed[S->pred[i][q]]){ ready=0; break; }
+            if(!ready) continue;
+            long long e=cp_shop_earliest(S,i,S->hi_mk+1);
+            if(e<0) continue;
+            unsigned h=rng*(unsigned)(i+1); rng=h*1103515245u+12345u;
+            long long key;
+            /* smaller key = higher priority */
+            if(rule==0)      key=-S->dur[i];                 /* shortest first */
+            else if(rule==1) key=-S->tail[i];                /* most work left */
+            else if(rule==2) key=S->dur[i];                  /* longest first */
+            else             key=-(S->tail[i]+S->dur[i]);    /* MWKR+duration */
+            /* `scale`=0 is the pure rule; 1 adds a bounded random nudge so the
+               restarts explore different orders (GRASP) */
+            key=key*1024+(long long)((h>>16)&1023)*scale;
+            if(pick<0||key<pick_key||(key==pick_key&&e<pick_e)){ pick=i; pick_e=e; pick_key=key; pick_r=h; }
+        }
+        (void)pick_r;
+        if(pick<0) return -1;                       /* stuck: dead dive */
+        long long e=cp_shop_earliest(S,pick,S->hi_mk+1);
+        long long comp=e+S->dur[pick];
+        for(int q=0;q<S->ndem[pick];q++){
+            int r=S->demr[pick][q]; long long a=S->dema[pick][q];
+            if(a<=0) continue;
+            for(long long u=e;u<comp;u++) S->load[r][u]+=(int)a;
+        }
+        S->placed[pick]=1; S->start[pick]=e;
+        if(comp>curmax) curmax=comp;
+    }
+    return curmax;
+}
+
+
+static void cp_shop_rec(CPShop*S,int depth,long long curmax){
+    if(S->aborted) return;
+    if(++S->nodes>S->nodecap){ S->aborted=1; return; }
+    if(S->deadline>0 && (S->nodes&511)==0){
+        struct timespec now; clock_gettime(CLOCK_MONOTONIC,&now);
+        double el=(now.tv_sec-S->t_start.tv_sec)+(now.tv_nsec-S->t_start.tv_nsec)*1e-9;
+        if(el>S->deadline){ S->aborted=1; return; }
+    }
+    if(depth==S->ntask){
+        if(curmax<S->best){
+            S->best=curmax;
+            memcpy(S->beststart,S->start,(size_t)S->ntask*sizeof(long long));
+        }
         return;
     }
+    /* candidates: unplaced tasks whose predecessors are all placed */
     int ncand=0;
-    for(int i=0;i<P->n;i++){
-        if(P->placed[i]) continue;
-        long long e=mks_earliest(P,i,P->best);
-        if(e<0) return;            /* no placement now, and placing others can
-                                      only consume capacity: dead branch */
-        P->early[i]=e;
-        /* insertion into the candidate order: earliest start first, larger
-           work per time unit breaks ties (most constrained first) */
+    static const int ORDER_CAP=CP_SHOP_MAXT;
+    long long e_of[CP_SHOP_MAXT];
+    int ord[CP_SHOP_MAXT];
+    for(int i=0;i<S->ntask;i++){
+        if(S->placed[i]) continue;
+        int ready=1;
+        for(int q=0;q<S->npred[i];q++) if(!S->placed[S->pred[i][q]]){ ready=0; break; }
+        if(!ready) continue;
+        long long e=cp_shop_earliest(S,i,S->best);
+        if(e<0) return;                  /* cannot be placed at all: dead branch */
+        e_of[i]=e;
         int k=ncand++;
         while(k>0){
-            int j=P->ord[k-1];
-            long long ej=P->early[j];
-            int before = (e<ej) || (e==ej && P->dur[i]*P->res[i] > P->dur[j]*P->res[j]);
+            /* most-work-remaining first (best of the dispatch rules tested on
+               the jobshop sweep), earliest start breaking ties */
+            int j=ord[k-1];
+            int before = (S->tail[i]>S->tail[j]) || (S->tail[i]==S->tail[j]&&e<e_of[j]);
             if(!before) break;
-            P->ord[k]=P->ord[k-1]; k--;
+            ord[k]=ord[k-1]; k--;
         }
-        P->ord[k]=i;
+        ord[k]=i;
+        if(ncand>ORDER_CAP) return;
     }
-    P->early_best=P->best;
+    if(cp_shop_remaining_lb(S,curmax)>=S->best) return;
     for(int k=0;k<ncand;k++){
-        int i=P->ord[k];
-        /* the cached earliest start is only valid while the incumbent (which
-           bounds the scan) is unchanged; otherwise recompute, because a
-           stale later start would drop schedules from the enumeration and
-           could lose the optimum */
-        long long e = (P->best==P->early_best) ? P->early[i] : mks_earliest(P,i,P->best);
+        int i=ord[k];
+        long long e=cp_shop_earliest(S,i,S->best);   /* incumbent may have improved */
         if(e<0) continue;
-        long long comp=e+P->dur[i];
-        if(comp>=P->best) continue;
-        for(long long u=e;u<comp;u++) P->load[u]+=(int)P->res[i];
-        P->placed[i]=1; P->start[i]=e;
-        mks_rec(P,depth+1, curmax>comp?curmax:comp);
-        P->placed[i]=0;
-        for(long long u=e;u<comp;u++) P->load[u]-=(int)P->res[i];
-        if(P->aborted) return;
-        if(P->best<=P->lo_mk) return;   /* incumbent meets the lower bound */
+        long long comp=e+S->dur[i];
+        if(comp>=S->best) continue;
+        for(int q=0;q<S->ndem[i];q++){
+            int r=S->demr[i][q]; long long a=S->dema[i][q];
+            if(a<=0) continue;
+            for(long long u=e;u<comp;u++) S->load[r][u]+=(int)a;
+        }
+        S->placed[i]=1; S->start[i]=e;
+        cp_shop_rec(S,depth+1,curmax>comp?curmax:comp);
+        S->placed[i]=0;
+        for(int q=0;q<S->ndem[i];q++){
+            int r=S->demr[i][q]; long long a=S->dema[i][q];
+            if(a<=0) continue;
+            for(long long u=e;u<comp;u++) S->load[r][u]-=(int)a;
+        }
+        if(S->aborted) return;
+        if(S->best<=S->lo_mk) return;                /* meets the bound */
     }
 }
 
-/* returns 1 = proven optimum written to outx/opt, -1 = proven infeasible,
-   0 = pattern not recognised (or node cap hit): caller falls back */
-static int cp_mks_try(CP*cp,CPCR*cr,int nc,CPOptCtx*opt,double*outx,long*nodes){
+/* returns 1 = proven optimum in outx/opt, -1 = proven infeasible,
+   2 = verified incumbent seeded into opt (generic search must still prove),
+   0 = not applicable (or node cap hit).  When `out_shop` is given and the
+   generic search still has to run, the extracted structure is handed back so
+   that every node can push the scheduling bound into mk (cp_shop_push_bound). */
+static int cp_shop_apply(CP*cp,CPCR*cr,int nc,CPOptCtx*opt,double*outx,long*nodes,CPShop**out_shop){
+    if(out_shop) *out_shop=NULL;
     if(!opt||!opt->idx||!opt->coef||opt->n!=1||opt->coef[0]!=1||opt->sense!=1) return 0;
     int mk=opt->idx[0];
     if(mk<0||mk>=cp->nvars||!cp->bounded[mk]) return 0;
-    int ci=-1;
-    for(int i=0;i<nc;i++){
-        if(cr[i].kind==CPK_CUM){ if(ci>=0) return 0; ci=i; }
-        else if(cr[i].kind!=CPK_LIN) return 0;
-    }
-    if(ci<0) return 0;
-    CPCR*C=&cr[ci];
-    int n=C->n;
-    if(n<1||n>CP_MKS_MAXN) return 0;
-    if(!C->terms||!C->terms2||!C->terms3||!C->arr_terms) return 0;
-    if(!C->terms3[0].isc) return 0;
-    long long cap=C->terms3[0].c;
-    if(cap<=0) return 0;
-    /* extra rows are tolerated only as integer bounds on mk itself (the
-       derived makespan bound is exactly that); they tighten the window */
-    long long extra_lo=LLONG_MIN, extra_hi=LLONG_MAX;
-    long long dur[CP_MKS_MAXN], res[CP_MKS_MAXN];
-    int sv[CP_MKS_MAXN], used[CP_MKS_MAXN];
-    memset(used,0,sizeof(used));
-    __int128 energy=0;
-    for(int t=0;t<n;t++){
-        if(!C->terms[t].isc||!C->terms2[t].isc) return 0;
-        long long d=C->terms[t].c, r=C->terms2[t].c;
-        if(d<0||r<0||r>cap) return 0;
-        if(C->arr_terms[t].isc||C->arr_terms[t].off) return 0;
-        int v=C->arr_terms[t].v;
-        if(v<0||v>=cp->nvars||!cp->bounded[v]) return 0;
-        for(int q=0;q<t;q++) if(sv[q]==v) return 0;   /* distinct starts */
-        sv[t]=v; dur[t]=d; res[t]=r;
-        energy+=(__int128)d*r;
-        /* exactly one row `s_t - mk <= -d_t` */
-        int rows=0;
-        for(int j=0;j<nc;j++){
-            if(j==ci) continue;
-            CPCR*L=&cr[j];
-            if(L->kind!=CPK_LIN||L->rel!=1||L->n!=2||!L->lvars||!L->lcoef) continue;  /* mk-only bound row */
-            if(L->lcoef[0]==1&&L->lcoef[1]==-1&&L->lvars[0]==v&&L->lvars[1]==mk&&L->rhs==-d){ rows++; used[j]=1; }
-        }
-        if(rows!=1) return 0;
-    }
-    for(int j=0;j<nc;j++){
-        if(j==ci||used[j]) continue;
-        CPCR*L=&cr[j];
-        if(L->kind!=CPK_LIN||L->n!=1||!L->lvars||!L->lcoef||L->lvars[0]!=mk) return 0;
-        long long c=L->lcoef[0], rh=L->rhs; int rel=L->rel;
-        if(c==0) return 0;
-        if(c<0){ if(c==LLONG_MIN) return 0; c=-c; if(rh==LLONG_MIN) return 0; rh=-rh; rel=(rel==1)?2:(rel==2)?1:(rel==3)?4:(rel==4)?3:rel; }
-        /* c > 0: floor/ceil division of rhs by c (c is safe, |c| <= CP_BIG) */
-        long long dq=rh/c, dr=rh%c; if(dr<0){ dr+=c; dq--; }   /* floor */
-        long long cq=dq+((dr>0)?1:0);                          /* ceil */
-        if(rel==0||rel==1){ if(dq<extra_hi) extra_hi=dq; }
-        if(rel==0||rel==2){ if(cq>extra_lo) extra_lo=cq; }
-        if(rel==3){ if(cq-1<extra_hi) extra_hi=cq-1; }
-        if(rel==4){ if(dq+1>extra_lo) extra_lo=dq+1; }
-    }
-    long long lo_mk=cp->lo[mk], hi_mk=cp->hi[mk];
-    if(extra_lo>lo_mk) lo_mk=extra_lo;
-    if(extra_hi<hi_mk) hi_mk=extra_hi;
-    if(hi_mk<lo_mk) return -1;
-    for(int t=0;t<n;t++){
-        long long lb=(long long)cp->lo[sv[t]]+dur[t];
-        if(lb>lo_mk) lo_mk=lb;
-    }
-    {
-        long long t0=LLONG_MAX;
-        for(int t=0;t<n;t++) if(cp->lo[sv[t]]<t0) t0=(long long)cp->lo[sv[t]];
-        if(t0==LLONG_MAX) t0=0;
-        if(t0<0) t0=0;
-        long long lb=t0+cp_cum_mk_lb(dur,res,n,cap,t0);
-        if(lb>lo_mk) lo_mk=lb;
-    }
-    if(lo_mk>hi_mk) return -1;
-    if(hi_mk-lo_mk>1000000) return 0;
-
-    MKSP P; memset(&P,0,sizeof(P));
-    P.n=n; P.dur=dur; P.res=res; P.cap=cap; P.hi_mk=hi_mk; P.lo_mk=lo_mk;
-    P.best=hi_mk+1; P.nodecap=2000000;
-    P.est=(long long*)psolve_malloc((size_t)n*sizeof(long long));
-    P.lst=(long long*)psolve_malloc((size_t)n*sizeof(long long));
-    P.early=(long long*)psolve_malloc((size_t)n*sizeof(long long));
-    P.start=(long long*)psolve_malloc((size_t)n*sizeof(long long));
-    P.beststart=(long long*)psolve_malloc((size_t)n*sizeof(long long));
-    P.ord=(int*)psolve_malloc((size_t)n*sizeof(int));
-    P.placed=(unsigned char*)psolve_calloc((size_t)n,1);
-    P.load=(int*)psolve_calloc((size_t)(hi_mk>0?hi_mk:1),sizeof(int));
-    for(int t=0;t<n;t++){
-        P.est[t]=(long long)cp->lo[sv[t]]; P.lst[t]=(long long)cp->hi[sv[t]];
-        if(P.est[t]<0) P.est[t]=0;                 /* negative starts are fine
-                                                      but never useful here */
-        P.start[t]=0; P.beststart[t]=0;
-    }
-    mks_rec(&P,0,0);
+    CPShop*S=(CPShop*)psolve_calloc(1,sizeof(CPShop));
+    if(!cp_shop_extract(cp,cr,nc,S,mk)){ psolve_free(S); return 0; }
     int ret=0;
-    if(P.aborted){ ret=0; }
-    else if(P.best>hi_mk){ ret=-1; }               /* no schedule at all */
-    else {
-        for(int t=0;t<n;t++) outx[sv[t]]=(double)P.beststart[t];
-        outx[mk]=(double)P.best;
-        opt->best=(__int128)P.best; opt->have=1;
+    /* root lower bound: critical path, per-resource preemptive Schrage and the
+       cumulative class bound */
+    long long lb=S->lo_mk;
+    long long t0=LLONG_MAX;
+    for(int i=0;i<S->ntask;i++){
+        if(S->est[i]<t0) t0=S->est[i];
+        long long v=S->est[i]+S->dur[i];
+        if(v>lb) lb=v;
+    }
+    if(t0==LLONG_MAX) t0=0;
+    for(int r=0;r<S->nres;r++){
+        long long dd[CP_SHOP_MAXT], rr[CP_SHOP_MAXT], qq[CP_SHOP_MAXT];
+        long long dl[CP_SHOP_MAXT], rl[CP_SHOP_MAXT];
+        int m=0, m2=0;
+        long long t0r=LLONG_MAX;
+        int excl=1;                     /* tasks mutually exclusive? */
+        for(int i=0;i<S->ntask;i++){
+            long long a=0;
+            for(int k=0;k<S->ndem[i];k++) if(S->demr[i][k]==r) a=S->dema[i][k];
+            if(a<=0) continue;
+            dd[m]=S->dur[i]; rr[m]=S->est[i]; qq[m]=S->tail[i];
+            dl[m2]=S->dur[i]; rl[m2]=a;
+            if(S->est[i]<t0r) t0r=S->est[i];
+            for(int j=0;j<m;j++) if(a+rl[j]<=S->rcap[r]) excl=0;
+            m++; m2++;
+        }
+        if(m==0) continue;
+        if(t0r==LLONG_MAX) t0r=0;
+        if(excl){
+            /* every pair of tasks needs more than the full capacity together,
+               so they really do serialize: the one-machine preemptive
+               (Schrage) relaxation applies with the true durations */
+            long long v=cp_schrage_lb(rr,dd,qq,m);
+            if(v>lb) lb=v;
+        } else if(S->rcap[r]>1 && m<=CP_MKS_MAXN){
+            /* capacity above one: only the energy/class bound is sound (a
+               task of demand a occupies d*a capacity-time but can share the
+               resource, so scaling durations to a serial machine over-counts
+               -- two tasks of demand 2 in three time units fit into capacity
+               5, and ceil(3*2/5)=2 each would claim 4) */
+            long long v=t0r+cp_cum_mk_lb(dl,rl,m,S->rcap[r],t0r);
+            if(v>lb) lb=v;
+        }
+    }
+    if(lb>S->lo_mk) S->lo_mk=lb;
+    if(S->lo_mk>S->hi_mk){ cp_shop_free(S); psolve_free(S); return -1; }
+    /* the bound is admissible at the root, so it goes into the model either way */
+    if(cp_intersect(cp,mk,S->lo_mk,cp->hi[mk])){ cp_shop_free(S); psolve_free(S); return -1; }
+
+    /* serial-SGS search: exact for the pure pattern, incumbent generator
+       otherwise (a short run is enough to beat anything the generic dive
+       finds on its own) */
+    /* Proofs on the pure cumulative pattern finish in a few thousand nodes, so
+       it keeps a large node budget.  A model with precedence (jobshop shape)
+       can spend millions of nodes in the SGS enumeration without proving
+       anything, so there it is only an incumbent generator with a wall-clock
+       budget -- the generic search (plus cp_shop_push_bound) does the proof. */
+    S->nodecap = S->pure?2000000:20000;
+    /* seed the incumbent with GRASP-style greedy dives (cheap, and a tight
+       incumbent is what makes the branch and bound finish) */
+    {
+        long long bestmk=S->best;
+        long long keep[CP_SHOP_MAXT];
+        for(int i=0;i<S->ntask;i++) keep[i]=S->beststart[i];
+        /* the dives may use the full serial-schedule horizon; the load arrays
+           are sized for exactly that, so never go past it */
+        long long saved_hi=S->hi_mk;
+        if(S->hi_mk<(long long)S->horizon) S->hi_mk=S->horizon;
+        unsigned rs=12345u;
+        for(int rule=0;rule<4;rule++){
+            for(int rep=0;rep<8;rep++){
+                long long v=cp_shop_greedy(S,rule,rep==0?0:1,
+                                           rs+rep*7919u+rule*104729u);
+                if(v>=0&&v<bestmk){
+                    bestmk=v;
+                    memcpy(keep,S->start,(size_t)S->ntask*sizeof(long long));
+                }
+            }
+        }
+        S->hi_mk=saved_hi;
+        if(bestmk<S->best){ S->best=bestmk; memcpy(S->beststart,keep,(size_t)S->ntask*sizeof(long long)); }
+        for(int i=0;i<S->ntask;i++){ S->placed[i]=0; S->start[i]=0; }
+        for(int r=0;r<S->nres;r++) memset(S->load[r],0,(size_t)S->horizon*sizeof(int));
+    }
+    if(S->npred_total>0){ S->deadline=0.02; clock_gettime(CLOCK_MONOTONIC,&S->t_start); }
+    cp_shop_rec(S,0,0);
+    if(S->best>S->hi_mk){
+        ret = S->aborted?0:-1;                      /* complete search found none */
+    } else if(S->pure&&!S->aborted){
+        for(int i=0;i<S->ntask;i++) outx[S->sv[i]]=(double)S->beststart[i];
+        outx[mk]=(double)S->best;
+        opt->best=(__int128)S->best; opt->have=1;
         if(opt->bestx) memcpy(opt->bestx,outx,(size_t)opt->nv*sizeof(double));
         ret=1;
+    } else {
+        /* incumbent mode: usable only if it satisfies the whole model */
+        double *tmp=(double*)psolve_malloc((size_t)(opt->nv?opt->nv:1)*sizeof(double));
+        memcpy(tmp,outx,(size_t)opt->nv*sizeof(double));
+        for(int i=0;i<S->ntask;i++) tmp[S->sv[i]]=(double)S->beststart[i];
+        tmp[mk]=(double)S->best;
+        if(cp_verify(cp,cr,nc,tmp)){
+            if(!opt->have||(__int128)S->best<opt->best){
+                opt->best=(__int128)S->best; opt->have=1;
+                if(opt->bestx) memcpy(opt->bestx,tmp,(size_t)opt->nv*sizeof(double));
+            }
+            ret=2;
+        } else ret=0;
+        psolve_free(tmp);
     }
-    if(nodes) *nodes=(long)P.nodes;
-    psolve_free(P.est); psolve_free(P.lst); psolve_free(P.early);
-    psolve_free(P.start); psolve_free(P.beststart); psolve_free(P.ord);
-    psolve_free(P.placed); psolve_free(P.load);
+    if(nodes) *nodes=(long)S->nodes;
+    if(ret==1||ret==-1){ cp_shop_free(S); psolve_free(S); }
+    else if(out_shop){
+        /* hand the structure to the search: reset the SGS state, keep the
+           static model */
+        for(int r=0;r<S->nres;r++) memset(S->load[r],0,(size_t)S->horizon*sizeof(int));
+        memset(S->placed,0,(size_t)S->ntask);
+        for(int i=0;i<S->ntask;i++) S->start[i]=0;
+        S->nodes=0; S->aborted=0;
+        *out_shop=S;
+    } else { cp_shop_free(S); psolve_free(S); }
     return ret;
 }
 
@@ -4509,11 +4964,13 @@ static int fz_cp_try(const FZModel*m,FZSolution*sol){
 
     double *outx=sol->x; /* sized nv */
 
-    /* dedicated scheduler for the makespan/cumulative pattern (see
-       cp_mks_try); proven results only, everything else falls through */
+    /* dedicated scheduler for models with a scheduling structure (see
+       cp_shop_apply): exact when the model *is* the structure, otherwise a
+       verified incumbent plus the root bound pushed into mk */
+    CPShop *shop=NULL;
     if(m->solve_kind!=0 && !all){
         long mks_nodes=0;
-        int mr=cp_mks_try(&cp,cr,nc,&opt,outx,&mks_nodes);
+        int mr=cp_shop_apply(&cp,cr,nc,&opt,outx,&mks_nodes,&shop);
         if(mr==1){
             if(cp_verify(&cp,cr,nc,outx)){
                 sol->status=0; sol->nodes=mks_nodes;
@@ -4550,11 +5007,11 @@ static int fz_cp_try(const FZModel*m,FZSolution*sol){
         }
         if(ctx.key_len>SIZE_MAX/sizeof(uint64_t))psolve_fail(PSOLVE_ERR_OOM);
         ctx.scratch=(uint64_t*)psolve_calloc(ctx.key_len?ctx.key_len:1,sizeof(uint64_t));
-        rr=cp_solve_rec(&cp,cr,nc,searchme,outx,0,1,fz_solution_cb,&ctx,NULL,&cp_nodes,&suspect);
+        rr=cp_solve_rec(&cp,cr,nc,searchme,outx,0,1,fz_solution_cb,&ctx,NULL,&cp_nodes,&suspect,shop);
         fz_solve_ctx_free(&ctx);
     } else {
         rr=cp_solve_rec(&cp,cr,nc,searchme,outx,0,0,NULL,NULL,
-                        m->solve_kind!=0?&opt:NULL,&cp_nodes,&suspect);
+                        m->solve_kind!=0?&opt:NULL,&cp_nodes,&suspect,shop);
     }
 
     int handled=1;
@@ -4576,7 +5033,28 @@ static int fz_cp_try(const FZModel*m,FZSolution*sol){
             if(bad){ sol->status=2; break; }
         }
     }
-    else if(rr==0){ if(suspect){ handled=0; } else { sol->status=1; sol->nodes=cp_nodes; } }
+    else if(rr==0){
+        if(suspect) handled=0;
+        else if(opt.bestx && opt.have){
+            /* The search was cut everywhere by the incumbent bound: every
+               remaining branch provably cannot beat opt.best, so the
+               incumbent is the optimum.  (Without this the caller claimed
+               UNSATISFIABLE even though a verified solution was in hand.) */
+            memcpy(sol->x,opt.bestx,(size_t)nv*sizeof(double));
+            sol->obj=(double)opt.best+(double)opt.c0;
+            sol->status=0; sol->nodes=cp_nodes;
+            sol->best_bound=(double)opt.best+(double)opt.c0;
+            for(int d=0;d<m->ndecl;d++){ FZDecl*decl=&m->decls[d];
+                if(!decl->is_var||decl->base_idx<0||decl->is_alias) continue;
+                if(decl->has_lo && decl->has_hi) continue;
+                int bad=0;
+                for(int e=0;e<decl->n;e++){ int v=decl->base_idx+e; if(v<0||v>=nv) continue;
+                    double val=sol->x[v];
+                    if(val>FZ_BIG_BOUND-FZ_BIG_HIT_TOL || val< -FZ_BIG_BOUND+FZ_BIG_HIT_TOL){ bad=1; break; } }
+                if(bad){ sol->status=2; break; }
+            }
+        } else { sol->status=1; sol->nodes=cp_nodes; }
+    }
     else if(all && (rr==3)){ if(suspect){ handled=0; } else { sol->status=0; sol->nodes=cp_nodes; } }
     else if(all && rr==4){ sol->nodes=cp_nodes; sol->status=4; }
     else if(opt.bestx && rr==3){
@@ -4612,6 +5090,7 @@ static int fz_cp_try(const FZModel*m,FZSolution*sol){
     for(int i=0;i<nc;i++){ cp_cr_aux_free(&cr[i]); psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);psolve_free(cr[i].terms2);psolve_free(cr[i].terms3);} psolve_free(cr);
     psolve_free(referenced); psolve_free(searchme);
     psolve_free(opt.bestx); psolve_free(optcoef);
+    if(shop){ cp_shop_free(shop); psolve_free(shop); shop=NULL; }
     if(!handled) return 0;
     return 1;
 }
