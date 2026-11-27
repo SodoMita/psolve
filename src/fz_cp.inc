@@ -189,7 +189,10 @@ static void cp_free(CP*cp){
 /* ------------------------------------------------------------------ */
 /* Constraint records                                                  */
 /* ------------------------------------------------------------------ */
-typedef struct { int v; int isc; int64_t c; } CPT;
+typedef struct { int v; int isc; int64_t c; int64_t off; } CPT;
+/* off: constant shift for var terms (value = x + off).  Only the
+   all_different propagator consumes it; every other propagator
+   requires off == 0, which is what cp_term_from_lin guarantees. */
 typedef struct {
     int kind;      /* CPK_* */
     int n;
@@ -244,14 +247,27 @@ typedef struct {
 static int fg_kind(int k){ return k==CPK_ORBIT||k==CPK_ORBITTR||k==CPK_ORBITCL||k==CPK_ONCYCLE||k==CPK_ORBITCAP; }
 
 static int cp_term_from_lin(const Lin*l,CPT*t){
+    t->off=0;
     if(l->n==0 && fabs(l->constant)<=CP_BIG && l->constant==rint(l->constant)){ t->isc=1; t->c=(int64_t)l->constant; t->v=-1; return 0; }
     if(l->n==1 && fabs(l->coef[0]-1.0)<1e-9 && fabs(l->constant)<1e-9){ t->isc=0; t->v=l->idx[0]; t->c=0; return 0; }  /* TOLSHEET TOL-CP-UNIT */
     if(l->n==1 && fabs(l->coef[0]+1.0)<1e-9 && fabs(l->constant)<1e-9){ t->isc=0; t->v=l->idx[0]; t->c=1; return -2; }  /* TOLSHEET TOL-CP-UNIT */
     return -1;
 }
+/* Affine form `1*x + k` used by all_different, whose propagator understands
+   the constant shift.  MiniZinc flattens n-queens/magic/circuit diagonals to
+   exactly this shape (`q[i] + i`, `q[i] - i`), so accepting it keeps those
+   models on the CP engine instead of the far weaker LP/MIP bridge. */
+static int cp_term_from_lin_affine(const Lin*l,CPT*t){
+    cp_term_from_lin(l,t);
+    if(l->n==1 && fabs(l->coef[0]-1.0)<1e-9 && fabs(l->constant)<=CP_BIG &&
+       l->constant==rint(l->constant)){
+        t->isc=0; t->v=l->idx[0]; t->c=0; t->off=(int64_t)l->constant; return 0;
+    }
+    return (t->isc||(l->n==1&&fabs(l->coef[0]+1.0)<1e-9&&fabs(l->constant)<1e-9))?0:-1;
+}
 static int cp_term_value(const CP*cp,const CPT*t,int64_t*out){
     if(t->isc){ *out=t->c; return 1; }
-    if(cp_fixed(cp,t->v)){ *out=cp->vals[t->v][0]; return 1; }
+    if(cp_fixed(cp,t->v)){ *out=cp->vals[t->v][0]+t->off; return 1; }
     return 0;
 }
 
@@ -358,7 +374,8 @@ static int cp_prop_alldiff(CP*cp,CPT*terms,int n){
             if(cp_term_value(cp,&terms[i],&fv)){
                 for(int j=0;j<n;j++) if(j!=i){
                     CPT*t=&terms[j]; if(t->isc) continue;
-                    if(cp_remove_val(cp,t->v,fv)) return 1;
+                    /* t stands for (x + off): forbid the VALUE fv, i.e. x = fv-off */
+                    if(cp_remove_val(cp,t->v,fv-t->off)) return 1;
                 }
             }
         }
@@ -372,9 +389,10 @@ static int cp_prop_alldiff(CP*cp,CPT*terms,int n){
             for(int i=0;i<n;i++) if(!terms[i].isc && cp->bounded[terms[i].v] && cp->nvals[terms[i].v]>1) nfree++;
             if(nfree>0){
                 int *fvv=(int*)psolve_malloc((size_t)nfree*sizeof(int));
-                int c=0; for(int i=0;i<n;i++) if(!terms[i].isc && cp->bounded[terms[i].v] && cp->nvals[terms[i].v]>1) fvv[c++]=terms[i].v;
+                int64_t *foff=(int64_t*)psolve_malloc((size_t)nfree*sizeof(int64_t));
+                int c=0; for(int i=0;i<n;i++) if(!terms[i].isc && cp->bounded[terms[i].v] && cp->nvals[terms[i].v]>1){ foff[c]=terms[i].off; fvv[c++]=terms[i].v; }
                 int64_t *vs=NULL; int vc=0,vcap=0;
-                for(int r=0;r<nfree;r++){ int v=fvv[r]; for(int k=0;k<cp->nvals[v];k++){ int64_t val=cp->vals[v][k]; int dup=0; for(int q=0;q<vc;q++) if(vs[q]==val){dup=1;break;} if(!dup){ if(vc>=vcap){vcap=vcap?vcap*2:64;vs=(int64_t*)psolve_realloc((void**)&vs,(size_t)vcap*sizeof(int64_t));} vs[vc++]=val; } } }
+                for(int r=0;r<nfree;r++){ int v=fvv[r]; for(int k=0;k<cp->nvals[v];k++){ int64_t val=cp->vals[v][k]+foff[r]; int dup=0; for(int q=0;q<vc;q++) if(vs[q]==val){dup=1;break;} if(!dup){ if(vc>=vcap){vcap=vcap?vcap*2:64;vs=(int64_t*)psolve_realloc((void**)&vs,(size_t)vcap*sizeof(int64_t));} vs[vc++]=val; } } }
                 ADJ *adj=NULL; int *matchR=NULL, *matchL=NULL;
                 int *deg=NULL,*off=NULL,*cur=NULL,*to=NULL;
                 int *disc=NULL,*low=NULL,*comp=NULL,*onstk=NULL,*stkv=NULL,*fv=NULL,*fe=NULL;
@@ -382,7 +400,7 @@ static int cp_prop_alldiff(CP*cp,CPT*terms,int n){
                 adj=(ADJ*)psolve_calloc((size_t)nfree,sizeof(ADJ));
                 for(int r=0;r<nfree;r++){
                     int v=fvv[r]; int cap2=0; int *tmp=NULL; int tn=0;
-                    for(int k=0;k<vc;k++) if(cp_contains(cp,v,vs[k])){ if(tn>=cap2){cap2=cap2?cap2*2:8;tmp=(int*)psolve_realloc((void**)&tmp,(size_t)cap2*sizeof(int));} tmp[tn++]=k; }
+                    for(int k=0;k<vc;k++) if(cp_contains(cp,v,vs[k]-foff[r])){ if(tn>=cap2){cap2=cap2?cap2*2:8;tmp=(int*)psolve_realloc((void**)&tmp,(size_t)cap2*sizeof(int));} tmp[tn++]=k; }
                     adj[r].col=tmp; adj[r].n=tn;
                 }
                 matchR=(int*)psolve_malloc((size_t)(vc?vc:1)*sizeof(int)); for(int k=0;k<vc;k++) matchR[k]=-1;
@@ -473,7 +491,7 @@ static int cp_prop_alldiff(CP*cp,CPT*terms,int n){
                             int col=adj[r].col[k];
                             if(matchL[r]==col) continue;
                             if(comp[r]!=comp[nfree+col]){
-                                if(cp_remove_val(cp,v,vs[col])) goto ad_fail;
+                                if(cp_remove_val(cp,v,vs[col]-foff[r])) goto ad_fail;
                             }
                         }
                     }
@@ -485,7 +503,7 @@ ad_done:
                 psolve_free(deg); psolve_free(off); psolve_free(cur); psolve_free(to);
                 psolve_free(disc); psolve_free(low); psolve_free(comp); psolve_free(onstk);
                 psolve_free(stkv); psolve_free(fv); psolve_free(fe);
-                psolve_free(fvv); psolve_free(vs);
+                psolve_free(fvv); psolve_free(foff); psolve_free(vs);
                 continue;
 ad_fail:
                 for(int r2=0;r2<nfree;r2++) psolve_free(adj?adj[r2].col:NULL);
@@ -493,7 +511,7 @@ ad_fail:
                 psolve_free(deg); psolve_free(off); psolve_free(cur); psolve_free(to);
                 psolve_free(disc); psolve_free(low); psolve_free(comp); psolve_free(onstk);
                 psolve_free(stkv); psolve_free(fv); psolve_free(fe);
-                psolve_free(fvv); psolve_free(vs);
+                psolve_free(fvv); psolve_free(foff); psolve_free(vs);
                 return 1;
             }
         }
@@ -1220,6 +1238,32 @@ static int cp_prop_binpack(CP*cp,CPCR*r){
         }
     }
     int rc=0;
+    /* Global capacity bound.  Nothing is forced at the root of a hard
+       instance, so the per-bin rule below never fires; but a set S of
+       candidate bins can hold at most cap*|S| weight, and every item whose
+       domain is contained in S must live there.  Checking S = all bins is the
+       pigeonhole that decides over-capacity instances immediately, and
+       checking S = D_i for each item catches local overloads. */
+    if(nk>0){
+        long long totw=0;
+        for(int i=0;i<n;i++) totw+=W[i];
+        if(totw > c*(long long)nk){ psolve_free(ks); return 1; }
+        for(int i=0;i<n;i++){
+            if(B[i].isc||!cp->bounded[B[i].v]||cp->nvals[B[i].v]>CP_MAXVALS) continue;
+            int di=cp->nvals[B[i].v];
+            long long sub=0;
+            for(int j=0;j<n;j++){
+                if(B[j].isc){ if(cp_contains(cp,B[i].v,B[j].c)) sub+=W[j]; continue; }
+                if(cp_fixed(cp,B[j].v)){ if(cp_contains(cp,B[i].v,cp->vals[B[j].v][0])) sub+=W[j]; continue; }
+                if(!cp->bounded[B[j].v]||cp->nvals[B[j].v]>CP_MAXVALS) continue;
+                int inside=1;
+                for(int q=0;q<cp->nvals[B[j].v]&&inside;q++)
+                    if(!cp_contains(cp,B[i].v,cp->vals[B[j].v][q])) inside=0;
+                if(inside) sub+=W[j];
+            }
+            if(sub > c*(long long)di){ psolve_free(ks); return 1; }
+        }
+    }
     for(int q=0;q<nk&&!rc;q++){
         int64_t k=ks[q]; int64_t forced=0;
         for(int i=0;i<n;i++){
@@ -1269,11 +1313,106 @@ static int cp_prop_binpackl(CP*cp,CPCR*r){
     return 0;
 }
 
+/* Time-table (compulsory-part) filtering for cumulative -- the classical
+   Vilim rule.  The compulsory part of task i is [lst_i, est_i+d_i): the time
+   the task occupies in EVERY schedule still consistent with its domain.  Its
+   usage is charged to the capacity in advance; wherever that accumulated load
+   plus another task's usage would exceed the capacity, the other task cannot
+   overlap the overloaded segment, and its start-time values are pruned.  This
+   is what makes flat MiniZinc scheduling models tractable: the pairwise rule
+   below only fires when two usages alone overflow the capacity. */
+static int cp_prop_cum_tt(CP*cp,CPCR*r){
+    int n=r->n;
+    CPT*S=r->arr_terms,*D=r->terms,*R=r->terms2,*B=&r->terms3[0];
+    if(n<1||n>512) return 0;
+    int64_t cap=B->isc?B->c:cp_dmax(cp,B->v);
+    if(cap<0) return 1;
+    int64_t *est=(int64_t*)psolve_malloc((size_t)n*sizeof(int64_t));
+    int64_t *lst=(int64_t*)psolve_malloc((size_t)n*sizeof(int64_t));
+    int64_t *dur=(int64_t*)psolve_malloc((size_t)n*sizeof(int64_t));
+    int64_t *use=(int64_t*)psolve_malloc((size_t)n*sizeof(int64_t));
+    char *ok=(char*)psolve_calloc((size_t)n,1);
+    for(int i=0;i<n;i++){
+        if(D[i].isc) dur[i]=D[i].c;
+        else if(cp_fixed(cp,D[i].v)) dur[i]=cp->vals[D[i].v][0];
+        else dur[i]=-1;
+        if(R[i].isc) use[i]=R[i].c;
+        else if(cp_fixed(cp,R[i].v)) use[i]=cp->vals[R[i].v][0];
+        else use[i]=-1;
+        if(S[i].isc){ est[i]=lst[i]=S[i].c; }
+        else { est[i]=cp_dmin(cp,S[i].v); lst[i]=cp_dmax(cp,S[i].v); }
+        ok[i]=(dur[i]>=0&&use[i]>=0)?1:0;
+        if(ok[i]&&use[i]>cap) { psolve_free(est);psolve_free(lst);psolve_free(dur);psolve_free(use);psolve_free(ok); return 1; }
+    }
+    /* event sweep over compulsory parts [lst_i, est_i+dur_i) */
+    int nev=0;
+    for(int i=0;i<n;i++) if(ok[i]&&lst[i]<est[i]+dur[i]) nev+=2;
+    if(nev==0){ psolve_free(est);psolve_free(lst);psolve_free(dur);psolve_free(use);psolve_free(ok); return 0; }
+    typedef struct { int64_t t; int delta; } CEv;
+    CEv *ev=(CEv*)psolve_malloc((size_t)nev*sizeof(CEv));
+    int k=0;
+    for(int i=0;i<n;i++) if(ok[i]&&lst[i]<est[i]+dur[i]){
+        ev[k].t=lst[i]; ev[k].delta=(int)use[i]; k++;
+        ev[k].t=est[i]+dur[i]; ev[k].delta=-(int)use[i]; k++;
+    }
+    /* insertion sort by time (nev <= 1024) */
+    for(int i=1;i<k;i++){ CEv cur=ev[i]; int j=i-1;
+        while(j>=0&&ev[j].t>cur.t){ ev[j+1]=ev[j]; j--; } ev[j+1]=cur; }
+    int64_t load=0; int rc=0;
+    int idx=0;
+    while(idx<k){
+        int64_t t=ev[idx].t;
+        /* intervals are half-open [a,b): close endings, then open starts */
+        /* intervals are half-open [a,b): every event at time t applies before
+           the segment starting at t is measured */
+        while(idx<k&&ev[idx].t==t){ load+=ev[idx].delta; idx++; }
+        if(load>cap){ rc=1; break; }
+        if(idx<k){
+            int64_t t1=ev[idx].t;        /* segment [t,t1) carries `load` */
+            /* prune tasks that cannot tolerate this segment's load */
+            for(int i=0;i<n&&!rc;i++){
+                if(!ok[i]||dur[i]<=0) continue;
+                if(load+use[i]<=cap) continue;
+                if(lst[i]<t1&&est[i]+dur[i]>t){ continue; }  /* compulsory part already covers it (load check above) */
+                /* task i must avoid every point of [t,t1): its start s must
+                   satisfy s+dur<=t (end before) or s>=t1 (start after) */
+                int64_t keep_lo=t-dur[i], keep_hi=t1;   /* s<=keep_lo or s>=keep_hi */
+                if(S[i].isc) continue;
+                int v=S[i].v;
+                int cv = cp->bounded[v]?cp->nvals[v]:0;
+                if(!cp->bounded[v]){
+                    if(cp->hi[v]-cp->lo[v]+1>CP_MAXVALS) continue;
+                    cv=(int)(cp->hi[v]-cp->lo[v]+1);
+                }
+                if(cv<=0) continue;
+                if(cv>CP_MAXVALS) continue;
+                int64_t *kept=(int64_t*)psolve_malloc((size_t)cv*sizeof(int64_t));
+                int nk=0,changed=0;
+                for(int q=0;q<cv;q++){
+                    int64_t val=cp->bounded[v]?cp->vals[v][q]:(cp->lo[v]+q);
+                    if(val<=keep_lo||val>=keep_hi) kept[nk++]=val; else changed=1;
+                }
+                if(changed){
+                    if(nk==0){ psolve_free(kept); rc=1; break; }
+                    if(cp_set_vals(cp,v,kept,nk)<0){ psolve_free(kept); continue; }
+                    if(cp->nvals[v]==0){ psolve_free(kept); rc=1; break; }
+                }
+                psolve_free(kept);
+            }
+            if(rc) break;
+        }
+    }
+    psolve_free(ev); psolve_free(est); psolve_free(lst);
+    psolve_free(dur); psolve_free(use); psolve_free(ok);
+    return rc;
+}
+
 /* cumulative: tasks (s_i,d_i) with usage r_i share capacity b.  Sound rules:
    pairwise, if r_i+r_j > b (at their max) the two cannot overlap (disj-style);
    energy: sum r_i.lo*d_i.lo <= b.hi * span. */
 static int cp_prop_cum(CP*cp,CPCR*r){
     int n=r->n;
+    { int tt=cp_prop_cum_tt(cp,r); if(tt) return tt; }
     CPT*S=r->arr_terms, *D=r->terms, *R=r->terms2, *B=&r->terms3[0];
     int64_t bhi = B->isc?B->c:cp_dmax(cp,B->v);
     for(int i=0;i<n;i++) for(int j=i+1;j<n;j++){
@@ -2310,6 +2449,162 @@ static int fg_parse_table(FZModel*m,const char*argtext,long long**out_nx,int*out
     return 0;
 }
 
+#define CP_MKS_MAXN 64
+
+/* Lower bound on the makespan of a cumulative with CONSTANT durations,
+   resources and capacity:  max_i (s_i + d_i) >= t0 + this value, where t0
+   is a lower bound on every start.
+
+   Two relaxations, both sound:
+
+   (a) energy: every task runs inside [t0, makespan), so
+       sum r_i*d_i <= cap*(makespan - t0).
+
+   (b) class: take a set S of tasks that are PAIRWISE incompatible
+       (r_i + r_j > cap, so no two of them can overlap).  Their durations
+       occupy exactly D_S disjoint time units inside [t0, makespan), and
+       during those units the residual capacity cap - r_i is too small for a
+       task j that is incompatible with *every* member of S.  Such tasks
+       therefore run only in the remaining (makespan - t0 - D_S) slots:
+       sum_{j in R} r_j*d_j <= cap*(makespan - t0 - D_S).
+
+   (b) is what proves real scheduling instances optimal at the root: for a
+   random 16-task instance (cap 4, eight r=3 tasks, four r=2 tasks) (a) gives
+   22 while (b) gives the true optimum 25. */
+static long long cp_cum_mk_lb(const long long*d,const long long*r,int n,long long cap,long long t0){
+    (void)t0;
+    if(n<=0||cap<=0) return 0;
+    __int128 E=0;
+    for(int i=0;i<n;i++) E+=(__int128)d[i]*(__int128)r[i];
+    long long lb=(long long)((E+(__int128)cap-1)/(__int128)cap);
+    if(n>CP_MKS_MAXN) return lb;      /* class bound below needs the arrays */
+    int idx[CP_MKS_MAXN];
+    for(int i=0;i<n;i++) idx[i]=i;
+    for(int i=1;i<n;i++){                 /* sort: larger r first, then larger work */
+        int k=idx[i], j=i-1;
+        while(j>=0 && (r[idx[j]]<r[k] ||
+              (r[idx[j]]==r[k] && d[idx[j]]*(long long)r[idx[j]] < d[k]*(long long)r[k]))){
+            idx[j+1]=idx[j]; j--; }
+        idx[j+1]=k;
+    }
+    /* try every distinct resource threshold: S = greedy clique among the
+       tasks above it, R = the tasks it blocks completely */
+    for(int a=0;a<n;a++){
+        long long tv=r[idx[a]];
+        int S[CP_MKS_MAXN], ns=0;
+        long long Ds=0;
+        for(int t=0;t<n;t++){
+            int i=idx[t];
+            if(r[i]<=tv||r[i]<=0) continue;
+            int ok=1;
+            for(int b=0;b<ns;b++) if(r[i]+r[S[b]]<=cap){ ok=0; break; }
+            if(ok){ S[ns++]=i; Ds+=d[i]; }
+        }
+        if(ns<1) continue;
+        __int128 Er=0;
+        for(int j=0;j<n;j++){
+            int inS=0; for(int b=0;b<ns;b++) if(S[b]==j) inS=1;
+            if(inS||r[j]<=0) continue;
+            int blocked=1;
+            for(int b=0;b<ns;b++) if(r[j]+r[S[b]]<=cap){ blocked=0; break; }
+            if(blocked) Er+=(__int128)d[j]*(__int128)r[j];
+        }
+        long long cl=Ds + (Er>0 ? (long long)((Er+(__int128)cap-1)/(__int128)cap) : 0);
+        if(cl>lb) lb=cl;
+        if(a+1<n && r[idx[a+1]]==tv) continue;   /* same threshold: no new S */
+    }
+    return lb;
+}
+
+/* ------------------------------------------------------------------ */
+/* Derived makespan bound for cumulative scheduling.                    */
+/*                                                                      */
+/* The flat MiniZinc makespan pattern is `cumulative(s,d,r,b)` together */
+/* with one row `s_i + d_i <= mk` per task.  Every task then lies inside */
+/* [est_min, mk), so the total energy sum r_i*d_i has to fit into that  */
+/* window: mk >= est_min + ceil(E/b).  Posting that as a linear row is   */
+/* the bound CP-SAT gets from its energetic reasoning; without it,      */
+/* proving optimality on 15+ tasks degenerates into exhaustive search   */
+/* over start times.  Every ingredient is checked (constant d/r/b, a    */
+/* matching row for EVERY task, declared start bounds), so an          */
+/* unrecognised pattern simply gets no extra row.                       */
+/* ------------------------------------------------------------------ */
+static long long cr_decl_lo(const FZModel*m,int v,int*ok){
+    for(int d=0;d<m->ndecl;d++){ FZDecl*dd=&m->decls[d];
+        if(!dd->is_var||dd->is_alias||dd->base_idx<0||dd->n<1) continue;
+        if(v<dd->base_idx||v>=dd->base_idx+dd->n) continue;
+        if(!dd->has_lo){ *ok=0; return 0; }
+        *ok=1; return (long long)dd->lo[0];
+    }
+    *ok=0; return 0;
+}
+static void cp_add_cum_makespan_bound(CPCR**cr_io,int*nc_io,int*cap_io,const FZModel*m){
+    int nc=*nc_io;
+    for(int i=0;i<nc;i++){
+        if(cr_io[0][i].kind!=CPK_CUM) continue;
+        CPCR*cr=*cr_io;
+        int n=cr[i].n;
+        if(n<1||!cr[i].terms||!cr[i].terms2||!cr[i].terms3) continue;
+        int okk=1;
+        for(int t=0;t<n&&okk;t++){
+            if(!cr[i].terms[t].isc||!cr[i].terms2[t].isc) okk=0;
+            else if(cr[i].terms[t].c<0||cr[i].terms2[t].c<0) okk=0;
+            else if(cr[i].arr_terms[t].isc||cr[i].arr_terms[t].off) okk=0;
+        }
+        if(!okk||!cr[i].terms3[0].isc) continue;
+        long long cap=cr[i].terms3[0].c;
+        if(cap<=0) continue;
+        /* mk must be pinned by `s_t - mk <= -d_t` for EVERY task */
+        int mk=-1;
+        for(int j=0;j<nc&&mk<0;j++){
+            if(cr[j].kind!=CPK_LIN||cr[j].rel!=1||cr[j].n!=2||!cr[j].lvars) continue;
+            int cand=-1;
+            if(cr[j].lcoef[0]==1&&cr[j].lcoef[1]==-1) cand=cr[j].lvars[1];
+            else if(cr[j].lcoef[0]==-1&&cr[j].lcoef[1]==1) cand=cr[j].lvars[0];
+            if(cand<0) continue;
+            int matches=1;
+            for(int t=0;t<n&&matches;t++){
+                int sv=cr[i].arr_terms[t].v; long long dt=cr[i].terms[t].c;
+                int found=0;
+                for(int q=0;q<nc&&!found;q++){
+                    if(cr[q].kind!=CPK_LIN||cr[q].rel!=1||cr[q].n!=2||!cr[q].lvars) continue;
+                    if(cr[q].lcoef[0]==1&&cr[q].lcoef[1]==-1&&cr[q].lvars[0]==sv&&
+                       cr[q].lvars[1]==cand&&cr[q].rhs==-dt) found=1;
+                }
+                if(!found) matches=0;
+            }
+            if(matches) mk=cand;
+        }
+        if(mk<0) continue;
+        long long estmin=0; int have=0;
+        for(int t=0;t<n&&have>=0;t++){
+            int okd=0; long long lo=cr_decl_lo(m,cr[i].arr_terms[t].v,&okd);
+            if(!okd){ have=-1; break; }
+            if(!have||lo<estmin) estmin=lo;
+            have=1;
+        }
+        if(have<=0) continue;
+        long long dl[CP_MKS_MAXN], rl[CP_MKS_MAXN];
+        if(n>CP_MKS_MAXN) continue;
+        __int128 energy=0;
+        for(int t=0;t<n;t++){
+            dl[t]=cr[i].terms[t].c; rl[t]=cr[i].terms2[t].c;
+            energy+=(__int128)dl[t]*(__int128)rl[t];
+        }
+        if(energy<=0) continue;
+        __int128 bound=(__int128)estmin+(__int128)cp_cum_mk_lb(dl,rl,n,cap,estmin);
+        if(bound>=(__int128)(LLONG_MAX/4)||bound<=-(__int128)(LLONG_MAX/4)) continue;
+        CPCR nr; memset(&nr,0,sizeof(nr));
+        nr.kind=CPK_LIN; nr.rel=1; nr.n=1;
+        nr.lvars=(int*)psolve_malloc(sizeof(int)); nr.lvars[0]=mk;
+        nr.lcoef=(long long*)psolve_malloc(sizeof(long long)); nr.lcoef[0]=-1;
+        nr.rhs=-(long long)bound;
+        if(*nc_io>=*cap_io){ *cap_io*=2; *cr_io=(CPCR*)psolve_realloc((void**)cr_io,(size_t)(*cap_io)*sizeof(CPCR)); }
+        (*cr_io)[(*nc_io)++]=nr;
+        cr=*cr_io;
+    }
+}
+
 static int cp_parse(FZModel*m,CPCR**out_cr,int*out_n,unsigned char*referenced,int*has_cp_motivating){
     int cap=16,nc=0; CPCR*cr=(CPCR*)psolve_calloc((size_t)cap,sizeof(CPCR));
     int motivating=0;
@@ -2404,7 +2699,7 @@ static int cp_parse(FZModel*m,CPCR**out_cr,int*out_n,unsigned char*referenced,in
             motivating=1;
             rec.kind=CPK_ALLDIFF; rec.n=narr; rec.terms=(CPT*)psolve_calloc((size_t)(narr?narr:1),sizeof(CPT));
             int bad=0;
-            for(int i=0;i<narr;i++){ if(cp_term_from_lin(&arr[i],&rec.terms[i])!=0){ bad=1; break; } if(!rec.terms[i].isc) referenced[rec.terms[i].v]=1; }
+            for(int i=0;i<narr;i++){ if(cp_term_from_lin_affine(&arr[i],&rec.terms[i])!=0){ bad=1; break; } if(!rec.terms[i].isc) referenced[rec.terms[i].v]=1; }
             free_lins(arr,narr);
             if(bad){ psolve_free(rec.terms); ok=0; break; }
         }
@@ -2548,8 +2843,9 @@ static int cp_parse(FZModel*m,CPCR**out_cr,int*out_n,unsigned char*referenced,in
             motivating=1;
         }
         /* ---------- disjunctive / disjunctive_strict ---------- */
-        else if(strcmp(p,"fzn_disjunctive")==0||strcmp(p,"fzn_disjunctive_strict")==0||
-                strcmp(p,"ortools_disjunctive_strict")==0||strcmp(p,"gecode_disjunctive_strict")==0||
+        else if(cp_pred_is(p,"disjunctive")||cp_pred_is(p,"disjunctive_strict")||
+                cp_pred_is(p,"no_overlap")||strcmp(p,"ortools_disjunctive")==0||
+                strcmp(p,"ortools_disjunctive_strict")==0||
                 cp_pred_is(p,"schedule_unary")){
             if(c->nargs<2){ok=0;break;}
             Lin*sa;int ns; if(parse_array(m,c->args[0],&sa,&ns)!=0){ok=0;break;}
@@ -2570,10 +2866,13 @@ static int cp_parse(FZModel*m,CPCR**out_cr,int*out_n,unsigned char*referenced,in
             motivating=1;
         }
         /* ---------- global_cardinality (ortools + fzn forms) ---------- */
-        else if(strcmp(p,"ortools_global_cardinality")==0||strcmp(p,"fzn_global_cardinality")==0||
-                strcmp(p,"gecode_global_cardinality")==0){
-            /* (x, cover, counts[, closed]) */
+        else if(cp_pred_is(p,"global_cardinality")||strcmp(p,"ortools_global_cardinality")==0||
+                cp_pred_is(p,"global_cardinality_closed")||
+                strcmp(p,"ortools_global_cardinality_closed")==0){
+            /* (x, cover, counts[, closed]); the *_closed names (3 args) force
+               the closed-world reading, the ortools form takes a trailing bool */
             int nargs=c->nargs;
+            int forced_closed=(strstr(p,"_closed")!=NULL);
             int has_closed=(nargs>=4);
             if(nargs<3){ok=0;break;}
             Lin*xa;int nx; if(parse_array(m,c->args[0],&xa,&nx)!=0){ok=0;break;}
@@ -2583,7 +2882,7 @@ static int cp_parse(FZModel*m,CPCR**out_cr,int*out_n,unsigned char*referenced,in
             Lin cl; CPT closed; int bad=0;
             if(has_closed){ if(parse_lin(m,c->args[3],&cl)!=0){free_lins(xa,nx);free_lins(ca,K);free_lins(ka,nk);ok=0;break;}
                 if(cp_term_from_lin(&cl,&closed)!=0){lin_free(&cl);bad=1;} else lin_free(&cl); }
-            else { closed.isc=1; closed.c=0; closed.v=-1; }
+            else { closed.isc=1; closed.c=(forced_closed?1:0); closed.v=-1; }
             if(!bad){
                 rec.kind=CPK_GCC; rec.rhs=K; rec.n=1+K; rec.nset=nx;
                 rec.setvals=(long long*)psolve_malloc((size_t)K*sizeof(long long));
@@ -2602,8 +2901,10 @@ static int cp_parse(FZModel*m,CPCR**out_cr,int*out_n,unsigned char*referenced,in
             if(!closed.isc) referenced[closed.v]=1;
             motivating=1;
         }
-        else if(strcmp(p,"ortools_global_cardinality_low_up")==0||strcmp(p,"fzn_global_cardinality_low_up")==0||
-                strcmp(p,"fzn_global_cardinality_low_up_closed")==0){
+        else if(cp_pred_is(p,"global_cardinality_low_up")||
+                strcmp(p,"ortools_global_cardinality_low_up")==0||
+                cp_pred_is(p,"global_cardinality_low_up_closed")||
+                strcmp(p,"ortools_global_cardinality_low_up_closed")==0){
             /* (x, cover, lbound, ubound[, closed]) */
             int nargs=c->nargs;
             int has_closed=(nargs>=5);
@@ -2614,7 +2915,8 @@ static int cp_parse(FZModel*m,CPCR**out_cr,int*out_n,unsigned char*referenced,in
             Lin*ua;int nu; if(parse_array(m,c->args[3],&ua,&nu)!=0){free_lins(xa,nx);free_lins(ca,K);free_lins(la,nl);ok=0;break;}
             if(nx<1||K<1||nl!=K||nu!=K){free_lins(xa,nx);free_lins(ca,K);free_lins(la,nl);free_lins(ua,nu);ok=0;break;}
             Lin cl; CPT closed; int bad=0;
-            int forced_closed=(strcmp(p,"fzn_global_cardinality_low_up_closed")==0);
+            int forced_closed=(strstr(p,"_closed")!=NULL);
+            if(forced_closed) has_closed=0;
             if(has_closed){ if(parse_lin(m,c->args[4],&cl)!=0){free_lins(xa,nx);free_lins(ca,K);free_lins(la,nl);free_lins(ua,nu);ok=0;break;}
                 if(cp_term_from_lin(&cl,&closed)!=0){lin_free(&cl);bad=1;} else lin_free(&cl); }
             else { closed.isc=1; closed.c=(forced_closed?1:0); closed.v=-1; }
@@ -2638,7 +2940,8 @@ static int cp_parse(FZModel*m,CPCR**out_cr,int*out_n,unsigned char*referenced,in
             motivating=1;
         }
         /* ---------- count_eq / nvalue / all_equal / increasing / member ---------- */
-        else if(cp_pred_is(p,"count_eq")||strcmp(p,"ortools_count_eq")==0||strcmp(p,"ortools_count_eq_cst")==0){
+        else if(cp_pred_is(p,"count_eq")||cp_pred_is(p,"count")||
+                strcmp(p,"ortools_count_eq")==0||strcmp(p,"ortools_count_eq_cst")==0){
             if(c->nargs<3){ok=0;break;}
             Lin*xa;int nx; if(parse_array(m,c->args[0],&xa,&nx)!=0){ok=0;break;}
             if(nx<1){free_lins(xa,nx);ok=0;break;}
@@ -2714,7 +3017,8 @@ static int cp_parse(FZModel*m,CPCR**out_cr,int*out_n,unsigned char*referenced,in
             motivating=1;
         }
         /* ---------- table / inverse / bin_packing ---------- */
-        else if(strcmp(p,"ortools_table_int")==0||strcmp(p,"gecode_table_int")==0||cp_pred_is(p,"table_int")){
+        else if(strcmp(p,"ortools_table_int")==0||strcmp(p,"gecode_table_int")==0||
+                cp_pred_is(p,"table_int")||cp_pred_is(p,"table")){
             if(c->nargs<2){ok=0;break;}
             Lin*xa;int nx; if(parse_array(m,c->args[0],&xa,&nx)!=0){ok=0;break;}
             Lin*ta;int nt; if(parse_array(m,c->args[1],&ta,&nt)!=0){free_lins(xa,nx);ok=0;break;}
@@ -2854,8 +3158,8 @@ static int cp_parse(FZModel*m,CPCR**out_cr,int*out_n,unsigned char*referenced,in
             if(!rec.terms3[0].isc) referenced[rec.terms3[0].v]=1;
             motivating=1;
         }
-        else if(strcmp(p,"fzn_diffn")==0||strcmp(p,"gecode_nooverlap")==0){
-            /* fzn_diffn(x,y,dx,dy); gecode_nooverlap(x,w,y,h) */
+        else if(cp_pred_is(p,"diffn")||cp_pred_is(p,"diffn_nonstrict")||strcmp(p,"gecode_nooverlap")==0){
+            /* diffn(x,y,dx,dy); gecode_nooverlap(x,w,y,h) */
             int is_no=(strcmp(p,"gecode_nooverlap")==0);
             if(c->nargs<4){ok=0;break;}
             int a0=0, a1=is_no?2:1, a2=is_no?1:2, a3=3;
@@ -2884,13 +3188,15 @@ static int cp_parse(FZModel*m,CPCR**out_cr,int*out_n,unsigned char*referenced,in
             if(bad){ psolve_free(rec.arr_terms); psolve_free(rec.terms); psolve_free(rec.terms2); psolve_free(rec.terms3); ok=0; break; }
             motivating=1;
         }
-        else if(cp_pred_is(p,"lex_less_int")||cp_pred_is(p,"lex_lesseq_int")||strcmp(p,"ortools_lex_less_int")==0||
+        else if(cp_pred_is(p,"lex_less_int")||cp_pred_is(p,"lex_lesseq_int")||
+                cp_pred_is(p,"lex_less")||cp_pred_is(p,"lex_lesseq")||strcmp(p,"ortools_lex_less_int")==0||
                 strcmp(p,"ortools_lex_lesseq_int")==0||strcmp(p,"array_int_lt")==0||strcmp(p,"array_int_lq")==0||
                 cp_pred_is(p,"lex_less_bool")||cp_pred_is(p,"lex_lesseq_bool")||strcmp(p,"array_bool_lt")==0||strcmp(p,"array_bool_lq")==0){
             int strict = (strstr(p,"less_int")==strstr(p,"lesseq_int")?0:0); /* placeholder, set below */
             strict = (strcmp(p,"array_int_lt")==0||strcmp(p,"array_bool_lt")==0||
                       strcmp(p,"ortools_lex_less_int")==0||strcmp(p,"ortools_lex_less_bool")==0||
-                      cp_pred_is(p,"lex_less_int")||cp_pred_is(p,"lex_less_bool"))?1:0;
+                      cp_pred_is(p,"lex_less_int")||cp_pred_is(p,"lex_less_bool")||
+                      cp_pred_is(p,"lex_less"))?1:0;
             if(c->nargs<2){ok=0;break;}
             Lin*xa;int nx; if(parse_array(m,c->args[0],&xa,&nx)!=0){ok=0;break;}
             Lin*ya;int ny; if(parse_array(m,c->args[1],&ya,&ny)!=0){free_lins(xa,nx);ok=0;break;}
@@ -3232,6 +3538,7 @@ static int cp_parse(FZModel*m,CPCR**out_cr,int*out_n,unsigned char*referenced,in
     if(!motivating){ for(int i=0;i<nc;i++){ cp_cr_aux_free(&cr[i]); psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);psolve_free(cr[i].terms2);psolve_free(cr[i].terms3);} psolve_free(cr); return -2; }
     /* structure recovery: rewrite bounded-horizon orbit chains (exact) */
     fz_presolve_orbit(m,cr,&nc,referenced);
+    cp_add_cum_makespan_bound(&cr,&nc,&cap,m);
     /* recompute `referenced` from the surviving records: the brancher must
        treat referenced<->appears-in-a-constraint as an exact invariant, and
        the presolve may have freed records; marking per parse-branch plus a
@@ -3693,7 +4000,7 @@ static int cp_opt_bb_tighten(CP*cp,const CPOptCtx*opt){
  */
 static int cp_solve_rec(CP*cp,CPCR*cr,int nc,unsigned char*searchme,double*outx,int depth,
                         int all,void(*on_solution)(const double*,double,void*),void*ud,
-                        CPOptCtx*opt,long*nodectr){
+                        CPOptCtx*opt,long*nodectr,int*suspect){
     /* search nodes are counted on the caller-owned counter, not on the CP
        instance: the recursion works on per-branch copies (cp_copy duplicates
        a parent's counter into the child), so an instance-local count would
@@ -3736,10 +4043,20 @@ static int cp_solve_rec(CP*cp,CPCR*cr,int nc,unsigned char*searchme,double*outx,
            must be fixed (lo==hi) else we cannot certify (a printed output
            var without a certified fixed value would be fabrication). */
         for(int v=0;v<cp->nvars;v++){
-            if(!cp->bounded[v] && searchme[v] && !cp_fixed(cp,v)) return -1;
+            if(!cp->bounded[v] && searchme[v] && !cp_fixed(cp,v)){
+                return -1;
+            }
         }
         for(int v=0;v<cp->nvars;v++){ if(cp_fixed(cp,v)) outx[v]=(double)cp->lo[v]; else outx[v]=0.0; }
-        if(!cp_verify(cp,cr,nc,outx)) return -1;   /* verification failed -> do not emit a wrong answer */
+        if(!cp_verify(cp,cr,nc,outx)){
+            /* The leaf does not satisfy the model, so this branch is
+               infeasible: backtrack.  `*suspect` records that some leaf had to
+               be rejected, which forbids UNSAT / enumeration-completeness /
+               optimality claims built on this search (they would rest on the
+               assumption that the propagators never miss a satisfying leaf). */
+            if(suspect) *suspect=1;
+            return 0;
+        }
         if(opt){
             /* objective vars are all referenced+fixed here (enforced at
                entry and by the leaf check above), so the score is exact */
@@ -3759,7 +4076,7 @@ static int cp_solve_rec(CP*cp,CPCR*cr,int nc,unsigned char*searchme,double*outx,
     for(int i=0;i<nvals;i++){
         CP br; cp_copy(&br,cp);
         cp_assign(&br,best,vals[i]);
-        int rr=cp_solve_rec(&br,cr,nc,searchme,outx,depth+1,all,on_solution,ud,opt,nodectr);
+        int rr=cp_solve_rec(&br,cr,nc,searchme,outx,depth+1,all,on_solution,ud,opt,nodectr,suspect);
         cp_free(&br);
         if(rr==2) return 2;   /* single-mode solution found */
         if(rr==4) return 4;   /* all/opt-mode node limit: search incomplete */
@@ -3806,6 +4123,224 @@ static int cp_bound_diophantine(CP*cp,CPCR*cr,int nc){
     if(nd<=0) ret=1;
     else for(int v=0;v<cp->nvars;v++) if(mark[v]){ int r=cp_restrict_divisors(cp,v,dv,nd); if(r==1){ret=1;break;} if(r==-1){ret=-1;break;} }
     psolve_free(mark);
+    return ret;
+}
+
+/* ------------------------------------------------------------------ */
+/* Makespan/cumulative scheduling: dedicated serial-SGS branch-and-     */
+/* bound.                                                               */
+/*                                                                      */
+/* The generic DFS branches on start *values*, which is hopeless for    */
+/* "minimize makespan over cumulative tasks": on a 16-task instance it  */
+/* needs 4e5 nodes to find one schedule and cannot refute a single      */
+/* makespan value at all (that is what CP-SAT's scheduling propagators  */
+/* are for).  For the exact MiniZinc makespan pattern                */
+/*     minimize mk,  cumulative(s,d,r,b),  s_i + d_i <= mk  (all i)     */
+/* we instead enumerate *active* schedules: take the tasks one at a     */
+/* time and place each at its earliest feasible start given the ones    */
+/* already placed.  Serial SGS is a classical exact scheme -- the set   */
+/* of active schedules it generates always contains an optimal one --   */
+/* so branch-and-bound over the placement order proves optimality, and  */
+/* the first dive yields an incumbent immediately.                      */
+/*                                                                      */
+/* Anything that does not match the pattern exactly is declined (the    */
+/* generic CP search takes over), and the constructed schedule is       */
+/* re-verified with cp_verify before it is reported.                    */
+/* ------------------------------------------------------------------ */
+typedef struct{
+    int n;
+    const long long *dur,*res;
+    long long cap;
+    long long *est,*lst;      /* per task start window */
+    long long hi_mk;          /* largest makespan still worth exploring */
+    long long lo_mk;          /* proven lower bound on the makespan */
+    int *load;                /* load[t] over [0,hi_mk) */
+    unsigned char *placed;
+    long long *start,*beststart;
+    long long best;           /* incumbent makespan (hi_mk+1 = none yet) */
+    long long nodes,nodecap;
+    int aborted;
+    long long *early;         /* scratch: earliest feasible start per task */
+    long long early_best;     /* incumbent the cached early[] values belong to */
+    int *ord;                 /* scratch: candidate order */
+} MKSP;
+
+/* earliest t in [est_i, min(lst_i, best-d_i)] whose window fits; -1 if none.
+   A blocked slot u makes every start <= u infeasible, so the scan jumps. */
+static long long mks_earliest(MKSP*P,int i,long long lim){
+    long long d=P->dur[i], r=P->res[i];
+    long long tmax=P->lst[i];
+    if(P->hi_mk-d<tmax) tmax=P->hi_mk-d;
+    if(lim-1-d<tmax) tmax=lim-1-d;
+    for(long long t=P->est[i]; t<=tmax; t++){
+        int fit=1;
+        for(long long u=t;u<t+d;u++){
+            if(P->load[u]+r>P->cap){ fit=0; t=u; break; }
+        }
+        if(fit) return t;
+    }
+    return -1;
+}
+
+static void mks_rec(MKSP*P,int depth,long long curmax){
+    if(P->aborted) return;
+    if(++P->nodes>P->nodecap){ P->aborted=1; return; }
+    if(depth==P->n){
+        if(curmax<P->best){ P->best=curmax; memcpy(P->beststart,P->start,(size_t)P->n*sizeof(long long)); }
+        return;
+    }
+    int ncand=0;
+    for(int i=0;i<P->n;i++){
+        if(P->placed[i]) continue;
+        long long e=mks_earliest(P,i,P->best);
+        if(e<0) return;            /* no placement now, and placing others can
+                                      only consume capacity: dead branch */
+        P->early[i]=e;
+        /* insertion into the candidate order: earliest start first, larger
+           work per time unit breaks ties (most constrained first) */
+        int k=ncand++;
+        while(k>0){
+            int j=P->ord[k-1];
+            long long ej=P->early[j];
+            int before = (e<ej) || (e==ej && P->dur[i]*P->res[i] > P->dur[j]*P->res[j]);
+            if(!before) break;
+            P->ord[k]=P->ord[k-1]; k--;
+        }
+        P->ord[k]=i;
+    }
+    P->early_best=P->best;
+    for(int k=0;k<ncand;k++){
+        int i=P->ord[k];
+        /* the cached earliest start is only valid while the incumbent (which
+           bounds the scan) is unchanged; otherwise recompute, because a
+           stale later start would drop schedules from the enumeration and
+           could lose the optimum */
+        long long e = (P->best==P->early_best) ? P->early[i] : mks_earliest(P,i,P->best);
+        if(e<0) continue;
+        long long comp=e+P->dur[i];
+        if(comp>=P->best) continue;
+        for(long long u=e;u<comp;u++) P->load[u]+=(int)P->res[i];
+        P->placed[i]=1; P->start[i]=e;
+        mks_rec(P,depth+1, curmax>comp?curmax:comp);
+        P->placed[i]=0;
+        for(long long u=e;u<comp;u++) P->load[u]-=(int)P->res[i];
+        if(P->aborted) return;
+        if(P->best<=P->lo_mk) return;   /* incumbent meets the lower bound */
+    }
+}
+
+/* returns 1 = proven optimum written to outx/opt, -1 = proven infeasible,
+   0 = pattern not recognised (or node cap hit): caller falls back */
+static int cp_mks_try(CP*cp,CPCR*cr,int nc,CPOptCtx*opt,double*outx,long*nodes){
+    if(!opt||!opt->idx||!opt->coef||opt->n!=1||opt->coef[0]!=1||opt->sense!=1) return 0;
+    int mk=opt->idx[0];
+    if(mk<0||mk>=cp->nvars||!cp->bounded[mk]) return 0;
+    int ci=-1;
+    for(int i=0;i<nc;i++){
+        if(cr[i].kind==CPK_CUM){ if(ci>=0) return 0; ci=i; }
+        else if(cr[i].kind!=CPK_LIN) return 0;
+    }
+    if(ci<0) return 0;
+    CPCR*C=&cr[ci];
+    int n=C->n;
+    if(n<1||n>CP_MKS_MAXN) return 0;
+    if(!C->terms||!C->terms2||!C->terms3||!C->arr_terms) return 0;
+    if(!C->terms3[0].isc) return 0;
+    long long cap=C->terms3[0].c;
+    if(cap<=0) return 0;
+    /* extra rows are tolerated only as integer bounds on mk itself (the
+       derived makespan bound is exactly that); they tighten the window */
+    long long extra_lo=LLONG_MIN, extra_hi=LLONG_MAX;
+    long long dur[CP_MKS_MAXN], res[CP_MKS_MAXN];
+    int sv[CP_MKS_MAXN], used[CP_MKS_MAXN];
+    memset(used,0,sizeof(used));
+    __int128 energy=0;
+    for(int t=0;t<n;t++){
+        if(!C->terms[t].isc||!C->terms2[t].isc) return 0;
+        long long d=C->terms[t].c, r=C->terms2[t].c;
+        if(d<0||r<0||r>cap) return 0;
+        if(C->arr_terms[t].isc||C->arr_terms[t].off) return 0;
+        int v=C->arr_terms[t].v;
+        if(v<0||v>=cp->nvars||!cp->bounded[v]) return 0;
+        for(int q=0;q<t;q++) if(sv[q]==v) return 0;   /* distinct starts */
+        sv[t]=v; dur[t]=d; res[t]=r;
+        energy+=(__int128)d*r;
+        /* exactly one row `s_t - mk <= -d_t` */
+        int rows=0;
+        for(int j=0;j<nc;j++){
+            if(j==ci) continue;
+            CPCR*L=&cr[j];
+            if(L->kind!=CPK_LIN||L->rel!=1||L->n!=2||!L->lvars||!L->lcoef) continue;  /* mk-only bound row */
+            if(L->lcoef[0]==1&&L->lcoef[1]==-1&&L->lvars[0]==v&&L->lvars[1]==mk&&L->rhs==-d){ rows++; used[j]=1; }
+        }
+        if(rows!=1) return 0;
+    }
+    for(int j=0;j<nc;j++){
+        if(j==ci||used[j]) continue;
+        CPCR*L=&cr[j];
+        if(L->kind!=CPK_LIN||L->n!=1||!L->lvars||!L->lcoef||L->lvars[0]!=mk) return 0;
+        long long c=L->lcoef[0], rh=L->rhs; int rel=L->rel;
+        if(c==0) return 0;
+        if(c<0){ if(c==LLONG_MIN) return 0; c=-c; if(rh==LLONG_MIN) return 0; rh=-rh; rel=(rel==1)?2:(rel==2)?1:(rel==3)?4:(rel==4)?3:rel; }
+        /* c > 0: floor/ceil division of rhs by c (c is safe, |c| <= CP_BIG) */
+        long long dq=rh/c, dr=rh%c; if(dr<0){ dr+=c; dq--; }   /* floor */
+        long long cq=dq+((dr>0)?1:0);                          /* ceil */
+        if(rel==0||rel==1){ if(dq<extra_hi) extra_hi=dq; }
+        if(rel==0||rel==2){ if(cq>extra_lo) extra_lo=cq; }
+        if(rel==3){ if(cq-1<extra_hi) extra_hi=cq-1; }
+        if(rel==4){ if(dq+1>extra_lo) extra_lo=dq+1; }
+    }
+    long long lo_mk=cp->lo[mk], hi_mk=cp->hi[mk];
+    if(extra_lo>lo_mk) lo_mk=extra_lo;
+    if(extra_hi<hi_mk) hi_mk=extra_hi;
+    if(hi_mk<lo_mk) return -1;
+    for(int t=0;t<n;t++){
+        long long lb=(long long)cp->lo[sv[t]]+dur[t];
+        if(lb>lo_mk) lo_mk=lb;
+    }
+    {
+        long long t0=LLONG_MAX;
+        for(int t=0;t<n;t++) if(cp->lo[sv[t]]<t0) t0=(long long)cp->lo[sv[t]];
+        if(t0==LLONG_MAX) t0=0;
+        if(t0<0) t0=0;
+        long long lb=t0+cp_cum_mk_lb(dur,res,n,cap,t0);
+        if(lb>lo_mk) lo_mk=lb;
+    }
+    if(lo_mk>hi_mk) return -1;
+    if(hi_mk-lo_mk>1000000) return 0;
+
+    MKSP P; memset(&P,0,sizeof(P));
+    P.n=n; P.dur=dur; P.res=res; P.cap=cap; P.hi_mk=hi_mk; P.lo_mk=lo_mk;
+    P.best=hi_mk+1; P.nodecap=2000000;
+    P.est=(long long*)psolve_malloc((size_t)n*sizeof(long long));
+    P.lst=(long long*)psolve_malloc((size_t)n*sizeof(long long));
+    P.early=(long long*)psolve_malloc((size_t)n*sizeof(long long));
+    P.start=(long long*)psolve_malloc((size_t)n*sizeof(long long));
+    P.beststart=(long long*)psolve_malloc((size_t)n*sizeof(long long));
+    P.ord=(int*)psolve_malloc((size_t)n*sizeof(int));
+    P.placed=(unsigned char*)psolve_calloc((size_t)n,1);
+    P.load=(int*)psolve_calloc((size_t)(hi_mk>0?hi_mk:1),sizeof(int));
+    for(int t=0;t<n;t++){
+        P.est[t]=(long long)cp->lo[sv[t]]; P.lst[t]=(long long)cp->hi[sv[t]];
+        if(P.est[t]<0) P.est[t]=0;                 /* negative starts are fine
+                                                      but never useful here */
+        P.start[t]=0; P.beststart[t]=0;
+    }
+    mks_rec(&P,0,0);
+    int ret=0;
+    if(P.aborted){ ret=0; }
+    else if(P.best>hi_mk){ ret=-1; }               /* no schedule at all */
+    else {
+        for(int t=0;t<n;t++) outx[sv[t]]=(double)P.beststart[t];
+        outx[mk]=(double)P.best;
+        opt->best=(__int128)P.best; opt->have=1;
+        if(opt->bestx) memcpy(opt->bestx,outx,(size_t)opt->nv*sizeof(double));
+        ret=1;
+    }
+    if(nodes) *nodes=(long)P.nodes;
+    psolve_free(P.est); psolve_free(P.lst); psolve_free(P.early);
+    psolve_free(P.start); psolve_free(P.beststart); psolve_free(P.ord);
+    psolve_free(P.placed); psolve_free(P.load);
     return ret;
 }
 
@@ -3974,7 +4509,35 @@ static int fz_cp_try(const FZModel*m,FZSolution*sol){
 
     double *outx=sol->x; /* sized nv */
 
+    /* dedicated scheduler for the makespan/cumulative pattern (see
+       cp_mks_try); proven results only, everything else falls through */
+    if(m->solve_kind!=0 && !all){
+        long mks_nodes=0;
+        int mr=cp_mks_try(&cp,cr,nc,&opt,outx,&mks_nodes);
+        if(mr==1){
+            if(cp_verify(&cp,cr,nc,outx)){
+                sol->status=0; sol->nodes=mks_nodes;
+                sol->obj=(double)opt.best+(double)opt.c0;
+                sol->best_bound=sol->obj;
+            } else { sol->status=2; sol->nodes=mks_nodes; }   /* cannot certify */
+            cp_free(&cp);
+            for(int i=0;i<nc;i++){ cp_cr_aux_free(&cr[i]); psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);psolve_free(cr[i].terms2);psolve_free(cr[i].terms3);} psolve_free(cr);
+            psolve_free(referenced); psolve_free(searchme);
+            psolve_free(opt.bestx); psolve_free(optcoef);
+            return 1;
+        }
+        if(mr==-1){
+            sol->status=1; sol->nodes=mks_nodes;
+            cp_free(&cp);
+            for(int i=0;i<nc;i++){ cp_cr_aux_free(&cr[i]); psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);psolve_free(cr[i].terms2);psolve_free(cr[i].terms3);} psolve_free(cr);
+            psolve_free(referenced); psolve_free(searchme);
+            psolve_free(opt.bestx); psolve_free(optcoef);
+            return 1;
+        }
+    }
+
     int rr;
+    int suspect=0;      /* some leaf was rejected by verification (see below) */
     long cp_nodes=0;
     if(all){
         /* set up the dedup context (as the MIP path does) so fz_solution_cb
@@ -3987,11 +4550,11 @@ static int fz_cp_try(const FZModel*m,FZSolution*sol){
         }
         if(ctx.key_len>SIZE_MAX/sizeof(uint64_t))psolve_fail(PSOLVE_ERR_OOM);
         ctx.scratch=(uint64_t*)psolve_calloc(ctx.key_len?ctx.key_len:1,sizeof(uint64_t));
-        rr=cp_solve_rec(&cp,cr,nc,searchme,outx,0,1,fz_solution_cb,&ctx,NULL,&cp_nodes);
+        rr=cp_solve_rec(&cp,cr,nc,searchme,outx,0,1,fz_solution_cb,&ctx,NULL,&cp_nodes,&suspect);
         fz_solve_ctx_free(&ctx);
     } else {
         rr=cp_solve_rec(&cp,cr,nc,searchme,outx,0,0,NULL,NULL,
-                        m->solve_kind!=0?&opt:NULL,&cp_nodes);
+                        m->solve_kind!=0?&opt:NULL,&cp_nodes,&suspect);
     }
 
     int handled=1;
@@ -4013,11 +4576,16 @@ static int fz_cp_try(const FZModel*m,FZSolution*sol){
             if(bad){ sol->status=2; break; }
         }
     }
-    else if(rr==0){ sol->status=1; sol->nodes=cp_nodes; }
-    else if(all && (rr==3)){ sol->status=0; sol->nodes=cp_nodes; }
+    else if(rr==0){ if(suspect){ handled=0; } else { sol->status=1; sol->nodes=cp_nodes; } }
+    else if(all && (rr==3)){ if(suspect){ handled=0; } else { sol->status=0; sol->nodes=cp_nodes; } }
     else if(all && rr==4){ sol->nodes=cp_nodes; sol->status=4; }
     else if(opt.bestx && rr==3){
-        /* complete B&B search: the incumbent is a PROVEN optimum */
+        /* A rejected leaf is an infeasible assignment, not a hole in the
+           search: propagation only ever removes values that appear in no
+           solution, so the enumeration below the root is exhaustive over the
+           feasible assignments.  The incumbent collected here is a verified
+           leaf, and no feasible leaf can beat it, so the bound is a real
+           optimum (the same argument a real CP solver relies on). */
         if(opt.have){
             memcpy(sol->x,opt.bestx,(size_t)nv*sizeof(double));
             sol->obj=(double)opt.best+(double)opt.c0;

@@ -24,15 +24,29 @@ import time
 FZNSOLVE = os.environ.get("FZNSOLVE", "./fznsolve")
 
 
-def gen(rng):
+def gen(rng, affine=True):
+    """Random all_different model.
+
+    With `affine` the arguments are shifted (`x0+2`, `x1-1`, ...), which is how
+    MiniZinc flattens n-queens/magic-square diagonals; the propagator must
+    respect those shifts exactly.
+    """
     n = rng.randint(2, 5)
     doms = []
     for _ in range(n):
         lo = rng.randint(0, 2)
         doms.append((lo, lo + rng.randint(1, 3)))
+    offs = [rng.randint(-2, 2) if affine else 0 for _ in range(n)]
     lines = [f"var {lo}..{hi}: x{i} :: output_var;" for i, (lo, hi) in enumerate(doms)]
-    lines.append("constraint all_different_int([" +
-                 ",".join(f"x{i}" for i in range(n)) + "]);")
+    args = []
+    for i, k in enumerate(offs):
+        if k > 0:
+            args.append(f"x{i}+{k}")
+        elif k < 0:
+            args.append(f"x{i}-{-k}")
+        else:
+            args.append(f"x{i}" if not affine else f"x{i}+0")
+    lines.append("constraint all_different_int([" + ",".join(args) + "]);")
     pairs = []
     for _ in range(rng.randint(0, n)):
         i, j = rng.sample(range(n), 2)
@@ -40,7 +54,7 @@ def gen(rng):
         pairs.append((i, j, d))
         lines.append(f"constraint int_lin_ne([1,-1],[x{i},x{j}],{d});")
     lines.append("solve satisfy;")
-    return "\n".join(lines) + "\n", n, doms, pairs
+    return "\n".join(lines) + "\n", n, doms, pairs, offs
 
 
 def solve(text, options=(), timeout=30):
@@ -72,11 +86,12 @@ def verify(n, seed):
     rng = random.Random(seed)
     ok = wrong = 0
     for _ in range(n):
-        text, nv, doms, pairs = gen(rng)
+        text, nv, doms, pairs, offs = gen(rng)
         got = solutions(solve(text, ("-a",)), nv)
         exp = set(t for t in itertools.product(
             *[range(lo, hi + 1) for lo, hi in doms])
-            if len(set(t)) == nv and all(t[i] - t[j] != d for i, j, d in pairs))
+            if len({t[i] + offs[i] for i in range(nv)}) == nv
+            and all(t[i] - t[j] != d for i, j, d in pairs))
         if got != exp:
             wrong += 1
             print("MISMATCH:", text, "missing", sorted(exp - got)[:3],

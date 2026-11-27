@@ -3058,7 +3058,18 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
         if(c->nargs<2)return -1;
         Lin *xs,*tuples; int nx,nt;
         if(parse_array(m,c->args[0],&xs,&nx)!=0)return -1;
-        if(parse_array(m,c->args[1],&tuples,&nt)!=0){free_lins(xs,nx);return -1;}
+        if(parse_array(m,c->args[1],&tuples,&nt)!=0){
+            /* MiniZinc emits the tuple matrix as array2d(lo1,hi1,lo2,hi2,[v..])
+               (or a bare flat literal); parse_array only knows identifier
+               arrays and flat literals, so fall back to table_values(), which
+               understands every ground shape. */
+            long *tv=NULL; int ntv=0;
+            if(table_values(m,c->args[1],&tv,&ntv)!=0){free_lins(xs,nx);return -1;}
+            nt=ntv;
+            tuples=(Lin*)psolve_calloc((size_t)(nt?nt:1),sizeof(Lin));
+            for(int k=0;k<nt;k++) tuples[k].constant=(double)tv[k];
+            psolve_free(tv);
+        }
         if(nx<=0||nt<0||nt%nx!=0){free_lins(xs,nx);free_lins(tuples,nt);return -1;}
         int nrows=nt/nx;
         /* Bound the deliberately compact MIP encoding on hostile FlatZinc

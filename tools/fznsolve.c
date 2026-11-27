@@ -130,7 +130,7 @@ int main(int argc,char**argv)
         printf("%%%%mzn-stat: exactResolves=%ld\n", sol.fx_solves);
         if (m.solve_kind != 0 && sol.status == 0)
             printf("%%%%mzn-stat: objectiveBound=%.15g\n", sol.best_bound);
-        printf("%%%%mzn-stat: solveTime=%.3f\n", secs);
+        printf("%%%%mzn-stat: solveTime=%.6f\n", secs);   /* microsecond resolution */
         printf("%%%%mzn-stat-end\n");
     }
     if (opt.verbose && sol.status != 0)

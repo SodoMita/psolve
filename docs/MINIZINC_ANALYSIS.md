@@ -343,3 +343,108 @@ random small domains, with and without extra `int_lin_ne` rows.  A run of 200
 instances is clean (`OK=200 WRONG=0`), as are 1200 old-vs-new status-parity
 models.  `tools/alldiff_scc_verify.py --bench` reproduces the timing table;
 set `ALDIFF_REF` to a reference binary to print its column too.
+
+---
+
+## 8. Head-to-head against CP-SAT, and closing the scheduling gap (2026-11-25)
+
+### 8.1 How the comparison is made
+
+The official `fzn-cp-sat` binary is not obtainable in this environment
+(`/home/user/mz/bin/fzn-cp-sat` does not exist and the MiniZinc/OR-Tools
+`flatzinc` tarballs are unreachable), so the oracle is a **local reference
+built on the OR-Tools Python API**: `tools/fzn_cpsat_ref.py` parses the same
+`.fzn` text, builds the same `CpModel` by hand (one builder per supported
+predicate) and solves it with `CpSolver` at `num_search_workers = 1`.  It is
+the CP-SAT *engine*, not the MiniZinc wrapper, and every result in this
+section is therefore "fznsolve vs CP-SAT-the-solver", not "vs fzn-cp-sat".
+
+`tools/cpsat_perf.py` is the harness.  It generates a seeded 45-instance
+corpus (`corpus()`), runs both sides on identical files, and reports two
+numbers per instance:
+
+* **end-to-end** — wall clock of the whole `fznsolve -s file.fzn` process
+  against the reference's whole run.  This includes a fixed **~1.4 ms process
+  floor** (fork/exec, dynamic linking, parser init) that the CP-SAT side does
+  not pay, because the reference is timed *in process*;
+* **solve-only** — the `%%mzn-stat: solveTime` reported by `fznsolve -s`
+  (microsecond resolution since this change) against the reference's in-process
+  build+solve.  This is the like-for-like comparison of the algorithms.
+
+Failure criteria: a verdict mismatch (including "we say UNKNOWN where the
+reference decides"), an invalid assignment (each SAT answer is re-checked
+independently by the harness), or a solve-only ratio above 1.0.
+
+### 8.2 Result (`--reps 3`, 45 instances)
+
+| metric | before this work | after |
+|---|---:|---:|
+| end-to-end geomean / median / max | 0.79x / 0.74x / >100x | **0.27x / ~0.30x / <=2.9x** |
+| solve-only geomean / median / max | — | **0.04x / 0.07x / 0.29x** |
+| instances at least as fast (solve-only) | 31/45 | **45/45** |
+| instances at least as fast (end-to-end) | 31/45 | 37/45 |
+| total time (end-to-end / solve-only) | 104171.7 ms | **92 ms / ~40 ms vs 2789 ms (0.03x / 0.01x)** |
+
+The eight remaining end-to-end misses (`alldiff_pigeonhole_9/19/39`,
+`subset_sum_16/24/32`, `arith_8/14`) are all sub-millisecond solves whose
+end-to-end time is the process floor itself; their solve-only ratios are
+0.00–0.10x.  Every reference run in the suite returned a **proven** optimum
+(`fzn_cpsat_ref.run()` now reports `proven`, and the harness prints when a
+reference stops at its own limit instead of proving).
+
+### 8.3 What was missing: three scheduling defects
+
+`cumulative_opt_16` was the last genuine blow-up (48.4 s, UNKNOWN, vs 2.0 s).
+It turned out to be three separate problems:
+
+1. **No time-table (compulsory-part) filtering.**  `cp_prop_cum_tt`
+   (`src/fz_cp.inc`) now runs before `cp_prop_cum`: it computes each task's
+   compulsory part `[lst, est+d)`, sweeps the events, and prunes task starts to
+   `s <= t-d` or `s >= t1` on over-loaded segments.  That alone took
+   `cumulative_opt_6` from 9.87 s / 18129 nodes to 2 ms / 1 node, and fixed two
+   wrong-UNSAT cases.
+2. **A failed leaf aborted the whole search.**  `cp_solve_rec` used to return
+   `-1` ("uncertifiable") when `cp_verify` rejected a leaf, which sent the
+   instance to the MIP bridge.  It now reports a *local* dead end (`*suspect`)
+   and keeps searching; `fz_cp_try` still refuses to claim UNSAT/enumeration
+   completeness/optimality on a search that produced a rejected leaf, except
+   for the branch-and-bound incumbent (a verified leaf plus sound propagation
+   *is* an optimum).
+3. **The generic brancher cannot prove a makespan.**  Branching on start
+   *values* needed 4·10⁵ nodes to find one schedule for the 16-task instance
+   and could not refute a single makespan value — CP-SAT's schedulers are what
+   that search is for.  Two additions close the gap:
+
+   * **A derived makespan bound** (`cp_add_cum_makespan_bound`): recognising
+     `cumulative(s,d,r,b)` + `s_i + d_i <= mk` for every task (all `d/r/b`
+     constant), the parser appends `mk >= t0 + LB` where `LB` is the maximum of
+     the energy bound `ceil(sum r_i d_i / b)` and the **class bound** of
+     `cp_cum_mk_lb`: for a set `S` of pairwise incompatible tasks
+     (`r_i + r_j > b`, so they cannot overlap) and the tasks `R` incompatible
+     with *every* member of `S`, the makespan is at least
+     `sum_{S} d + ceil(sum_{R} r d / b)`.  For the 16-task instance this yields
+     `20 + ceil(20/4) = 25` = the true optimum, where plain energy reasoning
+     only gives 22;
+   * **`cp_mks_try`, a dedicated serial-SGS branch-and-bound** for that exact
+     pattern: it enumerates *active* schedules (take tasks one at a time, place
+     each at its earliest feasible start given the placed ones) — a classical
+     exact scheme whose schedule set contains an optimal one — with the
+     incumbent and the lower bound as cuts, and re-verifies the schedule with
+     `cp_verify` before reporting it.
+
+   `cumulative_opt_16`: 48.4 s UNKNOWN → **0.33 ms, proven optimum 25**
+   (1515 nodes; the reference needs 2.04 s for the same instance).
+
+### 8.4 Gates
+
+* `tools/cum_mks_verify.py` (new, hard-gated in `test.sh`): random makespan
+  patterns checked against an exhaustive brute-force oracle — 300/0 with the
+  brute-force fallback, 300/0 against the CP-SAT oracle — including capacity,
+  window and `mk == max(s_i+d_i)` re-checks of every reported schedule.
+* `tools/cumulative_verify.py`: 300/0/0 (seed 777), 200/0/0 (4242 and 999).
+* `tools/cp_opt_verify.py 250 20260814`: 500/0 (both CP and MIP paths).
+* `tools/alldiff_scc_verify.py`, `table_verify`, `divmod_verify`,
+  `extrema_verify`, `fzn_globals_verify`, `fzn_bilinear_verify`,
+  `fzn_semantics_test`: unchanged, all clean.
+* `./test.sh` is green up to `fzn_cpsat_verify`, which needs the missing
+  external `fzn-cp-sat` binary and reports environment-blocked.
