@@ -28,6 +28,12 @@
 
 #define CP_MAXVALS   65536L
 #define CP_MAXNODES  2000000L
+/* Scheduling models get a smaller budget: their nodes are expensive (a full
+   domain-array copy each) and 2e6 nodes is 36 s on an 8x8 jobshop and 210 s on
+   a 10x10 one, for instances that are not provable at any node count we can
+   reach.  Every proven case so far needs far less (7x7: 31k), so the budget
+   only decides how long we keep trying before reporting the incumbent. */
+#define CP_MAXNODES_SHOP 200000L
 #define CP_BIG       ((int64_t)INT64_C(1)<<50)
 
 typedef struct {
@@ -155,6 +161,11 @@ static void cp_assign(CP*cp,int v,int64_t val){
 }
 
 static int cp_fixed(const CP*cp,int v){ return cp->bounded[v]? cp->nvals[v]==1 : cp->lo[v]==cp->hi[v]; }
+static int cp_dom_has(const CP*cp,int v,int64_t x){
+    if(!cp->bounded[v]) return x>=cp->lo[v]&&x<=cp->hi[v];
+    for(int i=0;i<cp->nvals[v];i++) if(cp->vals[v][i]==x) return 1;
+    return 0;
+}
 
 static void cp_copy(CP*dst,const CP*src){
     dst->nvars=src->nvars; dst->nodes=src->nodes;
@@ -184,7 +195,10 @@ static void cp_free(CP*cp){
 /* ------------------------------------------------------------------ */
 /* Constraint records                                                  */
 /* ------------------------------------------------------------------ */
-typedef struct { int v; int isc; int64_t c; } CPT;
+typedef struct { int v; int isc; int64_t c; int64_t off; } CPT;
+/* off: constant shift for var terms (value = x + off).  Only the
+   all_different propagator consumes it; every other propagator
+   requires off == 0, which is what cp_term_from_lin guarantees. */
 typedef struct {
     int kind;      /* CPK_* */
     int n;
@@ -192,6 +206,8 @@ typedef struct {
     CPT   *terms;
     int    nset; long long *setvals;
     CPT   *arr_terms;  /* element array entries (CPT, const or var) */
+    CPT   *terms2;     /* spare operand array (cumulative resources, diffn dims...) */
+    CPT   *terms3;     /* spare operand array (cumulative bound, diffn heights...) */
     void  *aux;        /* per-kind solver state (orbit family: FZOrbit digest) */
     int    aux_owned;  /* 1 when this record owns aux; 0 = shared digest borrow */
 } CPCR;
@@ -214,18 +230,50 @@ typedef struct {
 #define CPK_ONCYCLE 15 /* `start` lies on a cycle of the functional graph */
 #define CPK_ORBITCAP 16 /* len = min(orbit length of `start`, cap in rhs); presolve rewrite target */
 #define CPK_AND 17     /* terms[0] <-> AND(terms[1..n)) of bools */
+#define CPK_CIRCUIT 18 /* x[i] = successor of node base+i (terms, n, rhs=base, rel=is_sub):
+                          permutation with a single cycle (sub: self-loops allowed) */
+#define CPK_IMP 19    /* like CPK_REIF but one-directional: terms[0]=1 => inner relation holds */
+#define CPK_ARRMM 20  /* m = min/max(arr): terms[0]=m, arr_terms[0..nset-1]=operands; n=ismax flag */
+#define CPK_DISJ 21   /* no-overlap tasks: arr_terms[i]=start s_i, terms[i]=duration d_i; n=nset=#tasks */
+#define CPK_GCC 22    /* global_cardinality: arr_terms=x (nset=N), setvals=cover (rhs=K), terms[0]=closed, terms[1..K]=counts; n=1+K */
+#define CPK_GCCLU 23  /* low_up variant: terms[1..K]=lbound, terms[K+1..2K]=ubound; n=1+2K */
+#define CPK_COUNTEQ 24 /* c = #{x[i]==y}: arr_terms=x (nset=N), terms[0]=y, terms[1]=c; n=2 */
+#define CPK_NVALUE 25  /* n = #distinct values in x: terms[0]=n, arr_terms=x (nset=N); n=1 */
+#define CPK_ALLEQ 26   /* all x equal: arr_terms=x; n=nset=N */
+#define CPK_CHAIN 27   /* x[1]<=x[2]<=...: arr_terms=x; n=nset=N */
+#define CPK_MEMBER 28  /* y in {x[i]}: arr_terms=x (nset=N), terms[0]=y; n=1 */
+#define CPK_TABLE 29   /* tuple (x[0..W-1]) in table t: arr_terms=x (nset=W), setvals=t flat (rhs=|t|), n=W */
+#define CPK_INVERSE 30 /* invf[f[i]-bf]=i+bi: arr_terms=f (nset=n), terms=invf (n=n), lvars[0]=bf, lvars[1]=bi */
+#define CPK_BINPACK 31 /* sum w_i [bin_i==k] <= c forall k: arr_terms=bin (nset=n), setvals=w (n=n), rhs=c */
+#define CPK_BINPACKL 32/* load[k] = sum w_i [bin_i==k+lo]: arr_terms=bin (nset=n), terms=load (n=nl), setvals=w (rhs=nw), lvars[0]=lo,lvars[1]=hi */
+#define CPK_CUM 33     /* cumulative(s,d,r,b): arr_terms=s, terms=d, terms2=r (n=nset=n), terms3=[b] */
+#define CPK_DIFFN 34   /* 2D no-overlap boxes: arr_terms=x, terms=y, terms2=w, terms3=h; n=nset=n */
+#define CPK_LEX 35     /* lex_less/lesseq(x,y): arr_terms=x, terms=y, n=nset=len; rhs=1 if strict */
 /* the functional-graph constraint family sharing one FZOrbit digest */
 static int fg_kind(int k){ return k==CPK_ORBIT||k==CPK_ORBITTR||k==CPK_ORBITCL||k==CPK_ONCYCLE||k==CPK_ORBITCAP; }
 
 static int cp_term_from_lin(const Lin*l,CPT*t){
+    t->off=0;
     if(l->n==0 && fabs(l->constant)<=CP_BIG && l->constant==rint(l->constant)){ t->isc=1; t->c=(int64_t)l->constant; t->v=-1; return 0; }
     if(l->n==1 && fabs(l->coef[0]-1.0)<1e-9 && fabs(l->constant)<1e-9){ t->isc=0; t->v=l->idx[0]; t->c=0; return 0; }  /* TOLSHEET TOL-CP-UNIT */
     if(l->n==1 && fabs(l->coef[0]+1.0)<1e-9 && fabs(l->constant)<1e-9){ t->isc=0; t->v=l->idx[0]; t->c=1; return -2; }  /* TOLSHEET TOL-CP-UNIT */
     return -1;
 }
+/* Affine form `1*x + k` used by all_different, whose propagator understands
+   the constant shift.  MiniZinc flattens n-queens/magic/circuit diagonals to
+   exactly this shape (`q[i] + i`, `q[i] - i`), so accepting it keeps those
+   models on the CP engine instead of the far weaker LP/MIP bridge. */
+static int cp_term_from_lin_affine(const Lin*l,CPT*t){
+    cp_term_from_lin(l,t);
+    if(l->n==1 && fabs(l->coef[0]-1.0)<1e-9 && fabs(l->constant)<=CP_BIG &&   /* TOLSHEET TOL-CP-UNIT */
+       l->constant==rint(l->constant)){
+        t->isc=0; t->v=l->idx[0]; t->c=0; t->off=(int64_t)l->constant; return 0;
+    }
+    return (t->isc||(l->n==1&&fabs(l->coef[0]+1.0)<1e-9&&fabs(l->constant)<1e-9))?0:-1;  /* TOLSHEET TOL-CP-UNIT */
+}
 static int cp_term_value(const CP*cp,const CPT*t,int64_t*out){
     if(t->isc){ *out=t->c; return 1; }
-    if(cp_fixed(cp,t->v)){ *out=cp->vals[t->v][0]; return 1; }
+    if(cp_fixed(cp,t->v)){ *out=cp->vals[t->v][0]+t->off; return 1; }
     return 0;
 }
 
@@ -332,7 +380,8 @@ static int cp_prop_alldiff(CP*cp,CPT*terms,int n){
             if(cp_term_value(cp,&terms[i],&fv)){
                 for(int j=0;j<n;j++) if(j!=i){
                     CPT*t=&terms[j]; if(t->isc) continue;
-                    if(cp_remove_val(cp,t->v,fv)) return 1;
+                    /* t stands for (x + off): forbid the VALUE fv, i.e. x = fv-off */
+                    if(cp_remove_val(cp,t->v,fv-t->off)) return 1;
                 }
             }
         }
@@ -346,71 +395,130 @@ static int cp_prop_alldiff(CP*cp,CPT*terms,int n){
             for(int i=0;i<n;i++) if(!terms[i].isc && cp->bounded[terms[i].v] && cp->nvals[terms[i].v]>1) nfree++;
             if(nfree>0){
                 int *fvv=(int*)psolve_malloc((size_t)nfree*sizeof(int));
-                int c=0; for(int i=0;i<n;i++) if(!terms[i].isc && cp->bounded[terms[i].v] && cp->nvals[terms[i].v]>1) fvv[c++]=terms[i].v;
+                int64_t *foff=(int64_t*)psolve_malloc((size_t)nfree*sizeof(int64_t));
+                int c=0; for(int i=0;i<n;i++) if(!terms[i].isc && cp->bounded[terms[i].v] && cp->nvals[terms[i].v]>1){ foff[c]=terms[i].off; fvv[c++]=terms[i].v; }
                 int64_t *vs=NULL; int vc=0,vcap=0;
-                for(int r=0;r<nfree;r++){ int v=fvv[r]; for(int k=0;k<cp->nvals[v];k++){ int64_t val=cp->vals[v][k]; int dup=0; for(int q=0;q<vc;q++) if(vs[q]==val){dup=1;break;} if(!dup){ if(vc>=vcap){vcap=vcap?vcap*2:64;vs=(int64_t*)psolve_realloc((void**)&vs,(size_t)vcap*sizeof(int64_t));} vs[vc++]=val; } } }
-                if(vc==0){ psolve_free(fvv); psolve_free(vs); continue; }
-                ADJ *adj=(ADJ*)psolve_calloc((size_t)nfree,sizeof(ADJ));
+                for(int r=0;r<nfree;r++){ int v=fvv[r]; for(int k=0;k<cp->nvals[v];k++){ int64_t val=cp->vals[v][k]+foff[r]; int dup=0; for(int q=0;q<vc;q++) if(vs[q]==val){dup=1;break;} if(!dup){ if(vc>=vcap){vcap=vcap?vcap*2:64;vs=(int64_t*)psolve_realloc((void**)&vs,(size_t)vcap*sizeof(int64_t));} vs[vc++]=val; } } }
+                ADJ *adj=NULL; int *matchR=NULL, *matchL=NULL;
+                int *deg=NULL,*off=NULL,*cur=NULL,*to=NULL;
+                int *disc=NULL,*low=NULL,*comp=NULL,*onstk=NULL,*stkv=NULL,*fv=NULL,*fe=NULL;
+                if(vc==0) goto ad_done;
+                adj=(ADJ*)psolve_calloc((size_t)nfree,sizeof(ADJ));
                 for(int r=0;r<nfree;r++){
                     int v=fvv[r]; int cap2=0; int *tmp=NULL; int tn=0;
-                    for(int k=0;k<vc;k++) if(cp_contains(cp,v,vs[k])){ if(tn>=cap2){cap2=cap2?cap2*2:8;tmp=(int*)psolve_realloc((void**)&tmp,(size_t)cap2*sizeof(int));} tmp[tn++]=k; }
+                    for(int k=0;k<vc;k++) if(cp_contains(cp,v,vs[k]-foff[r])){ if(tn>=cap2){cap2=cap2?cap2*2:8;tmp=(int*)psolve_realloc((void**)&tmp,(size_t)cap2*sizeof(int));} tmp[tn++]=k; }
                     adj[r].col=tmp; adj[r].n=tn;
                 }
-                int *matchR=(int*)psolve_malloc((size_t)(vc?vc:1)*sizeof(int)); for(int k=0;k<vc;k++) matchR[k]=-1;
+                matchR=(int*)psolve_malloc((size_t)(vc?vc:1)*sizeof(int)); for(int k=0;k<vc;k++) matchR[k]=-1;
+                matchL=(int*)psolve_calloc((size_t)(nfree?nfree:1),sizeof(int)); for(int k=0;k<nfree;k++) matchL[k]=-1;
                 int matches=0;
                 for(int r=0;r<nfree;r++){
                     int *seen=(int*)psolve_calloc((size_t)(vc?vc:1),sizeof(int));
                     if(cp_aug(r,matchR,seen,adj,vc)) matches++;
                     psolve_free(seen);
                 }
-                if(matches<nfree){ /* Hall violated -> UNSAT */
-                    for(int r=0;r<nfree;r++) psolve_free(adj[r].col);
-                    psolve_free(adj); psolve_free(matchR); psolve_free(fvv); psolve_free(vs);
-                    return 1;
-                }
-                /* Value removal: a value val in dom(fvv[r]) is removable iff the edge
-                   (r,val) is in NO maximum matching, i.e. forcing (r,val) leaves no
-                   perfect matching.  Cheap for the small all_different constraints in
-                   FlatZinc CSPs. */
-                for(int r=0;r<nfree;r++){
-                    int v=fvv[r];
-                    for(int k=0;k<adj[r].n;k++){
-                        int c=adj[r].col[k];
-                        if(matchR[c]==r) continue; /* matched edge is in this matching; keep */
-                        int64_t val=vs[c];
-                        ADJ *adj2=(ADJ*)psolve_calloc((size_t)nfree,sizeof(ADJ));
-                        for(int r2=0;r2<nfree;r2++){
-                            int v2=fvv[r2]; int *tmp=NULL; int tn=0,cap2=0;
-                            for(int c2=0;c2<vc;c2++){
-                                /* force (r,c): var r may only take value c */
-                                if(r2==r && c2!=c) continue;
-                                if(cp_contains(cp,v2,vs[c2])){ if(tn>=cap2){cap2=cap2?cap2*2:8;tmp=(int*)psolve_realloc((void**)&tmp,(size_t)cap2*sizeof(int));} tmp[tn++]=c2; }
+                if(matches<nfree) goto ad_fail;   /* Hall violated -> UNSAT */
+                for(int col=0;col<vc;col++) if(matchR[col]>=0) matchL[matchR[col]]=col;
+
+                /* Régin arc consistency in O(E+V) instead of one fresh maximum
+                   matching per edge.  Build the residual graph of THIS maximum
+                   matching: an unmatched (var,value) edge points var->value, a
+                   matched edge points value->var; unmatched values go through a
+                   dummy node when there are more values than variables.  An
+                   edge (r,c) can belong to some maximum matching iff r and the
+                   value node c lie in the same strongly connected component.
+                   Same construction as ortools/sat/all_different.cc. */
+                long nedges=0;
+                for(int r=0;r<nfree;r++) nedges+=adj[r].n;
+                int dummy=-1;
+                if(nfree<vc){ dummy=nfree+vc; nedges+=(long)(vc-nfree)+nfree; }
+                int V=nfree+vc+(dummy>=0?1:0);
+                if(nedges>0 && nedges<=INT_MAX/2 && V>0){
+                    deg=(int*)psolve_calloc((size_t)V,sizeof(int));
+                    off=(int*)psolve_calloc((size_t)V+1,sizeof(int));
+                    cur=(int*)psolve_malloc((size_t)V*sizeof(int));
+                    to=(int*)psolve_malloc((size_t)nedges*sizeof(int));
+                    for(int r=0;r<nfree;r++) for(int k=0;k<adj[r].n;k++){
+                        int col=adj[r].col[k];
+                        if(matchL[r]==col) deg[nfree+col]++; else deg[r]++;
+                    }
+                    if(dummy>=0){
+                        for(int col=0;col<vc;col++) if(matchR[col]<0) deg[nfree+col]++;
+                        for(int r=0;r<nfree;r++) deg[dummy]++;
+                    }
+                    for(int v=0;v<V;v++) off[v+1]=off[v]+deg[v];
+                    if(off[V]!=(int)nedges) goto ad_fail;  /* defensive: counts must agree */
+                    memcpy(cur,off,(size_t)V*sizeof(int));
+                    for(int r=0;r<nfree;r++) for(int k=0;k<adj[r].n;k++){
+                        int col=adj[r].col[k];
+                        if(matchL[r]==col) to[cur[nfree+col]++]=r;
+                        else to[cur[r]++]=nfree+col;
+                    }
+                    if(dummy>=0){
+                        for(int col=0;col<vc;col++) if(matchR[col]<0) to[cur[nfree+col]++]=dummy;
+                        for(int r=0;r<nfree;r++) to[cur[dummy]++]=r;
+                    }
+                    /* iterative Tarjan SCC */
+                    disc=(int*)psolve_calloc((size_t)V,sizeof(int));
+                    low=(int*)psolve_malloc((size_t)V*sizeof(int));
+                    comp=(int*)psolve_malloc((size_t)V*sizeof(int));
+                    onstk=(int*)psolve_calloc((size_t)V,sizeof(int));
+                    stkv=(int*)psolve_malloc((size_t)V*sizeof(int));
+                    fv=(int*)psolve_malloc((size_t)V*sizeof(int));
+                    fe=(int*)psolve_malloc((size_t)V*sizeof(int));
+                    int timer=0,ncomp=0,top=0,sp=0;
+                    for(int s=0;s<V;s++){
+                        if(disc[s]) continue;
+                        disc[s]=low[s]=++timer; onstk[s]=1; stkv[top++]=s;
+                        fv[sp]=s; fe[sp]=off[s]; sp++;
+                        while(sp>0){
+                            int v=fv[sp-1];
+                            if(fe[sp-1]<off[v+1]){
+                                int w=to[fe[sp-1]++];
+                                if(!disc[w]){
+                                    disc[w]=low[w]=++timer; onstk[w]=1; stkv[top++]=w;
+                                    fv[sp]=w; fe[sp]=off[w]; sp++;
+                                } else if(onstk[w] && disc[w]<low[v]) low[v]=disc[w];
+                            } else {
+                                sp--;
+                                if(sp>0){ int p=fv[sp-1]; if(low[v]<low[p]) low[p]=low[v]; }
+                                if(low[v]==disc[v]){
+                                    int w;
+                                    do{ w=stkv[--top]; onstk[w]=0; comp[w]=ncomp; }while(w!=v);
+                                    ncomp++;
+                                }
                             }
-                            adj2[r2].col=tmp; adj2[r2].n=tn;
-                        }
-                        int *mR=(int*)psolve_malloc((size_t)(vc?vc:1)*sizeof(int));
-                        for(int z=0;z<vc;z++) mR[z]=-1;
-                        int m2=0;
-                        for(int r2=0;r2<nfree;r2++){
-                            int *seen2=(int*)psolve_calloc((size_t)(vc?vc:1),sizeof(int));
-                            if(cp_aug(r2,mR,seen2,adj2,vc)) m2++;
-                            psolve_free(seen2);
-                        }
-                        int removable=(m2<nfree); /* forcing (r,c) breaks every matching */
-                        for(int r2=0;r2<nfree;r2++) psolve_free(adj2[r2].col);
-                        psolve_free(adj2); psolve_free(mR);
-                        if(removable){
-                            if(cp_remove_val(cp,v,val)){
-                                for(int r=0;r<nfree;r++) psolve_free(adj[r].col);
-                                psolve_free(adj); psolve_free(matchR); psolve_free(fvv); psolve_free(vs);
-                                return 1;
-                            }
-                            changed=1;
                         }
                     }
+                    long mut0=cp->mutations;
+                    for(int r=0;r<nfree;r++){
+                        int v=fvv[r];
+                        for(int k=0;k<adj[r].n;k++){
+                            int col=adj[r].col[k];
+                            if(matchL[r]==col) continue;
+                            if(comp[r]!=comp[nfree+col]){
+                                if(cp_remove_val(cp,v,vs[col]-foff[r])) goto ad_fail;
+                            }
+                        }
+                    }
+                    if(cp->mutations!=mut0) changed=1;
                 }
-                for(int r=0;r<nfree;r++) psolve_free(adj[r].col);
-                psolve_free(adj); psolve_free(matchR); psolve_free(fvv); psolve_free(vs);
+ad_done:
+                for(int r2=0;r2<nfree;r2++) psolve_free(adj?adj[r2].col:NULL);
+                psolve_free(adj); psolve_free(matchR); psolve_free(matchL);
+                psolve_free(deg); psolve_free(off); psolve_free(cur); psolve_free(to);
+                psolve_free(disc); psolve_free(low); psolve_free(comp); psolve_free(onstk);
+                psolve_free(stkv); psolve_free(fv); psolve_free(fe);
+                psolve_free(fvv); psolve_free(foff); psolve_free(vs);
+                continue;
+ad_fail:
+                for(int r2=0;r2<nfree;r2++) psolve_free(adj?adj[r2].col:NULL);
+                psolve_free(adj); psolve_free(matchR); psolve_free(matchL);
+                psolve_free(deg); psolve_free(off); psolve_free(cur); psolve_free(to);
+                psolve_free(disc); psolve_free(low); psolve_free(comp); psolve_free(onstk);
+                psolve_free(stkv); psolve_free(fv); psolve_free(fe);
+                psolve_free(fvv); psolve_free(foff); psolve_free(vs);
+                return 1;
             }
         }
     }
@@ -745,6 +853,763 @@ static int cp_prop_reif(CP*cp,CPCR*r){
         return 0;
     }
     return 0;
+}
+
+/* b -> (sum coef*x rel rhs): if b is fixed 1, propagate the inner relation;
+   if the inner is fully determined and false, force b=0.  Sound (search stays
+   exhaustive). */
+static int cp_prop_imp(CP*cp,CPCR*r){
+    if(r->terms[0].isc){
+        if(r->terms[0].c==1) return cp_prop_lin(cp,r->n,r->lvars,r->lcoef,r->rhs,r->rel);
+        return 0;
+    }
+    int bv=r->terms[0].v;
+    if(bv<0||bv>=cp->nvars) return 0;
+    if(cp_fixed(cp,bv)){
+        if(cp->vals[bv][0]==1) return cp_prop_lin(cp,r->n,r->lvars,r->lcoef,r->rhs,r->rel);
+        return 0;
+    }
+    int allfix=1; __int128 val=0;
+    for(int i=0;i<r->n;i++){ int v=r->lvars[i]; if(!cp_fixed(cp,v)){allfix=0;break;} val+=(__int128)r->lcoef[i]*cp->vals[v][0]; }
+    if(allfix){
+        int holds=0;
+        switch(r->rel){case 0:holds=(val==r->rhs);break;case 1:holds=(val<=r->rhs);break;case 2:holds=(val>=r->rhs);break;case 3:holds=(val<r->rhs);break;case 4:holds=(val>r->rhs);break;case 5:holds=(val!=r->rhs);break;}
+        if(!holds) cp_assign(cp,bv,0);
+    }
+    return 0;
+}
+
+/* m = min/max of an array of terms: sound bounds propagation.
+   min case: m >= min_k dmin_k, m <= min_k dmax_k; if m fixed to mv then every
+   operand >= mv and at least one operand must be able to equal mv (if exactly
+   one can, it is forced to mv).  max is the dual. */
+static int cp_prop_arrmm(CP*cp,CPCR*r){
+    int ismax=(r->n!=0);
+    CPT*M=&r->terms[0];
+    int K=r->nset;
+    int64_t mv=0; int mF=cp_term_value(cp,M,&mv);
+    int64_t blo= ismax?INT64_MIN:INT64_MAX;   /* bound on m from operand mins */
+    int64_t bhi= ismax?INT64_MIN:INT64_MAX;   /* bound on m from operand maxs */
+    for(int k=0;k<K;k++){
+        CPT*A=&r->arr_terms[k];
+        int64_t mn,mx;
+        if(A->isc){ mn=mx=A->c; } else { mn=cp_dmin(cp,A->v); mx=cp_dmax(cp,A->v); }
+        if(ismax){ if(mn>blo)blo=mn; if(mx>bhi)bhi=mx; }
+        else     { if(mn<blo)blo=mn; if(mx<bhi)bhi=mx; }
+    }
+    if(!mF){
+        if(M->isc){ int64_t res=blo; return res==mv?0:1; }
+        return cp_intersect(cp,M->v,blo,bhi)?1:0;
+    }
+    /* m fixed to mv */
+    int can=0, cank=-1;
+    for(int k=0;k<K;k++){
+        CPT*A=&r->arr_terms[k];
+        int64_t mn,mx;
+        if(A->isc){ mn=mx=A->c; } else { mn=cp_dmin(cp,A->v); mx=cp_dmax(cp,A->v); }
+        if(ismax){
+            if(mn>mv) return 1;                 /* operand forced above mv */
+            if(!A->isc && mx>mv){ if(cp_intersect(cp,A->v,mn,mv)) return 1; }
+            if(mx>=mv && mn<=mv){ can++; cank=k; }
+        } else {
+            if(mx<mv) return 1;                 /* operand forced below mv */
+            if(!A->isc && mn<mv){ if(cp_intersect(cp,A->v,mv,mx)) return 1; }
+            if(mn<=mv && mx>=mv){ can++; cank=k; }
+        }
+    }
+    if(can==0) return 1;                        /* no operand can attain mv */
+    if(can==1){
+        CPT*A=&r->arr_terms[cank];
+        if(!A->isc){ if(cp_intersect(cp,A->v,mv,mv)) return 1; }
+        else if(A->c!=mv) return 1;
+    }
+    return 0;
+}
+
+/* CPK_DISJ: forall i<j: s_i+d_i <= s_j OR s_j+d_j <= s_i.  Sound pairwise
+   bound reasoning: if one order is impossible given current bounds, the
+   other is forced (prune inside current bounds only). */
+/* Remove every value in [a,b] from one variable's domain.  Bounded variables
+   carry an explicit value list, so an interior hole is exact; an interval
+   domain can only lose a prefix/suffix (the caller knows that is sound too,
+   because the removed window touches the domain edge). */
+static int cp_remove_range(CP*cp,int v,int64_t a,int64_t b){
+    if(a>b) return 0;
+    if(b<cp_dmin(cp,v)||a>cp_dmax(cp,v)) return 0;      /* no overlap */
+    if(!cp->bounded[v]){
+        int rc=0;
+        if(a<=cp->lo[v]){
+            int64_t nhi=b+1;
+            if(nhi>cp->hi[v]) nhi=cp->hi[v];
+            rc=cp_intersect(cp,v,nhi,cp->hi[v]);
+        } else if(b>=cp->hi[v]){
+            int64_t nlo=a-1;
+            if(nlo<cp->lo[v]) nlo=cp->lo[v];
+            rc=cp_intersect(cp,v,cp->lo[v],nlo);
+        }
+        return rc;
+    }
+    int w=0;
+    for(int i=0;i<cp->nvals[v];i++){
+        int64_t x=cp->vals[v][i];
+        if(x<a||x>b) cp->vals[v][w++]=x;
+    }
+    if(w==cp->nvals[v]) return 0;
+    cp->nvals[v]=w; cp->mutations++;
+    cp->lo[v]= w?cp->vals[v][0]:INT64_MAX;
+    cp->hi[v]= w?cp->vals[v][w-1]:INT64_MIN;
+    return w?0:1;
+}
+
+/* Time-tabling for a unary machine (classical "compulsory part" filtering).
+   Task k must start in [est_k, lst_k], so every schedule of it covers the
+   interval C_k = [lst_k, est_k + d_k).  The machine is unary, therefore no
+   other task may overlap C_k whatever value s_k takes, so each other task j
+   must fit entirely before or entirely after it:
+       s_j + d_j <= lst_k     or     s_j >= est_k + d_k.
+   Nothing here depends on a deadline, an incumbent or the objective: it only
+   uses the current start domains and the constant durations of the
+   `disjunctive` record.  Pairwise bounds alone never learn this, and it is
+   the cheapest of the classical one-machine rules to get provably right. */
+static int cp_prop_disj_tt(CP*cp,CPCR*r){
+    int n=r->n;
+    for(int i=0;i<n;i++) if(!r->terms[i].isc) return 0;   /* constant durations only */
+    for(int k=0;k<n;k++){
+        CPT*Sk=&r->arr_terms[k];
+        if(Sk->isc) continue;
+        int64_t dk=r->terms[k].c;
+        if(dk<=0) continue;
+        int64_t est=cp_dmin(cp,Sk->v), lst=cp_dmax(cp,Sk->v);
+        long long lo=lst, hi=(long long)est+dk;
+        if(lo>=hi) continue;                       /* no compulsory part */
+        for(int j=0;j<n;j++){
+            if(j==k) continue;
+            CPT*Sj=&r->arr_terms[j];
+            int64_t dj=r->terms[j].c;
+            if(dj<=0) continue;
+            if(Sj->isc){
+                if(!((long long)Sj->c+dj<=lo || (long long)Sj->c>=hi)) return 1;
+                continue;
+            }
+            /* skip the scan when the forbidden window misses the domain
+               entirely: this is the inner loop of every node */
+            if(lo-dj+1>cp_dmax(cp,Sj->v) || hi-1<cp_dmin(cp,Sj->v)) continue;
+            if(cp_remove_range(cp,Sj->v,lo-dj+1,hi-1)) return 1;
+        }
+    }
+    return 0;
+}
+
+static int cp_prop_disj(CP*cp,CPCR*r){
+    int n=r->n;
+    for(int i=0;i<n;i++) for(int j=i+1;j<n;j++){
+        CPT*Si=&r->arr_terms[i]; CPT*Sj=&r->arr_terms[j];
+        CPT*Di=&r->terms[i];     CPT*Dj=&r->terms[j];
+        int64_t silo,sihi,dilo,dihi,sjlo,sjhi,djlo,djhi;
+        if(Si->isc){silo=sihi=Si->c;}else{silo=cp_dmin(cp,Si->v);sihi=cp_dmax(cp,Si->v);}
+        if(Di->isc){dilo=dihi=Di->c;}else{dilo=cp_dmin(cp,Di->v);dihi=cp_dmax(cp,Di->v);}
+        if(Sj->isc){sjlo=sjhi=Sj->c;}else{sjlo=cp_dmin(cp,Sj->v);sjhi=cp_dmax(cp,Sj->v);}
+        if(Dj->isc){djlo=djhi=Dj->c;}else{djlo=cp_dmin(cp,Dj->v);djhi=cp_dmax(cp,Dj->v);}
+        int i_before=(silo+dilo<=sjhi);   /* exists s_i+d_i<=s_j */
+        int j_before=(sjlo+djlo<=sihi);
+        if(!i_before && !j_before) return 1;
+        if(!i_before){ /* force j before i: s_j+d_j <= s_i */
+            if(!Sj->isc && cp_intersect(cp,Sj->v,sjlo,sihi-djlo)) return 1;
+            if(!Dj->isc && cp_intersect(cp,Dj->v,djlo,sihi-sjlo)) return 1;
+            if(!Si->isc && cp_intersect(cp,Si->v,sjlo+djlo,sihi)) return 1;
+            if(Si->isc && Si->c < sjlo+djlo) return 1;
+        }
+            if(!j_before){ /* force i before j: s_i+d_i <= s_j */
+            if(!Si->isc && cp_intersect(cp,Si->v,silo,sjhi-dilo)) return 1;
+            if(!Di->isc && cp_intersect(cp,Di->v,dilo,sjhi-silo)) return 1;
+            if(!Sj->isc && cp_intersect(cp,Sj->v,silo+dilo,sjhi)) return 1;
+            if(Sj->isc && Sj->c < silo+dilo) return 1;
+        }
+    }
+    return cp_prop_disj_tt(cp,r);
+}
+
+/* CPK_GCC / CPK_GCCLU: counts (or l/u bounds) of each cover value among x.
+   lo_c = #vars fixed to v (exact), hi_c = #vars whose domain contains v. */
+static int cp_prop_gcc(CP*cp,CPCR*r,int lowup){
+    int K=(int)r->rhs, N=r->nset;
+    CPT*closed=&r->terms[0];
+    long long*cover=r->setvals;
+    int cF=0; int64_t cv=0;
+    if(closed->isc){ cF=1; cv=closed->c; }
+    else if(cp_fixed(cp,closed->v)){ cF=1; cv=cp->vals[closed->v][0]; }
+    if(cF&&cv==1){
+        for(int i=0;i<N;i++){ CPT*X=&r->arr_terms[i];
+            if(X->isc){ int ok=0; for(int c=0;c<K;c++) if(cover[c]==X->c){ok=1;break;} if(!ok) return 1; }
+            else { int ok=0; for(int c=0;c<K;c++) if(cp_dom_has(cp,X->v,cover[c])){ok=1;break;} if(!ok) return 1; }
+        }
+    }
+    for(int c=0;c<K;c++){
+        int64_t v=cover[c];
+        int lo=0,hi=0;
+        for(int i=0;i<N;i++){ CPT*X=&r->arr_terms[i];
+            if(X->isc){ if(X->c==v){lo++;hi++;} }
+            else if(cp_fixed(cp,X->v)){ if(cp->vals[X->v][0]==v){lo++;hi++;} }
+            else if(cp_dom_has(cp,X->v,v)) hi++;
+        }
+        if(lowup){
+            CPT*L=&r->terms[1+c];      /* lbound[c] */
+            CPT*U=&r->terms[1+K+c];    /* ubound[c] */
+            /* lbound[c] <= cnt <= hi  and  lo <= cnt <= ubound[c] */
+            if(L->isc){ if(L->c>hi) return 1; }
+            else if(cp_intersect(cp,L->v,cp_dmin(cp,L->v),hi)) return 1;
+            if(U->isc){ if(U->c<lo) return 1; }
+            else if(cp_intersect(cp,U->v,lo,cp_dmax(cp,U->v))) return 1;
+            int64_t uk=0; int uF=cp_term_value(cp,U,&uk);
+            int64_t lk=0; int lF=cp_term_value(cp,L,&lk);
+            if(uF && uk==(int64_t)lo){ for(int i=0;i<N;i++){ CPT*X=&r->arr_terms[i]; if(!X->isc&&!cp_fixed(cp,X->v)&&cp_dom_has(cp,X->v,v)){ if(cp_remove_val(cp,X->v,v)) return 1; } } }
+            if(lF && lk==(int64_t)hi){ for(int i=0;i<N;i++){ CPT*X=&r->arr_terms[i]; if(!X->isc&&!cp_fixed(cp,X->v)&&cp_dom_has(cp,X->v,v)){ if(cp_intersect(cp,X->v,v,v)) return 1; } } }
+        } else {
+            CPT*T=&r->terms[1+c];
+            if(T->isc){ if(T->c<lo||T->c>hi) return 1; }
+            else if(cp_intersect(cp,T->v,lo,hi)) return 1;
+            int64_t k=0; int kF=cp_term_value(cp,T,&k);
+            if(kF){
+                if(k==lo){ for(int i=0;i<N;i++){ CPT*X=&r->arr_terms[i]; if(!X->isc&&!cp_fixed(cp,X->v)&&cp_dom_has(cp,X->v,v)){ if(cp_remove_val(cp,X->v,v)) return 1; } } }
+                if(k==hi){ for(int i=0;i<N;i++){ CPT*X=&r->arr_terms[i]; if(!X->isc&&!cp_fixed(cp,X->v)&&cp_dom_has(cp,X->v,v)){ if(cp_intersect(cp,X->v,v,v)) return 1; } } }
+            }
+        }
+    }
+    return 0;
+}
+
+static void cp_count_bounds(CP*cp,CPT*x,int N,int64_t v,int*lo,int*hi){
+    int l=0,h=0;
+    for(int i=0;i<N;i++){
+        if(x[i].isc){ if(x[i].c==v){l++;h++;} }
+        else if(cp_fixed(cp,x[i].v)){ if(cp->vals[x[i].v][0]==v){l++;h++;} }
+        else if(cp_dom_has(cp,x[i].v,v)) h++;
+    }
+    *lo=l; *hi=h;
+}
+
+/* c = #{x[i] == y} */
+static int cp_prop_counteq(CP*cp,CPCR*r){
+    CPT*X=r->arr_terms; int N=r->nset;
+    CPT*Y=&r->terms[0]; CPT*C=&r->terms[1];
+    int64_t yv=0; int yF=cp_term_value(cp,Y,&yv);
+    if(yF){
+        int lo,hi; cp_count_bounds(cp,X,N,yv,&lo,&hi);
+        if(C->isc){ if(C->c<lo||C->c>hi) return 1; }
+        else if(cp_intersect(cp,C->v,lo,hi)) return 1;
+        int64_t k=0; int kF=cp_term_value(cp,C,&k);
+        if(kF){
+            if(k==(int64_t)lo) for(int i=0;i<N;i++) if(!X[i].isc&&!cp_fixed(cp,X[i].v)&&cp_dom_has(cp,X[i].v,yv)){ if(cp_remove_val(cp,X[i].v,yv)) return 1; }
+            if(k==(int64_t)hi) for(int i=0;i<N;i++) if(!X[i].isc&&!cp_fixed(cp,X[i].v)&&cp_dom_has(cp,X[i].v,yv)){ if(cp_intersect(cp,X[i].v,yv,yv)) return 1; }
+        }
+    } else {
+        /* y is unrestricted (count_eq does NOT require y in {x}): only the
+           count is bounded: 0 <= c <= N */
+        if(C->isc){ if(C->c<0||C->c>N) return 1; }
+        else if(cp_intersect(cp,C->v,0,N)) return 1;
+    }
+    return 0;
+}
+
+/* n = number of distinct values among x */
+static int cp_prop_nvalue(CP*cp,CPCR*r){
+    CPT*X=r->arr_terms; int N=r->nset; CPT*Nt=&r->terms[0];
+    /* forced: distinct values taken by fixed vars; possible: distinct values in any dom */
+    int64_t *fv=NULL,*pv=NULL; int nf=0,np_=0,capf=0,capp=0;
+    int exact=1;
+    for(int i=0;i<N;i++){
+        if(X[i].isc||cp_fixed(cp,X[i].v)){
+            int64_t v=X[i].isc?X[i].c:cp->vals[X[i].v][0];
+            int seen=0; for(int k=0;k<nf;k++) if(fv[k]==v){seen=1;break;}
+            if(!seen){ if(nf>=capf){capf=capf?capf*2:8;fv=(int64_t*)psolve_realloc((void**)&fv,(size_t)capf*sizeof(int64_t));} fv[nf++]=v; }
+        }
+        if(!X[i].isc && !(cp->bounded[X[i].v]&&cp->nvals[X[i].v]<=CP_MAXVALS)) exact=0;
+    }
+    int64_t plo=INT64_MAX,phi=INT64_MIN;
+    for(int i=0;i<N;i++){
+        if(X[i].isc){ int64_t v=X[i].c; int seen=0; for(int k=0;k<np_;k++) if(pv[k]==v){seen=1;break;} if(!seen){ if(np_>=capp){capp=capp?capp*2:8;pv=(int64_t*)psolve_realloc((void**)&pv,(size_t)capp*sizeof(int64_t));} pv[np_++]=v; } }
+        else if(cp->bounded[X[i].v]&&cp->nvals[X[i].v]<=CP_MAXVALS){
+            for(int k=0;k<cp->nvals[X[i].v];k++){ int64_t v=cp->vals[X[i].v][k]; int seen=0; for(int q=0;q<np_;q++) if(pv[q]==v){seen=1;break;} if(!seen){ if(np_>=capp){capp=capp?capp*2:8;pv=(int64_t*)psolve_realloc((void**)&pv,(size_t)capp*sizeof(int64_t));} pv[np_++]=v; } }
+        } else { int64_t a=cp_dmin(cp,X[i].v),b=cp_dmax(cp,X[i].v); if(a<plo)plo=a; if(b>phi)phi=b; exact=0; }
+    }
+    int64_t lo=nf, hi = exact? (int64_t)np_ : (phi>=plo? phi-plo+1 : 0);
+    /* hi must also count interval-only vars conservatively: union approx = exact pv set plus interval ranges; over-approx via pv count + interval size is sound only if disjoint... use max(np_, interval size) as sound upper? not sound in general; use np_ + (phi-plo+1) as safe upper */
+    if(!exact) hi = (int64_t)np_ + (phi>=plo? phi-plo+1 : 0);
+    if(Nt->isc){ if(Nt->c<lo||Nt->c>hi){ psolve_free(fv); psolve_free(pv); return 1; } }
+    else if(cp_intersect(cp,Nt->v,lo,hi)){ psolve_free(fv); psolve_free(pv); return 1; }
+    int64_t k=0; int kF=cp_term_value(cp,Nt,&k);
+    if(kF&&exact){
+        if(k==(int64_t)nf){ /* every free var must take a forced value */
+            for(int i=0;i<N;i++) if(!X[i].isc&&!cp_fixed(cp,X[i].v)){
+                for(int q=0;q<cp->nvals[X[i].v];q++){ int64_t v=cp->vals[X[i].v][q]; int ok=0; for(int t=0;t<nf;t++) if(fv[t]==v){ok=1;break;} if(!ok){ if(cp_remove_val(cp,X[i].v,v)){ psolve_free(fv); psolve_free(pv); return 1; } } }
+            }
+        }
+        if(k==(int64_t)np_){ /* every possible value must be taken */
+            for(int q=0;q<np_;q++){ int64_t v=pv[q]; int cnt=0,last=-1;
+                for(int i=0;i<N;i++){ if(X[i].isc){ if(X[i].c==v){cnt++;} } else if(cp_dom_has(cp,X[i].v,v)){ cnt++; last=i; } }
+                if(cnt==0){ psolve_free(fv); psolve_free(pv); return 1; }
+                if(cnt==1&&last>=0&&!cp_fixed(cp,X[last].v)){ if(cp_intersect(cp,X[last].v,v,v)){ psolve_free(fv); psolve_free(pv); return 1; } }
+            }
+        }
+    }
+    psolve_free(fv); psolve_free(pv);
+    return 0;
+}
+
+/* all x equal */
+static int cp_prop_alleq(CP*cp,CPCR*r){
+    CPT*X=r->arr_terms; int N=r->n;
+    int64_t lo=INT64_MIN,hi=INT64_MAX;
+    for(int i=0;i<N;i++){
+        int64_t a,b;
+        if(X[i].isc){a=b=X[i].c;} else {a=cp_dmin(cp,X[i].v);b=cp_dmax(cp,X[i].v);}
+        if(a>lo) lo=a;
+        if(b<hi) hi=b;
+        if(lo>hi) return 1;
+    }
+    for(int i=0;i<N;i++) if(!X[i].isc){ if(cp_intersect(cp,X[i].v,lo,hi)) return 1; }
+    return 0;
+}
+
+/* x[1] <= x[2] <= ... */
+static int cp_prop_chain(CP*cp,CPCR*r){
+    CPT*X=r->arr_terms; int N=r->n;
+    for(int i=1;i<N;i++){
+        int64_t a,b,c,d;
+        if(X[i-1].isc){a=b=X[i-1].c;}else{a=cp_dmin(cp,X[i-1].v);b=cp_dmax(cp,X[i-1].v);}
+        if(X[i].isc){c=d=X[i].c;}else{c=cp_dmin(cp,X[i].v);d=cp_dmax(cp,X[i].v);}
+        if(a>d) return 1;                                   /* x_{i-1} > x_i impossible */
+        if(!X[i].isc && a>c){ if(cp_intersect(cp,X[i].v,a,d)) return 1; }      /* x_i.lo >= x_{i-1}.lo */
+        if(!X[i-1].isc && b>d){ if(cp_intersect(cp,X[i-1].v,a,d)) return 1; }  /* x_{i-1}.hi <= x_i.hi */
+    }
+    return 0;
+}
+
+/* y in {x[1..N]} */
+static int cp_prop_member(CP*cp,CPCR*r){
+    CPT*X=r->arr_terms; int N=r->nset; CPT*Y=&r->terms[0];
+    int64_t yv=0; int yF=cp_term_value(cp,Y,&yv);
+    if(yF){
+        int cnt=0,last=-1;
+        for(int i=0;i<N;i++){ if(X[i].isc){ if(X[i].c==yv) cnt++; } else if(cp_dom_has(cp,X[i].v,yv)){ cnt++; last=i; } }
+        if(cnt==0) return 1;
+        if(cnt==1&&last>=0&&!cp_fixed(cp,X[last].v)){ if(cp_intersect(cp,X[last].v,yv,yv)) return 1; }
+    } else {
+        /* if all x determined, y must equal one of them */
+        int allfix=1; long long *sv=NULL; int sn=0,cap=0;
+        for(int i=0;i<N;i++){
+            if(X[i].isc||cp_fixed(cp,X[i].v)){
+                long long v=X[i].isc?(long long)X[i].c:(long long)cp->vals[X[i].v][0];
+                if(sn>=cap){cap=cap?cap*2:8;sv=(long long*)psolve_realloc((void**)&sv,(size_t)cap*sizeof(long long));}
+                sv[sn++]=v;
+            } else allfix=0;
+        }
+        if(allfix){ int r=cp_prop_setin(cp,Y,sv,sn); psolve_free(sv); return r==1?1:0; }
+        psolve_free(sv);
+        int64_t lo=INT64_MAX,hi=INT64_MIN;
+        for(int i=0;i<N;i++){ int64_t a,b; if(X[i].isc){a=b=X[i].c;}else{a=cp_dmin(cp,X[i].v);b=cp_dmax(cp,X[i].v);} if(a<lo)lo=a; if(b>hi)hi=b; }
+        if(cp_intersect(cp,Y->v,lo,hi)) return 1;
+    }
+    return 0;
+}
+
+/* table: allowed tuples are rows of t (width W). Prune x_j values that no
+   compatible row supports. */
+static int cp_prop_table(CP*cp,CPCR*r){
+    int W=r->n; long long*T=r->setvals; int Tn=(int)r->rhs; int R=Tn/W;
+    if(Tn%W) return 1;
+    CPT*X=r->arr_terms;
+    for(int j=0;j<W;j++){
+        if(X[j].isc) continue;
+        if(!(cp->bounded[X[j].v]&&cp->nvals[X[j].v]<=CP_MAXVALS)) continue;
+        int64_t *keep=NULL; int nk=0,cap=0;
+        for(int q=0;q<cp->nvals[X[j].v];q++){
+            int64_t v=cp->vals[X[j].v][q];
+            for(int row=0;row<R;row++){
+                if(T[(size_t)row*W+j]!=v) continue;
+                int ok=1;
+                for(int k=0;k<W&&ok;k++){
+                    if(k==j) continue;
+                    int64_t tv=T[(size_t)row*W+k]; int hit=0;
+                    if(X[k].isc){ if(X[k].c==tv) hit=1; }
+                    else if(cp_dom_has(cp,X[k].v,tv)) hit=1;
+                    if(!hit) ok=0;
+                }
+                if(ok){ if(nk>=cap){cap=cap?cap*2:8;keep=(int64_t*)psolve_realloc((void**)&keep,(size_t)cap*sizeof(int64_t));} keep[nk++]=v; break; }
+            }
+        }
+        if(nk==0){ psolve_free(keep); return 1; }
+        if(nk<cp->nvals[X[j].v]){
+            int svr=cp_set_vals(cp,X[j].v,keep,nk); psolve_free(keep);
+            if(svr<0) return -1;
+            if(svr) return 1;
+        } else psolve_free(keep);
+    }
+    /* no compatible row at all -> fail */
+    for(int row=0;row<R;row++){
+        int ok=1;
+        for(int k=0;k<W&&ok;k++){
+            int64_t tv=T[(size_t)row*W+k]; int hit=0;
+            if(X[k].isc){ if(X[k].c==tv) hit=1; } else if(cp_dom_has(cp,X[k].v,tv)) hit=1;
+            if(!hit) ok=0;
+        }
+        if(ok) return 0;
+    }
+    return R==0?1:0;
+}
+
+/* inverse: invf[f[i]-bf] == i+bi  for all i (indices must be in range) */
+static int cp_prop_inverse(CP*cp,CPCR*r){
+    int n=r->n; CPT*F=r->arr_terms; CPT*G=r->terms;
+    long bf=r->lvars[0], bi=r->lvars[1];
+    for(int i=0;i<n;i++){
+        /* f_i = v  =>  G[v-bf] = i+bi */
+        if(F[i].isc||cp_fixed(cp,F[i].v)){
+            int64_t v=F[i].isc?F[i].c:cp->vals[F[i].v][0];
+            if(v-bf<0||v-bf>=n) return 1;
+            int g=(int)(v-bf);
+            if(G[g].isc){ if(G[g].c!=i+bi) return 1; }
+            else if(cp_intersect(cp,G[g].v,i+bi,i+bi)) return 1;
+        } else {
+            /* f_i may only take values v with G[v-bf] able to equal i+bi */
+            if(cp->bounded[F[i].v]&&cp->nvals[F[i].v]<=CP_MAXVALS){
+                int64_t *keep=NULL; int nk=0,cap=0;
+                for(int q=0;q<cp->nvals[F[i].v];q++){
+                    int64_t v=cp->vals[F[i].v][q];
+                    if(v-bf<0||v-bf>=n) continue;
+                    int g=(int)(v-bf); int hit=0;
+                    if(G[g].isc){ if(G[g].c==i+bi) hit=1; }
+                    else if(cp_dom_has(cp,G[g].v,i+bi)) hit=1;
+                    if(hit){ if(nk>=cap){cap=cap?cap*2:8;keep=(int64_t*)psolve_realloc((void**)&keep,(size_t)cap*sizeof(int64_t));} keep[nk++]=v; }
+                }
+                if(nk==0){ psolve_free(keep); return 1; }
+                if(nk<cp->nvals[F[i].v]){ int svr=cp_set_vals(cp,F[i].v,keep,nk); psolve_free(keep); if(svr<0) return -1; if(svr) return 1; }
+                else psolve_free(keep);
+            } else {
+                if(cp_intersect(cp,F[i].v,bf,bf+n-1)) return 1;
+            }
+        }
+        /* G[g] = w  =>  F[w-bi] = g+bf */
+        if(G[i].isc||cp_fixed(cp,G[i].v)){
+            int64_t w=G[i].isc?G[i].c:cp->vals[G[i].v][0];
+            if(w-bi<0||w-bi>=n) return 1;
+            int f=(int)(w-bi);
+            if(F[f].isc){ if(F[f].c!=i+bf) return 1; }
+            else if(cp_intersect(cp,F[f].v,i+bf,i+bf)) return 1;
+        }
+    }
+    return 0;
+}
+
+/* bin_packing(c, bin, w): for each value k, sum of w_i with bin_i==k <= c */
+static int cp_prop_binpack(CP*cp,CPCR*r){
+    int n=r->nset; CPT*B=r->arr_terms; long long*W=r->setvals; int64_t c=r->rhs;
+    /* collect candidate bin values */
+    int64_t *ks=NULL; int nk=0,cap=0;
+    for(int i=0;i<n;i++){
+        if(B[i].isc){ int seen=0; for(int q=0;q<nk;q++) if(ks[q]==B[i].c){seen=1;break;} if(!seen){ if(nk>=cap){cap=cap?cap*2:8;ks=(int64_t*)psolve_realloc((void**)&ks,(size_t)cap*sizeof(int64_t));} ks[nk++]=B[i].c; } }
+        else if(cp->bounded[B[i].v]&&cp->nvals[B[i].v]<=CP_MAXVALS){
+            for(int q=0;q<cp->nvals[B[i].v];q++){ int64_t v=cp->vals[B[i].v][q]; int seen=0; for(int t=0;t<nk;t++) if(ks[t]==v){seen=1;break;} if(!seen){ if(nk>=cap){cap=cap?cap*2:8;ks=(int64_t*)psolve_realloc((void**)&ks,(size_t)cap*sizeof(int64_t));} ks[nk++]=v; } }
+        } else {
+            /* unbounded/interval domain: fall back to interval check per value lazily; use [lo,hi] candidates via bounds only */
+        }
+    }
+    int rc=0;
+    /* Global capacity bound.  Nothing is forced at the root of a hard
+       instance, so the per-bin rule below never fires; but a set S of
+       candidate bins can hold at most cap*|S| weight, and every item whose
+       domain is contained in S must live there.  Checking S = all bins is the
+       pigeonhole that decides over-capacity instances immediately, and
+       checking S = D_i for each item catches local overloads. */
+    if(nk>0){
+        long long totw=0;
+        for(int i=0;i<n;i++) totw+=W[i];
+        if(totw > c*(long long)nk){ psolve_free(ks); return 1; }
+        for(int i=0;i<n;i++){
+            if(B[i].isc||!cp->bounded[B[i].v]||cp->nvals[B[i].v]>CP_MAXVALS) continue;
+            int di=cp->nvals[B[i].v];
+            long long sub=0;
+            for(int j=0;j<n;j++){
+                if(B[j].isc){ if(cp_contains(cp,B[i].v,B[j].c)) sub+=W[j]; continue; }
+                if(cp_fixed(cp,B[j].v)){ if(cp_contains(cp,B[i].v,cp->vals[B[j].v][0])) sub+=W[j]; continue; }
+                if(!cp->bounded[B[j].v]||cp->nvals[B[j].v]>CP_MAXVALS) continue;
+                int inside=1;
+                for(int q=0;q<cp->nvals[B[j].v]&&inside;q++)
+                    if(!cp_contains(cp,B[i].v,cp->vals[B[j].v][q])) inside=0;
+                if(inside) sub+=W[j];
+            }
+            if(sub > c*(long long)di){ psolve_free(ks); return 1; }
+        }
+    }
+    for(int q=0;q<nk&&!rc;q++){
+        int64_t k=ks[q]; int64_t forced=0;
+        for(int i=0;i<n;i++){
+            if(B[i].isc){ if(B[i].c==k) forced+=W[i]; }
+            else if(cp_fixed(cp,B[i].v)){ if(cp->vals[B[i].v][0]==k) forced+=W[i]; }
+        }
+        if(forced>c){ rc=1; break; }
+        for(int i=0;i<n;i++){
+            if(B[i].isc) continue;
+            if(cp_fixed(cp,B[i].v)) continue;
+            if(cp_dom_has(cp,B[i].v,k)){
+                if(forced+W[i]>c){ if(cp_remove_val(cp,B[i].v,k)){ rc=1; break; } }
+            }
+        }
+    }
+    psolve_free(ks);
+    return rc;
+}
+
+/* bin_packing_load: load[k] = sum w_i [bin_i == k] for k in [lo..hi] */
+static int cp_prop_binpackl(CP*cp,CPCR*r){
+    int n=r->nset; CPT*B=r->arr_terms; long long*W=r->setvals; int nw=(int)r->rhs;
+    int nl=r->n; CPT*L=r->terms;
+    long lo=r->lvars[0];
+    if(nw!=n) return 1;
+    for(int k=0;k<nl;k++){
+        int64_t kval=lo+k;
+        int64_t forced=0;
+        for(int i=0;i<n;i++){
+            if(B[i].isc){ if(B[i].c==kval) forced+=W[i]; }
+            else if(cp_fixed(cp,B[i].v)){ if(cp->vals[B[i].v][0]==kval) forced+=W[i]; }
+        }
+        int64_t poss=forced;
+        for(int i=0;i<n;i++){
+            if(B[i].isc||cp_fixed(cp,B[i].v)) continue;
+            if(cp_dom_has(cp,B[i].v,kval)) poss+=W[i];
+        }
+        CPT*Lk=&L[k];
+        if(Lk->isc){ if(Lk->c<forced||Lk->c>poss) return 1; }
+        else if(cp_intersect(cp,Lk->v,forced,poss)) return 1;
+        int64_t lv=0; int lF=cp_term_value(cp,Lk,&lv);
+        if(lF){
+            if(lv==forced) for(int i=0;i<n;i++) if(!B[i].isc&&!cp_fixed(cp,B[i].v)&&cp_dom_has(cp,B[i].v,kval)){ if(cp_remove_val(cp,B[i].v,kval)) return 1; }
+            if(lv==poss) for(int i=0;i<n;i++) if(!B[i].isc&&!cp_fixed(cp,B[i].v)&&cp_dom_has(cp,B[i].v,kval)){ if(cp_intersect(cp,B[i].v,kval,kval)) return 1; }
+        }
+    }
+    return 0;
+}
+
+/* Time-table (compulsory-part) filtering for cumulative -- the classical
+   Vilim rule.  The compulsory part of task i is [lst_i, est_i+d_i): the time
+   the task occupies in EVERY schedule still consistent with its domain.  Its
+   usage is charged to the capacity in advance; wherever that accumulated load
+   plus another task's usage would exceed the capacity, the other task cannot
+   overlap the overloaded segment, and its start-time values are pruned.  This
+   is what makes flat MiniZinc scheduling models tractable: the pairwise rule
+   below only fires when two usages alone overflow the capacity. */
+static int cp_prop_cum_tt(CP*cp,CPCR*r){
+    int n=r->n;
+    CPT*S=r->arr_terms,*D=r->terms,*R=r->terms2,*B=&r->terms3[0];
+    if(n<1||n>512) return 0;
+    int64_t cap=B->isc?B->c:cp_dmax(cp,B->v);
+    if(cap<0) return 1;
+    int64_t *est=(int64_t*)psolve_malloc((size_t)n*sizeof(int64_t));
+    int64_t *lst=(int64_t*)psolve_malloc((size_t)n*sizeof(int64_t));
+    int64_t *dur=(int64_t*)psolve_malloc((size_t)n*sizeof(int64_t));
+    int64_t *use=(int64_t*)psolve_malloc((size_t)n*sizeof(int64_t));
+    char *ok=(char*)psolve_calloc((size_t)n,1);
+    for(int i=0;i<n;i++){
+        if(D[i].isc) dur[i]=D[i].c;
+        else if(cp_fixed(cp,D[i].v)) dur[i]=cp->vals[D[i].v][0];
+        else dur[i]=-1;
+        if(R[i].isc) use[i]=R[i].c;
+        else if(cp_fixed(cp,R[i].v)) use[i]=cp->vals[R[i].v][0];
+        else use[i]=-1;
+        if(S[i].isc){ est[i]=lst[i]=S[i].c; }
+        else { est[i]=cp_dmin(cp,S[i].v); lst[i]=cp_dmax(cp,S[i].v); }
+        ok[i]=(dur[i]>=0&&use[i]>=0)?1:0;
+        if(ok[i]&&use[i]>cap) { psolve_free(est);psolve_free(lst);psolve_free(dur);psolve_free(use);psolve_free(ok); return 1; }
+    }
+    /* event sweep over compulsory parts [lst_i, est_i+dur_i) */
+    int nev=0;
+    for(int i=0;i<n;i++) if(ok[i]&&lst[i]<est[i]+dur[i]) nev+=2;
+    if(nev==0){ psolve_free(est);psolve_free(lst);psolve_free(dur);psolve_free(use);psolve_free(ok); return 0; }
+    typedef struct { int64_t t; int delta; } CEv;
+    CEv *ev=(CEv*)psolve_malloc((size_t)nev*sizeof(CEv));
+    int k=0;
+    for(int i=0;i<n;i++) if(ok[i]&&lst[i]<est[i]+dur[i]){
+        ev[k].t=lst[i]; ev[k].delta=(int)use[i]; k++;
+        ev[k].t=est[i]+dur[i]; ev[k].delta=-(int)use[i]; k++;
+    }
+    /* insertion sort by time (nev <= 1024) */
+    for(int i=1;i<k;i++){ CEv cur=ev[i]; int j=i-1;
+        while(j>=0&&ev[j].t>cur.t){ ev[j+1]=ev[j]; j--; } ev[j+1]=cur; }
+    int64_t load=0; int rc=0;
+    int idx=0;
+    while(idx<k){
+        int64_t t=ev[idx].t;
+        /* intervals are half-open [a,b): close endings, then open starts */
+        /* intervals are half-open [a,b): every event at time t applies before
+           the segment starting at t is measured */
+        while(idx<k&&ev[idx].t==t){ load+=ev[idx].delta; idx++; }
+        if(load>cap){ rc=1; break; }
+        if(idx<k){
+            int64_t t1=ev[idx].t;        /* segment [t,t1) carries `load` */
+            /* prune tasks that cannot tolerate this segment's load */
+            for(int i=0;i<n&&!rc;i++){
+                if(!ok[i]||dur[i]<=0) continue;
+                if(load+use[i]<=cap) continue;
+                if(lst[i]<t1&&est[i]+dur[i]>t){ continue; }  /* compulsory part already covers it (load check above) */
+                /* task i must avoid every point of [t,t1): its start s must
+                   satisfy s+dur<=t (end before) or s>=t1 (start after) */
+                int64_t keep_lo=t-dur[i], keep_hi=t1;   /* s<=keep_lo or s>=keep_hi */
+                if(S[i].isc) continue;
+                int v=S[i].v;
+                int cv = cp->bounded[v]?cp->nvals[v]:0;
+                if(!cp->bounded[v]){
+                    if(cp->hi[v]-cp->lo[v]+1>CP_MAXVALS) continue;
+                    cv=(int)(cp->hi[v]-cp->lo[v]+1);
+                }
+                if(cv<=0) continue;
+                if(cv>CP_MAXVALS) continue;
+                int64_t *kept=(int64_t*)psolve_malloc((size_t)cv*sizeof(int64_t));
+                int nk=0,changed=0;
+                for(int q=0;q<cv;q++){
+                    int64_t val=cp->bounded[v]?cp->vals[v][q]:(cp->lo[v]+q);
+                    if(val<=keep_lo||val>=keep_hi) kept[nk++]=val; else changed=1;
+                }
+                if(changed){
+                    if(nk==0){ psolve_free(kept); rc=1; break; }
+                    if(cp_set_vals(cp,v,kept,nk)<0){ psolve_free(kept); continue; }
+                    if(cp->nvals[v]==0){ psolve_free(kept); rc=1; break; }
+                }
+                psolve_free(kept);
+            }
+            if(rc) break;
+        }
+    }
+    psolve_free(ev); psolve_free(est); psolve_free(lst);
+    psolve_free(dur); psolve_free(use); psolve_free(ok);
+    return rc;
+}
+
+/* cumulative: tasks (s_i,d_i) with usage r_i share capacity b.  Sound rules:
+   pairwise, if r_i+r_j > b (at their max) the two cannot overlap (disj-style);
+   energy: sum r_i.lo*d_i.lo <= b.hi * span. */
+static int cp_prop_cum(CP*cp,CPCR*r){
+    int n=r->n;
+    { int tt=cp_prop_cum_tt(cp,r); if(tt) return tt; }
+    CPT*S=r->arr_terms, *D=r->terms, *R=r->terms2, *B=&r->terms3[0];
+    int64_t bhi = B->isc?B->c:cp_dmax(cp,B->v);
+    for(int i=0;i<n;i++) for(int j=i+1;j<n;j++){
+        int64_t ri = R[i].isc?R[i].c:cp_dmax(cp,R[i].v);
+        int64_t rj = R[j].isc?R[j].c:cp_dmax(cp,R[j].v);
+        if(ri+rj<=bhi) continue;   /* may share */
+        int64_t dilo0 = D[i].isc?D[i].c:cp_dmin(cp,D[i].v);
+        int64_t djlo0 = D[j].isc?D[j].c:cp_dmin(cp,D[j].v);
+        if(dilo0==0||djlo0==0) continue;  /* a possibly-zero-duration task occupies no time: no conflict */
+        /* cannot overlap: s_i+d_i<=s_j or s_j+d_j<=s_i */
+        CPT*Si=&S[i]; CPT*Sj=&S[j]; CPT*Di=&D[i]; CPT*Dj=&D[j];
+        int64_t silo,sihi,dilo,dihi,sjlo,sjhi,djlo,djhi;
+        if(Si->isc){silo=sihi=Si->c;}else{silo=cp_dmin(cp,Si->v);sihi=cp_dmax(cp,Si->v);}
+        if(Di->isc){dilo=dihi=Di->c;}else{dilo=cp_dmin(cp,Di->v);dihi=cp_dmax(cp,Di->v);}
+        if(Sj->isc){sjlo=sjhi=Sj->c;}else{sjlo=cp_dmin(cp,Sj->v);sjhi=cp_dmax(cp,Sj->v);}
+        if(Dj->isc){djlo=djhi=Dj->c;}else{djlo=cp_dmin(cp,Dj->v);djhi=cp_dmax(cp,Dj->v);}
+        int i_before=(silo+dilo<=sjhi), j_before=(sjlo+djlo<=sihi);
+        if(!i_before && !j_before) return 1;
+        if(!i_before){
+            if(!Sj->isc && cp_intersect(cp,Sj->v,sjlo,sihi-djlo)) return 1;
+            if(!Dj->isc && cp_intersect(cp,Dj->v,djlo,sihi-sjlo)) return 1;
+            if(!Si->isc && cp_intersect(cp,Si->v,sjlo+djlo,sihi)) return 1;
+            if(Si->isc && Si->c<sjlo+djlo) return 1;
+        }
+        if(!j_before){
+            if(!Si->isc && cp_intersect(cp,Si->v,silo,sjhi-dilo)) return 1;
+            if(!Di->isc && cp_intersect(cp,Di->v,dilo,sjhi-silo)) return 1;
+            if(!Sj->isc && cp_intersect(cp,Sj->v,silo+dilo,sjhi)) return 1;
+            if(Sj->isc && Sj->c<silo+dilo) return 1;
+        }
+    }
+    /* energy bound */
+    __int128 need=0; int64_t smin=INT64_MAX, smaxend=INT64_MIN;
+    for(int i=0;i<n;i++){
+        int64_t rl = R[i].isc?R[i].c:cp_dmin(cp,R[i].v);
+        int64_t dl = D[i].isc?D[i].c:cp_dmin(cp,D[i].v);
+        need += (__int128)rl*dl;
+        int64_t s0 = S[i].isc?S[i].c:cp_dmin(cp,S[i].v);
+        int64_t s1 = S[i].isc?S[i].c:cp_dmax(cp,S[i].v);
+        int64_t d1 = D[i].isc?D[i].c:cp_dmax(cp,D[i].v);
+        if(s0<smin) smin=s0;
+        if(s1+d1>smaxend) smaxend=s1+d1;
+    }
+    if(smaxend>smin){
+        __int128 cap=(__int128)bhi*(smaxend-smin);
+        if(need>cap) return 1;
+    }
+    return 0;
+}
+
+/* 2D no-overlap: boxes (x_i,y_i,w_i,h_i) pairwise non-overlapping */
+static int cp_prop_diffn(CP*cp,CPCR*r){
+    int n=r->n;
+    CPT*X=r->arr_terms, *Y=r->terms, *W=r->terms2, *H=r->terms3;
+    for(int i=0;i<n;i++) for(int j=i+1;j<n;j++){
+        int64_t xlo_i,xhi_i,wlo_i,whi_i, ylo_i,yhi_i,hlo_i,hhi_i;
+        int64_t xlo_j,xhi_j,wlo_j,whi_j, ylo_j,yhi_j,hlo_j,hhi_j;
+        #define DOMS(A,Alo,Ahi) { if((A)->isc){Alo=Ahi=(A)->c;}else{Alo=cp_dmin(cp,(A)->v);Ahi=cp_dmax(cp,(A)->v);} }
+        DOMS(&X[i],xlo_i,xhi_i) DOMS(&W[i],wlo_i,whi_i) DOMS(&Y[i],ylo_i,yhi_i) DOMS(&H[i],hlo_i,hhi_i)
+        DOMS(&X[j],xlo_j,xhi_j) DOMS(&W[j],wlo_j,whi_j) DOMS(&Y[j],ylo_j,yhi_j) DOMS(&H[j],hlo_j,hhi_j)
+        /* must overlap in dim d iff neither separation order is possible */
+        int sep_ij_x = (xlo_i + wlo_i <= xhi_j);   /* i left of j possible */
+        int sep_ji_x = (xlo_j + wlo_j <= xhi_i);
+        int sep_ij_y = (ylo_i + hlo_i <= yhi_j);
+        int sep_ji_y = (ylo_j + hlo_j <= yhi_i);
+        int mux = !(sep_ij_x||sep_ji_x);   /* must overlap in x */
+        int muy = !(sep_ij_y||sep_ji_y);
+        if(mux&&muy) return 1;
+        if(mux){ /* must separate in y */
+            if(!sep_ij_y && !sep_ji_y) return 1;
+            if(!sep_ij_y){ if(!Y[j].isc && cp_intersect(cp,Y[j].v,ylo_j,yhi_i-hlo_j)) return 1;
+                           if(!H[j].isc && cp_intersect(cp,H[j].v,hlo_j,yhi_i-ylo_j)) return 1;
+                           if(!Y[i].isc && cp_intersect(cp,Y[i].v,ylo_j+hlo_j,yhi_i)) return 1;
+                           if(Y[i].isc && Y[i].c < ylo_j+hlo_j) return 1; }
+            if(!sep_ji_y){ if(!Y[i].isc && cp_intersect(cp,Y[i].v,ylo_i,yhi_j-hlo_i)) return 1;
+                           if(!H[i].isc && cp_intersect(cp,H[i].v,hlo_i,yhi_j-ylo_i)) return 1;
+                           if(!Y[j].isc && cp_intersect(cp,Y[j].v,ylo_i+hlo_i,yhi_j)) return 1;
+                           if(Y[j].isc && Y[j].c < ylo_i+hlo_i) return 1; }
+        }
+        if(muy){ /* must separate in x */
+            if(!sep_ij_x && !sep_ji_x) return 1;
+            if(!sep_ij_x){ if(!X[j].isc && cp_intersect(cp,X[j].v,xlo_j,xhi_i-wlo_j)) return 1;
+                           if(!W[j].isc && cp_intersect(cp,W[j].v,wlo_j,xhi_i-xlo_j)) return 1;
+                           if(!X[i].isc && cp_intersect(cp,X[i].v,xlo_j+wlo_j,xhi_i)) return 1;
+                           if(X[i].isc && X[i].c < xlo_j+wlo_j) return 1; }
+            if(!sep_ji_x){ if(!X[i].isc && cp_intersect(cp,X[i].v,xlo_i,xhi_j-wlo_i)) return 1;
+                           if(!W[i].isc && cp_intersect(cp,W[i].v,wlo_i,xhi_j-xlo_i)) return 1;
+                           if(!X[j].isc && cp_intersect(cp,X[j].v,xlo_i+wlo_i,xhi_j)) return 1;
+                           if(X[j].isc && X[j].c < xlo_i+wlo_i) return 1; }
+        }
+    }
+    return 0;
+}
+
+/* lex_less / lex_lesseq on arrays x,y */
+static int cp_prop_lex(CP*cp,CPCR*r){
+    int n=r->n; int strict=(r->rhs!=0);
+    CPT*X=r->arr_terms, *Y=r->terms;
+    for(int i=0;i<n;i++){
+        int64_t xv,yv; int xF=cp_term_value(cp,&X[i],&xv), yF=cp_term_value(cp,&Y[i],&yv);
+        if(xF&&yF){
+            if(xv<yv) return 0;      /* decided: x < y lexicographically */
+            if(xv>yv) return 1;
+            continue;                /* equal, next position */
+        }
+        /* all previous positions fixed equal: need x_i <= y_i */
+        int64_t xlo,xhi,ylo,yhi;
+        if(X[i].isc){xlo=xhi=X[i].c;}else{xlo=cp_dmin(cp,X[i].v);xhi=cp_dmax(cp,X[i].v);}
+        if(Y[i].isc){ylo=yhi=Y[i].c;}else{ylo=cp_dmin(cp,Y[i].v);yhi=cp_dmax(cp,Y[i].v);}
+        if(!X[i].isc && xhi>yhi){ if(cp_intersect(cp,X[i].v,xlo,yhi)) return 1; }
+        if(!Y[i].isc && ylo<xlo){ if(cp_intersect(cp,Y[i].v,xlo,yhi)) return 1; }
+        if(xlo<yhi){ /* can be strictly less here -> decided */ return 0; }
+        /* x_i >= y_i always: need equality at i and continue */
+        int64_t lo2=xlo>ylo?xlo:ylo, hi2=xhi<yhi?xhi:yhi;
+        if(lo2>hi2) return 1;
+        if(!X[i].isc && cp_intersect(cp,X[i].v,lo2,hi2)) return 1;
+        if(!Y[i].isc && cp_intersect(cp,Y[i].v,lo2,hi2)) return 1;
+        if(X[i].isc&&Y[i].isc){ if(X[i].c!=Y[i].c) return 1; }
+    }
+    return strict?1:0;   /* all equal */
 }
 
 /* ------------------------------------------------------------------ */
@@ -1217,7 +2082,7 @@ static int cp_pred_is(const char*p,const char*base){
 static int cr_uses_var(const CPCR*r,int v){
     switch(r->kind){
     case CPK_LIN: for(int i=0;i<r->n;i++) if(r->lvars[i]==v) return 1; return 0;
-    case CPK_REIF:
+    case CPK_REIF: case CPK_IMP:
         if(!r->terms[0].isc&&r->terms[0].v==v) return 1;
         for(int i=0;i<r->n;i++) if(r->lvars[i]==v) return 1;
         return 0;
@@ -1232,6 +2097,52 @@ static int cr_uses_var(const CPCR*r,int v){
     case CPK_MINMAX:
         for(int i=0;i<3;i++) if(!r->terms[i].isc&&r->terms[i].v==v) return 1;
         return 0;
+    case CPK_ARRMM:
+        if(!r->terms[0].isc&&r->terms[0].v==v) return 1;
+        for(int i=0;i<r->nset;i++) if(!r->arr_terms[i].isc&&r->arr_terms[i].v==v) return 1;
+        return 0;
+    case CPK_DISJ:
+        for(int i=0;i<r->n;i++){ if(!r->arr_terms[i].isc&&r->arr_terms[i].v==v) return 1; if(!r->terms[i].isc&&r->terms[i].v==v) return 1; }
+        return 0;
+    case CPK_GCC: case CPK_GCCLU:
+        for(int i=0;i<r->n;i++) if(!r->terms[i].isc&&r->terms[i].v==v) return 1;
+        for(int i=0;i<r->nset;i++) if(!r->arr_terms[i].isc&&r->arr_terms[i].v==v) return 1;
+        return 0;
+    case CPK_COUNTEQ: case CPK_MEMBER:
+        if(!r->terms[0].isc&&r->terms[0].v==v) return 1;
+        if(r->kind==CPK_COUNTEQ&&!r->terms[1].isc&&r->terms[1].v==v) return 1;
+        for(int i=0;i<r->nset;i++) if(!r->arr_terms[i].isc&&r->arr_terms[i].v==v) return 1;
+        return 0;
+    case CPK_NVALUE:
+        if(!r->terms[0].isc&&r->terms[0].v==v) return 1;
+        for(int i=0;i<r->nset;i++) if(!r->arr_terms[i].isc&&r->arr_terms[i].v==v) return 1;
+        return 0;
+    case CPK_ALLEQ: case CPK_CHAIN:
+        for(int i=0;i<r->n;i++) if(!r->arr_terms[i].isc&&r->arr_terms[i].v==v) return 1;
+        return 0;
+    case CPK_TABLE:
+        for(int i=0;i<r->nset;i++) if(!r->arr_terms[i].isc&&r->arr_terms[i].v==v) return 1;
+        return 0;
+    case CPK_INVERSE:
+        for(int i=0;i<r->n;i++){ if(!r->arr_terms[i].isc&&r->arr_terms[i].v==v) return 1; if(!r->terms[i].isc&&r->terms[i].v==v) return 1; }
+        return 0;
+    case CPK_BINPACK:
+        for(int i=0;i<r->nset;i++) if(!r->arr_terms[i].isc&&r->arr_terms[i].v==v) return 1;
+        return 0;
+    case CPK_BINPACKL:
+        for(int i=0;i<r->nset;i++) if(!r->arr_terms[i].isc&&r->arr_terms[i].v==v) return 1;
+        for(int i=0;i<r->n;i++) if(!r->terms[i].isc&&r->terms[i].v==v) return 1;
+        return 0;
+    case CPK_CUM:
+        for(int i=0;i<r->n;i++){ if(!r->arr_terms[i].isc&&r->arr_terms[i].v==v) return 1; if(!r->terms[i].isc&&r->terms[i].v==v) return 1; if(!r->terms2[i].isc&&r->terms2[i].v==v) return 1; }
+        if(!r->terms3[0].isc&&r->terms3[0].v==v) return 1;
+        return 0;
+    case CPK_DIFFN:
+        for(int i=0;i<r->n;i++){ if(!r->arr_terms[i].isc&&r->arr_terms[i].v==v) return 1; if(!r->terms[i].isc&&r->terms[i].v==v) return 1; if(!r->terms2[i].isc&&r->terms2[i].v==v) return 1; if(!r->terms3[i].isc&&r->terms3[i].v==v) return 1; }
+        return 0;
+    case CPK_LEX:
+        for(int i=0;i<r->n;i++){ if(!r->arr_terms[i].isc&&r->arr_terms[i].v==v) return 1; if(!r->terms[i].isc&&r->terms[i].v==v) return 1; }
+        return 0;
     default: /* LIN-counted terms layouts + the orbit family */
         for(int i=0;i<r->n;i++) if(!r->terms[i].isc&&r->terms[i].v==v) return 1;
         return 0;
@@ -1242,7 +2153,7 @@ static int cr_uses_var(const CPCR*r,int v){
 static void cr_mark_vars(const CPCR*r,unsigned char*referenced){
     switch(r->kind){
     case CPK_LIN: for(int i=0;i<r->n;i++) referenced[r->lvars[i]]=1; return;
-    case CPK_REIF:
+    case CPK_REIF: case CPK_IMP:
         if(!r->terms[0].isc) referenced[r->terms[0].v]=1;
         for(int i=0;i<r->n;i++) referenced[r->lvars[i]]=1;
         return;
@@ -1256,6 +2167,52 @@ static void cr_mark_vars(const CPCR*r,unsigned char*referenced){
         return;
     case CPK_MINMAX:
         for(int i=0;i<3;i++) if(!r->terms[i].isc) referenced[r->terms[i].v]=1;
+        return;
+    case CPK_ARRMM:
+        if(!r->terms[0].isc) referenced[r->terms[0].v]=1;
+        for(int i=0;i<r->nset;i++) if(!r->arr_terms[i].isc) referenced[r->arr_terms[i].v]=1;
+        return;
+    case CPK_DISJ:
+        for(int i=0;i<r->n;i++){ if(!r->arr_terms[i].isc) referenced[r->arr_terms[i].v]=1; if(!r->terms[i].isc) referenced[r->terms[i].v]=1; }
+        return;
+    case CPK_GCC: case CPK_GCCLU:
+        for(int i=0;i<r->n;i++) if(!r->terms[i].isc) referenced[r->terms[i].v]=1;
+        for(int i=0;i<r->nset;i++) if(!r->arr_terms[i].isc) referenced[r->arr_terms[i].v]=1;
+        return;
+    case CPK_COUNTEQ: case CPK_MEMBER:
+        if(!r->terms[0].isc) referenced[r->terms[0].v]=1;
+        if(r->kind==CPK_COUNTEQ&&!r->terms[1].isc) referenced[r->terms[1].v]=1;
+        for(int i=0;i<r->nset;i++) if(!r->arr_terms[i].isc) referenced[r->arr_terms[i].v]=1;
+        return;
+    case CPK_NVALUE:
+        if(!r->terms[0].isc) referenced[r->terms[0].v]=1;
+        for(int i=0;i<r->nset;i++) if(!r->arr_terms[i].isc) referenced[r->arr_terms[i].v]=1;
+        return;
+    case CPK_ALLEQ: case CPK_CHAIN:
+        for(int i=0;i<r->n;i++) if(!r->arr_terms[i].isc) referenced[r->arr_terms[i].v]=1;
+        return;
+    case CPK_TABLE:
+        for(int i=0;i<r->nset;i++) if(!r->arr_terms[i].isc) referenced[r->arr_terms[i].v]=1;
+        return;
+    case CPK_INVERSE:
+        for(int i=0;i<r->n;i++){ if(!r->arr_terms[i].isc) referenced[r->arr_terms[i].v]=1; if(!r->terms[i].isc) referenced[r->terms[i].v]=1; }
+        return;
+    case CPK_BINPACK:
+        for(int i=0;i<r->nset;i++) if(!r->arr_terms[i].isc) referenced[r->arr_terms[i].v]=1;
+        return;
+    case CPK_BINPACKL:
+        for(int i=0;i<r->nset;i++) if(!r->arr_terms[i].isc) referenced[r->arr_terms[i].v]=1;
+        for(int i=0;i<r->n;i++) if(!r->terms[i].isc) referenced[r->terms[i].v]=1;
+        return;
+    case CPK_CUM:
+        for(int i=0;i<r->n;i++){ if(!r->arr_terms[i].isc) referenced[r->arr_terms[i].v]=1; if(!r->terms[i].isc) referenced[r->terms[i].v]=1; if(!r->terms2[i].isc) referenced[r->terms2[i].v]=1; }
+        if(!r->terms3[0].isc) referenced[r->terms3[0].v]=1;
+        return;
+    case CPK_DIFFN:
+        for(int i=0;i<r->n;i++){ if(!r->arr_terms[i].isc) referenced[r->arr_terms[i].v]=1; if(!r->terms[i].isc) referenced[r->terms[i].v]=1; if(!r->terms2[i].isc) referenced[r->terms2[i].v]=1; if(!r->terms3[i].isc) referenced[r->terms3[i].v]=1; }
+        return;
+    case CPK_LEX:
+        for(int i=0;i<r->n;i++){ if(!r->arr_terms[i].isc) referenced[r->arr_terms[i].v]=1; if(!r->terms[i].isc) referenced[r->terms[i].v]=1; }
         return;
     default:
         for(int i=0;i<r->n;i++) if(!r->terms[i].isc) referenced[r->terms[i].v]=1;
@@ -1520,7 +2477,7 @@ static void fz_presolve_orbit(FZModel*m,CPCR*cr,int*nc_io,unsigned char*referenc
         for(i=0;i<nc;i++){
             if(dead[i]){
                 psolve_free(cr[i].lvars); psolve_free(cr[i].lcoef); psolve_free(cr[i].terms);
-                psolve_free(cr[i].setvals); psolve_free(cr[i].arr_terms);
+                psolve_free(cr[i].setvals); psolve_free(cr[i].arr_terms);psolve_free(cr[i].terms2);psolve_free(cr[i].terms3);
                 continue;
             }
             if(w!=i) cr[w]=cr[i];
@@ -1567,6 +2524,162 @@ static int fg_parse_table(FZModel*m,const char*argtext,long long**out_nx,int*out
     if(bad){ psolve_free(nx); return -1; }
     *out_nx=nx; *out_n=narr;
     return 0;
+}
+
+#define CP_MKS_MAXN 64
+
+/* Lower bound on the makespan of a cumulative with CONSTANT durations,
+   resources and capacity:  max_i (s_i + d_i) >= t0 + this value, where t0
+   is a lower bound on every start.
+
+   Two relaxations, both sound:
+
+   (a) energy: every task runs inside [t0, makespan), so
+       sum r_i*d_i <= cap*(makespan - t0).
+
+   (b) class: take a set S of tasks that are PAIRWISE incompatible
+       (r_i + r_j > cap, so no two of them can overlap).  Their durations
+       occupy exactly D_S disjoint time units inside [t0, makespan), and
+       during those units the residual capacity cap - r_i is too small for a
+       task j that is incompatible with *every* member of S.  Such tasks
+       therefore run only in the remaining (makespan - t0 - D_S) slots:
+       sum_{j in R} r_j*d_j <= cap*(makespan - t0 - D_S).
+
+   (b) is what proves real scheduling instances optimal at the root: for a
+   random 16-task instance (cap 4, eight r=3 tasks, four r=2 tasks) (a) gives
+   22 while (b) gives the true optimum 25. */
+static long long cp_cum_mk_lb(const long long*d,const long long*r,int n,long long cap,long long t0){
+    (void)t0;
+    if(n<=0||cap<=0) return 0;
+    __int128 E=0;
+    for(int i=0;i<n;i++) E+=(__int128)d[i]*(__int128)r[i];
+    long long lb=(long long)((E+(__int128)cap-1)/(__int128)cap);
+    if(n>CP_MKS_MAXN) return lb;      /* class bound below needs the arrays */
+    int idx[CP_MKS_MAXN];
+    for(int i=0;i<n;i++) idx[i]=i;
+    for(int i=1;i<n;i++){                 /* sort: larger r first, then larger work */
+        int k=idx[i], j=i-1;
+        while(j>=0 && (r[idx[j]]<r[k] ||
+              (r[idx[j]]==r[k] && d[idx[j]]*(long long)r[idx[j]] < d[k]*(long long)r[k]))){
+            idx[j+1]=idx[j]; j--; }
+        idx[j+1]=k;
+    }
+    /* try every distinct resource threshold: S = greedy clique among the
+       tasks above it, R = the tasks it blocks completely */
+    for(int a=0;a<n;a++){
+        long long tv=r[idx[a]];
+        int S[CP_MKS_MAXN], ns=0;
+        long long Ds=0;
+        for(int t=0;t<n;t++){
+            int i=idx[t];
+            if(r[i]<=tv||r[i]<=0) continue;
+            int ok=1;
+            for(int b=0;b<ns;b++) if(r[i]+r[S[b]]<=cap){ ok=0; break; }
+            if(ok){ S[ns++]=i; Ds+=d[i]; }
+        }
+        if(ns<1) continue;
+        __int128 Er=0;
+        for(int j=0;j<n;j++){
+            int inS=0; for(int b=0;b<ns;b++) if(S[b]==j) inS=1;
+            if(inS||r[j]<=0) continue;
+            int blocked=1;
+            for(int b=0;b<ns;b++) if(r[j]+r[S[b]]<=cap){ blocked=0; break; }
+            if(blocked) Er+=(__int128)d[j]*(__int128)r[j];
+        }
+        long long cl=Ds + (Er>0 ? (long long)((Er+(__int128)cap-1)/(__int128)cap) : 0);
+        if(cl>lb) lb=cl;
+        if(a+1<n && r[idx[a+1]]==tv) continue;   /* same threshold: no new S */
+    }
+    return lb;
+}
+
+/* ------------------------------------------------------------------ */
+/* Derived makespan bound for cumulative scheduling.                    */
+/*                                                                      */
+/* The flat MiniZinc makespan pattern is `cumulative(s,d,r,b)` together */
+/* with one row `s_i + d_i <= mk` per task.  Every task then lies inside */
+/* [est_min, mk), so the total energy sum r_i*d_i has to fit into that  */
+/* window: mk >= est_min + ceil(E/b).  Posting that as a linear row is   */
+/* the bound CP-SAT gets from its energetic reasoning; without it,      */
+/* proving optimality on 15+ tasks degenerates into exhaustive search   */
+/* over start times.  Every ingredient is checked (constant d/r/b, a    */
+/* matching row for EVERY task, declared start bounds), so an          */
+/* unrecognised pattern simply gets no extra row.                       */
+/* ------------------------------------------------------------------ */
+static long long cr_decl_lo(const FZModel*m,int v,int*ok){
+    for(int d=0;d<m->ndecl;d++){ FZDecl*dd=&m->decls[d];
+        if(!dd->is_var||dd->is_alias||dd->base_idx<0||dd->n<1) continue;
+        if(v<dd->base_idx||v>=dd->base_idx+dd->n) continue;
+        if(!dd->has_lo){ *ok=0; return 0; }
+        *ok=1; return (long long)dd->lo[0];
+    }
+    *ok=0; return 0;
+}
+static void cp_add_cum_makespan_bound(CPCR**cr_io,int*nc_io,int*cap_io,const FZModel*m){
+    int nc=*nc_io;
+    for(int i=0;i<nc;i++){
+        if(cr_io[0][i].kind!=CPK_CUM) continue;
+        CPCR*cr=*cr_io;
+        int n=cr[i].n;
+        if(n<1||!cr[i].terms||!cr[i].terms2||!cr[i].terms3) continue;
+        int okk=1;
+        for(int t=0;t<n&&okk;t++){
+            if(!cr[i].terms[t].isc||!cr[i].terms2[t].isc) okk=0;
+            else if(cr[i].terms[t].c<0||cr[i].terms2[t].c<0) okk=0;
+            else if(cr[i].arr_terms[t].isc||cr[i].arr_terms[t].off) okk=0;
+        }
+        if(!okk||!cr[i].terms3[0].isc) continue;
+        long long cap=cr[i].terms3[0].c;
+        if(cap<=0) continue;
+        /* mk must be pinned by `s_t - mk <= -d_t` for EVERY task */
+        int mk=-1;
+        for(int j=0;j<nc&&mk<0;j++){
+            if(cr[j].kind!=CPK_LIN||cr[j].rel!=1||cr[j].n!=2||!cr[j].lvars) continue;
+            int cand=-1;
+            if(cr[j].lcoef[0]==1&&cr[j].lcoef[1]==-1) cand=cr[j].lvars[1];
+            else if(cr[j].lcoef[0]==-1&&cr[j].lcoef[1]==1) cand=cr[j].lvars[0];
+            if(cand<0) continue;
+            int matches=1;
+            for(int t=0;t<n&&matches;t++){
+                int sv=cr[i].arr_terms[t].v; long long dt=cr[i].terms[t].c;
+                int found=0;
+                for(int q=0;q<nc&&!found;q++){
+                    if(cr[q].kind!=CPK_LIN||cr[q].rel!=1||cr[q].n!=2||!cr[q].lvars) continue;
+                    if(cr[q].lcoef[0]==1&&cr[q].lcoef[1]==-1&&cr[q].lvars[0]==sv&&
+                       cr[q].lvars[1]==cand&&cr[q].rhs==-dt) found=1;
+                }
+                if(!found) matches=0;
+            }
+            if(matches) mk=cand;
+        }
+        if(mk<0) continue;
+        long long estmin=0; int have=0;
+        for(int t=0;t<n&&have>=0;t++){
+            int okd=0; long long lo=cr_decl_lo(m,cr[i].arr_terms[t].v,&okd);
+            if(!okd){ have=-1; break; }
+            if(!have||lo<estmin) estmin=lo;
+            have=1;
+        }
+        if(have<=0) continue;
+        long long dl[CP_MKS_MAXN], rl[CP_MKS_MAXN];
+        if(n>CP_MKS_MAXN) continue;
+        __int128 energy=0;
+        for(int t=0;t<n;t++){
+            dl[t]=cr[i].terms[t].c; rl[t]=cr[i].terms2[t].c;
+            energy+=(__int128)dl[t]*(__int128)rl[t];
+        }
+        if(energy<=0) continue;
+        __int128 bound=(__int128)estmin+(__int128)cp_cum_mk_lb(dl,rl,n,cap,estmin);
+        if(bound>=(__int128)(LLONG_MAX/4)||bound<=-(__int128)(LLONG_MAX/4)) continue;
+        CPCR nr; memset(&nr,0,sizeof(nr));
+        nr.kind=CPK_LIN; nr.rel=1; nr.n=1;
+        nr.lvars=(int*)psolve_malloc(sizeof(int)); nr.lvars[0]=mk;
+        nr.lcoef=(long long*)psolve_malloc(sizeof(long long)); nr.lcoef[0]=-1;
+        nr.rhs=-(long long)bound;
+        if(*nc_io>=*cap_io){ *cap_io*=2; *cr_io=(CPCR*)psolve_realloc((void**)cr_io,(size_t)(*cap_io)*sizeof(CPCR)); }
+        (*cr_io)[(*nc_io)++]=nr;
+        cr=*cr_io;
+    }
 }
 
 static int cp_parse(FZModel*m,CPCR**out_cr,int*out_n,unsigned char*referenced,int*has_cp_motivating){
@@ -1663,6 +2776,36 @@ static int cp_parse(FZModel*m,CPCR**out_cr,int*out_n,unsigned char*referenced,in
             motivating=1;
             rec.kind=CPK_ALLDIFF; rec.n=narr; rec.terms=(CPT*)psolve_calloc((size_t)(narr?narr:1),sizeof(CPT));
             int bad=0;
+            for(int i=0;i<narr;i++){ if(cp_term_from_lin_affine(&arr[i],&rec.terms[i])!=0){ bad=1; break; } if(!rec.terms[i].isc) referenced[rec.terms[i].v]=1; }
+            free_lins(arr,narr);
+            if(bad){ psolve_free(rec.terms); ok=0; break; }
+        }
+        /* ---------- circuit / subcircuit ---------- */
+        else if(cp_pred_is(p,"circuit")||cp_pred_is(p,"subcircuit")||
+                strcmp(p,"ortools_circuit")==0||strcmp(p,"ortools_subcircuit")==0){
+            int is_sub=(strstr(p,"subcircuit")!=NULL);
+            const char*xarg=NULL; long long base=1;
+            if(strncmp(p,"gecode_",7)==0||strcmp(p,"gecode_circuit")==0||strcmp(p,"gecode_subcircuit")==0){
+                if(c->nargs<2){ok=0;break;}
+                Lin ol; if(parse_lin(m,c->args[0],&ol)!=0){ok=0;break;}
+                if(ol.n!=0||ol.constant!=rint(ol.constant)){lin_free(&ol);ok=0;break;}
+                base=(long long)rint(ol.constant); lin_free(&ol); xarg=c->args[1];
+            } else if(strcmp(p,"ortools_circuit")==0||strcmp(p,"ortools_subcircuit")==0){
+                if(c->nargs<2){ok=0;break;}
+                xarg=c->args[0];
+                Lin ol; if(parse_lin(m,c->args[1],&ol)!=0){ok=0;break;}
+                if(ol.n!=0||ol.constant!=rint(ol.constant)){lin_free(&ol);ok=0;break;}
+                base=(long long)rint(ol.constant); lin_free(&ol);
+            } else {
+                if(c->nargs<1){ok=0;break;}
+                xarg=c->args[0];
+            }
+            if(parse_array(m,xarg,&arr,&narr)!=0){ok=0;break;}
+            motivating=1;
+            if(narr>32){ free_lins(arr,narr); ok=0; break; }  /* CP search cap; MIP bridge takes over */
+            rec.kind=CPK_CIRCUIT; rec.n=narr; rec.rhs=base; rec.rel=is_sub;
+            rec.terms=(CPT*)psolve_calloc((size_t)(narr?narr:1),sizeof(CPT));
+            int bad=0;
             for(int i=0;i<narr;i++){ if(cp_term_from_lin(&arr[i],&rec.terms[i])!=0){ bad=1; break; } if(!rec.terms[i].isc) referenced[rec.terms[i].v]=1; }
             free_lins(arr,narr);
             if(bad){ psolve_free(rec.terms); ok=0; break; }
@@ -1717,14 +2860,27 @@ static int cp_parse(FZModel*m,CPCR**out_cr,int*out_n,unsigned char*referenced,in
                 cp_pred_is(p,"array_int_element_nonshifted")||cp_pred_is(p,"array_var_int_element_nonshifted")||
                 cp_pred_is(p,"array_bool_element_nonshifted")||cp_pred_is(p,"array_var_bool_element_nonshifted")||
                 cp_pred_is(p,"gecode_int_element")||cp_pred_is(p,"gecode_bool_element")||
-                cp_pred_is(p,"gecode_var_int_element")||cp_pred_is(p,"gecode_var_bool_element")){
+                cp_pred_is(p,"gecode_var_int_element")||cp_pred_is(p,"gecode_var_bool_element")||
+                strcmp(p,"ortools_array_int_element")==0||strcmp(p,"ortools_array_var_int_element")==0||
+                strcmp(p,"ortools_array_bool_element")==0||strcmp(p,"ortools_array_var_bool_element")==0){
             int gec=(strncmp(p,"gecode_",7)==0);
+            int is_ort=(strncmp(p,"ortools_array_",14)==0);
             int nonshifted=(strstr(p,"_nonshifted")!=NULL);
-            int na=gec?4:3;
+            int na=(gec||is_ort)?4:3;
             if(c->nargs<na){ok=0;break;}
-            int idx_arg=0, off_arg=1, arr_arg=gec?2:1, val_arg=gec?3:2;
+            int idx_arg=0, off_arg=1, arr_arg=(gec||is_ort)?2:1, val_arg=(gec||is_ort)?3:2;
             long offset= nonshifted?0:1;
             if(gec){ Lin ol; if(parse_lin(m,c->args[off_arg],&ol)!=0){ok=0;break;} if(ol.n==0&&isfinite(ol.constant)&&ol.constant==rint(ol.constant)&&fabs(ol.constant)<=(double)CP_BIG){offset=(long)llround(ol.constant);} else {lin_free(&ol);ok=0;break;} lin_free(&ol); }
+            if(is_ort){
+                /* ortools_array_*_element(idx, index_set_of_x, x, c):
+                   flat position = idx - min(index_set_of_x) + 1 */
+                int isr=0; long rlo=0,rhi=0; long *vals=NULL; int nvals=0;
+                if(fz_parse_int_set(c->args[off_arg],1024,&isr,&rlo,&rhi,&vals,&nvals)!=0){ok=0;break;}
+                if(isr&&rhi>=rlo) offset=(long)rlo;
+                else if(!isr&&nvals>0) offset=(long)vals[0];
+                else { if(vals)psolve_free(vals); ok=0; break; }
+                if(vals)psolve_free(vals);
+            }
             Lin il; if(parse_lin(m,c->args[idx_arg],&il)!=0){ok=0;break;}
             Lin*arr;int narr; if(parse_array(m,c->args[arr_arg],&arr,&narr)!=0){lin_free(&il);ok=0;break;}
             Lin vl; if(parse_lin(m,c->args[val_arg],&vl)!=0){lin_free(&il);free_lins(arr,narr);ok=0;break;}
@@ -1741,7 +2897,7 @@ static int cp_parse(FZModel*m,CPCR**out_cr,int*out_n,unsigned char*referenced,in
             free_lins(arr,narr);
             if(!bad){ if(cp_term_from_lin(&il,&rec.terms[0])!=0) bad=1; if(cp_term_from_lin(&vl,&rec.terms[1])!=0) bad=1; }
             lin_free(&il);lin_free(&vl);
-            if(bad){ psolve_free(rec.terms); psolve_free(rec.arr_terms); ok=0; break; }
+            if(bad){ psolve_free(rec.terms); psolve_free(rec.arr_terms);psolve_free(rec.terms2);psolve_free(rec.terms3); ok=0; break; }
             if(!rec.terms[0].isc) referenced[rec.terms[0].v]=1;
             if(!rec.terms[1].isc) referenced[rec.terms[1].v]=1;
             rec.lvars=(int*)psolve_malloc(sizeof(int)); rec.lvars[0]=(int)offset; /* store offset */
@@ -1761,6 +2917,409 @@ static int cp_parse(FZModel*m,CPCR**out_cr,int*out_n,unsigned char*referenced,in
             lin_free(&l1);lin_free(&l2);lin_free(&l3);
             if(bad){ psolve_free(rec.terms); ok=0; break; }
             for(int i=0;i<3;i++) if(!rec.terms[i].isc) referenced[rec.terms[i].v]=1;
+            motivating=1;
+        }
+        /* ---------- disjunctive / disjunctive_strict ---------- */
+        else if(cp_pred_is(p,"disjunctive")||cp_pred_is(p,"disjunctive_strict")||
+                cp_pred_is(p,"no_overlap")||strcmp(p,"ortools_disjunctive")==0||
+                strcmp(p,"ortools_disjunctive_strict")==0||
+                cp_pred_is(p,"schedule_unary")){
+            if(c->nargs<2){ok=0;break;}
+            Lin*sa;int ns; if(parse_array(m,c->args[0],&sa,&ns)!=0){ok=0;break;}
+            Lin*da;int nd; if(parse_array(m,c->args[1],&da,&nd)!=0){free_lins(sa,ns);ok=0;break;}
+            if(ns<1||ns!=nd){free_lins(sa,ns);free_lins(da,nd);ok=0;break;}
+            rec.kind=CPK_DISJ; rec.n=ns; rec.nset=ns;
+            rec.arr_terms=(CPT*)psolve_calloc((size_t)ns,sizeof(CPT));
+            rec.terms=(CPT*)psolve_calloc((size_t)ns,sizeof(CPT));
+            int bad=0;
+            for(int i=0;i<ns;i++){
+                if(cp_term_from_lin(&sa[i],&rec.arr_terms[i])!=0){bad=1;break;}
+                if(cp_term_from_lin(&da[i],&rec.terms[i])!=0){bad=1;break;}
+                if(!rec.arr_terms[i].isc) referenced[rec.arr_terms[i].v]=1;
+                if(!rec.terms[i].isc) referenced[rec.terms[i].v]=1;
+            }
+            free_lins(sa,ns); free_lins(da,nd);
+            if(bad){ psolve_free(rec.arr_terms);psolve_free(rec.terms2);psolve_free(rec.terms3); psolve_free(rec.terms); ok=0; break; }
+            motivating=1;
+        }
+        /* ---------- global_cardinality (ortools + fzn forms) ---------- */
+        else if(cp_pred_is(p,"global_cardinality")||strcmp(p,"ortools_global_cardinality")==0||
+                cp_pred_is(p,"global_cardinality_closed")||
+                strcmp(p,"ortools_global_cardinality_closed")==0){
+            /* (x, cover, counts[, closed]); the *_closed names (3 args) force
+               the closed-world reading, the ortools form takes a trailing bool */
+            int nargs=c->nargs;
+            int forced_closed=(strstr(p,"_closed")!=NULL);
+            int has_closed=(nargs>=4);
+            if(nargs<3){ok=0;break;}
+            Lin*xa;int nx; if(parse_array(m,c->args[0],&xa,&nx)!=0){ok=0;break;}
+            Lin*ca;int K; if(parse_array(m,c->args[1],&ca,&K)!=0){free_lins(xa,nx);ok=0;break;}
+            Lin*ka;int nk; if(parse_array(m,c->args[2],&ka,&nk)!=0){free_lins(xa,nx);free_lins(ca,K);ok=0;break;}
+            if(nx<1||K<1||nk!=K){free_lins(xa,nx);free_lins(ca,K);free_lins(ka,nk);ok=0;break;}
+            Lin cl; CPT closed; int bad=0;
+            if(has_closed){ if(parse_lin(m,c->args[3],&cl)!=0){free_lins(xa,nx);free_lins(ca,K);free_lins(ka,nk);ok=0;break;}
+                if(cp_term_from_lin(&cl,&closed)!=0){lin_free(&cl);bad=1;} else lin_free(&cl); }
+            else { closed.isc=1; closed.c=(forced_closed?1:0); closed.v=-1; }
+            if(!bad){
+                rec.kind=CPK_GCC; rec.rhs=K; rec.n=1+K; rec.nset=nx;
+                rec.setvals=(long long*)psolve_malloc((size_t)K*sizeof(long long));
+                for(int c2=0;c2<K;c2++){
+                    if(ca[c2].n!=0||!isfinite(ca[c2].constant)||ca[c2].constant!=rint(ca[c2].constant)||fabs(ca[c2].constant)>=(double)CP_BIG){bad=1;break;}
+                    rec.setvals[c2]=(long long)llround(ca[c2].constant);
+                }
+                rec.arr_terms=(CPT*)psolve_calloc((size_t)nx,sizeof(CPT));
+                rec.terms=(CPT*)psolve_calloc((size_t)(1+K),sizeof(CPT));
+                rec.terms[0]=closed;
+                for(int i=0;i<nx&&!bad;i++){ if(cp_term_from_lin(&xa[i],&rec.arr_terms[i])!=0){bad=1;break;} if(!rec.arr_terms[i].isc) referenced[rec.arr_terms[i].v]=1; }
+                for(int c2=0;c2<K&&!bad;c2++){ if(cp_term_from_lin(&ka[c2],&rec.terms[1+c2])!=0){bad=1;break;} if(!rec.terms[1+c2].isc) referenced[rec.terms[1+c2].v]=1; }
+            }
+            free_lins(xa,nx); free_lins(ca,K); free_lins(ka,nk);
+            if(bad){ if(rec.setvals)psolve_free(rec.setvals); if(rec.arr_terms)psolve_free(rec.arr_terms);psolve_free(rec.terms2);psolve_free(rec.terms3); if(rec.terms)psolve_free(rec.terms); memset(&rec,0,sizeof(rec)); ok=0; break; }
+            if(!closed.isc) referenced[closed.v]=1;
+            motivating=1;
+        }
+        else if(cp_pred_is(p,"global_cardinality_low_up")||
+                strcmp(p,"ortools_global_cardinality_low_up")==0||
+                cp_pred_is(p,"global_cardinality_low_up_closed")||
+                strcmp(p,"ortools_global_cardinality_low_up_closed")==0){
+            /* (x, cover, lbound, ubound[, closed]) */
+            int nargs=c->nargs;
+            int has_closed=(nargs>=5);
+            if(nargs<4){ok=0;break;}
+            Lin*xa;int nx; if(parse_array(m,c->args[0],&xa,&nx)!=0){ok=0;break;}
+            Lin*ca;int K; if(parse_array(m,c->args[1],&ca,&K)!=0){free_lins(xa,nx);ok=0;break;}
+            Lin*la;int nl; if(parse_array(m,c->args[2],&la,&nl)!=0){free_lins(xa,nx);free_lins(ca,K);ok=0;break;}
+            Lin*ua;int nu; if(parse_array(m,c->args[3],&ua,&nu)!=0){free_lins(xa,nx);free_lins(ca,K);free_lins(la,nl);ok=0;break;}
+            if(nx<1||K<1||nl!=K||nu!=K){free_lins(xa,nx);free_lins(ca,K);free_lins(la,nl);free_lins(ua,nu);ok=0;break;}
+            Lin cl; CPT closed; int bad=0;
+            int forced_closed=(strstr(p,"_closed")!=NULL);
+            if(forced_closed) has_closed=0;
+            if(has_closed){ if(parse_lin(m,c->args[4],&cl)!=0){free_lins(xa,nx);free_lins(ca,K);free_lins(la,nl);free_lins(ua,nu);ok=0;break;}
+                if(cp_term_from_lin(&cl,&closed)!=0){lin_free(&cl);bad=1;} else lin_free(&cl); }
+            else { closed.isc=1; closed.c=(forced_closed?1:0); closed.v=-1; }
+            if(!bad){
+                rec.kind=CPK_GCCLU; rec.rhs=K; rec.n=1+2*K; rec.nset=nx;
+                rec.setvals=(long long*)psolve_malloc((size_t)K*sizeof(long long));
+                for(int c2=0;c2<K;c2++){
+                    if(ca[c2].n!=0||!isfinite(ca[c2].constant)||ca[c2].constant!=rint(ca[c2].constant)||fabs(ca[c2].constant)>=(double)CP_BIG){bad=1;break;}
+                    rec.setvals[c2]=(long long)llround(ca[c2].constant);
+                }
+                rec.arr_terms=(CPT*)psolve_calloc((size_t)nx,sizeof(CPT));
+                rec.terms=(CPT*)psolve_calloc((size_t)(1+2*K),sizeof(CPT));
+                rec.terms[0]=closed;
+                for(int i=0;i<nx&&!bad;i++){ if(cp_term_from_lin(&xa[i],&rec.arr_terms[i])!=0){bad=1;break;} if(!rec.arr_terms[i].isc) referenced[rec.arr_terms[i].v]=1; }
+                for(int c2=0;c2<K&&!bad;c2++){ if(cp_term_from_lin(&la[c2],&rec.terms[1+c2])!=0){bad=1;break;} if(!rec.terms[1+c2].isc) referenced[rec.terms[1+c2].v]=1; }
+                for(int c2=0;c2<K&&!bad;c2++){ if(cp_term_from_lin(&ua[c2],&rec.terms[1+K+c2])!=0){bad=1;break;} if(!rec.terms[1+K+c2].isc) referenced[rec.terms[1+K+c2].v]=1; }
+            }
+            free_lins(xa,nx); free_lins(ca,K); free_lins(la,nl); free_lins(ua,nu);
+            if(bad){ if(rec.setvals)psolve_free(rec.setvals); if(rec.arr_terms)psolve_free(rec.arr_terms);psolve_free(rec.terms2);psolve_free(rec.terms3); if(rec.terms)psolve_free(rec.terms); memset(&rec,0,sizeof(rec)); ok=0; break; }
+            if(!closed.isc) referenced[closed.v]=1;
+            motivating=1;
+        }
+        /* ---------- count_eq / nvalue / all_equal / increasing / member ---------- */
+        else if(cp_pred_is(p,"count_eq")||cp_pred_is(p,"count")||
+                strcmp(p,"ortools_count_eq")==0||strcmp(p,"ortools_count_eq_cst")==0){
+            if(c->nargs<3){ok=0;break;}
+            Lin*xa;int nx; if(parse_array(m,c->args[0],&xa,&nx)!=0){ok=0;break;}
+            if(nx<1){free_lins(xa,nx);ok=0;break;}
+            if(parse_lin(m,c->args[1],&l1)!=0){free_lins(xa,nx);ok=0;break;}
+            if(parse_lin(m,c->args[2],&l2)!=0){lin_free(&l1);free_lins(xa,nx);ok=0;break;}
+            rec.kind=CPK_COUNTEQ; rec.n=2; rec.nset=nx;
+            rec.terms=(CPT*)psolve_calloc(2,sizeof(CPT));
+            rec.arr_terms=(CPT*)psolve_calloc((size_t)nx,sizeof(CPT));
+            int bad=0;
+            if(cp_term_from_lin(&l1,&rec.terms[0])!=0) bad=1;
+            if(cp_term_from_lin(&l2,&rec.terms[1])!=0) bad=1;
+            for(int i=0;i<nx&&!bad;i++){ if(cp_term_from_lin(&xa[i],&rec.arr_terms[i])!=0){bad=1;break;} if(!rec.arr_terms[i].isc) referenced[rec.arr_terms[i].v]=1; }
+            lin_free(&l1); lin_free(&l2); free_lins(xa,nx);
+            if(bad){ psolve_free(rec.terms); psolve_free(rec.arr_terms); ok=0; break; }
+            if(!rec.terms[0].isc) referenced[rec.terms[0].v]=1;
+            if(!rec.terms[1].isc) referenced[rec.terms[1].v]=1;
+            motivating=1;
+        }
+        else if(cp_pred_is(p,"nvalue")||strcmp(p,"ortools_nvalue")==0){
+            if(c->nargs<2){ok=0;break;}
+            if(parse_lin(m,c->args[0],&l1)!=0){ok=0;break;}
+            Lin*xa;int nx; if(parse_array(m,c->args[1],&xa,&nx)!=0){lin_free(&l1);ok=0;break;}
+            if(nx<1){lin_free(&l1);free_lins(xa,nx);ok=0;break;}
+            rec.kind=CPK_NVALUE; rec.n=1; rec.nset=nx;
+            rec.terms=(CPT*)psolve_calloc(1,sizeof(CPT));
+            rec.arr_terms=(CPT*)psolve_calloc((size_t)nx,sizeof(CPT));
+            int bad=0;
+            if(cp_term_from_lin(&l1,&rec.terms[0])!=0) bad=1;
+            for(int i=0;i<nx&&!bad;i++){ if(cp_term_from_lin(&xa[i],&rec.arr_terms[i])!=0){bad=1;break;} if(!rec.arr_terms[i].isc) referenced[rec.arr_terms[i].v]=1; }
+            lin_free(&l1); free_lins(xa,nx);
+            if(bad){ psolve_free(rec.terms); psolve_free(rec.arr_terms); ok=0; break; }
+            if(!rec.terms[0].isc) referenced[rec.terms[0].v]=1;
+            motivating=1;
+        }
+        else if(cp_pred_is(p,"all_equal_int")||cp_pred_is(p,"all_equal")){
+            if(c->nargs<1){ok=0;break;}
+            Lin*xa;int nx; if(parse_array(m,c->args[0],&xa,&nx)!=0){ok=0;break;}
+            if(nx<1){free_lins(xa,nx);ok=0;break;}
+            rec.kind=CPK_ALLEQ; rec.n=nx; rec.nset=nx;
+            rec.arr_terms=(CPT*)psolve_calloc((size_t)nx,sizeof(CPT));
+            int bad=0;
+            for(int i=0;i<nx;i++){ if(cp_term_from_lin(&xa[i],&rec.arr_terms[i])!=0){bad=1;break;} if(!rec.arr_terms[i].isc) referenced[rec.arr_terms[i].v]=1; }
+            free_lins(xa,nx);
+            if(bad){ psolve_free(rec.arr_terms); ok=0; break; }
+            motivating=1;
+        }
+        else if(cp_pred_is(p,"increasing_int")||cp_pred_is(p,"increasing")){
+            if(c->nargs<1){ok=0;break;}
+            Lin*xa;int nx; if(parse_array(m,c->args[0],&xa,&nx)!=0){ok=0;break;}
+            if(nx<1){free_lins(xa,nx);ok=0;break;}
+            rec.kind=CPK_CHAIN; rec.n=nx; rec.nset=nx;
+            rec.arr_terms=(CPT*)psolve_calloc((size_t)nx,sizeof(CPT));
+            int bad=0;
+            for(int i=0;i<nx;i++){ if(cp_term_from_lin(&xa[i],&rec.arr_terms[i])!=0){bad=1;break;} if(!rec.arr_terms[i].isc) referenced[rec.arr_terms[i].v]=1; }
+            free_lins(xa,nx);
+            if(bad){ psolve_free(rec.arr_terms); ok=0; break; }
+            motivating=1;
+        }
+        else if(cp_pred_is(p,"member_int")||cp_pred_is(p,"member")){
+            if(c->nargs<2){ok=0;break;}
+            Lin*xa;int nx; if(parse_array(m,c->args[0],&xa,&nx)!=0){ok=0;break;}
+            if(nx<1){free_lins(xa,nx);ok=0;break;}
+            if(parse_lin(m,c->args[1],&l1)!=0){free_lins(xa,nx);ok=0;break;}
+            rec.kind=CPK_MEMBER; rec.n=1; rec.nset=nx;
+            rec.terms=(CPT*)psolve_calloc(1,sizeof(CPT));
+            rec.arr_terms=(CPT*)psolve_calloc((size_t)nx,sizeof(CPT));
+            int bad=0;
+            for(int i=0;i<nx&&!bad;i++){ if(cp_term_from_lin(&xa[i],&rec.arr_terms[i])!=0){bad=1;break;} if(!rec.arr_terms[i].isc) referenced[rec.arr_terms[i].v]=1; }
+            if(cp_term_from_lin(&l1,&rec.terms[0])!=0) bad=1;
+            lin_free(&l1); free_lins(xa,nx);
+            if(bad){ psolve_free(rec.terms); psolve_free(rec.arr_terms); ok=0; break; }
+            if(!rec.terms[0].isc) referenced[rec.terms[0].v]=1;
+            motivating=1;
+        }
+        /* ---------- table / inverse / bin_packing ---------- */
+        else if(strcmp(p,"ortools_table_int")==0||strcmp(p,"gecode_table_int")==0||
+                cp_pred_is(p,"table_int")||cp_pred_is(p,"table")){
+            if(c->nargs<2){ok=0;break;}
+            Lin*xa;int nx; if(parse_array(m,c->args[0],&xa,&nx)!=0){ok=0;break;}
+            Lin*ta;int nt; if(parse_array(m,c->args[1],&ta,&nt)!=0){free_lins(xa,nx);ok=0;break;}
+            if(nx<1||nt<1||nt%nx!=0){free_lins(xa,nx);free_lins(ta,nt);ok=0;break;}
+            rec.kind=CPK_TABLE; rec.n=nx; rec.nset=nx; rec.rhs=nt;
+            rec.setvals=(long long*)psolve_malloc((size_t)nt*sizeof(long long));
+            rec.arr_terms=(CPT*)psolve_calloc((size_t)nx,sizeof(CPT));
+            int bad=0;
+            for(int i=0;i<nt&&!bad;i++){
+                if(ta[i].n!=0||!isfinite(ta[i].constant)||ta[i].constant!=rint(ta[i].constant)||fabs(ta[i].constant)>=(double)CP_BIG){bad=1;break;}
+                rec.setvals[i]=(long long)llround(ta[i].constant);
+            }
+            for(int i=0;i<nx&&!bad;i++){ if(cp_term_from_lin(&xa[i],&rec.arr_terms[i])!=0){bad=1;break;} if(!rec.arr_terms[i].isc) referenced[rec.arr_terms[i].v]=1; }
+            free_lins(xa,nx); free_lins(ta,nt);
+            if(bad){ psolve_free(rec.setvals); psolve_free(rec.arr_terms); ok=0; break; }
+            motivating=1;
+        }
+        else if(strcmp(p,"ortools_inverse")==0||strcmp(p,"inverse_offsets")==0||cp_pred_is(p,"inverse")){
+            /* ortools_inverse(f, invf, base_f, base_invf); inverse_offsets(f, foff, invf, invfoff) */
+            int is_off=(strcmp(p,"inverse_offsets")==0);
+            int na=is_off?4:4;
+            if(c->nargs<na){ok=0;break;}
+            int fa=is_off?0:0, ia=is_off?2:1, ba=is_off?1:2, bb=is_off?3:3;
+            Lin*fa_ ;int nf; if(parse_array(m,c->args[fa],&fa_,&nf)!=0){ok=0;break;}
+            Lin*ia_ ;int ni; if(parse_array(m,c->args[ia],&ia_,&ni)!=0){free_lins(fa_,nf);ok=0;break;}
+            Lin bla,blb;
+            if(parse_lin(m,c->args[ba],&bla)!=0){free_lins(fa_,nf);free_lins(ia_,ni);ok=0;break;}
+            if(parse_lin(m,c->args[bb],&blb)!=0){lin_free(&bla);free_lins(fa_,nf);free_lins(ia_,ni);ok=0;break;}
+            long bfa=0,bfb=0; int bad=0;
+            if(bla.n!=0||!isfinite(bla.constant)||bla.constant!=rint(bla.constant)||fabs(bla.constant)>=(double)CP_BIG) bad=1;
+            else bfa=(long)llround(bla.constant);
+            if(!bad&&(blb.n!=0||!isfinite(blb.constant)||blb.constant!=rint(blb.constant)||fabs(blb.constant)>=(double)CP_BIG)) bad=1;
+            else if(!bad) bfb=(long)llround(blb.constant);
+            lin_free(&bla); lin_free(&blb);
+            if(nf<1||nf!=ni||bad){free_lins(fa_,nf);free_lins(ia_,ni);ok=0;break;}
+            rec.kind=CPK_INVERSE; rec.n=nf; rec.nset=nf;
+            rec.lvars=(int*)psolve_malloc(2*sizeof(int)); rec.lvars[0]=(int)bfa; rec.lvars[1]=(int)bfb;
+            rec.arr_terms=(CPT*)psolve_calloc((size_t)nf,sizeof(CPT));
+            rec.terms=(CPT*)psolve_calloc((size_t)nf,sizeof(CPT));
+            for(int i=0;i<nf&&!bad;i++){
+                if(cp_term_from_lin(&fa_[i],&rec.arr_terms[i])!=0){bad=1;break;}
+                if(cp_term_from_lin(&ia_[i],&rec.terms[i])!=0){bad=1;break;}
+                if(!rec.arr_terms[i].isc) referenced[rec.arr_terms[i].v]=1;
+                if(!rec.terms[i].isc) referenced[rec.terms[i].v]=1;
+            }
+            free_lins(fa_,nf); free_lins(ia_,ni);
+            if(bad){ psolve_free(rec.lvars); psolve_free(rec.arr_terms); psolve_free(rec.terms); ok=0; break; }
+            motivating=1;
+        }
+        else if(strcmp(p,"ortools_bin_packing")==0||cp_pred_is(p,"bin_packing")){
+            /* (c, bin, w) */
+            if(c->nargs<3){ok=0;break;}
+            if(parse_lin(m,c->args[0],&l1)!=0){ok=0;break;}
+            Lin*ba;int nb; if(parse_array(m,c->args[1],&ba,&nb)!=0){lin_free(&l1);ok=0;break;}
+            Lin*wa;int nw; if(parse_array(m,c->args[2],&wa,&nw)!=0){lin_free(&l1);free_lins(ba,nb);ok=0;break;}
+            if(nb<1||nw!=nb||l1.n!=0||!isfinite(l1.constant)||l1.constant!=rint(l1.constant)||fabs(l1.constant)>=(double)CP_BIG){lin_free(&l1);free_lins(ba,nb);free_lins(wa,nw);ok=0;break;}
+            long long capc=(long long)llround(l1.constant); lin_free(&l1);
+            rec.kind=CPK_BINPACK; rec.nset=nb; rec.rhs=capc;
+            rec.setvals=(long long*)psolve_malloc((size_t)nb*sizeof(long long));
+            rec.arr_terms=(CPT*)psolve_calloc((size_t)nb,sizeof(CPT));
+            int bad=0;
+            for(int i=0;i<nb&&!bad;i++){
+                if(wa[i].n!=0||!isfinite(wa[i].constant)||wa[i].constant!=rint(wa[i].constant)||fabs(wa[i].constant)>=(double)CP_BIG){bad=1;break;}
+                rec.setvals[i]=(long long)llround(wa[i].constant);
+            }
+            for(int i=0;i<nb&&!bad;i++){ if(cp_term_from_lin(&ba[i],&rec.arr_terms[i])!=0){bad=1;break;} if(!rec.arr_terms[i].isc) referenced[rec.arr_terms[i].v]=1; }
+            free_lins(ba,nb); free_lins(wa,nw);
+            if(bad){ psolve_free(rec.setvals); psolve_free(rec.arr_terms); ok=0; break; }
+            motivating=1;
+        }
+        else if(strcmp(p,"ortools_bin_packing_load")==0||strcmp(p,"gecode_bin_packing_load")==0){
+            /* ortools: (load, bin, load_set, w); gecode: (l, bin, w, minIndex) */
+            int is_gec=(strcmp(p,"gecode_bin_packing_load")==0);
+            if(c->nargs<4){ok=0;break;}
+            Lin*la;int nl; if(parse_array(m,c->args[0],&la,&nl)!=0){ok=0;break;}
+            Lin*ba;int nb; if(parse_array(m,c->args[1],&ba,&nb)!=0){free_lins(la,nl);ok=0;break;}
+            Lin*wa;int nw; int setarg, warg;
+            if(is_gec){ warg=2; setarg=3; } else { setarg=2; warg=3; }
+            if(parse_array(m,c->args[warg],&wa,&nw)!=0){free_lins(la,nl);free_lins(ba,nb);ok=0;break;}
+            if(nl<1||nb<1||nw!=nb){free_lins(la,nl);free_lins(ba,nb);free_lins(wa,nw);ok=0;break;}
+            long llo=0,lhi=0; int bad=0;
+            if(is_gec){
+                if(parse_lin(m,c->args[setarg],&l1)!=0){free_lins(la,nl);free_lins(ba,nb);free_lins(wa,nw);ok=0;break;}
+                if(l1.n!=0||!isfinite(l1.constant)||l1.constant!=rint(l1.constant)||fabs(l1.constant)>=(double)CP_BIG){lin_free(&l1);bad=1;}
+                else { llo=(long)llround(l1.constant); lhi=llo+nl-1; }
+                lin_free(&l1);
+            } else {
+                int isr=0; long rlo=0,rhi=0; long *vals=NULL; int nvals=0;
+                if(fz_parse_int_set(c->args[setarg],4096,&isr,&rlo,&rhi,&vals,&nvals)!=0){free_lins(la,nl);free_lins(ba,nb);free_lins(wa,nw);ok=0;break;}
+                if(isr&&rhi>=rlo){ llo=rlo; lhi=rhi; }
+                else if(!isr&&nvals==nl){ /* vals must be exactly nl consecutive? just take min..min+nl-1 only if matches; else bail */ llo=vals[0]; lhi=vals[nvals-1]; if(lhi-llo+1!=nl) bad=1; }
+                else bad=1;
+                if(vals) psolve_free(vals);
+            }
+            if(!bad){
+                rec.kind=CPK_BINPACKL; rec.n=nl; rec.nset=nb; rec.rhs=nw;
+                rec.lvars=(int*)psolve_malloc(2*sizeof(int)); rec.lvars[0]=(int)llo; rec.lvars[1]=(int)lhi;
+                rec.setvals=(long long*)psolve_malloc((size_t)nb*sizeof(long long));
+                rec.terms=(CPT*)psolve_calloc((size_t)nl,sizeof(CPT));
+                rec.arr_terms=(CPT*)psolve_calloc((size_t)nb,sizeof(CPT));
+                for(int i=0;i<nb&&!bad;i++){
+                    if(wa[i].n!=0||!isfinite(wa[i].constant)||wa[i].constant!=rint(wa[i].constant)||fabs(wa[i].constant)>=(double)CP_BIG){bad=1;break;}
+                    rec.setvals[i]=(long long)llround(wa[i].constant);
+                }
+                for(int i=0;i<nl&&!bad;i++){ if(cp_term_from_lin(&la[i],&rec.terms[i])!=0){bad=1;break;} if(!rec.terms[i].isc) referenced[rec.terms[i].v]=1; }
+                for(int i=0;i<nb&&!bad;i++){ if(cp_term_from_lin(&ba[i],&rec.arr_terms[i])!=0){bad=1;break;} if(!rec.arr_terms[i].isc) referenced[rec.arr_terms[i].v]=1; }
+            }
+            free_lins(la,nl); free_lins(ba,nb); free_lins(wa,nw);
+            if(bad){ if(rec.lvars)psolve_free(rec.lvars); if(rec.setvals)psolve_free(rec.setvals); if(rec.terms)psolve_free(rec.terms); if(rec.arr_terms)psolve_free(rec.arr_terms); memset(&rec,0,sizeof(rec)); ok=0; break; }
+            motivating=1;
+        }
+        /* ---------- cumulative / diffn / nooverlap / lex ---------- */
+        else if(cp_pred_is(p,"cumulative")||strcmp(p,"gecode_cumulatives")==0||strcmp(p,"fzn_cumulative")==0){
+            if(c->nargs<4){ok=0;break;}
+            Lin*sa;int ns; if(parse_array(m,c->args[0],&sa,&ns)!=0){ok=0;break;}
+            Lin*da;int nd; if(parse_array(m,c->args[1],&da,&nd)!=0){free_lins(sa,ns);ok=0;break;}
+            Lin*ra;int nr; if(parse_array(m,c->args[2],&ra,&nr)!=0){free_lins(sa,ns);free_lins(da,nd);ok=0;break;}
+            if(parse_lin(m,c->args[3],&l1)!=0){free_lins(sa,ns);free_lins(da,nd);free_lins(ra,nr);ok=0;break;}
+            if(ns<1||ns!=nd||ns!=nr){lin_free(&l1);free_lins(sa,ns);free_lins(da,nd);free_lins(ra,nr);ok=0;break;}
+            rec.kind=CPK_CUM; rec.n=ns; rec.nset=ns;
+            rec.arr_terms=(CPT*)psolve_calloc((size_t)ns,sizeof(CPT));
+            rec.terms=(CPT*)psolve_calloc((size_t)ns,sizeof(CPT));
+            rec.terms2=(CPT*)psolve_calloc((size_t)ns,sizeof(CPT));
+            rec.terms3=(CPT*)psolve_calloc(1,sizeof(CPT));
+            int bad=0;
+            for(int i=0;i<ns&&!bad;i++){
+                if(cp_term_from_lin(&sa[i],&rec.arr_terms[i])!=0){bad=1;break;}
+                if(cp_term_from_lin(&da[i],&rec.terms[i])!=0){bad=1;break;}
+                if(cp_term_from_lin(&ra[i],&rec.terms2[i])!=0){bad=1;break;}
+                if(!rec.arr_terms[i].isc) referenced[rec.arr_terms[i].v]=1;
+                if(!rec.terms[i].isc) referenced[rec.terms[i].v]=1;
+                if(!rec.terms2[i].isc) referenced[rec.terms2[i].v]=1;
+            }
+            if(cp_term_from_lin(&l1,&rec.terms3[0])!=0) bad=1;
+            lin_free(&l1); free_lins(sa,ns); free_lins(da,nd); free_lins(ra,nr);
+            if(bad){ psolve_free(rec.arr_terms); psolve_free(rec.terms); psolve_free(rec.terms2); psolve_free(rec.terms3); ok=0; break; }
+            if(!rec.terms3[0].isc) referenced[rec.terms3[0].v]=1;
+            motivating=1;
+        }
+        else if(cp_pred_is(p,"diffn")||cp_pred_is(p,"diffn_nonstrict")||strcmp(p,"gecode_nooverlap")==0){
+            /* diffn(x,y,dx,dy); gecode_nooverlap(x,w,y,h) */
+            int is_no=(strcmp(p,"gecode_nooverlap")==0);
+            if(c->nargs<4){ok=0;break;}
+            int a0=0, a1=is_no?2:1, a2=is_no?1:2, a3=3;
+            Lin*xa;int nx; if(parse_array(m,c->args[a0],&xa,&nx)!=0){ok=0;break;}
+            Lin*ya;int ny; if(parse_array(m,c->args[a1],&ya,&ny)!=0){free_lins(xa,nx);ok=0;break;}
+            Lin*wa;int nw2; if(parse_array(m,c->args[a2],&wa,&nw2)!=0){free_lins(xa,nx);free_lins(ya,ny);ok=0;break;}
+            Lin*ha;int nh; if(parse_array(m,c->args[a3],&ha,&nh)!=0){free_lins(xa,nx);free_lins(ya,ny);free_lins(wa,nw2);ok=0;break;}
+            if(nx<1||nx!=ny||nx!=nw2||nx!=nh){free_lins(xa,nx);free_lins(ya,ny);free_lins(wa,nw2);free_lins(ha,nh);ok=0;break;}
+            rec.kind=CPK_DIFFN; rec.n=nx; rec.nset=nx;
+            rec.arr_terms=(CPT*)psolve_calloc((size_t)nx,sizeof(CPT));
+            rec.terms=(CPT*)psolve_calloc((size_t)nx,sizeof(CPT));
+            rec.terms2=(CPT*)psolve_calloc((size_t)nx,sizeof(CPT));
+            rec.terms3=(CPT*)psolve_calloc((size_t)nx,sizeof(CPT));
+            int bad=0;
+            for(int i=0;i<nx&&!bad;i++){
+                if(cp_term_from_lin(&xa[i],&rec.arr_terms[i])!=0){bad=1;break;}
+                if(cp_term_from_lin(&ya[i],&rec.terms[i])!=0){bad=1;break;}
+                if(cp_term_from_lin(&wa[i],&rec.terms2[i])!=0){bad=1;break;}
+                if(cp_term_from_lin(&ha[i],&rec.terms3[i])!=0){bad=1;break;}
+                if(!rec.arr_terms[i].isc) referenced[rec.arr_terms[i].v]=1;
+                if(!rec.terms[i].isc) referenced[rec.terms[i].v]=1;
+                if(!rec.terms2[i].isc) referenced[rec.terms2[i].v]=1;
+                if(!rec.terms3[i].isc) referenced[rec.terms3[i].v]=1;
+            }
+            free_lins(xa,nx); free_lins(ya,ny); free_lins(wa,nw2); free_lins(ha,nh);
+            if(bad){ psolve_free(rec.arr_terms); psolve_free(rec.terms); psolve_free(rec.terms2); psolve_free(rec.terms3); ok=0; break; }
+            motivating=1;
+        }
+        else if(cp_pred_is(p,"lex_less_int")||cp_pred_is(p,"lex_lesseq_int")||
+                cp_pred_is(p,"lex_greater_int")||cp_pred_is(p,"lex_greatereq_int")||
+                cp_pred_is(p,"lex_less")||cp_pred_is(p,"lex_lesseq")||
+                cp_pred_is(p,"lex_greater")||cp_pred_is(p,"lex_greatereq")||strcmp(p,"ortools_lex_less_int")==0||
+                strcmp(p,"ortools_lex_lesseq_int")==0||strcmp(p,"array_int_lt")==0||strcmp(p,"array_int_lq")==0||
+                cp_pred_is(p,"lex_less_bool")||cp_pred_is(p,"lex_lesseq_bool")||strcmp(p,"array_bool_lt")==0||strcmp(p,"array_bool_lq")==0){
+            /* lex_greater(x,y) is lex_less(y,x); the arrays are swapped below
+               and the strictness follows the name after the swap */
+            int greater = (strstr(p,"greater")!=NULL);
+            int strict;
+            strict = greater ? (strstr(p,"greatereq")==NULL)
+                             : ((strcmp(p,"array_int_lt")==0||strcmp(p,"array_bool_lt")==0||
+                                 strcmp(p,"ortools_lex_less_int")==0||strcmp(p,"ortools_lex_less_bool")==0||
+                                 cp_pred_is(p,"lex_less_int")||cp_pred_is(p,"lex_less_bool")||
+                                 cp_pred_is(p,"lex_less"))?1:0);
+            if(c->nargs<2){ok=0;break;}
+            Lin*xa;int nx; if(parse_array(m,c->args[0],&xa,&nx)!=0){ok=0;break;}
+            Lin*ya;int ny; if(parse_array(m,c->args[1],&ya,&ny)!=0){free_lins(xa,nx);ok=0;break;}
+            if(greater){ Lin*t=xa;xa=ya;ya=t; int tn=nx;nx=ny;ny=tn; }
+            if(nx<1||nx!=ny){free_lins(xa,nx);free_lins(ya,ny);ok=0;break;}
+            rec.kind=CPK_LEX; rec.n=nx; rec.nset=nx; rec.rhs=strict;
+            rec.arr_terms=(CPT*)psolve_calloc((size_t)nx,sizeof(CPT));
+            rec.terms=(CPT*)psolve_calloc((size_t)nx,sizeof(CPT));
+            int bad=0;
+            for(int i=0;i<nx&&!bad;i++){
+                if(cp_term_from_lin(&xa[i],&rec.arr_terms[i])!=0){bad=1;break;}
+                if(cp_term_from_lin(&ya[i],&rec.terms[i])!=0){bad=1;break;}
+                if(!rec.arr_terms[i].isc) referenced[rec.arr_terms[i].v]=1;
+                if(!rec.terms[i].isc) referenced[rec.terms[i].v]=1;
+            }
+            free_lins(xa,nx); free_lins(ya,ny);
+            if(bad){ psolve_free(rec.arr_terms); psolve_free(rec.terms); ok=0; break; }
+            motivating=1;
+        }
+        /* ---------- array_int_minimum / array_int_maximum ---------- */
+        else if(strcmp(p,"array_int_minimum")==0||strcmp(p,"array_int_maximum")==0||
+                strcmp(p,"fzn_array_int_minimum")==0||strcmp(p,"fzn_array_int_maximum")==0){
+            if(c->nargs<2){ok=0;break;}
+            Lin*arr;int narr; if(parse_array(m,c->args[1],&arr,&narr)!=0){ok=0;break;}
+            if(narr<1){free_lins(arr,narr);ok=0;break;}
+            if(parse_lin(m,c->args[0],&l1)!=0){free_lins(arr,narr);ok=0;break;}
+            CPT M; if(cp_term_from_lin(&l1,&M)!=0){lin_free(&l1);free_lins(arr,narr);ok=0;break;}
+            lin_free(&l1);
+            rec.kind=CPK_ARRMM;
+            rec.n=(strcmp(p,"array_int_maximum")==0||strcmp(p,"fzn_array_int_maximum")==0)?1:0;
+            rec.terms=(CPT*)psolve_calloc(1,sizeof(CPT)); rec.terms[0]=M;
+            rec.nset=narr; rec.arr_terms=(CPT*)psolve_calloc((size_t)narr,sizeof(CPT));
+            int bad=0;
+            for(int i=0;i<narr;i++){
+                if(cp_term_from_lin(&arr[i],&rec.arr_terms[i])!=0){bad=1;break;}
+                if(!rec.arr_terms[i].isc) referenced[rec.arr_terms[i].v]=1;
+            }
+            free_lins(arr,narr);
+            if(bad){ psolve_free(rec.arr_terms);psolve_free(rec.terms2);psolve_free(rec.terms3); psolve_free(rec.terms); ok=0; break; }
+            if(!M.isc) referenced[M.v]=1;
             motivating=1;
         }
         /* ---------- orbit_len(next, start, len) -- psolve global ----------
@@ -1891,6 +3450,43 @@ static int cp_parse(FZModel*m,CPCR**out_cr,int*out_n,unsigned char*referenced,in
             referenced[rb.v]=1;
             motivating=1;
         }
+        /* ---------- half-reified (implicational) linear relations: b -> rel ---------- */
+        else if(cp_pred_is(p,"int_lin_eq_imp")||cp_pred_is(p,"int_lin_ne_imp")||
+                cp_pred_is(p,"int_lin_le_imp")||cp_pred_is(p,"int_lin_lt_imp")||
+                cp_pred_is(p,"int_lin_ge_imp")||cp_pred_is(p,"int_lin_gt_imp")||
+                cp_pred_is(p,"bool_lin_eq_imp")||cp_pred_is(p,"bool_lin_ne_imp")||
+                cp_pred_is(p,"bool_lin_le_imp")||cp_pred_is(p,"bool_lin_lt_imp")||
+                cp_pred_is(p,"bool_lin_ge_imp")||cp_pred_is(p,"bool_lin_gt_imp")){
+            if(c->nargs<4){ok=0;break;}
+            Lin*arr;int narr; if(parse_array(m,c->args[0],&arr,&narr)!=0){ok=0;break;}
+            Lin*parr;int nparr; if(parse_array(m,c->args[1],&parr,&nparr)!=0){free_lins(arr,narr);ok=0;break;}
+            Lin d; if(parse_lin(m,c->args[2],&d)!=0){free_lins(arr,narr);free_lins(parr,nparr);ok=0;break;}
+            Lin rl; if(parse_lin(m,c->args[3],&rl)!=0){free_lins(arr,narr);free_lins(parr,nparr);lin_free(&d);ok=0;break;}
+            if(narr!=nparr){free_lins(arr,narr);free_lins(parr,nparr);lin_free(&d);lin_free(&rl);ok=0;break;}
+            Lin L;memset(&L,0,sizeof(L)); int bad=0;
+            for(int i=0;i<narr;i++){ if(arr[i].n!=0||!isfinite(arr[i].constant)){bad=1;break;} lin_into(&L,&parr[i],arr[i].constant); }
+            lin_into(&L,&d,-1.0);
+            free_lins(arr,narr);free_lins(parr,nparr);lin_free(&d);
+            if(bad){lin_free(&L);lin_free(&rl);ok=0;break;}
+            if(!cp_lin_is_exact(&L)){ lin_free(&L); lin_free(&rl); ok=0; break; }
+            CPT rb; if(cp_term_from_lin(&rl,&rb)!=0 || rb.isc){ lin_free(&L);lin_free(&rl);ok=0;break; }
+            lin_free(&rl);
+            int rel;
+            if(cp_pred_is(p,"int_lin_eq_imp")||cp_pred_is(p,"bool_lin_eq_imp"))rel=0;
+            else if(cp_pred_is(p,"int_lin_ne_imp")||cp_pred_is(p,"bool_lin_ne_imp"))rel=5;
+            else if(cp_pred_is(p,"int_lin_le_imp")||cp_pred_is(p,"bool_lin_le_imp"))rel=1;
+            else if(cp_pred_is(p,"int_lin_lt_imp")||cp_pred_is(p,"bool_lin_lt_imp"))rel=3;
+            else if(cp_pred_is(p,"int_lin_ge_imp")||cp_pred_is(p,"bool_lin_ge_imp"))rel=2;
+            else rel=4;
+            rec.kind=CPK_IMP; rec.rel=rel; rec.terms=(CPT*)psolve_calloc(1,sizeof(CPT)); rec.terms[0]=rb;
+            rec.n=L.n; rec.lvars=(int*)psolve_malloc((size_t)(L.n?L.n:1)*sizeof(int));
+            rec.lcoef=(long long*)psolve_malloc((size_t)(L.n?L.n:1)*sizeof(long long));
+            for(int i=0;i<L.n;i++){ rec.lvars[i]=L.idx[i]; rec.lcoef[i]=(long long)llround(L.coef[i]); referenced[L.idx[i]]=1; }
+            rec.rhs= -(long long)llround(L.constant);
+            lin_free(&L);
+            referenced[rb.v]=1;
+            motivating=1;
+        }
         /* ---------- reified scalar relations ---------- */
         else if(cp_pred_is(p,"int_eq_reif")||cp_pred_is(p,"int_ne_reif")||
                 cp_pred_is(p,"int_le_reif")||cp_pred_is(p,"int_lt_reif")||
@@ -1915,6 +3511,38 @@ static int cp_parse(FZModel*m,CPCR**out_cr,int*out_n,unsigned char*referenced,in
             else if(cp_pred_is(p,"int_ge_reif")||cp_pred_is(p,"bool_ge_reif"))rel=2;
             else rel=4;
             rec.kind=CPK_REIF; rec.rel=rel; rec.terms=(CPT*)psolve_calloc(1,sizeof(CPT)); rec.terms[0]=rb;
+            rec.n=dd.n; rec.lvars=(int*)psolve_malloc((size_t)(dd.n?dd.n:1)*sizeof(int));
+            rec.lcoef=(long long*)psolve_malloc((size_t)(dd.n?dd.n:1)*sizeof(long long));
+            for(int i=0;i<dd.n;i++){ rec.lvars[i]=dd.idx[i]; rec.lcoef[i]=(long long)llround(dd.coef[i]); referenced[dd.idx[i]]=1; }
+            rec.rhs= -(long long)llround(dd.constant);
+            lin_free(&dd);
+            referenced[rb.v]=1;
+            motivating=1;
+        }
+        /* ---------- half-reified scalar relations: r -> a (rel) b ---------- */
+        else if(cp_pred_is(p,"int_eq_imp")||cp_pred_is(p,"int_ne_imp")||
+                cp_pred_is(p,"int_le_imp")||cp_pred_is(p,"int_lt_imp")||
+                cp_pred_is(p,"int_ge_imp")||cp_pred_is(p,"int_gt_imp")||
+                cp_pred_is(p,"bool_eq_imp")||cp_pred_is(p,"bool_ne_imp")||
+                cp_pred_is(p,"bool_le_imp")||cp_pred_is(p,"bool_lt_imp")||
+                cp_pred_is(p,"bool_ge_imp")||cp_pred_is(p,"bool_gt_imp")){
+            if(c->nargs<3){ok=0;break;}
+            if(parse_lin(m,c->args[0],&l1)!=0){ok=0;break;}
+            if(parse_lin(m,c->args[1],&l2)!=0){lin_free(&l1);ok=0;break;}
+            if(parse_lin(m,c->args[2],&l3)!=0){lin_free(&l1);lin_free(&l2);ok=0;break;}
+            Lin dd;memset(&dd,0,sizeof(dd)); lin_into(&dd,&l1,1.0); lin_into(&dd,&l2,-1.0);
+            lin_free(&l1);lin_free(&l2);
+            if(!cp_lin_is_exact(&dd)){ lin_free(&dd); lin_free(&l3); ok=0; break; }
+            CPT rb; if(cp_term_from_lin(&l3,&rb)!=0 || rb.isc){ lin_free(&dd);lin_free(&l3);ok=0;break; }
+            lin_free(&l3);
+            int rel;
+            if(cp_pred_is(p,"int_eq_imp")||cp_pred_is(p,"bool_eq_imp"))rel=0;
+            else if(cp_pred_is(p,"int_ne_imp")||cp_pred_is(p,"bool_ne_imp"))rel=5;
+            else if(cp_pred_is(p,"int_le_imp")||cp_pred_is(p,"bool_le_imp"))rel=1;
+            else if(cp_pred_is(p,"int_lt_imp")||cp_pred_is(p,"bool_lt_imp"))rel=3;
+            else if(cp_pred_is(p,"int_ge_imp")||cp_pred_is(p,"bool_ge_imp"))rel=2;
+            else rel=4;
+            rec.kind=CPK_IMP; rec.rel=rel; rec.terms=(CPT*)psolve_calloc(1,sizeof(CPT)); rec.terms[0]=rb;
             rec.n=dd.n; rec.lvars=(int*)psolve_malloc((size_t)(dd.n?dd.n:1)*sizeof(int));
             rec.lcoef=(long long*)psolve_malloc((size_t)(dd.n?dd.n:1)*sizeof(long long));
             for(int i=0;i<dd.n;i++){ rec.lvars[i]=dd.idx[i]; rec.lcoef[i]=(long long)llround(dd.coef[i]); referenced[dd.idx[i]]=1; }
@@ -1990,10 +3618,11 @@ static int cp_parse(FZModel*m,CPCR**out_cr,int*out_n,unsigned char*referenced,in
         if(nc>=cap){ cap*=2; cr=(CPCR*)psolve_realloc((void**)&cr,(size_t)cap*sizeof(CPCR)); }
         cr[nc++]=rec;
     }
-    if(!ok){ for(int i=0;i<nc;i++){ cp_cr_aux_free(&cr[i]); psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);} psolve_free(cr); return -1; }
-    if(!motivating){ for(int i=0;i<nc;i++){ cp_cr_aux_free(&cr[i]); psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);} psolve_free(cr); return -2; }
+    if(!ok){ for(int i=0;i<nc;i++){ cp_cr_aux_free(&cr[i]); psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);psolve_free(cr[i].terms2);psolve_free(cr[i].terms3);} psolve_free(cr); return -1; }
+    if(!motivating){ for(int i=0;i<nc;i++){ cp_cr_aux_free(&cr[i]); psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);psolve_free(cr[i].terms2);psolve_free(cr[i].terms3);} psolve_free(cr); return -2; }
     /* structure recovery: rewrite bounded-horizon orbit chains (exact) */
     fz_presolve_orbit(m,cr,&nc,referenced);
+    cp_add_cum_makespan_bound(&cr,&nc,&cap,m);
     /* recompute `referenced` from the surviving records: the brancher must
        treat referenced<->appears-in-a-constraint as an exact invariant, and
        the presolve may have freed records; marking per parse-branch plus a
@@ -2001,6 +3630,93 @@ static int cp_parse(FZModel*m,CPCR**out_cr,int*out_n,unsigned char*referenced,in
     memset(referenced,0,(size_t)(m->nvars?m->nvars:1));
     for(int i=0;i<nc;i++) cr_mark_vars(&cr[i],referenced);
     *out_cr=cr; *out_n=nc; *has_cp_motivating=motivating;
+    return 0;
+}
+
+/* circuit/subcircuit propagation: Régin all-different over the successor
+   vars, no self-loops for a plain circuit (n>1), and once every successor is
+   fixed an exact single-cycle check.  Sound at every partial state (the
+   search remains exhaustive, so no valid assignment is ever pruned). */
+static int cp_prop_circuit(CP*cp,const CPCR*cr){
+    int n=cr->n; long long base=cr->rhs; int is_sub=cr->rel;
+    if(n<=0) return 0;
+    int r=cp_prop_alldiff(cp,cr->terms,n);
+    if(r!=0) return r;
+    if(!is_sub && n>1){
+        for(int i=0;i<n;i++){
+            if(cr->terms[i].isc) continue;
+            if(cp_remove_val(cp,cr->terms[i].v,(int64_t)(base+i))) return 1;
+        }
+    }
+    int *succ=(int*)psolve_malloc((size_t)n*sizeof(int));
+    int allfixed=1;
+    for(int i=0;i<n;i++){
+        int64_t fv;
+        if(cp_term_value(cp,&cr->terms[i],&fv)){
+            long long d=fv-base;
+            if(d<0||d>=n){ psolve_free(succ); return 1; }
+            succ[i]=(int)d;
+        } else { succ[i]=-1; allfixed=0; }
+    }
+    if(allfixed){
+        /* exact single-cycle check */
+        int *seen=(int*)psolve_calloc((size_t)n,sizeof(int));
+        int start;
+        if(!is_sub) start=0;
+        else { start=-1; for(int i=0;i<n;i++) if(succ[i]!=i){ start=i; break; } }
+        int ok=1;
+        if(start<0) ok=1;               /* subcircuit: all self-loops is allowed */
+        else {
+            int cur=start, cnt=0;
+            do{
+                if(seen[cur]){ ok=0; break; }
+                seen[cur]=1; cnt++; cur=succ[cur];
+            }while(cur!=start);
+            if(ok){
+                if(!is_sub){ if(cnt!=n) ok=0; }
+                else { int nself=0; for(int i=0;i<n;i++) if(succ[i]==i) nself++;
+                       if(cnt!=n-nself) ok=0; }
+            }
+        }
+        psolve_free(seen); psolve_free(succ);
+        return ok?0:1;
+    }
+    /* partial subtour elimination (sound): walk fixed arcs from each fixed
+       non-self node; a closed cycle that cannot absorb every remaining node
+       makes the state infeasible. */
+    for(int s=0;s<n;s++){
+        if(succ[s]<0) continue;
+        if(is_sub && succ[s]==s) continue;
+        /* does the walk from s return to s (closed cycle)? */
+        int cur=s, closed=0, guard=0;
+        int *vis=(int*)psolve_calloc((size_t)n,sizeof(int));
+        vis[s]=1;
+        while(guard++<=2*n){
+            int nx=succ[cur];
+            if(nx<0) break;                       /* hits an unfixed arc */
+            if(is_sub && nx==cur) break;          /* self loop: not a cycle */
+            if(nx==s){ closed=1; break; }
+            if(vis[nx]) break;                    /* enters a different cycle */
+            vis[nx]=1; cur=nx;
+        }
+        if(closed){
+            /* size of the closed cycle starting at s */
+            int sz=0; cur=s;
+            do{ sz++; cur=succ[cur]; }while(cur!=s);
+            if(!is_sub){
+                if(sz<n){ psolve_free(vis); psolve_free(succ); return 1; }
+            } else {
+                /* any OTHER fixed non-self node outside the cycle is fatal */
+                for(int j=0;j<n;j++){
+                    if(j==s||succ[j]<0) continue;
+                    if(succ[j]==j) continue;
+                    if(!vis[j]){ psolve_free(vis); psolve_free(succ); return 1; }
+                }
+            }
+        }
+        psolve_free(vis);
+    }
+    psolve_free(succ);
     return 0;
 }
 
@@ -2021,6 +3737,23 @@ static int cp_propagate(CP*cp,CPCR*cr,int nc){
                 case CPK_SETIN: r=cp_prop_setin(cp,&cr[i].terms[0],cr[i].setvals,cr[i].nset); break;
                 case CPK_POW: r=cp_prop_pow(cp,&cr[i].terms[0],cr[i].terms[1].c,&cr[i].terms[2]); break;
                 case CPK_REIF: r=cp_prop_reif(cp,&cr[i]); break;
+                case CPK_IMP: r=cp_prop_imp(cp,&cr[i]); break;
+                case CPK_ARRMM: r=cp_prop_arrmm(cp,&cr[i]); break;
+                case CPK_DISJ: r=cp_prop_disj(cp,&cr[i]); break;
+                case CPK_GCC: r=cp_prop_gcc(cp,&cr[i],0); break;
+                case CPK_GCCLU: r=cp_prop_gcc(cp,&cr[i],1); break;
+                case CPK_COUNTEQ: r=cp_prop_counteq(cp,&cr[i]); break;
+                case CPK_NVALUE: r=cp_prop_nvalue(cp,&cr[i]); break;
+                case CPK_ALLEQ: r=cp_prop_alleq(cp,&cr[i]); break;
+                case CPK_CHAIN: r=cp_prop_chain(cp,&cr[i]); break;
+                case CPK_MEMBER: r=cp_prop_member(cp,&cr[i]); break;
+                case CPK_TABLE: r=cp_prop_table(cp,&cr[i]); break;
+                case CPK_INVERSE: r=cp_prop_inverse(cp,&cr[i]); break;
+                case CPK_BINPACK: r=cp_prop_binpack(cp,&cr[i]); break;
+                case CPK_BINPACKL: r=cp_prop_binpackl(cp,&cr[i]); break;
+                case CPK_CUM: r=cp_prop_cum(cp,&cr[i]); break;
+                case CPK_DIFFN: r=cp_prop_diffn(cp,&cr[i]); break;
+                case CPK_LEX: r=cp_prop_lex(cp,&cr[i]); break;
                 case CPK_CLAUSE: r=cp_prop_clause(cp,&cr[i]); break;
                 case CPK_MINMAX: r=cp_prop_minmax(cp,&cr[i]); break;
                 case CPK_ORBIT: r=cp_prop_orbit(cp,&cr[i]); break;
@@ -2029,6 +3762,7 @@ static int cp_propagate(CP*cp,CPCR*cr,int nc){
                 case CPK_ORBITCAP: r=cp_prop_orbit_gen(cp,&cr[i],3); break;
                 case CPK_ONCYCLE: r=cp_prop_oncycle(cp,&cr[i]); break;
                 case CPK_AND: r=cp_prop_and(cp,&cr[i]); break;
+                case CPK_CIRCUIT: r=cp_prop_circuit(cp,&cr[i]); break;
             }
             if(r==1) return 1;
             if(r==-1) return -1;
@@ -2079,6 +3813,124 @@ static int cp_verify(const CP*cp,CPCR*cr,int nc,const double*outx){
             int64_t a=cp_term_out(&r->terms[0],outx), b=cp_term_out(&r->terms[1],outx), m=cp_term_out(&r->terms[2],outx);
             int64_t res=(r->n? (a>b?a:b) : (a<b?a:b));
             if(res!=m) return 0;
+        }
+        else if(r->kind==CPK_ARRMM){
+            int64_t m=cp_term_out(&r->terms[0],outx), res=cp_term_out(&r->arr_terms[0],outx);
+            for(int k=1;k<r->nset;k++){ int64_t a=cp_term_out(&r->arr_terms[k],outx); res=(r->n? (a>res?a:res) : (a<res?a:res)); }
+            if(res!=m) return 0;
+        }
+        else if(r->kind==CPK_DISJ){
+            for(int i=0;i<r->n;i++) for(int j=i+1;j<r->n;j++){
+                int64_t si=cp_term_out(&r->arr_terms[i],outx), di=cp_term_out(&r->terms[i],outx);
+                int64_t sj=cp_term_out(&r->arr_terms[j],outx), dj=cp_term_out(&r->terms[j],outx);
+                if(!((si+di<=sj)||(sj+dj<=si))) return 0;
+            }
+        }
+        else if(r->kind==CPK_GCC||r->kind==CPK_GCCLU){
+            int K=(int)r->rhs, N=r->nset; int lowup=(r->kind==CPK_GCCLU);
+            for(int c=0;c<K;c++){
+                int64_t v=r->setvals[c]; int act=0;
+                for(int i=0;i<N;i++){ if(cp_term_out(&r->arr_terms[i],outx)==v) act++; }
+                if(!lowup){ if(cp_term_out(&r->terms[1+c],outx)!=act) return 0; }
+                else { if(act<cp_term_out(&r->terms[1+c],outx)||act>cp_term_out(&r->terms[1+K+c],outx)) return 0; }
+            }
+            int64_t cv=cp_term_out(&r->terms[0],outx);
+            if(cv==1){
+                for(int i=0;i<N;i++){ int64_t xv=cp_term_out(&r->arr_terms[i],outx); int ok=0;
+                    for(int c=0;c<K;c++) if(r->setvals[c]==xv){ok=1;break;}
+                    if(!ok) return 0; }
+            }
+        }
+        else if(r->kind==CPK_COUNTEQ){
+            int64_t yv=cp_term_out(&r->terms[0],outx), cv=cp_term_out(&r->terms[1],outx); int act=0;
+            for(int i=0;i<r->nset;i++) if(cp_term_out(&r->arr_terms[i],outx)==yv) act++;
+            if(act!=cv) return 0;
+        }
+        else if(r->kind==CPK_NVALUE){
+            int64_t nv=cp_term_out(&r->terms[0],outx); int act=0;
+            for(int i=0;i<r->nset;i++){ int64_t v=cp_term_out(&r->arr_terms[i],outx); int dup=0;
+                for(int j=0;j<i;j++) if(cp_term_out(&r->arr_terms[j],outx)==v){dup=1;break;}
+                if(!dup) act++; }
+            if(act!=nv) return 0;
+        }
+        else if(r->kind==CPK_ALLEQ){
+            int64_t v0=cp_term_out(&r->arr_terms[0],outx);
+            for(int i=1;i<r->n;i++) if(cp_term_out(&r->arr_terms[i],outx)!=v0) return 0;
+        }
+        else if(r->kind==CPK_CHAIN){
+            for(int i=1;i<r->n;i++) if(cp_term_out(&r->arr_terms[i-1],outx)>cp_term_out(&r->arr_terms[i],outx)) return 0;
+        }
+        else if(r->kind==CPK_MEMBER){
+            int64_t yv=cp_term_out(&r->terms[0],outx); int ok=0;
+            for(int i=0;i<r->nset;i++) if(cp_term_out(&r->arr_terms[i],outx)==yv){ok=1;break;}
+            if(!ok) return 0;
+        }
+        else if(r->kind==CPK_TABLE){
+            int W=r->n; long long*T=r->setvals; int R=(int)r->rhs/W; int ok=0;
+            for(int row=0;row<R&&!ok;row++){
+                int m=1;
+                for(int k=0;k<W;k++) if(cp_term_out(&r->arr_terms[k],outx)!=T[(size_t)row*W+k]){m=0;break;}
+                if(m) ok=1;
+            }
+            if(!ok) return 0;
+        }
+        else if(r->kind==CPK_INVERSE){
+            int n=r->n; long bf=r->lvars[0], bi=r->lvars[1];
+            for(int i=0;i<n;i++){
+                int64_t fv=cp_term_out(&r->arr_terms[i],outx);
+                if(fv-bf<0||fv-bf>=n) return 0;
+                if(cp_term_out(&r->terms[(int)(fv-bf)],outx)!=i+bi) return 0;
+            }
+        }
+        else if(r->kind==CPK_BINPACK){
+            int n=r->nset; long long*W=r->setvals; int64_t c=r->rhs;
+            int64_t *ks=NULL; int nk=0,cap=0;
+            for(int i=0;i<n;i++){ int64_t k=cp_term_out(&r->arr_terms[i],outx); int seen=0; for(int q=0;q<nk;q++) if(ks[q]==k){seen=1;break;} if(!seen){ if(nk>=cap){cap=cap?cap*2:8;ks=(int64_t*)psolve_realloc((void**)&ks,(size_t)cap*sizeof(int64_t));} ks[nk++]=k; } }
+            int bad2=0;
+            for(int q=0;q<nk;q++){ int64_t s=0; for(int i=0;i<n;i++) if(cp_term_out(&r->arr_terms[i],outx)==ks[q]) s+=W[i]; if(s>c){bad2=1;break;} }
+            psolve_free(ks);
+            if(bad2) return 0;
+        }
+        else if(r->kind==CPK_BINPACKL){
+            int n=r->nset; long long*W=r->setvals; long lo=r->lvars[0];
+            for(int k=0;k<r->n;k++){
+                int64_t kval=lo+k, s=0;
+                for(int i=0;i<n;i++) if(cp_term_out(&r->arr_terms[i],outx)==kval) s+=W[i];
+                if(s!=cp_term_out(&r->terms[k],outx)) return 0;
+            }
+        }
+        else if(r->kind==CPK_CUM){
+            int n=r->n; CPT*S=r->arr_terms,*D=r->terms,*R=r->terms2;
+            int64_t b=cp_term_out(&r->terms3[0],outx);
+            /* exact: at every task start time, sum of active usages <= b */
+            for(int i=0;i<n;i++){
+                int64_t t=cp_term_out(&S[i],outx); int64_t sum=0;
+                for(int j=0;j<n;j++){
+                    int64_t sj=cp_term_out(&S[j],outx), dj=cp_term_out(&D[j],outx);
+                    if(sj<=t && t<sj+dj) sum+=cp_term_out(&R[j],outx);
+                }
+                if(sum>b) return 0;
+            }
+        }
+        else if(r->kind==CPK_DIFFN){
+            int n=r->n; CPT*X=r->arr_terms,*Y=r->terms,*W=r->terms2,*H=r->terms3;
+            for(int i=0;i<n;i++) for(int j=i+1;j<n;j++){
+                int64_t xi=cp_term_out(&X[i],outx), yi=cp_term_out(&Y[i],outx), wi=cp_term_out(&W[i],outx), hi=cp_term_out(&H[i],outx);
+                int64_t xj=cp_term_out(&X[j],outx), yj=cp_term_out(&Y[j],outx), wj=cp_term_out(&W[j],outx), hj=cp_term_out(&H[j],outx);
+                int ox = (xi < xj+wj && xj < xi+wi);
+                int oy = (yi < yj+hj && yj < yi+hi);
+                if(ox&&oy) return 0;
+            }
+        }
+        else if(r->kind==CPK_LEX){
+            int n=r->n; int strict=(r->rhs!=0);
+            int cmp=0;
+            for(int i=0;i<n;i++){
+                int64_t xv=cp_term_out(&r->arr_terms[i],outx), yv=cp_term_out(&r->terms[i],outx);
+                if(xv<yv){cmp=-1;break;} if(xv>yv){cmp=1;break;}
+            }
+            int ok = strict? (cmp<0) : (cmp<=0);
+            if(!ok) return 0;
         }
         else if(r->kind==CPK_ORBIT){
             FZOrbit*o=(FZOrbit*)r->aux;
@@ -2230,15 +4082,64 @@ static int cp_opt_bb_tighten(CP*cp,const CPOptCtx*opt){
  * When `all` is set, each complete assignment is emitted via on_solution and
  * search continues (backtracks) to find the next distinct one.
  */
+#define CP_SHOP_MAXT 128
+#define CP_SHOP_MAXR 24
+#define CP_SHOP_MAXD 4
+
+typedef struct CPShopTag{
+    int ntask;
+    int sv[CP_SHOP_MAXT];
+    long long dur[CP_SHOP_MAXT];
+    long long est[CP_SHOP_MAXT], lst[CP_SHOP_MAXT], tail[CP_SHOP_MAXT];
+    int ndem[CP_SHOP_MAXT];
+    int demr[CP_SHOP_MAXT][CP_SHOP_MAXD];
+    long long dema[CP_SHOP_MAXT][CP_SHOP_MAXD];
+    int nres;
+    long long rcap[CP_SHOP_MAXR];
+    int *load[CP_SHOP_MAXR];
+    int npred[CP_SHOP_MAXT];
+    int *pred[CP_SHOP_MAXT];            /* one flat block, row per task */
+    int *predblk;
+    long long horizon, lo_mk, hi_mk, best;
+    long long *start, *beststart;
+    unsigned char *placed;
+    long long nodes, nodecap;
+    double deadline;                    /* wall-clock budget (0 = none) */
+    struct timespec t_start;
+    int aborted;
+    int mk;
+    int pure;                           /* model is exactly the pattern */
+    int npred_total;
+} CPShop;
+
+static int cp_shop_push_bound(CP*cp,CPShop*S);
+
+/* Variable order for scheduling models: take the unfixed searchable
+   variable with the smallest *index*, i.e. declaration order (the placement
+   order of the tasks), and leave `mk` to the end.  Everything else is
+   scheduling territory: a smallest-domain scan picks `mk` as soon as the
+   incumbent cuts it down and degenerates into makespan enumeration (7x7
+   jobshop: 0.9 s -> does not finish), and picking the most constrained
+   *start* is just as bad.  Committing one job's route before moving on is
+   what makes the disjunctive propagation bite. */
+static int cp_shop_pick_var(CP*cp,CPShop*S,unsigned char*searchme){
+    for(int v=0;v<cp->nvars;v++){
+        if(!searchme[v]||v==S->mk) continue;
+        if(!cp->bounded[v]||cp_fixed(cp,v)) continue;
+        for(int i=0;i<S->ntask;i++) if(S->sv[i]==v) return v;
+    }
+    return -1;
+}
+
 static int cp_solve_rec(CP*cp,CPCR*cr,int nc,unsigned char*searchme,double*outx,int depth,
                         int all,void(*on_solution)(const double*,double,void*),void*ud,
-                        CPOptCtx*opt,long*nodectr){
+                        CPOptCtx*opt,long*nodectr,int*suspect,CPShop*shop){
     /* search nodes are counted on the caller-owned counter, not on the CP
        instance: the recursion works on per-branch copies (cp_copy duplicates
        a parent's counter into the child), so an instance-local count would
        report path depth instead of total explored nodes */
     (*nodectr)++;
-    if(*nodectr>CP_MAXNODES) return (all||opt)?4:-1;
+    if(*nodectr>(shop?CP_MAXNODES_SHOP:CP_MAXNODES)) return (all||opt)?4:-1;
     int pr=cp_propagate(cp,cr,nc);
     if(pr==1) return 0;
     if(pr==-1) return -1;
@@ -2257,8 +4158,19 @@ static int cp_solve_rec(CP*cp,CPCR*cr,int nc,unsigned char*searchme,double*outx,
         if(bt==1) return 0;              /* objective row infeasible below incumbent */
         if(bt==2){ pr=cp_propagate(cp,cr,nc); if(pr==1) return 0; if(pr==-1) return -1; }
     }
+    /* after the incumbent has been pushed into mk: the scheduling bound and
+       its deadline propagation see the tightened makespan ceiling */
+    if(shop&&cp_shop_push_bound(cp,shop)) return 0;
+    /* Scheduling models: branch on the start of the most urgent task (the
+       one with the smallest latest start) instead of the first variable with
+       the smallest domain.  Value enumeration then commits a task to one
+       start and, on backtracking, only learns "not this value" -- for a
+       jobshop that explodes (6x6 jobshop: 3e5 nodes).  Below, the selected
+       start is instead split as `s = lo` / `s in (lo, hi]`, which keeps the
+       delay information and lets the disjunctive propagation bite. */
     int best=-1,bestsz=INT_MAX;
-    for(int v=0;v<cp->nvars;v++){
+    if(shop) best=cp_shop_pick_var(cp,shop,searchme);
+    if(best<0) for(int v=0;v<cp->nvars;v++){    /* MRV fallback */
         if(!searchme[v]) continue;     /* non-search vars (unconstrained AND
                                           non-output) cannot affect a leaf
                                           and are never printed: branching on
@@ -2275,10 +4187,20 @@ static int cp_solve_rec(CP*cp,CPCR*cr,int nc,unsigned char*searchme,double*outx,
            must be fixed (lo==hi) else we cannot certify (a printed output
            var without a certified fixed value would be fabrication). */
         for(int v=0;v<cp->nvars;v++){
-            if(!cp->bounded[v] && searchme[v] && !cp_fixed(cp,v)) return -1;
+            if(!cp->bounded[v] && searchme[v] && !cp_fixed(cp,v)){
+                return -1;
+            }
         }
         for(int v=0;v<cp->nvars;v++){ if(cp_fixed(cp,v)) outx[v]=(double)cp->lo[v]; else outx[v]=0.0; }
-        if(!cp_verify(cp,cr,nc,outx)) return -1;   /* verification failed -> do not emit a wrong answer */
+        if(!cp_verify(cp,cr,nc,outx)){
+            /* The leaf does not satisfy the model, so this branch is
+               infeasible: backtrack.  `*suspect` records that some leaf had to
+               be rejected, which forbids UNSAT / enumeration-completeness /
+               optimality claims built on this search (they would rest on the
+               assumption that the propagators never miss a satisfying leaf). */
+            if(suspect) *suspect=1;
+            return 0;
+        }
         if(opt){
             /* objective vars are all referenced+fixed here (enforced at
                entry and by the leaf check above), so the score is exact */
@@ -2298,7 +4220,7 @@ static int cp_solve_rec(CP*cp,CPCR*cr,int nc,unsigned char*searchme,double*outx,
     for(int i=0;i<nvals;i++){
         CP br; cp_copy(&br,cp);
         cp_assign(&br,best,vals[i]);
-        int rr=cp_solve_rec(&br,cr,nc,searchme,outx,depth+1,all,on_solution,ud,opt,nodectr);
+        int rr=cp_solve_rec(&br,cr,nc,searchme,outx,depth+1,all,on_solution,ud,opt,nodectr,suspect,shop);
         cp_free(&br);
         if(rr==2) return 2;   /* single-mode solution found */
         if(rr==4) return 4;   /* all/opt-mode node limit: search incomplete */
@@ -2345,6 +4267,1099 @@ static int cp_bound_diophantine(CP*cp,CPCR*cr,int nc){
     if(nd<=0) ret=1;
     else for(int v=0;v<cp->nvars;v++) if(mark[v]){ int r=cp_restrict_divisors(cp,v,dv,nd); if(r==1){ret=1;break;} if(r==-1){ret=-1;break;} }
     psolve_free(mark);
+    return ret;
+}
+
+/* ------------------------------------------------------------------ */
+/* Scheduling: generalised serial-SGS branch and bound.                 */
+/*                                                                      */
+/* Branching on start *values* is hopeless for scheduling models: on a  */
+/* 6x6 jobshop the generic branch and bound needs 7.5k nodes (5.7k of   */
+/* them before the first schedule) and a 16-task cumulative instance    */
+/* could not refute a single makespan value at all.  For models that    */
+/* carry a scheduling structure -- `disjunctive`/`cumulative` over      */
+/* constant durations plus `s_i + d_i <= mk` rows -- we instead          */
+/* enumerate *active* schedules: take the tasks one at a time (in a      */
+/* precedence-feasible order) and place each at its earliest feasible    */
+/* start given the ones already placed.  Serial SGS is a classical exact */
+/* scheme: the set of active schedules it generates always contains an   */
+/* optimal one (Kolisch 1996, for the precedence-constrained case too),  */
+/* so branch and bound over the placement order proves optimality, and   */
+/* the first dive yields an incumbent immediately.                       */
+/*                                                                      */
+/* Two uses:                                                             */
+/*   * model == exactly the scheduling shape -> the search is the answer  */
+/*     (proven optimum, re-verified with cp_verify before reporting);     */
+/*   * model has extra constraints (side rows, other globals) -> the      */
+/*     search is only an *incumbent generator*: its schedule is verified  */
+/*     against the whole model and, if it holds, seeds the generic branch */
+/*     and bound, which still has to prove optimality itself.             */
+/* In both cases the extracted structure also yields a root lower bound   */
+/* (critical path + per-machine preemptive Schrage + the cumulative class */
+/* bound) that is pushed into mk's domain, so the generic search keeps    */
+/* the strong bound even when it cannot use the SGS search itself.        */
+/* ------------------------------------------------------------------ */
+
+
+/* Preemptive Schrage value of 1|r_j, pmtn|Lmax: a lower bound on the
+   non-preemptive 1|r_j, q_j|Cmax of the same jobs (heads r, durations p,
+   tails q).  Every preemptive schedule is also an upper bound on what any
+   non-preemptive schedule can shave off, so this is admissible. */
+static long long cp_schrage_lb(const long long*r,const long long*p,const long long*q,int n){
+    if(n<=0||n>CP_SHOP_MAXT) return 0;
+    long long rem[CP_SHOP_MAXT];
+    unsigned char done[CP_SHOP_MAXT];
+    for(int i=0;i<n;i++){ rem[i]=p[i]; done[i]=0; }
+    long long t=0, best=0;
+    for(;;){
+        int pick=-1;
+        for(int i=0;i<n;i++){
+            if(done[i]||rem[i]<=0) continue;
+            if(r[i]<=t && (pick<0||q[i]>q[pick])) pick=i;
+        }
+        if(pick<0){
+            long long nt=LLONG_MAX;
+            for(int i=0;i<n;i++) if(!done[i]&&rem[i]>0&&r[i]>t&&r[i]<nt) nt=r[i];
+            if(nt==LLONG_MAX) break;
+            t=nt; continue;
+        }
+        long long nt=LLONG_MAX;
+        for(int i=0;i<n;i++) if(!done[i]&&rem[i]>0&&r[i]>t&&r[i]<nt) nt=r[i];
+        long long run=rem[pick];
+        if(nt!=LLONG_MAX && nt-t<run) run=nt-t;
+        if(run<=0) run=1;                       /* never stall */
+        t+=run; rem[pick]-=run;
+        if(rem[pick]<=0){ done[pick]=1; long long v=t+q[pick]; if(v>best) best=v; }
+    }
+    return best;
+}
+
+static void cp_shop_free(CPShop*S){
+    for(int r=0;r<S->nres;r++) psolve_free(S->load[r]);
+    psolve_free(S->predblk);   /* S->pred[i] are rows inside this block */
+    psolve_free(S->start);
+    psolve_free(S->beststart); psolve_free(S->placed);
+    memset(S,0,sizeof(*S));
+}
+
+static int cp_shop_find_task(CPShop*S,int v){
+    for(int i=0;i<S->ntask;i++) if(S->sv[i]==v) return i;
+    return -1;
+}
+
+/* Build the scheduling structure from the parsed constraints.  Returns 1 when
+   a usable structure (>=1 resource, constant durations, a makespan variable
+   that bounds every task) was found; S->pure says whether the model is
+   *exactly* that structure. */
+static int cp_shop_extract(CP*cp,CPCR*cr,int nc,CPShop*S,int mk){
+    memset(S,0,sizeof(*S));
+    S->mk=mk; S->pure=1;
+    S->predblk=(int*)psolve_calloc((size_t)CP_SHOP_MAXT*(size_t)CP_SHOP_MAXT,sizeof(int));
+    for(int i=0;i<CP_SHOP_MAXT;i++) S->pred[i]=S->predblk+(size_t)i*CP_SHOP_MAXT;
+    unsigned char *row_used=(unsigned char*)psolve_calloc((size_t)(nc?nc:1),1);
+    long long extra_lo=LLONG_MIN, extra_hi=LLONG_MAX;
+    int ok=1;
+    for(int i=0;i<nc&&ok;i++){
+        int kind=cr[i].kind;
+        if(kind!=CPK_DISJ&&kind!=CPK_CUM){ if(kind!=CPK_LIN) S->pure=0; continue; }
+        CPCR*C=&cr[i];
+        if(!C->arr_terms||!C->terms){ ok=0; break; }
+        long long cap=1;
+        if(kind==CPK_CUM){
+            if(!C->terms3||!C->terms3[0].isc){ ok=0; break; }
+            cap=C->terms3[0].c;
+            if(cap<=0){ ok=0; break; }
+        }
+        if(S->nres>=CP_SHOP_MAXR){ ok=0; break; }
+        int rid=S->nres++;
+        S->rcap[rid]=cap;
+        for(int t=0;t<C->n;t++){
+            if(!C->terms[t].isc){ ok=0; break; }
+            long long d=C->terms[t].c;
+            if(d<0){ ok=0; break; }
+            long long dem=1;
+            if(kind==CPK_CUM){
+                if(!C->terms2||!C->terms2[t].isc){ ok=0; break; }
+                dem=C->terms2[t].c;
+                if(dem<0||dem>cap){ ok=0; break; }
+            }
+            CPT*St=&C->arr_terms[t];
+            if(St->isc||St->off){ ok=0; break; }
+            int v=St->v;
+            if(v<0||v>=cp->nvars||!cp->bounded[v]){ ok=0; break; }
+            int ti=cp_shop_find_task(S,v);
+            if(ti<0){
+                if(S->ntask>=CP_SHOP_MAXT){ ok=0; break; }
+                ti=S->ntask++;
+                S->sv[ti]=v; S->dur[ti]=d;
+            } else if(S->dur[ti]!=d){ ok=0; break; }
+            int k=S->ndem[ti];
+            int dup=0;
+            for(int q=0;q<k;q++) if(S->demr[ti][q]==rid){ dup=1; S->dema[ti][q]+=dem; }
+            if(!dup){
+                if(k>=CP_SHOP_MAXD){ ok=0; break; }
+                S->demr[ti][k]=rid; S->dema[ti][k]=dem; S->ndem[ti]=k+1;
+            }
+        }
+    }
+    if(!ok||S->ntask<1||S->nres<1){ cp_shop_free(S); psolve_free(row_used); return 0; }
+    /* classify the linear rows */
+    for(int j=0;j<nc;j++){
+        if(cr[j].kind!=CPK_LIN) continue;
+        if(j==nc) continue;
+        CPCR*L=&cr[j];
+        if(!L->lvars||!L->lcoef){ S->pure=0; continue; }
+        if(L->n==1&&L->lvars[0]==mk){
+            long long c=L->lcoef[0], rh=L->rhs; int rel=L->rel;
+            if(c==0){ S->pure=0; continue; }
+            if(c<0){ if(c==LLONG_MIN||rh==LLONG_MIN){ S->pure=0; continue; }
+                     c=-c; rh=-rh; rel=(rel==1)?2:(rel==2)?1:(rel==3)?4:(rel==4)?3:rel; }
+            long long dq=rh/c, dr=rh%c; if(dr<0){ dr+=c; dq--; }
+            long long cq=dq+((dr>0)?1:0);
+            if(rel==0||rel==1){ if(dq<extra_hi) extra_hi=dq; }
+            if(rel==0||rel==2){ if(cq>extra_lo) extra_lo=cq; }
+            if(rel==3){ if(cq-1<extra_hi) extra_hi=cq-1; }
+            if(rel==4){ if(dq+1>extra_lo) extra_lo=dq+1; }
+            continue;
+        }
+        if(L->rel!=1||L->n!=2){ S->pure=0; continue; }
+        int a=L->lvars[0], b=L->lvars[1];
+        long long ca=L->lcoef[0], cb=L->lcoef[1];
+        int ta=cp_shop_find_task(S,a), tb=cp_shop_find_task(S,b);
+        /* s_i + d_i <= mk : the makespan row of task i */
+        if(ca==1&&cb==-1&&b==mk&&ta>=0&&L->rhs==-S->dur[ta]){ row_used[j]=1; continue; }
+        /* s_i + d_i <= s_j : a precedence edge i -> j */
+        if(ca==1&&cb==-1&&ta>=0&&tb>=0&&L->rhs==-S->dur[ta]){
+            if(S->npred[tb]>=CP_SHOP_MAXT){ S->pure=0; continue; }
+            int dup=0;
+            for(int q=0;q<S->npred[tb];q++) if(S->pred[tb][q]==ta) dup=1;
+            if(!dup) S->pred[tb][S->npred[tb]++]=ta;
+            row_used[j]=1; continue;
+        }
+        S->pure=0;
+    }
+    /* the structure must be complete for an exact solve: every task needs its
+       makespan row, and every row must be explained by the structure */
+    for(int i=0;i<S->ntask;i++){
+        int found=0;
+        for(int j=0;j<nc;j++){
+            if(!row_used[j]||cr[j].kind!=CPK_LIN) continue;
+            CPCR*L=&cr[j];
+            if(L->n==2&&L->lcoef[0]==1&&L->lcoef[1]==-1&&L->lvars[0]==S->sv[i]&&
+               L->lvars[1]==mk&&L->rhs==-S->dur[i]) found=1;
+        }
+        if(!found) S->pure=0;
+    }
+    /* horizon / windows */
+    S->hi_mk=cp->hi[mk];
+    S->lo_mk=cp->lo[mk];
+    if(extra_hi<LLONG_MAX&&extra_hi<S->hi_mk) S->hi_mk=extra_hi;
+    if(extra_lo>LLONG_MIN&&extra_lo>S->lo_mk) S->lo_mk=extra_lo;
+    long long hmax=0;
+    for(int i=0;i<S->ntask;i++){
+        S->est[i]=(long long)cp->lo[S->sv[i]];
+        S->lst[i]=(long long)cp->hi[S->sv[i]];
+        if(S->lst[i]+S->dur[i]>hmax) hmax=S->lst[i]+S->dur[i];
+    }
+    if(S->hi_mk<0) S->hi_mk=hmax;
+    if(S->hi_mk>hmax&&hmax>0) S->hi_mk=hmax;      /* never explore past the windows */
+    S->horizon=S->hi_mk+1;
+    if(S->horizon<=0||S->horizon>2000000||(S->hi_mk-S->lo_mk)>2000000){
+        cp_shop_free(S); psolve_free(row_used); return 0;
+    }
+    /* acyclic precedence + tails (longest remaining path) */
+    int *indeg=(int*)psolve_calloc((size_t)S->ntask,sizeof(int));
+    int *succ_n=(int*)psolve_calloc((size_t)S->ntask,sizeof(int));
+    int (*succ)[CP_SHOP_MAXT]=(int(*)[CP_SHOP_MAXT])psolve_calloc((size_t)S->ntask,(size_t)CP_SHOP_MAXT*sizeof(int));
+    for(int j=0;j<S->ntask;j++) for(int q=0;q<S->npred[j];q++){ succ[S->pred[j][q]][succ_n[S->pred[j][q]]++]=j; indeg[j]++; }
+    int *order=(int*)psolve_malloc((size_t)S->ntask*sizeof(int));
+    int nord=0, bad=0;
+    int *stack=(int*)psolve_malloc((size_t)S->ntask*sizeof(int));
+    int sp=0;
+    for(int j=0;j<S->ntask;j++) if(indeg[j]==0) stack[sp++]=j;
+    while(sp>0){
+        int i=stack[--sp];
+        order[nord++]=i;
+        for(int q=0;q<succ_n[i];q++){ int j=succ[i][q]; if(--indeg[j]==0) stack[sp++]=j; }
+    }
+    if(nord!=S->ntask) bad=1;                       /* cycle: not a DAG */
+    for(int i=0;i<S->ntask;i++) S->tail[i]=0;
+    if(!bad){
+        for(int t=nord-1;t>=0;t--){
+            int i=order[t];
+            long long tl=0;
+            for(int q=0;q<succ_n[i];q++){ int j=succ[i][q]; long long v=S->dur[j]+S->tail[j]; if(v>tl) tl=v; }
+            S->tail[i]=tl;
+        }
+    }
+    psolve_free(indeg); psolve_free(succ_n); psolve_free(succ); psolve_free(order); psolve_free(stack);
+    psolve_free(row_used);
+    if(bad){ cp_shop_free(S); return 0; }
+    S->npred_total=0;
+    for(int i=0;i<S->ntask;i++) S->npred_total+=S->npred[i];
+    for(int r=0;r<S->nres;r++) S->load[r]=(int*)psolve_calloc((size_t)S->horizon,sizeof(int));
+    S->start=(long long*)psolve_malloc((size_t)S->ntask*sizeof(long long));
+    S->beststart=(long long*)psolve_malloc((size_t)S->ntask*sizeof(long long));
+    S->placed=(unsigned char*)psolve_calloc((size_t)S->ntask,1);
+    for(int i=0;i<S->ntask;i++){ S->start[i]=0; S->beststart[i]=0; }
+    S->best=S->hi_mk+1;
+    return 1;
+}
+
+/* earliest t at which task i fits (precedence + every resource), or -1 */
+static long long cp_shop_earliest(CPShop*S,int i,long long lim){
+    long long d=S->dur[i];
+    long long e=S->est[i];
+    for(int q=0;q<S->npred[i];q++){
+        int p=S->pred[i][q];
+        if(!S->placed[p]) continue;                  /* unknown: ignore (SGS
+                                                        order keeps preds first) */
+        long long v=S->start[p]+S->dur[p];
+        if(v>e) e=v;
+    }
+    long long tmax=S->lst[i];
+    if(S->hi_mk-d<tmax) tmax=S->hi_mk-d;
+    if(lim-1-d<tmax) tmax=lim-1-d;
+    for(long long t=e;t<=tmax;t++){
+        long long jump=-1;
+        for(int k=0;k<S->ndem[i];k++){
+            int r=S->demr[i][k]; long long a=S->dema[i][k];
+            if(a<=0) continue;
+            for(long long u=t;u<t+d;u++){
+                if((long long)S->load[r][u]+a>S->rcap[r]){
+                    /* every start <= u contains u in its window */
+                    if(u>jump) jump=u;
+                    break;
+                }
+            }
+        }
+        if(jump<0) return t;
+        t=jump;
+    }
+    return -1;
+}
+
+/* lower bound on the makespan of the unplaced tasks (sound: releases and
+   precedence are only ever postponed, tails never shrink) */
+static long long cp_shop_remaining_lb(CPShop*S,long long curmax){
+    long long lb=curmax;
+    int n=0;
+    for(int i=0;i<S->ntask;i++){
+        if(S->placed[i]) continue;
+        long long e=S->est[i];
+        for(int k=0;k<S->npred[i];k++){
+            int pp=S->pred[i][k];
+            if(S->placed[pp]){ long long v=S->start[pp]+S->dur[pp]; if(v>e) e=v; }
+        }
+        long long v=e+S->dur[i]+S->tail[i];
+        if(v>lb) lb=v;
+        n++;
+    }
+    /* per-resource preemptive Schrage (exact for capacity 1; for capacity >1
+       scaling the demands down to one unit keeps it a relaxation) */
+    if(n>0){
+        for(int rr2=0;rr2<S->nres;rr2++){
+            long long r2[CP_SHOP_MAXT], p2[CP_SHOP_MAXT], q2[CP_SHOP_MAXT];
+            int m=0;
+            int cnt=0;
+            for(int i=0;i<S->ntask;i++) if(!S->placed[i]) cnt++;
+            if(cnt>CP_SHOP_MAXT) continue;
+            long long mina=LLONG_MAX;
+            for(int i=0;i<S->ntask;i++){
+                if(S->placed[i]) continue;
+                for(int k=0;k<S->ndem[i];k++) if(S->demr[i][k]==rr2&&S->dema[i][k]>0&&S->dema[i][k]<mina) mina=S->dema[i][k];
+            }
+            (void)mina;
+            for(int i=0;i<S->ntask;i++){
+                if(S->placed[i]) continue;
+                long long a=0;
+                for(int k=0;k<S->ndem[i];k++) if(S->demr[i][k]==rr2) a=S->dema[i][k];
+                if(a<=0) continue;
+                /* capacity-scaled duration: ceil(d*a/cap) time units of the
+                   machine at full width -- a relaxation of "a units wide for
+                   d time units" whenever a <= cap */
+                long long pd=(a>=S->rcap[rr2])?S->dur[i]
+                              :(S->dur[i]*a+S->rcap[rr2]-1)/S->rcap[rr2];
+                r2[m]=S->est[i];
+                for(int k=0;k<S->npred[i];k++){
+                    int pp=S->pred[i][k];
+                    if(S->placed[pp]){ long long v=S->start[pp]+S->dur[pp]; if(v>r2[m]) r2[m]=v; }
+                }
+                p2[m]=pd; q2[m]=S->tail[i]; m++;
+            }
+            if(m>0){ long long v=cp_schrage_lb(r2,p2,q2,m); if(v>lb) lb=v; }
+        }
+    }
+    return lb;
+}
+
+/* Push the scheduling lower bound computed from the CURRENT domains into the
+   makespan variable.  Every ingredient is admissible at every search node:
+   a task cannot start before its domain minimum, tails are longest paths in
+   the (static) precedence graph, and the per-resource value is the preemptive
+   Schrage relaxation.  Returns 1 if mk became empty (node is infeasible). */
+static int cp_shop_push_bound(CP*cp,CPShop*S){
+    if(!S||S->ntask<1||S->mk<0) return 0;
+    long long lb=0;
+    /* Deadline propagation from the makespan ceiling.  With M the current
+       upper bound on mk, every solution still inside it satisfies
+       s_i + d_i + tail_i <= mk <= M, so each start is capped by M - tail_i -
+       d_i.  This is what makes the machine propagators bite: without it the
+       start windows stay at the raw horizon until the very end of the search,
+       so time-tabling finds no compulsory part and pairwise bounds are weak. */
+    long long M=cp_dmax(cp,S->mk);
+    for(int i=0;i<S->ntask;i++){
+        int64_t lo=cp_dmin(cp,S->sv[i]);
+        if(lo>=(INT64_C(1)<<60)) return 0;          /* wild: decline */
+        long long cap=(long long)M-S->tail[i]-S->dur[i];
+        if(cap<lo) return 1;                        /* no schedule inside M */
+        if(cap<cp_dmax(cp,S->sv[i])){
+            if(cp_intersect(cp,S->sv[i],lo,(int64_t)cap)) return 1;
+        }
+        long long v=(long long)lo+S->dur[i]+S->tail[i];
+        if(v>lb) lb=v;
+    }
+    for(int r=0;r<S->nres;r++){
+        long long rr2[CP_SHOP_MAXT], pp[CP_SHOP_MAXT], qq[CP_SHOP_MAXT];
+        long long dl[CP_SHOP_MAXT], rl[CP_SHOP_MAXT];
+        int m=0, m2=0, excl=1;
+        long long t0r=LLONG_MAX;
+        for(int i=0;i<S->ntask;i++){
+            long long a=0;
+            for(int k=0;k<S->ndem[i];k++) if(S->demr[i][k]==r) a=S->dema[i][k];
+            if(a<=0) continue;
+            int64_t lo=cp_dmin(cp,S->sv[i]);
+            if(lo>=(INT64_C(1)<<60)) return 0;      /* wild: decline */
+            rr2[m]=(long long)lo; pp[m]=S->dur[i]; qq[m]=S->tail[i];
+            dl[m2]=S->dur[i]; rl[m2]=a;
+            if((long long)lo<t0r) t0r=(long long)lo;
+            for(int j=0;j<m;j++) if(a+rl[j]<=S->rcap[r]) excl=0;
+            m++; m2++;
+        }
+        if(m==0) continue;
+        if(t0r==LLONG_MAX) t0r=0;
+        if(excl){
+            long long v=cp_schrage_lb(rr2,pp,qq,m);
+            if(v>lb) lb=v;
+        } else if(S->rcap[r]>1 && m<=CP_MKS_MAXN){
+            long long v=t0r+cp_cum_mk_lb(dl,rl,m,S->rcap[r],t0r);
+            if(v>lb) lb=v;
+        }
+    }
+    if(lb<=cp->lo[S->mk]) return 0;
+    return cp_intersect(cp,S->mk,lb,cp->hi[S->mk]);
+}
+
+
+/* One greedy (no backtracking) serial-SGS dive: repeatedly place the available
+   task with the best priority at its earliest feasible start.  `rule` selects
+   the priority, `jitter` perturbs it (GRASP-style restarts).  Returns the
+   makespan of the complete schedule, or -1 when the dive gets stuck. */
+static long long cp_shop_greedy(CPShop*S,int rule,int rcl,unsigned *state){
+    for(int i=0;i<S->ntask;i++){ S->placed[i]=0; S->start[i]=0; }
+    for(int r=0;r<S->nres;r++) memset(S->load[r],0,(size_t)S->horizon*sizeof(int));
+    long long curmax=0;
+    long long *key=(long long*)psolve_malloc((size_t)S->ntask*sizeof(long long));
+    long long *est=(long long*)psolve_malloc((size_t)S->ntask*sizeof(long long));
+    unsigned char *cand=(unsigned char*)psolve_calloc((size_t)S->ntask,1);
+    int *top=(int*)psolve_malloc((size_t)S->ntask*sizeof(int));
+    int rc_ok=1;
+    for(int step=0;step<S->ntask;step++){
+        int nready=0;
+        for(int i=0;i<S->ntask;i++){
+            if(S->placed[i]) continue;
+            int ready=1;
+            for(int q=0;q<S->npred[i];q++) if(!S->placed[S->pred[i][q]]){ ready=0; break; }
+            if(!ready) continue;
+            long long e=cp_shop_earliest(S,i,S->hi_mk+1);
+            if(e<0) continue;
+            if(rule==0)      key[i]=-S->dur[i];                 /* shortest first */
+            else if(rule==1) key[i]=-S->tail[i];                /* most work left */
+            else if(rule==2) key[i]=S->dur[i];                  /* longest first */
+            else             key[i]=-(S->tail[i]+S->dur[i]);    /* MWKR + duration */
+            est[i]=e;
+            cand[i]=1;
+            nready++;
+        }
+        if(nready==0){ rc_ok=0; break; }                    /* stuck: dead dive */
+        /* restricted candidate list: take the `rcl` best by priority and pick
+           one uniformly.  A deterministic best-first rule makes every restart
+           produce the same schedule, which is why this list is the part that
+           makes the restarts worth running. */
+        int ntop=0;
+        for(int k=0;k<rcl&&k<nready;k++){
+            int besti=-1;
+            for(int i=0;i<S->ntask;i++){
+                if(!cand[i]) continue;
+                if(besti<0||key[i]<key[besti]||(key[i]==key[besti]&&est[i]<est[besti])) besti=i;
+            }
+            if(besti<0) break;
+            cand[besti]=0;
+            top[ntop++]=besti;
+        }
+        *state=(*state)*1103515245u+12345u;
+        int pick=top[ntop?(*state>>8)%(unsigned)ntop:0];
+        long long e=cp_shop_earliest(S,pick,S->hi_mk+1);
+        long long comp=e+S->dur[pick];
+        for(int q=0;q<S->ndem[pick];q++){
+            int r=S->demr[pick][q]; long long a=S->dema[pick][q];
+            if(a<=0) continue;
+            for(long long u=e;u<comp;u++) S->load[r][u]+=(int)a;
+        }
+        S->placed[pick]=1; S->start[pick]=e;
+        if(comp>curmax) curmax=comp;
+        for(int i=0;i<S->ntask;i++) cand[i]=0;
+    }
+    psolve_free(key); psolve_free(est); psolve_free(cand); psolve_free(top);
+    return rc_ok ? curmax : -1;
+}
+
+/* ---- critical-block local search on the disjunctive graph ----------------
+   The serial SGS enumerates active schedules, but a handful of dispatch rules
+   -- even restarted through a restricted candidate list -- still land several
+   percent above the optimum on the jobshops that are too large to prove.  The
+   standard way to close that gap is the critical-block neighbourhood: from a
+   feasible schedule derive the machine orders (a total order per machine,
+   since the tasks on it are mutually exclusive), re-time the graph by longest
+   paths, and swap the boundary operations of every critical block.  Steepest
+   descent over that neighbourhood, restarted by random perturbations (an
+   iterated local search).
+
+   Preconditions, all checked in cp_ls_init: every task runs on exactly one
+   resource, and on each resource every pair of tasks needs more than the
+   capacity together, i.e. the resource really is a machine.  Anything else
+   (cumulative resources, multi-machine tasks) declines and keeps the SGS
+   incumbent.  The result is an ordinary semi-active schedule: feasible for
+   the extracted structure by construction, and still handed to cp_verify
+   before it is reported as an incumbent. */
+typedef struct CPLS_Tag{
+    CPShop *S;
+    int mach[CP_SHOP_MAXT];             /* resource of a task, -1 = none */
+    int mfirst[CP_SHOP_MAXR];
+    int mprev[CP_SHOP_MAXT], mnext[CP_SHOP_MAXT];
+    int *psucc;                         /* precedence successors, flat */
+    int poff[CP_SHOP_MAXT+1];
+    int indeg[CP_SHOP_MAXT], topo[CP_SHOP_MAXT];
+    long long hs[CP_SHOP_MAXT];         /* heads of the current orders */
+    long long tmp[CP_SHOP_MAXT];        /* scratch heads for a trial move */
+    long long besths[CP_SHOP_MAXT];
+    long long keep[CP_SHOP_MAXT];       /* heads of the best order inside a phase */
+    int *tabu;                          /* n*n iteration stamps for reversed moves */
+    long long evals, evalcap;
+    unsigned state;
+} CPLS;
+
+static void cp_ls_free(CPLS*L){
+    if(L->psucc) psolve_free(L->psucc);
+    if(L->tabu) psolve_free(L->tabu);
+    L->psucc=NULL; L->tabu=NULL;
+}
+
+static int cp_ls_init(CPLS*L,CPShop*S){
+    memset(L,0,sizeof(*L));
+    L->S=S;
+    int n=S->ntask;
+    for(int i=0;i<n;i++) L->mach[i]=-1;
+    for(int i=0;i<n;i++){
+        if(S->ndem[i]!=1) return 0;                 /* multi-resource task */
+        int r=S->demr[i][0];
+        if(r<0||r>=S->nres||S->dema[i][0]<=0) return 0;
+        L->mach[i]=r;
+    }
+    for(int r=0;r<S->nres;r++){
+        for(int i=0;i<n;i++){
+            if(L->mach[i]!=r) continue;
+            for(int j=i+1;j<n;j++){
+                if(L->mach[j]!=r) continue;
+                if(S->dema[i][0]+S->dema[j][0]<=S->rcap[r]) return 0;  /* cumulative */
+            }
+        }
+    }
+    /* precedence successor offsets */
+    int cnt[CP_SHOP_MAXT]; memset(cnt,0,sizeof(cnt));
+    for(int v=0;v<n;v++) for(int q=0;q<S->npred[v];q++){
+        int u=S->pred[v][q];
+        if(u>=0&&u<n) cnt[u]++;
+    }
+    int total=0;
+    for(int u=0;u<n;u++){ L->poff[u]=total; total+=cnt[u]; }
+    L->poff[n]=total;
+    L->psucc=(int*)psolve_malloc((size_t)(total?total:1)*sizeof(int));
+    L->tabu=(int*)psolve_calloc((size_t)n*(size_t)n,sizeof(int));
+    int cur[CP_SHOP_MAXT];
+    for(int u=0;u<n;u++) cur[u]=L->poff[u];
+    for(int v=0;v<n;v++) for(int q=0;q<S->npred[v];q++){
+        int u=S->pred[v][q];
+        if(u>=0&&u<n) L->psucc[cur[u]++]=v;
+    }
+    return 1;
+}
+
+/* machine orders from a start-time vector (semi-active schedule) */
+static void cp_ls_order(CPLS*L,const long long*start){
+    CPShop*S=L->S;
+    int n=S->ntask;
+    unsigned char used[CP_SHOP_MAXT];
+    for(int i=0;i<n;i++){ L->mprev[i]=L->mnext[i]=-1; used[i]=0; }
+    for(int r=0;r<S->nres;r++){
+        L->mfirst[r]=-1;
+        int prev=-1;
+        for(;;){
+            int best=-1;
+            for(int i=0;i<n;i++){
+                if(used[i]||L->mach[i]!=r) continue;
+                if(best<0||start[i]<start[best]||(start[i]==start[best]&&i<best)) best=i;
+            }
+            if(best<0) break;
+            used[best]=1;
+            if(prev<0) L->mfirst[r]=best;
+            else { L->mnext[prev]=best; L->mprev[best]=prev; }
+            prev=best;
+        }
+    }
+}
+
+/* longest paths through the current machine orders; -1 = cycle */
+static long long cp_ls_eval(CPLS*L,long long*hs){
+    CPShop*S=L->S;
+    int n=S->ntask;
+    int *q=L->topo;
+    int qh=0,qt=0;
+    for(int i=0;i<n;i++){
+        hs[i]=S->est[i];
+        L->indeg[i]=S->npred[i]+(L->mprev[i]>=0?1:0);
+        if(!L->indeg[i]) q[qt++]=i;
+    }
+    int seen=0;
+    while(qh<qt){
+        int u=q[qh++]; seen++;
+        long long hu=hs[u]+S->dur[u];
+        for(int k=L->poff[u];k<L->poff[u+1];k++){
+            int v=L->psucc[k];
+            if(hs[v]<hu) hs[v]=hu;
+            if(--L->indeg[v]==0) q[qt++]=v;
+        }
+        int v=L->mnext[u];
+        if(v>=0){
+            if(hs[v]<hu) hs[v]=hu;
+            if(--L->indeg[v]==0) q[qt++]=v;
+        }
+    }
+    if(seen<n) return -1;
+    long long mk=0;
+    for(int i=0;i<n;i++){ long long e=hs[i]+S->dur[i]; if(e>mk) mk=e; }
+    return mk;
+}
+
+/* swap two adjacent operations on their machine */
+static void cp_ls_swap(CPLS*L,int u,int v){
+    int pu=L->mprev[u], nv=L->mnext[v], r=L->mach[u];
+    if(pu>=0) L->mnext[pu]=v; else L->mfirst[r]=v;
+    L->mprev[v]=pu;
+    L->mnext[v]=u; L->mprev[u]=v; L->mnext[u]=nv;
+    if(nv>=0) L->mprev[nv]=u;
+}
+
+/* critical blocks of the current heads, reduced to their machine-order ends:
+   blocks[] holds pairs (first,last) and returns the number of blocks */
+static int cp_ls_blocks(CPLS*L,int*blocks){
+    CPShop*S=L->S;
+    int n=S->ntask;
+    long long mk=0;
+    for(int i=0;i<n;i++){ long long e=L->hs[i]+S->dur[i]; if(e>mk) mk=e; }
+    int cur=-1;
+    for(int i=0;i<n;i++) if(L->hs[i]+S->dur[i]==mk){ cur=i; break; }
+    int nb=0, first=-1, last=-1;
+    while(cur>=0){
+        int p=-1, mach=0;
+        int mp=L->mprev[cur];
+        if(mp>=0&&L->hs[mp]+S->dur[mp]==L->hs[cur]){ p=mp; mach=1; }
+        else for(int q=0;q<S->npred[cur];q++){
+            int u=S->pred[cur][q];
+            if(u>=0&&u<n&&L->hs[u]+S->dur[u]==L->hs[cur]){ p=u; mach=0; break; }
+        }
+        if(mach){
+            if(last<0) last=cur;
+            first=p;
+        } else {
+            if(last>=0&&nb<CP_SHOP_MAXT){ blocks[2*nb]=first; blocks[2*nb+1]=last; nb++; }
+            first=last=-1;
+        }
+        cur=p;
+    }
+    if(last>=0&&nb<CP_SHOP_MAXT){ blocks[2*nb]=first; blocks[2*nb+1]=last; nb++; }
+    return nb;
+}
+
+/* Tabu search over the critical-block neighbourhood.  A plain steepest
+   descent stalls on the first plateau: swapping two operations of a critical
+   block very often leaves the makespan unchanged, and refusing those moves
+   strands the search a few percent above the optimum (8x8: 76 vs 75, 10x10:
+   96 vs 92).  The standard fix is to take the best move available -- equal or
+   worse included -- and forbid its reverse for a short tenure, with the usual
+   aspiration (a move that beats the best schedule is never forbidden). */
+static long long cp_ls_tabu(CPLS*L,long long*hs){
+    int n=L->S->ntask;
+    long long cur=cp_ls_eval(L,hs);
+    if(cur<0) return -1;
+    long long bmk=cur;
+    memcpy(L->keep,hs,(size_t)n*sizeof(long long));
+    /* the width of one tabu phase matters more than the total budget: a few
+       hundred non-improving iterations (i.e. a real walk over the plateaus)
+       is what reaches 75/92-shaped answers, and it also pays for itself by
+       tightening the incumbent the branch and bound prunes with */
+    int tenure=6, iter=0, stale=0, maxstale=40+4*n;
+    for(;;){
+        if(L->evals>=L->evalcap) break;
+        int blocks[2*CP_SHOP_MAXT];
+        int nb=cp_ls_blocks(L,blocks);
+        long long bestv=LLONG_MAX; int bu=-1, bv=-1;
+        for(int b=0;b<nb;b++){
+            int lo=blocks[2*b], hi=blocks[2*b+1];
+            int cand[8]; int nc=0;
+            /* the two boundary pairs inside the block, then the two moves that
+               push the block outwards (Nowicki-Smutnicki N5) */
+            if(L->mprev[hi]>=0){ cand[2*nc]=L->mprev[hi]; cand[2*nc+1]=hi; nc++; }
+            if(L->mnext[lo]>=0){ cand[2*nc]=lo; cand[2*nc+1]=L->mnext[lo]; nc++; }
+            if(L->mprev[lo]>=0){ cand[2*nc]=L->mprev[lo]; cand[2*nc+1]=lo; nc++; }
+            if(L->mnext[hi]>=0){ cand[2*nc]=hi; cand[2*nc+1]=L->mnext[hi]; nc++; }
+            for(int c=0;c<nc;c++){
+                int u=cand[2*c], v=cand[2*c+1];
+                if(u<0||v<0||L->mach[u]!=L->mach[v]||L->mnext[u]!=v) continue;
+                /* forbidden unless it beats the best schedule (aspiration) */
+                int forb=L->tabu[u*n+v]>iter;
+                if(L->evals>=L->evalcap) break;
+                cp_ls_swap(L,u,v); L->evals++;
+                long long t=cp_ls_eval(L,L->tmp);   /* trial heads, hs untouched */
+                cp_ls_swap(L,v,u);                  /* u and v changed places: undo reversed */
+                if(t<0) continue;
+                if(forb&&t>=bmk) continue;
+                if(t<bestv||(t==bestv&&bu>=0&&((L->state>>11)&1))){
+                    bestv=t; bu=u; bv=v;
+                }
+            }
+        }
+        if(bu<0) break;
+        cp_ls_swap(L,bu,bv);
+        L->tabu[bv*n+bu]=iter+tenure;               /* forbid the reverse move */
+        cur=cp_ls_eval(L,hs);
+        if(cur<0) break;
+        if(cur<bmk){
+            bmk=cur; stale=0;
+            memcpy(L->keep,hs,(size_t)n*sizeof(long long));   /* the heads that scored bmk */
+        }
+        else if(++stale>maxstale) break;
+        L->state=L->state*1103515245u+12345u;
+        iter++;
+    }
+    /* hand back the schedule that actually scored bmk, not whatever order the
+       phase happened to stop in: the two differ, and reporting the wrong one
+       makes the incumbent fail cp_verify (the makespan row is checked) */
+    memcpy(hs,L->keep,(size_t)n*sizeof(long long));
+    return bmk;
+}
+
+/* iterated local search from the given starts; overwrites start[] with the
+   best schedule found and returns its makespan (-1 = not applicable) */
+static long long cp_ls_pass(CPLS*L,long long*start,unsigned seed,long long evcap){
+    CPShop*S=L->S;
+    int n=S->ntask;
+    L->state=seed;
+    L->evals=0;
+    L->evalcap=evcap;
+    long long *scratch=(long long*)psolve_malloc((size_t)n*sizeof(long long));
+    cp_ls_order(L,start);
+    long long mk=cp_ls_eval(L,L->hs);
+    long long bmk=mk;
+    if(mk>=0) memcpy(L->besths,L->hs,(size_t)n*sizeof(long long));
+    int rounds=0;
+    while(mk>=0&&L->evals<L->evalcap&&rounds<40){
+        mk=cp_ls_tabu(L,L->hs);
+        if(mk>=0&&mk<bmk){ bmk=mk; memcpy(L->besths,L->hs,(size_t)n*sizeof(long long)); }
+        if(L->evals>=L->evalcap) break;
+        /* restart from the best schedule so far, kicked by one random adjacent
+           swap inside a random machine: the elite restart keeps the phase in a
+           promising basin, the kick gives the tabu walk a new entry point */
+        cp_ls_order(L,L->besths);
+        cp_ls_eval(L,L->hs);
+        for(int tries=0;tries<24;tries++){
+            L->state=L->state*1103515245u+12345u;
+            int r=(int)((L->state>>8)%(unsigned)S->nres);
+            int cnt=0;
+            for(int i=0;i<n;i++) if(L->mach[i]==r) cnt++;
+            if(cnt<2) continue;
+            L->state=L->state*1103515245u+12345u;
+            int k=(int)((L->state>>8)%(unsigned)(cnt-1));
+            int u=L->mfirst[r];
+            for(int q=0;q<k&&u>=0;q++) u=L->mnext[u];
+            if(u<0) continue;
+            int v=L->mnext[u];
+            if(v<0) continue;
+            cp_ls_swap(L,u,v); L->evals++;
+            long long t=cp_ls_eval(L,scratch);
+            if(t<0){ cp_ls_swap(L,v,u); cp_ls_eval(L,L->hs); }   /* cycle: undo (reversed) */
+            else { memcpy(L->hs,scratch,(size_t)n*sizeof(long long)); break; }
+        }
+        rounds++;
+        mk=cp_ls_eval(L,L->hs);
+    }
+    if(bmk>=0) memcpy(start,L->besths,(size_t)n*sizeof(long long));
+    psolve_free(scratch);
+    return bmk;
+}
+
+/* three independent passes with different seeds: the tabu walk is randomized,
+   and on the 8x8/10x10 jobshops the spread between seeds is 1-2 makespans, so
+   the best of three is measurably better than one long run from one seed */
+static long long cp_ls_run(CPShop*S,long long*start){
+    CPLS*L=(CPLS*)psolve_malloc(sizeof(CPLS));
+    if(!L) return -1;
+    if(!cp_ls_init(L,S)){ cp_ls_free(L); psolve_free(L); return -1; }
+    int n=S->ntask;
+    long long evcap=2000+40*(long long)n*(long long)n;
+    static const unsigned seeds[3]={2463534242u,1234567891u,362436069u};
+    long long bmk=-1;
+    for(int pass=0;pass<3;pass++){
+        long long v=cp_ls_pass(L,start,seeds[pass],evcap/3);
+        if(v>=0&&(bmk<0||v<bmk)) bmk=v;
+    }
+    cp_ls_free(L);
+    psolve_free(L);
+    return bmk;
+}
+
+static void cp_shop_rec(CPShop*S,int depth,long long curmax){
+    if(S->aborted) return;
+    if(++S->nodes>S->nodecap){ S->aborted=1; return; }
+    if(S->deadline>0 && (S->nodes&511)==0){
+        struct timespec now; clock_gettime(CLOCK_MONOTONIC,&now);
+        double el=(now.tv_sec-S->t_start.tv_sec)+(now.tv_nsec-S->t_start.tv_nsec)*1e-9;  /* TOLSHEET TOL-SYS-NSEC */
+        if(el>S->deadline){ S->aborted=1; return; }
+    }
+    if(depth==S->ntask){
+        if(curmax<S->best){
+            S->best=curmax;
+            memcpy(S->beststart,S->start,(size_t)S->ntask*sizeof(long long));
+        }
+        return;
+    }
+    /* candidates: unplaced tasks whose predecessors are all placed */
+    int ncand=0;
+    static const int ORDER_CAP=CP_SHOP_MAXT;
+    long long e_of[CP_SHOP_MAXT];
+    int ord[CP_SHOP_MAXT];
+    for(int i=0;i<S->ntask;i++){
+        if(S->placed[i]) continue;
+        int ready=1;
+        for(int q=0;q<S->npred[i];q++) if(!S->placed[S->pred[i][q]]){ ready=0; break; }
+        if(!ready) continue;
+        long long e=cp_shop_earliest(S,i,S->best);
+        if(e<0) return;                  /* cannot be placed at all: dead branch */
+        e_of[i]=e;
+        int k=ncand++;
+        while(k>0){
+            /* most-work-remaining first (best of the dispatch rules tested on
+               the jobshop sweep), earliest start breaking ties */
+            int j=ord[k-1];
+            int before = (S->tail[i]>S->tail[j]) || (S->tail[i]==S->tail[j]&&e<e_of[j]);
+            if(!before) break;
+            ord[k]=ord[k-1]; k--;
+        }
+        ord[k]=i;
+        if(ncand>ORDER_CAP) return;
+    }
+    if(cp_shop_remaining_lb(S,curmax)>=S->best) return;
+    for(int k=0;k<ncand;k++){
+        int i=ord[k];
+        long long e=cp_shop_earliest(S,i,S->best);   /* incumbent may have improved */
+        if(e<0) continue;
+        long long comp=e+S->dur[i];
+        if(comp>=S->best) continue;
+        for(int q=0;q<S->ndem[i];q++){
+            int r=S->demr[i][q]; long long a=S->dema[i][q];
+            if(a<=0) continue;
+            for(long long u=e;u<comp;u++) S->load[r][u]+=(int)a;
+        }
+        S->placed[i]=1; S->start[i]=e;
+        cp_shop_rec(S,depth+1,curmax>comp?curmax:comp);
+        S->placed[i]=0;
+        for(int q=0;q<S->ndem[i];q++){
+            int r=S->demr[i][q]; long long a=S->dema[i][q];
+            if(a<=0) continue;
+            for(long long u=e;u<comp;u++) S->load[r][u]-=(int)a;
+        }
+        if(S->aborted) return;
+        if(S->best<=S->lo_mk) return;                /* meets the bound */
+    }
+}
+
+/* returns 1 = proven optimum in outx/opt, -1 = proven infeasible,
+   2 = verified incumbent seeded into opt (generic search must still prove),
+   0 = not applicable (or node cap hit).  When `out_shop` is given and the
+   generic search still has to run, the extracted structure is handed back so
+   that every node can push the scheduling bound into mk (cp_shop_push_bound). */
+/* Exact solver for a model that is nothing but all_different constraints over
+   disjoint variable sets (e.g. `all_different_int` on a permutation domain, or
+   a pigeonhole instance).  Such a model is a bipartite matching problem, so a
+   maximum matching *is* a witness: Kuhn's algorithm on each component gives a
+   solution in one pass, and Hall's theorem turns "no perfect matching" into a
+   proof of UNSATISFIABILITY.  The general search reaches the same answers by
+   enumerating values, which costs 2 s for n=320 -- CP-SAT solves the same
+   instance in 14 ms, and so does this.
+
+   Declines (returns 0) unless the model really is that shape: any other
+   constraint kind, an objective, overlapping variable sets, `-a` enumeration,
+   or an unbounded/uncovered searchable variable.  Every constructed schedule
+   is re-checked with cp_verify before it is reported.
+   Returns 1 (solved), -1 (proven UNSAT) or 0 (not this shape). */
+static int cp_alldiff_apply(CP*cp,CPCR*cr,int nc,unsigned char*searchme,
+                            double*outx,long*nodes){
+    if(nc<1) return 0;
+    for(int i=0;i<nc;i++) if(cr[i].kind!=CPK_ALLDIFF) return 0;
+    for(int v=0;v<cp->nvars;v++){
+        if(!searchme[v]) continue;
+        if(!cp->bounded[v]||cp->nvals[v]<1) return 0;
+    }
+    unsigned char *seen=(unsigned char*)psolve_calloc((size_t)(cp->nvars?cp->nvars:1),1);
+    int covered=0,decline=0;
+    for(int i=0;i<nc&&!decline;i++){
+        for(int k=0;k<cr[i].n;k++){
+            CPT*t=&cr[i].terms[k];
+            if(t->isc) continue;
+            int v=t->v;
+            if(v<0||v>=cp->nvars||!cp->bounded[v]||cp->nvals[v]<1){ decline=1; break; }
+            if(seen[v]){ decline=1; break; }        /* overlapping components */
+            seen[v]=1; covered++;
+        }
+    }
+    if(!decline)
+        for(int v=0;v<cp->nvars;v++) if(searchme[v]&&!seen[v]){ decline=1; break; }
+    if(decline){ psolve_free(seen); return 0; }
+
+    /* every covered variable starts at its domain minimum; the matching then
+       gives each component a distinct value among what is still available */
+    for(int v=0;v<cp->nvars;v++) if(seen[v]) outx[v]=(double)cp->vals[v][0];
+
+    long long adjcount=0;
+    for(int i=0;i<nc&&!decline;i++){
+        int nfree=0;
+        for(int k=0;k<cr[i].n;k++) if(!cr[i].terms[k].isc) nfree++;
+        if(nfree==0) continue;
+        /* value universe of this component (terms carry an offset: x+off) */
+        int64_t *vs=NULL; int vc=0,vcap=0;
+        for(int k=0;k<cr[i].n;k++){
+            CPT*t=&cr[i].terms[k];
+            if(t->isc) continue;
+            for(int q=0;q<cp->nvals[t->v];q++){
+                int64_t val=cp->vals[t->v][q]+t->off;
+                int dup=0;
+                for(int z=0;z<vc;z++) if(vs[z]==val){ dup=1; break; }
+                if(dup) continue;
+                if(vc>=vcap){ vcap=vcap?vcap*2:64; vs=(int64_t*)psolve_realloc((void**)&vs,(size_t)vcap*sizeof(int64_t)); }
+                vs[vc++]=val;
+            }
+        }
+        adjcount+=(long long)nfree*(long long)(vc?vc:1);
+        if(adjcount>4000000){ psolve_free(vs); decline=1; break; }
+        /* a constant term owns its value: drop it from the variables' columns */
+        unsigned char *taken=(unsigned char*)psolve_calloc((size_t)(vc?vc:1),1);
+        for(int k=0;k<cr[i].n;k++){
+            CPT*t=&cr[i].terms[k];
+            if(!t->isc) continue;
+            for(int z=0;z<vc;z++) if(vs[z]==t->c){
+                if(taken[z]){ psolve_free(vs); psolve_free(taken); psolve_free(seen); *nodes=0; return -1; }
+                taken[z]=1;
+            }
+        }
+        ADJ *adj=(ADJ*)psolve_calloc((size_t)nfree,sizeof(ADJ));
+        int *rows=(int*)psolve_malloc((size_t)nfree*sizeof(int));
+        int r=0;
+        for(int k=0;k<cr[i].n;k++){
+            CPT*t=&cr[i].terms[k];
+            if(t->isc) continue;
+            rows[r]=k;
+            int *tmp=NULL,tn=0,cap2=0;
+            for(int z=0;z<vc;z++){
+                if(taken[z]) continue;
+                if(!cp_contains(cp,t->v,vs[z]-t->off)) continue;
+                if(tn>=cap2){ cap2=cap2?cap2*2:8; tmp=(int*)psolve_realloc((void**)&tmp,(size_t)cap2*sizeof(int)); }
+                tmp[tn++]=z;
+            }
+            adj[r].col=tmp; adj[r].n=tn; r++;
+        }
+        int *matchR=(int*)psolve_malloc((size_t)(vc?vc:1)*sizeof(int));
+        for(int z=0;z<vc;z++) matchR[z]=-1;
+        int matches=0;
+        for(int q=0;q<nfree;q++){
+            int *sn=(int*)psolve_calloc((size_t)(vc?vc:1),sizeof(int));
+            if(cp_aug(q,matchR,sn,adj,vc)) matches++;
+            psolve_free(sn);
+        }
+        if(matches<nfree){
+            /* Hall violated inside one all_different: this model is UNSAT */
+            for(int q=0;q<nfree;q++) psolve_free(adj[q].col);
+            psolve_free(adj); psolve_free(rows); psolve_free(matchR);
+            psolve_free(taken); psolve_free(vs); psolve_free(seen);
+            *nodes=0; return -1;
+        }
+        for(int z=0;z<vc;z++) if(matchR[z]>=0){
+            CPT*t=&cr[i].terms[rows[matchR[z]]];
+            outx[t->v]=(double)(vs[z]-t->off);
+        }
+        for(int q=0;q<nfree;q++) psolve_free(adj[q].col);
+        psolve_free(adj); psolve_free(rows); psolve_free(matchR);
+        psolve_free(taken); psolve_free(vs);
+    }
+    psolve_free(seen);
+    if(decline) return 0;
+    if(!cp_verify(cp,cr,nc,outx)) return 0;     /* never report an unverified witness */
+    *nodes=0;
+    return 1;
+}
+
+static int cp_shop_apply(CP*cp,CPCR*cr,int nc,CPOptCtx*opt,double*outx,long*nodes,CPShop**out_shop){
+    if(out_shop) *out_shop=NULL;
+    if(!opt||!opt->idx||!opt->coef||opt->n!=1||opt->coef[0]!=1||opt->sense!=1) return 0;
+    int mk=opt->idx[0];
+    if(mk<0||mk>=cp->nvars||!cp->bounded[mk]) return 0;
+    CPShop*S=(CPShop*)psolve_calloc(1,sizeof(CPShop));
+    if(!cp_shop_extract(cp,cr,nc,S,mk)){ psolve_free(S); return 0; }
+    int ret=0;
+    /* root lower bound: critical path, per-resource preemptive Schrage and the
+       cumulative class bound */
+    long long lb=S->lo_mk;
+    long long t0=LLONG_MAX;
+    for(int i=0;i<S->ntask;i++){
+        if(S->est[i]<t0) t0=S->est[i];
+        long long v=S->est[i]+S->dur[i];
+        if(v>lb) lb=v;
+    }
+    if(t0==LLONG_MAX) t0=0;
+    for(int r=0;r<S->nres;r++){
+        long long dd[CP_SHOP_MAXT], rr[CP_SHOP_MAXT], qq[CP_SHOP_MAXT];
+        long long dl[CP_SHOP_MAXT], rl[CP_SHOP_MAXT];
+        int m=0, m2=0;
+        long long t0r=LLONG_MAX;
+        int excl=1;                     /* tasks mutually exclusive? */
+        for(int i=0;i<S->ntask;i++){
+            long long a=0;
+            for(int k=0;k<S->ndem[i];k++) if(S->demr[i][k]==r) a=S->dema[i][k];
+            if(a<=0) continue;
+            dd[m]=S->dur[i]; rr[m]=S->est[i]; qq[m]=S->tail[i];
+            dl[m2]=S->dur[i]; rl[m2]=a;
+            if(S->est[i]<t0r) t0r=S->est[i];
+            for(int j=0;j<m;j++) if(a+rl[j]<=S->rcap[r]) excl=0;
+            m++; m2++;
+        }
+        if(m==0) continue;
+        if(t0r==LLONG_MAX) t0r=0;
+        if(excl){
+            /* every pair of tasks needs more than the full capacity together,
+               so they really do serialize: the one-machine preemptive
+               (Schrage) relaxation applies with the true durations */
+            long long v=cp_schrage_lb(rr,dd,qq,m);
+            if(v>lb) lb=v;
+        } else if(S->rcap[r]>1 && m<=CP_MKS_MAXN){
+            /* capacity above one: only the energy/class bound is sound (a
+               task of demand a occupies d*a capacity-time but can share the
+               resource, so scaling durations to a serial machine over-counts
+               -- two tasks of demand 2 in three time units fit into capacity
+               5, and ceil(3*2/5)=2 each would claim 4) */
+            long long v=t0r+cp_cum_mk_lb(dl,rl,m,S->rcap[r],t0r);
+            if(v>lb) lb=v;
+        }
+    }
+    if(lb>S->lo_mk) S->lo_mk=lb;
+    if(S->lo_mk>S->hi_mk){ cp_shop_free(S); psolve_free(S); return -1; }
+    /* the bound is admissible at the root, so it goes into the model either way */
+    if(cp_intersect(cp,mk,S->lo_mk,cp->hi[mk])){ cp_shop_free(S); psolve_free(S); return -1; }
+
+    /* serial-SGS search: exact for the pure pattern, incumbent generator
+       otherwise (a short run is enough to beat anything the generic dive
+       finds on its own) */
+    /* Proofs on the pure cumulative pattern finish in a few thousand nodes, so
+       it keeps a large node budget.  A model with precedence (jobshop shape)
+       can spend millions of nodes in the SGS enumeration without proving
+       anything, so there it is only an incumbent generator with a wall-clock
+       budget -- the generic search (plus cp_shop_push_bound) does the proof. */
+    S->nodecap = S->pure?2000000:20000;
+    /* seed the incumbent with GRASP-style greedy dives (cheap, and a tight
+       incumbent is what makes the branch and bound finish) */
+    {
+        long long bestmk=S->best;
+        long long keep[CP_SHOP_MAXT];
+        for(int i=0;i<S->ntask;i++) keep[i]=S->beststart[i];
+        /* the dives may use the full serial-schedule horizon; the load arrays
+           are sized for exactly that, so never go past it */
+        long long saved_hi=S->hi_mk;
+        if(S->hi_mk<(long long)S->horizon) S->hi_mk=S->horizon;
+        unsigned rs=987654321u;
+        for(int rule=0;rule<4;rule++){
+            for(int rep=0;rep<64;rep++){
+                /* rep==0 is the pure rule, then a widening RCL for GRASP
+                   restarts (bigger lists for bigger instances) */
+                int rcl=(rep==0)?1:(2+(rep%3));
+                long long v=cp_shop_greedy(S,rule,rcl,&rs);
+                if(v>=0&&v<bestmk){
+                    bestmk=v;
+                    memcpy(keep,S->start,(size_t)S->ntask*sizeof(long long));
+                }
+            }
+        }
+        S->hi_mk=saved_hi;
+        if(bestmk<S->best){ S->best=bestmk; memcpy(S->beststart,keep,(size_t)S->ntask*sizeof(long long)); }
+        for(int i=0;i<S->ntask;i++){ S->placed[i]=0; S->start[i]=0; }
+        for(int r=0;r<S->nres;r++) memset(S->load[r],0,(size_t)S->horizon*sizeof(int));
+    }
+    /* the dispatch rules land a few percent above the optimum; a critical-block
+       descent on the disjunctive graph closes most of that, and a tight
+       incumbent is exactly what lets the branch and bound prune.  Restricted
+       to models with precedence (jobshop shape): without it the SGS already
+       produces near-optimal active schedules. */
+    if(S->npred_total>0){
+        memcpy(S->start,S->beststart,(size_t)S->ntask*sizeof(long long));
+        long long v=cp_ls_run(S,S->start);
+        if(v>=0&&v<S->best){
+            S->best=v;
+            memcpy(S->beststart,S->start,(size_t)S->ntask*sizeof(long long));
+        }
+    }
+    if(S->npred_total>0){ S->deadline=0.02; clock_gettime(CLOCK_MONOTONIC,&S->t_start); }
+    cp_shop_rec(S,0,0);
+    if(S->best>S->hi_mk){
+        ret = S->aborted?0:-1;                      /* complete search found none */
+    } else if(S->pure&&!S->aborted){
+        for(int i=0;i<S->ntask;i++) outx[S->sv[i]]=(double)S->beststart[i];
+        outx[mk]=(double)S->best;
+        opt->best=(__int128)S->best; opt->have=1;
+        if(opt->bestx) memcpy(opt->bestx,outx,(size_t)opt->nv*sizeof(double));
+        ret=1;
+    } else {
+        /* incumbent mode: usable only if it satisfies the whole model */
+        double *tmp=(double*)psolve_malloc((size_t)(opt->nv?opt->nv:1)*sizeof(double));
+        memcpy(tmp,outx,(size_t)opt->nv*sizeof(double));
+        for(int i=0;i<S->ntask;i++) tmp[S->sv[i]]=(double)S->beststart[i];
+        tmp[mk]=(double)S->best;
+        if(cp_verify(cp,cr,nc,tmp)){
+            if(!opt->have||(__int128)S->best<opt->best){
+                opt->best=(__int128)S->best; opt->have=1;
+                if(opt->bestx) memcpy(opt->bestx,tmp,(size_t)opt->nv*sizeof(double));
+            }
+            ret=2;
+        } else ret=0;
+        psolve_free(tmp);
+    }
+    if(nodes) *nodes=(long)S->nodes;
+    if(ret==1||ret==-1){ cp_shop_free(S); psolve_free(S); }
+    else if(out_shop){
+        /* hand the structure to the search: reset the SGS state, keep the
+           static model */
+        for(int r=0;r<S->nres;r++) memset(S->load[r],0,(size_t)S->horizon*sizeof(int));
+        memset(S->placed,0,(size_t)S->ntask);
+        for(int i=0;i<S->ntask;i++) S->start[i]=0;
+        S->nodes=0; S->aborted=0;
+        *out_shop=S;
+    } else { cp_shop_free(S); psolve_free(S); }
     return ret;
 }
 
@@ -2409,7 +5424,7 @@ static int fz_cp_try(const FZModel*m,FZSolution*sol){
         int combinatorial=0;
         for(int i=0;i<nc;i++) if(cr[i].kind!=CPK_LIN){ combinatorial=1; break; }
         if(!combinatorial){
-            for(int i=0;i<nc;i++){ cp_cr_aux_free(&cr[i]); psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);} psolve_free(cr);
+            for(int i=0;i<nc;i++){ cp_cr_aux_free(&cr[i]); psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);psolve_free(cr[i].terms2);psolve_free(cr[i].terms3);} psolve_free(cr);
             psolve_free(referenced); psolve_free(optcoef); psolve_free(opt.bestx); return 0;
         }
         for(int i=0;i<m->objective.n;i++) referenced[m->objective.idx[i]]=1;
@@ -2475,7 +5490,7 @@ static int fz_cp_try(const FZModel*m,FZSolution*sol){
                 int64_t dlo= decl->has_lo?(int64_t)llround(decl->lo[0]):INT64_MIN;
                 int64_t dhi= decl->has_hi?(int64_t)llround(decl->hi[0]):INT64_MAX;
                 if(dlo>dhi){
-                    cp_free(&cp); for(int i=0;i<nc;i++){ cp_cr_aux_free(&cr[i]); psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);} psolve_free(cr); psolve_free(referenced); psolve_free(searchme); psolve_free(opt.bestx); psolve_free(optcoef);
+                    cp_free(&cp); for(int i=0;i<nc;i++){ cp_cr_aux_free(&cr[i]); psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);psolve_free(cr[i].terms2);psolve_free(cr[i].terms3);} psolve_free(cr); psolve_free(referenced); psolve_free(searchme); psolve_free(opt.bestx); psolve_free(optcoef);
                     sol->status=1; sol->nvars=nv; sol->nodes=0; return 1;
                 }
                 continue;
@@ -2490,7 +5505,7 @@ static int fz_cp_try(const FZModel*m,FZSolution*sol){
                        var {1..70000-as-set} pins).  Decline to the exact MIP
                        bridge instead, which represents the domain
                        symbolically. */
-                    cp_free(&cp); for(int i=0;i<nc;i++){ cp_cr_aux_free(&cr[i]); psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);} psolve_free(cr); psolve_free(referenced); psolve_free(searchme); psolve_free(opt.bestx); psolve_free(optcoef);
+                    cp_free(&cp); for(int i=0;i<nc;i++){ cp_cr_aux_free(&cr[i]); psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);psolve_free(cr[i].terms2);psolve_free(cr[i].terms3);} psolve_free(cr); psolve_free(referenced); psolve_free(searchme); psolve_free(opt.bestx); psolve_free(optcoef);
                     return 0;
                 }
                 continue;
@@ -2498,7 +5513,7 @@ static int fz_cp_try(const FZModel*m,FZSolution*sol){
             if(decl->has_lo){ int64_t lo=(int64_t)llround(decl->lo[0]); if(cp.lo[v]<lo)cp.lo[v]=lo; }
             if(decl->has_hi){ int64_t hi=(int64_t)llround(decl->hi[0]); if(cp.hi[v]>hi)cp.hi[v]=hi; }
             if(cp_intersect(&cp,v,cp.lo[v],cp.hi[v])){ /* empty initial domain -> UNSAT */
-                cp_free(&cp); for(int i=0;i<nc;i++){ cp_cr_aux_free(&cr[i]); psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);} psolve_free(cr); psolve_free(referenced); psolve_free(searchme); psolve_free(opt.bestx); psolve_free(optcoef);
+                cp_free(&cp); for(int i=0;i<nc;i++){ cp_cr_aux_free(&cr[i]); psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);psolve_free(cr[i].terms2);psolve_free(cr[i].terms3);} psolve_free(cr); psolve_free(referenced); psolve_free(searchme); psolve_free(opt.bestx); psolve_free(optcoef);
                 sol->status=1; sol->nvars=nv; sol->nodes=0; return 1;
             }
         }
@@ -2508,12 +5523,58 @@ static int fz_cp_try(const FZModel*m,FZSolution*sol){
        x*x*x*y*y = 100000 with unbounded x,y), bound the whole product chain
        to the divisors of that constant so search is finite and correct. */
     int bd=cp_bound_diophantine(&cp,cr,nc);
-    if(bd==1){ cp_free(&cp); for(int i=0;i<nc;i++){ cp_cr_aux_free(&cr[i]); psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);} psolve_free(cr); psolve_free(referenced); psolve_free(searchme); psolve_free(opt.bestx); psolve_free(optcoef); sol->status=1; sol->nvars=nv; return 1; }
-    if(bd==-1){ cp_free(&cp); for(int i=0;i<nc;i++){ cp_cr_aux_free(&cr[i]); psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);} psolve_free(cr); psolve_free(referenced); psolve_free(searchme); psolve_free(opt.bestx); psolve_free(optcoef); return 0; }
+    if(bd==1){ cp_free(&cp); for(int i=0;i<nc;i++){ cp_cr_aux_free(&cr[i]); psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);psolve_free(cr[i].terms2);psolve_free(cr[i].terms3);} psolve_free(cr); psolve_free(referenced); psolve_free(searchme); psolve_free(opt.bestx); psolve_free(optcoef); sol->status=1; sol->nvars=nv; return 1; }
+    if(bd==-1){ cp_free(&cp); for(int i=0;i<nc;i++){ cp_cr_aux_free(&cr[i]); psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);psolve_free(cr[i].terms2);psolve_free(cr[i].terms3);} psolve_free(cr); psolve_free(referenced); psolve_free(searchme); psolve_free(opt.bestx); psolve_free(optcoef); return 0; }
 
     double *outx=sol->x; /* sized nv */
 
+    /* pure all_different models are bipartite matching problems (see
+       cp_alldiff_apply): one maximum matching per component is the witness,
+       and a component that cannot be matched proves UNSATISFIABILITY */
+    if(m->solve_kind==0 && !all){
+        long ad_nodes=0;
+        int ar=cp_alldiff_apply(&cp,cr,nc,searchme,outx,&ad_nodes);
+        if(ar==1||ar==-1){
+            sol->status=(ar==1)?0:1; sol->nodes=ad_nodes;
+            cp_free(&cp);
+            for(int i=0;i<nc;i++){ cp_cr_aux_free(&cr[i]); psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);psolve_free(cr[i].terms2);psolve_free(cr[i].terms3);} psolve_free(cr);
+            psolve_free(referenced); psolve_free(searchme);
+            psolve_free(opt.bestx); psolve_free(optcoef);
+            return 1;
+        }
+    }
+
+    /* dedicated scheduler for models with a scheduling structure (see
+       cp_shop_apply): exact when the model *is* the structure, otherwise a
+       verified incumbent plus the root bound pushed into mk */
+    CPShop *shop=NULL;
+    if(m->solve_kind!=0 && !all){
+        long mks_nodes=0;
+        int mr=cp_shop_apply(&cp,cr,nc,&opt,outx,&mks_nodes,&shop);
+        if(mr==1){
+            if(cp_verify(&cp,cr,nc,outx)){
+                sol->status=0; sol->nodes=mks_nodes;
+                sol->obj=(double)opt.best+(double)opt.c0;
+                sol->best_bound=sol->obj;
+            } else { sol->status=2; sol->nodes=mks_nodes; }   /* cannot certify */
+            cp_free(&cp);
+            for(int i=0;i<nc;i++){ cp_cr_aux_free(&cr[i]); psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);psolve_free(cr[i].terms2);psolve_free(cr[i].terms3);} psolve_free(cr);
+            psolve_free(referenced); psolve_free(searchme);
+            psolve_free(opt.bestx); psolve_free(optcoef);
+            return 1;
+        }
+        if(mr==-1){
+            sol->status=1; sol->nodes=mks_nodes;
+            cp_free(&cp);
+            for(int i=0;i<nc;i++){ cp_cr_aux_free(&cr[i]); psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);psolve_free(cr[i].terms2);psolve_free(cr[i].terms3);} psolve_free(cr);
+            psolve_free(referenced); psolve_free(searchme);
+            psolve_free(opt.bestx); psolve_free(optcoef);
+            return 1;
+        }
+    }
+
     int rr;
+    int suspect=0;      /* some leaf was rejected by verification (see below) */
     long cp_nodes=0;
     if(all){
         /* set up the dedup context (as the MIP path does) so fz_solution_cb
@@ -2526,11 +5587,11 @@ static int fz_cp_try(const FZModel*m,FZSolution*sol){
         }
         if(ctx.key_len>SIZE_MAX/sizeof(uint64_t))psolve_fail(PSOLVE_ERR_OOM);
         ctx.scratch=(uint64_t*)psolve_calloc(ctx.key_len?ctx.key_len:1,sizeof(uint64_t));
-        rr=cp_solve_rec(&cp,cr,nc,searchme,outx,0,1,fz_solution_cb,&ctx,NULL,&cp_nodes);
+        rr=cp_solve_rec(&cp,cr,nc,searchme,outx,0,1,fz_solution_cb,&ctx,NULL,&cp_nodes,&suspect,shop);
         fz_solve_ctx_free(&ctx);
     } else {
         rr=cp_solve_rec(&cp,cr,nc,searchme,outx,0,0,NULL,NULL,
-                        m->solve_kind!=0?&opt:NULL,&cp_nodes);
+                        m->solve_kind!=0?&opt:NULL,&cp_nodes,&suspect,shop);
     }
 
     int handled=1;
@@ -2552,11 +5613,49 @@ static int fz_cp_try(const FZModel*m,FZSolution*sol){
             if(bad){ sol->status=2; break; }
         }
     }
-    else if(rr==0){ sol->status=1; sol->nodes=cp_nodes; }
-    else if(all && (rr==3)){ sol->status=0; sol->nodes=cp_nodes; }
+    else if(rr==0){
+        if(suspect) handled=0;
+        else if(opt.bestx && opt.have){
+            /* The search was cut everywhere by the incumbent bound: every
+               remaining branch provably cannot beat opt.best, so the
+               incumbent is the optimum.  (Without this the caller claimed
+               UNSATISFIABLE even though a verified solution was in hand.) */
+            memcpy(sol->x,opt.bestx,(size_t)nv*sizeof(double));
+            sol->obj=(double)opt.best+(double)opt.c0;
+            sol->status=0; sol->nodes=cp_nodes;
+            sol->best_bound=(double)opt.best+(double)opt.c0;
+            for(int d=0;d<m->ndecl;d++){ FZDecl*decl=&m->decls[d];
+                if(!decl->is_var||decl->base_idx<0||decl->is_alias) continue;
+                if(decl->has_lo && decl->has_hi) continue;
+                int bad=0;
+                for(int e=0;e<decl->n;e++){ int v=decl->base_idx+e; if(v<0||v>=nv) continue;
+                    double val=sol->x[v];
+                    if(val>FZ_BIG_BOUND-FZ_BIG_HIT_TOL || val< -FZ_BIG_BOUND+FZ_BIG_HIT_TOL){ bad=1; break; } }
+                if(bad){ sol->status=2; break; }
+            }
+        } else { sol->status=1; sol->nodes=cp_nodes; }
+    }
+    else if(all && (rr==3)){ if(suspect){ handled=0; } else { sol->status=0; sol->nodes=cp_nodes; } }
     else if(all && rr==4){ sol->nodes=cp_nodes; sol->status=4; }
+    else if(rr==4 && opt.bestx && opt.have && shop){
+        /* Node limit reached with a verified incumbent in hand.  The engine
+           cannot prove optimality, but the schedule is a real answer: report
+           it together with the proven lower bound and the UNKNOWN verdict
+           (status 5 prints the solution and then `=====UNKNOWN=====`), instead
+           of throwing the incumbent away.  This is what turns the 8x8/10x10
+           jobshops from "no output at all" into a usable schedule. */
+        memcpy(sol->x,opt.bestx,(size_t)nv*sizeof(double));
+        sol->obj=(double)opt.best+(double)opt.c0;
+        sol->best_bound=(double)shop->lo_mk+(double)opt.c0;
+        sol->status=5; sol->nodes=cp_nodes;
+    }
     else if(opt.bestx && rr==3){
-        /* complete B&B search: the incumbent is a PROVEN optimum */
+        /* A rejected leaf is an infeasible assignment, not a hole in the
+           search: propagation only ever removes values that appear in no
+           solution, so the enumeration below the root is exhaustive over the
+           feasible assignments.  The incumbent collected here is a verified
+           leaf, and no feasible leaf can beat it, so the bound is a real
+           optimum (the same argument a real CP solver relies on). */
         if(opt.have){
             memcpy(sol->x,opt.bestx,(size_t)nv*sizeof(double));
             sol->obj=(double)opt.best+(double)opt.c0;
@@ -2580,9 +5679,10 @@ static int fz_cp_try(const FZModel*m,FZSolution*sol){
     else { handled=0; } /* fallback: node cap (rr==4) or uncertifiable (rr==-1) */
 
     cp_free(&cp);
-    for(int i=0;i<nc;i++){ cp_cr_aux_free(&cr[i]); psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);} psolve_free(cr);
+    for(int i=0;i<nc;i++){ cp_cr_aux_free(&cr[i]); psolve_free(cr[i].lvars);psolve_free(cr[i].lcoef);psolve_free(cr[i].terms);psolve_free(cr[i].setvals);psolve_free(cr[i].arr_terms);psolve_free(cr[i].terms2);psolve_free(cr[i].terms3);} psolve_free(cr);
     psolve_free(referenced); psolve_free(searchme);
     psolve_free(opt.bestx); psolve_free(optcoef);
+    if(shop){ cp_shop_free(shop); psolve_free(shop); shop=NULL; }
     if(!handled) return 0;
     return 1;
 }

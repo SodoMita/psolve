@@ -430,6 +430,21 @@ echo -n "cumulative_verify (randomized, vs brute force): "
 python3 tools/cumulative_verify.py 200 777 | sed 's/.*: //'
 echo -n "cp_opt_verify (CP B&B + MIP bridge optimization, vs brute force, both paths): "
 python3 tools/cp_opt_verify.py 250 20260814 | sed 's/.*: //'
+# makespan/cumulative scheduler (serial-SGS branch and bound): the claimed
+# optimum must equal an exhaustive brute-force optimum (CP-SAT oracle when
+# OR-Tools is installed) and the reported schedule is re-checked slot by slot.
+echo -n "cum_mks_verify (makespan scheduler vs brute force): "
+python3 tools/cum_mks_verify.py 120 20260901 | sed 's/.*: //'
+# Jobshop shape (disjunctive machines + precedence chains): the serial-SGS
+# shop engine claims a proven optimum when the model *is* the structure and a
+# verified incumbent plus a scheduling bound otherwise.  Every reported
+# schedule is re-checked (precedence, machine overlap, mk == max completion)
+# and the optimum must match the CP-SAT oracle when OR-Tools is present.
+echo -n "jobshop_verify (shop scheduler vs CP-SAT, schedule re-checked): "
+python3 tools/jobshop_verify.py 40 20261125 | sed 's/.*: //' || { echo "jobshop_verify: FAIL"; exit 1; }
+# Régin all_different filtering via residual SCCs: -a solution sets must stay
+# exactly equal to brute force (no valid value may be filtered).
+python3 tools/alldiff_scc_verify.py 200 271828 || { echo "alldiff_scc_verify: FAIL"; exit 1; }
 
 echo "[8.25/8] FlatZinc strict/reified-int + float + table/circuit semantics..."
 python3 tools/fzn_semantics_test.py
@@ -447,6 +462,26 @@ python3 tools/divmod_verify.py 200 20260808 | sed 's/.*: //'
 # engine and the MIP bridge forced by a non-output float dummy), plus the
 # channel's acceptance pins.  Hard gate: rc matters.
 python3 tools/fzn_bilinear_verify.py 250 20261101 || { echo "fzn_bilinear_verify: FAIL"; exit 1; }
+
+# Phase 11.2 wave 2: the stdlib globals that reach FlatZinc as builtins and
+# were previously UNHANDLED (counting at_most/at_least/exactly/at_most1,
+# value-precede family, arg-min/max, sort/arg_sort, sliding among,
+# gecode_int_element2d).  Randomized differential vs brute force with exact
+# solution-set equality on -a, single-run verdict/witness checks, a sort
+# optimize check, pins, and MiniZinc-compiled end-to-end -a solution-set
+# equality vs the bundled fzn-gecode oracle.  Hard gate: rc matters.
+python3 tools/fzn_globals_verify.py 20 20261102 || { echo "fzn_globals_verify: FAIL"; exit 1; }
+
+# cp-sat (ortools_*) parity batch: differential verifier against the bundled
+# fzn-cp-sat oracle + brute force (solution-set equality, UNKNOWN = failure).
+# The oracle ships with the MiniZinc bundle, which is not always installed;
+# like the GLPK and minizinc sections below, the gate is skipped (loudly) when
+# the binary is absent, and `FZN_CP_SAT=/path/to/fzn-cp-sat` enables it.
+if [ -x "${FZN_CP_SAT:-/home/user/mz/bin/fzn-cp-sat}" ]; then
+  LD_LIBRARY_PATH="${MZ_LIB:-/home/user/mz/lib}" python3 tools/fzn_cpsat_verify.py 8 20261104 || { echo "fzn_cpsat_verify: FAIL"; exit 1; }
+else
+  echo "fzn_cpsat_verify: SKIPPED (no fzn-cp-sat oracle at ${FZN_CP_SAT:-/home/user/mz/bin/fzn-cp-sat}; set FZN_CP_SAT to enable)"
+fi
 
 # FlatZinc OUTPUT-layer round-trip (roadmap 6.7): re-parse every emitted
 # byte; each printed assignment must satisfy every constraint and stay in
