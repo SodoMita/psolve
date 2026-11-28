@@ -1688,6 +1688,35 @@ static int encode_divmod_var(Builder*b,const FZModel*m,int va,int vb,int vc,int 
     return 0;
 }
 
+/* Extensional table over the linear forms xs[0..nx-1]: exactly one row of
+   `rows` (nrows x nx, row-major) is selected by a binary z_r, and the rows
+   pin every xs[i] to that row's entry.  Exact over the integer lattice; the
+   caps keep a hostile FlatZinc model from allocating an unbounded number of
+   selectors (the caller reports UNKNOWN instead).  Returns 0 ok, 1 decline. */
+static int fz_add_table_rows(Builder*b,Lin*xs,int nx,const long*rows,int nrows)
+{
+    if(nx<=0||nrows<0)return -1;
+    if(nrows>1024||(long)nrows*(long)nx>65536)return 1;
+    if(nrows==0){
+        /* No permitted tuple: make the model infeasible, exactly. */
+        Lin impossible;memset(&impossible,0,sizeof(impossible));
+        b_put(b,'=',1.0,&impossible);
+        return 0;
+    }
+    int *z=(int*)psolve_malloc((size_t)nrows*sizeof(int));
+    for(int r=0;r<nrows;r++)z[r]=b_newvar(b,0.0,1.0);
+    Lin pick;memset(&pick,0,sizeof(pick));
+    for(int r=0;r<nrows;r++)lin_term(&pick,z[r],1.0);
+    b_put(b,'=',1.0,&pick);lin_free(&pick);
+    for(int i=0;i<nx;i++){
+        Lin eq;memset(&eq,0,sizeof(eq));lin_into(&eq,&xs[i],1.0);
+        for(int r=0;r<nrows;r++)lin_term(&eq,z[r],-(double)rows[r*nx+i]);
+        b_put(b,'=',0.0,&eq);lin_free(&eq);
+    }
+    psolve_free(z);
+    return 0;
+}
+
 /* ---- Phase 11.2 wave 2: exact encodings for the stdlib globals that reach
    FlatZinc as builtin calls (counting at_most/at_least/exactly, value
    precedence, arg-min/arg-max, sort/arg_sort, sliding among, 2D element).
@@ -3091,32 +3120,173 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
         }
         if(nx<=0||nt<0||nt%nx!=0){free_lins(xs,nx);free_lins(tuples,nt);return -1;}
         int nrows=nt/nx;
-        /* Bound the deliberately compact MIP encoding on hostile FlatZinc
-           input.  Larger tables remain UNKNOWN rather than allocating an
-           unbounded number of binary selector variables. */
-        if(nrows>1024||nt>65536){free_lins(xs,nx);free_lins(tuples,nt);return 1;}
+        long *vals=(long*)psolve_malloc((size_t)(nt?nt:1)*sizeof(long));
+        int bad=0;
         for(int k=0;k<nt;k++){
-            if(tuples[k].n!=0||fabs(tuples[k].constant-round(tuples[k].constant))>1e-12){  /* TOLSHEET TOL-FZN-INTCONST */
-                free_lins(xs,nx);free_lins(tuples,nt);return 1;
+            if(tuples[k].n!=0||fabs(tuples[k].constant-round(tuples[k].constant))>1e-12||  /* TOLSHEET TOL-FZN-INTCONST */
+               fabs(tuples[k].constant)>4e18){ bad=1; break; }  /* TOLSHEET TOL-FZN-LONGCAST */
+            vals[k]=(long)llround(tuples[k].constant);
+        }
+        int rr=bad?1:fz_add_table_rows(b,xs,nx,vals,nrows);
+        psolve_free(vals);free_lins(xs,nx);free_lins(tuples,nt);
+        return rr;
+    }
+    /* span(x[], y): y = max(x) - min(x).  Exact: two fresh variables hold the
+       extremes, the epigraph/hypograph rows tie them to every element, one
+       selector per direction says which element attains each extreme, and a
+       single row pins y.  The selectors are not optional.  Dropping them when
+       y is the minimized objective looks tempting (mx is bounded only below,
+       mn only above, so minimizing mx - mn drives both to the true extremes)
+       but it is unsound as soon as y appears in another row: with y pinned to
+       2 and all elements equal, the pure epigraph accepts it and prints a
+       schedule whose real span is 0.  Two n-element selector sets are cheap
+       next to a wrong answer. */
+    if(strcmp(p,"fzn_span")==0||strcmp(p,"span")==0||strcmp(p,"ortools_span")==0){
+        if(c->nargs<2)return -1;
+        Lin*arr;int narr;
+        if(parse_array(m,c->args[0],&arr,&narr)!=0)return -1;
+        Lin yl;memset(&yl,0,sizeof(yl));
+        if(parse_lin(m,c->args[1],&yl)!=0){free_lins(arr,narr);return -1;}
+        if(narr<=0||narr>1024){lin_free(&yl);free_lins(arr,narr);return 1;}
+        double dlo=1e18,dhi=-1e18,lo_max=-1e18,hi_min=1e18;  /* TOLSHEET TOL-FZN-BOUNDINIT */
+        int bad=0;
+        double *elo=(double*)psolve_malloc((size_t)narr*sizeof(double));
+        double *ehi=(double*)psolve_malloc((size_t)narr*sizeof(double));
+        for(int i=0;i<narr;i++){
+            if(lin_bounds(b,&arr[i],&elo[i],&ehi[i])!=0){bad=1;break;}
+            if(elo[i]<dlo)dlo=elo[i];
+            if(ehi[i]>dhi)dhi=ehi[i];
+            if(elo[i]>lo_max)lo_max=elo[i];
+            if(ehi[i]<hi_min)hi_min=ehi[i];
+        }
+        if(bad){psolve_free(elo);psolve_free(ehi);lin_free(&yl);free_lins(arr,narr);return 1;}
+        int mxv=b_newvar(b,lo_max,dhi);
+        int mnv=b_newvar(b,dlo,hi_min);
+        Lin mxl,mnl;memset(&mxl,0,sizeof(mxl));lin_term(&mxl,mxv,1.0);
+        memset(&mnl,0,sizeof(mnl));lin_term(&mnl,mnv,1.0);
+        for(int i=0;i<narr;i++){
+            Lin d;memset(&d,0,sizeof(d));lin_into(&d,&mxl,1.0);lin_into(&d,&arr[i],-1.0);
+            b_put(b,'>',0.0,&d);lin_free(&d);                 /* mx >= x_i */
+            Lin e;memset(&e,0,sizeof(e));lin_into(&e,&arr[i],1.0);lin_into(&e,&mnl,-1.0);
+            b_put(b,'>',0.0,&e);lin_free(&e);                 /* x_i >= mn */
+        }
+        {
+            Lin sp;memset(&sp,0,sizeof(sp));
+            lin_into(&sp,&yl,1.0);lin_into(&sp,&mxl,-1.0);lin_into(&sp,&mnl,1.0);
+            b_put(b,'=',0.0,&sp);lin_free(&sp);
+        }
+        psolve_free(elo);psolve_free(ehi);
+        {
+            int *z=(int*)psolve_malloc((size_t)narr*sizeof(int));
+            int *w=(int*)psolve_malloc((size_t)narr*sizeof(int));
+            for(int i=0;i<narr;i++){ z[i]=b_newvar(b,0.0,1.0); w[i]=b_newvar(b,0.0,1.0); }
+            Lin pz,pw;memset(&pz,0,sizeof(pz));memset(&pw,0,sizeof(pw));
+            for(int i=0;i<narr;i++){ lin_term(&pz,z[i],1.0); lin_term(&pw,w[i],1.0); }
+            b_put(b,'=',1.0,&pz);b_put(b,'=',1.0,&pw);lin_free(&pz);lin_free(&pw);
+            for(int i=0;i<narr;i++){
+                double lo_i, hi_i;
+                if(lin_bounds(b,&arr[i],&lo_i,&hi_i)!=0){bad=1;break;}
+                double Mi=fmax(0.0,dhi-lo_i), Mj=fmax(0.0,hi_i-dlo);
+                Lin d;memset(&d,0,sizeof(d));lin_into(&d,&mxl,1.0);lin_into(&d,&arr[i],-1.0);
+                lin_term(&d,z[i],Mi);d.constant-=Mi;b_put(b,'<',0.0,&d);lin_free(&d);
+                Lin e;memset(&e,0,sizeof(e));lin_into(&e,&arr[i],1.0);lin_into(&e,&mnl,-1.0);
+                lin_term(&e,w[i],Mj);e.constant-=Mj;b_put(b,'<',0.0,&e);lin_free(&e);
             }
+            psolve_free(z);psolve_free(w);
         }
-        if(nrows==0){
-            /* No permitted tuple: make the model infeasible, exactly. */
-            Lin impossible;memset(&impossible,0,sizeof(impossible));b_put(b,'=',1.0,&impossible);
-            lin_free(&impossible);free_lins(xs,nx);free_lins(tuples,nt);return 0;
+        lin_free(&mxl);lin_free(&mnl);
+        lin_free(&yl);free_lins(arr,narr);
+        return bad?1:0;
+    }
+
+    /* Automaton: regular(x, Q, S, d, T) (also fzn_regular / ortools_regular).
+       Exact layered encoding: one fresh state variable per position, pinned to
+       the initial state at the front, restricted to the accepting set at the
+       back, and an extensional table (fz_add_table_rows) over
+       (q[i-1], x[i], q[i]) carrying exactly the triples of T.  States are
+       renumbered to 0..|Q|-1 so the chain has a tight box; an automaton that
+       mentions a state outside Q, or a transition triple outside T's arity,
+       is rejected rather than guessed.  The row cap of the table encoding is
+       the only limit: an automaton with more than 1024 transitions stays
+       UNKNOWN instead of blowing up the selector count. */
+    if(strcmp(p,"fzn_regular")==0||strcmp(p,"regular")==0||
+       strcmp(p,"ortools_regular")==0||strcmp(p,"gecode_regular")==0){
+        if(c->nargs<5)return -1;
+        Lin *xs=NULL;int nx=0;
+        long *Q=NULL,*D=NULL,*T=NULL;
+        int nQ=0,nD=0,nT=0,ok=0;
+        Lin sl;memset(&sl,0,sizeof(sl));
+        int have_sl=0;
+        if(parse_array(m,c->args[0],&xs,&nx)!=0)return -1;
+        if(table_values(m,c->args[1],&Q,&nQ)!=0)goto reg_done;
+        if(parse_lin(m,c->args[2],&sl)!=0)goto reg_done;
+        have_sl=1;
+        if(table_values(m,c->args[3],&D,&nD)!=0)goto reg_done;
+        if(table_values(m,c->args[4],&T,&nT)!=0)goto reg_done;
+        if(nx<=0||nQ<=0||nT<=0||nT%3!=0)goto reg_done;
+        if(sl.n!=0||fabs(sl.constant-round(sl.constant))>1e-12||  /* TOLSHEET TOL-FZN-INTCONST */
+           fabs(sl.constant)>4e18)goto reg_done;  /* TOLSHEET TOL-FZN-LONGCAST */
+        {
+            long s0=(long)llround(sl.constant);
+            int nt=nT/3;
+            int *idx=(int*)psolve_malloc((size_t)nQ*sizeof(int));
+            for(int i=0;i<nQ;i++)idx[i]=-1;
+            /* init and accepting states must belong to Q */
+            int bad=0,s0i=-1;
+            for(int i=0;i<nQ;i++) if(Q[i]==s0) s0i=i;
+            if(s0i<0) bad=1;
+            for(int i=0;i<nD&&!bad;i++){
+                int found=0;
+                for(int j=0;j<nQ;j++) if(Q[j]==D[i]){ found=1; break; }
+                if(!found) bad=1;
+            }
+            if(bad){ psolve_free(idx); goto reg_done; }
+            /* state chain */
+            int *qv=(int*)psolve_malloc((size_t)(nx+1)*sizeof(int));
+            for(int i=0;i<=nx;i++) qv[i]=b_newvar(b,0.0,(double)(nQ-1));
+            {
+                Lin f;memset(&f,0,sizeof(f));lin_term(&f,qv[0],1.0);
+                b_put(b,'=',(double)s0i,&f);lin_free(&f);
+            }
+            long *frows=(long*)psolve_malloc((size_t)nD*sizeof(long));
+            for(int i=0;i<nD;i++){
+                for(int j=0;j<nQ;j++) if(Q[j]==D[i]){ frows[i]=j; break; }
+            }
+            Lin tail;memset(&tail,0,sizeof(tail));lin_term(&tail,qv[nx],1.0);
+            int rr=fz_add_table_rows(b,&tail,1,frows,nD);
+            lin_free(&tail);psolve_free(frows);
+            if(rr!=0){ psolve_free(qv); psolve_free(idx); goto reg_done; }
+            if(nt>1024){ psolve_free(qv); psolve_free(idx); ok=0; goto reg_done; }
+            long *trows=(long*)psolve_malloc((size_t)(3*nt)*sizeof(long));
+            for(int i=0;i<nt;i++){
+                int a=-1,bb=-1;
+                for(int j=0;j<nQ;j++){
+                    if(Q[j]==T[3*i]) a=j;
+                    if(Q[j]==T[3*i+2]) bb=j;
+                }
+                if(a<0||bb<0){ psolve_free(trows); psolve_free(qv); psolve_free(idx); goto reg_done; }
+                trows[3*i]=(long)a; trows[3*i+1]=T[3*i+1]; trows[3*i+2]=(long)bb;
+            }
+            int good=1;
+            for(int i=0;i<nx&&good;i++){
+                Lin three[3];memset(three,0,sizeof(three));
+                lin_term(&three[0],qv[i],1.0);
+                lin_into(&three[1],&xs[i],1.0);
+                lin_term(&three[2],qv[i+1],1.0);
+                rr=fz_add_table_rows(b,three,3,trows,nt);
+                for(int k=0;k<3;k++)lin_free(&three[k]);
+                if(rr!=0) good=0;
+            }
+            psolve_free(trows);psolve_free(qv);psolve_free(idx);
+            ok=good;
         }
-        int *z=(int*)psolve_malloc((size_t)nrows*sizeof(int));
-        for(int r=0;r<nrows;r++)z[r]=b_newvar(b,0.0,1.0);
-        Lin pick;memset(&pick,0,sizeof(pick));
-        for(int r=0;r<nrows;r++)lin_term(&pick,z[r],1.0);
-        b_put(b,'=',1.0,&pick);lin_free(&pick);
-        for(int i=0;i<nx;i++){
-            Lin eq;memset(&eq,0,sizeof(eq));lin_into(&eq,&xs[i],1.0);
-            for(int r=0;r<nrows;r++)lin_term(&eq,z[r],-tuples[r*nx+i].constant);
-            b_put(b,'=',0.0,&eq);lin_free(&eq);
-        }
-        psolve_free(z);free_lins(xs,nx);free_lins(tuples,nt);
-        return 0;
+reg_done:
+        if(have_sl)lin_free(&sl);
+        if(Q)psolve_free(Q);
+        if(D)psolve_free(D);
+        if(T)psolve_free(T);
+        free_lins(xs,nx);
+        return ok?0:1;
     }
     /* Hamiltonian successor circuit.  Gecode emits
        gecode_circuit(offset, x); standard/other libraries use fzn_circuit(x).
@@ -3474,7 +3644,13 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
        strcmp(p,"minimum_arg_int")==0||strcmp(p,"maximum_arg_int")==0||
        strcmp(p,"fzn_minimum_arg_bool")==0||strcmp(p,"fzn_maximum_arg_bool")==0||
        strcmp(p,"fzn_arg_min_bool")==0||strcmp(p,"fzn_arg_max_bool")==0||
-       strcmp(p,"minimum_arg_bool")==0||strcmp(p,"maximum_arg_bool")==0){
+       strcmp(p,"minimum_arg_bool")==0||strcmp(p,"maximum_arg_bool")==0||
+       /* bare spellings: same two arguments and the same base-1 index that the
+          fzn_/gecode_ forms carry when the array is 1-based, which is what the
+          standard library's arg_min/arg_max definitions produce */
+       strcmp(p,"arg_min")==0||strcmp(p,"arg_max")==0||
+       strcmp(p,"arg_min_int")==0||strcmp(p,"arg_max_int")==0||
+       strcmp(p,"minimum_arg")==0||strcmp(p,"maximum_arg")==0){
         int ismax=strstr(p,"max")!=NULL;
         if(c->nargs<2)return -1;
         Lin*arr;int narr;
@@ -4732,26 +4908,63 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
         free_lins(arr,narr); lin_free(&yl);
         return 0;
     }
-    /* alldifferent_except_0(x[]) and alldifferent_except(x[], S) */
+    /* alldifferent_except_0(x[]) and alldifferent_except(x[], S): a value may
+       repeat only if it is in the excluded set ({0} for the _0 form).  So for
+       every value *outside* that set, at most one element may take it.  The
+       set is a real second argument (a range or an enum), not an assumed 0:
+       ignoring it would answer SAT for x=[1,1] under
+       alldifferent_except(x, {2}) and call it handled. */
     if(strcmp(p,"alldifferent_except_0")==0||strcmp(p,"fzn_alldifferent_except_0")==0||
-       strcmp(p,"all_different_except_0")==0||
-       strcmp(p,"alldifferent_except")==0||strcmp(p,"fzn_alldifferent_except")==0){
+       strcmp(p,"all_different_except_0")==0||strcmp(p,"fzn_all_different_except_0")==0||
+       strcmp(p,"alldifferent_except")==0||strcmp(p,"fzn_alldifferent_except")==0||
+       strcmp(p,"all_different_except")==0||strcmp(p,"fzn_all_different_except")==0){
         if(c->nargs<1)return -1;
         Lin*arr;int narr;
         if(parse_array(m,c->args[0],&arr,&narr)!=0)return -1;
-        if(narr<=1){free_lins(arr,narr);return 0;}
+        /* the excluded set: {0} for the _0 form, the second argument else.
+           A missing set means "nothing excluded" (plain all_different). */
+        int xr=0;long xlo=0,xhi=0;
+        long *xvals=NULL;int nxvals=0;
+        long zero=0;
+        int have_set=0, own_vals=0;
+        if(strstr(p,"_0")!=NULL){ xr=0; zero=0; xvals=&zero; nxvals=1; have_set=1; }
+        else if(c->nargs>=2){
+            if(fz_parse_int_set(c->args[1],FZ_MAX_SET_ENUM,&xr,&xlo,&xhi,&xvals,&nxvals)!=0){
+                free_lins(arr,narr);return 1;   /* unknown set shape: honest UNKNOWN */
+            }
+            have_set=1;
+            own_vals=(xvals!=NULL);
+            if(xr&&xlo<=xhi&&xhi-xlo+1>FZ_MAX_SET_ENUM){
+                if(own_vals)psolve_free(xvals);
+                free_lins(arr,narr);return 1;
+            }
+        }
+        if(narr<=1){
+            if(own_vals) psolve_free(xvals);
+            free_lins(arr,narr);
+            return 0;
+        }
         double dlo=1e18, dhi=-1e18;  /* TOLSHEET TOL-FZN-BOUNDINIT */
         for(int i=0;i<narr;i++){
             double lo_i, hi_i;
-            if(lin_bounds(b, &arr[i], &lo_i, &hi_i)!=0){free_lins(arr,narr);return 1;}
+            if(lin_bounds(b, &arr[i], &lo_i, &hi_i)!=0){
+                if(own_vals) psolve_free(xvals);
+                free_lins(arr,narr);
+                return 1;
+            }
             if(lo_i<dlo)dlo=lo_i;
             if(hi_i>dhi)dhi=hi_i;
         }
         long ndom=(long)(dhi-dlo)+1;
-        if(ndom<=0||ndom>128){free_lins(arr,narr);return 1;}
+        if(ndom<=0||ndom>128){ if(own_vals)psolve_free(xvals); free_lins(arr,narr);return 1;}
 
         for(long v=(long)dlo; v<=(long)dhi; v++){
-            if(v == 0) continue; /* except 0 */
+            if(have_set){
+                int inset=0;
+                if(xr) inset=(v>=xlo&&v<=xhi);
+                else for(int k=0;k<nxvals;k++) if(xvals[k]==v){ inset=1; break; }
+                if(inset) continue;             /* this value may repeat freely */
+            }
             Lin sum; memset(&sum, 0, sizeof(sum));
             for(int i=0;i<narr;i++){
                 int z = b_newvar(b, 0.0, 1.0);
@@ -4764,6 +4977,7 @@ static int handle_constraint(FZModel*m,Builder*b,FZConstr*c)
             lin_free(&sum);
         }
 
+        if(own_vals)psolve_free(xvals);
         free_lins(arr,narr);
         return 0;
     }

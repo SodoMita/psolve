@@ -601,26 +601,37 @@ they are encoded exactly, never relaxed:
 |---|---|---|
 | `lex_greater(x,y)`, `lex_greatereq(x,y)` | MIP bridge **and** CP engine | `lex_less(y,x)` / `lex_lesseq(y,x)`: the arrays are swapped, the shared lex encoding (prefix-equality selectors + strict/non-strict last difference) is reused |
 | `array_bool_not(x,y)` | MIP bridge | one row `x_i + y_i = 1` per element; the relation is symmetric in its two arrays, so the argument order is not a risk |
+| `regular(x,Q,S,d,T)` | MIP bridge | one fresh state variable per position, pinned to `S` in front and to the accepting set at the back, and an extensional table over `(q[i-1], x[i], q[i])` built from `T` (states renumbered to `0..|Q|-1`). Exact for nondeterministic automata too — the chain is existential, which is the MiniZinc semantics; a transition to an unknown state declines rather than dropping the triple |
+| `span(x,y)` | MIP bridge | two fresh variables for the extremes (epigraph/hypograph rows to every element), one selector per direction saying which element attains it, and `y = max - min`. The selectors are what reject a `y` that is too *large*, so they are always emitted — the epigraph-only shortcut (valid while `y` is the minimized objective and appears nowhere else) silently accepts a pinned `y` that no pair of elements attains |
+| `alldifferent_except(x,S)`, `alldifferent_except_0(x)` | MIP bridge | a value may repeat only if it lies in the excluded set, so "at most one element equals v" is posted for every value *outside* it. The second argument is parsed as a real set (range or enum): the previous version assumed `S = {0}` and ignored the argument, which answered SAT for `x=[1,1]` under `alldifferent_except(x,{2})` |
+| bare `arg_max`/`arg_min`/`minimum_arg`/`maximum_arg` | MIP bridge | same encoding and base-1 index as the `fzn_*`/`gecode_*` spellings |
 
 Gate: `tools/fzn_globals_verify.py` grew `gen_lex_greater` (both strictness
-forms, lengths 1–4) and `gen_array_bool_not` (both argument orders) — the
-verifier compares the **solution sets** with brute force, not just the
-verdict, so a swapped argument or an inverted element fails:
-`OK=314 WRONG=0 UNKNOWN=0 (seed 20261125, N=30)`; hard-gated in `test.sh`.
+forms, lengths 1–4), `gen_array_bool_not` (both argument orders), `gen_regular`
+(random automata 1–4 states over a 2–3 symbol alphabet, *nondeterministic*
+transitions, random accepting sets including the empty one, an occasional
+pinned element), `gen_span` (1–4 elements, `y` covering both too-small and
+too-large values) and `gen_alldiff_except` (`_0`, explicit enum and range
+forms) — the verifier compares the **solution sets** with brute force, not just
+the verdict, so a swapped argument, an inverted element, a dropped transition,
+a wrong state renumbering or an ignored excluded set fails the gate:
+`OK=406 WRONG=0 UNKNOWN=0 (seed 20261125, N=30)`; hard-gated in `test.sh`.
 
 Still unhandled, and honestly so (each returns `=====UNKNOWN=====`, never a
 truncated relaxation):
 
-* `regular` — automaton constraints need layered-state propagation (or an
-  auxiliary state chain); a decomposition is possible but is not in yet;
-* `all_different_except(x,v)`, `value_precede(s,t,x)` (bare names — the
-  `fzn_*`/`gecode_*` forms the MiniZinc libraries actually emit are handled),
-  `arg_max`/`arg_min` (bare names);
+* `value_precede(s,t,x)` under its bare name (the `fzn_*`/`gecode_*` forms the
+  MiniZinc libraries emit are handled);
 * `float_floor`, `float_ceil`, `float_round`, `float2int`, `float_sqrt`: the
   rounding ones are *strict* inequalities (`y <= x < y+1`) and a MIP row cannot
   express the strict side exactly, so they are declined rather than
   epsilon-relaxed;
-* `span`, `diffn_k`, `int_set_channel`, `element_set`, `array_set_element`,
-  `mzn_div`/`mzn_mod`/`mzn_max`/`mzn_min` (semantics differ between MiniZinc
-  versions; guessing them would be worse than UNKNOWN), and the `ortools_*`
-  variants of the same.
+* `diffn_k`, `int_set_channel`, `element_set`, `array_set_element` and the set
+  builtins in general: this bridge has no set variables at all, and `diffn_k`'s
+  flattened shape is exactly the kind of thing that differs between MiniZinc
+  versions — a wrong guess would be a wrong answer, not a slow one;
+* `mzn_div`/`mzn_mod`: `div`/`mod` rounding semantics are not the `int_div`/
+  `int_mod` ones for negative operands, and guessing the version's rule is
+  worse than UNKNOWN; `mzn_max`/`mzn_min` are left with them because the same
+  version-dependent naming applies;
+* the `ortools_*` variants of the same.

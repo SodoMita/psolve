@@ -258,13 +258,15 @@ def gen_precede(rng):
 def gen_arg_extremum(rng):
     ln = rng.randint(2, 4)
     ismax = rng.random() < 0.5
-    gec = rng.random() < 0.5
     arr = "x"
     decls = [varray(arr, ln, 1, 3), var("i", 1, ln)]
     names = [arr, "i"]
     doms = {arr: arr_domain(ln, 1, 3), "i": list(range(1, ln + 1))}
-    if gec:
+    kind = rng.choice(["fzn", "gecode", "bare"])
+    if kind == "gecode":
         cons = [f"gecode_{'maximum' if ismax else 'minimum'}_arg_int_offset({arr}, 1, i)"]
+    elif kind == "bare":
+        cons = [f"arg_{'max' if ismax else 'min'}({arr}, i)"]
     else:
         cons = [f"fzn_{'maximum' if ismax else 'minimum'}_arg_int({arr}, i)"]
 
@@ -386,9 +388,110 @@ def gen_array_bool_not(rng):
                 lambda a: all(xv + yv == 1 for xv, yv in zip(a["x"], a["y"])))
 
 
+def gen_regular(rng):
+    """regular(x, Q, S, d, T): layered state chain over extensional tables.
+    The oracle is a reachable-state simulation, so a *nondeterministic*
+    automaton is checked too (the encoding is existential, exactly like the
+    MiniZinc semantics); a wrong state renumbering, a dropped transition or a
+    mishandled accepting set all change the solution set."""
+    nq = rng.randint(1, 4)
+    n = rng.randint(1, 4)
+    alpha = rng.randint(2, 3)
+    trans = []
+    for st in range(nq):
+        for lab in range(1, alpha + 1):
+            if rng.random() < 0.6:
+                trans.append((st, lab, rng.randrange(nq)))
+    if not trans:
+        trans.append((0, 1, 0))
+    finals = sorted(st for st in range(nq) if rng.random() < 0.5)
+    # a proper subset of states must accept: with finals == Q the accepting
+    # table is a tautology and a broken accepting-set encoding goes unnoticed
+    if nq > 1 and len(finals) == nq and rng.random() < 0.8:
+        finals = finals[:-1]
+    init = rng.randrange(nq)
+    pin = rng.randrange(n) if rng.random() < 0.3 else -1
+    decls, elems, doms = [], [], {}
+    for i in range(n):
+        nm = f"x{i + 1}"
+        if i == pin:
+            v = rng.randint(1, alpha)
+            decls.append(var(nm, v, v))
+            doms[nm] = [v]
+        else:
+            decls.append(var(nm, 1, alpha))
+            doms[nm] = list(range(1, alpha + 1))
+        elems.append(nm)
+    Q = ", ".join(str(st) for st in range(nq))
+    T = ", ".join(f"{a},{b},{c}" for (a, b, c) in trans)
+    D = ", ".join(str(st) for st in finals)
+    cons = [f"fzn_regular([{', '.join(elems)}], [{Q}], {init}, [{D}], [{T}])"]
+    names = [f"x{i + 1}" for i in range(n)]
+
+    def check(a):
+        cur = {init}
+        for i in range(n):
+            lab = a[f"x{i + 1}"]
+            cur = {c for (st, l, c) in trans if st in cur and l == lab}
+            if not cur:
+                return False
+        return bool(cur & set(finals))
+
+    return Inst(model(decls, cons), names, doms, check)
+
+
+def gen_span(rng):
+    """span(x, y): y = max(x) - min(x).  The encoding keeps two fresh extreme
+    variables and pins y to their difference, with a selector saying which
+    element attains each end -- so a y that is too *large* (never reached by
+    any pair) has to be rejected too, not just a y that is too small."""
+    n = rng.randint(1, 4)
+    hi = rng.randint(2, 5)
+    decls = [varray("x", n, 1, hi), var("y", 0, hi - 1)]
+    cons = ["fzn_span(x, y)"]
+    doms = {"x": arr_domain(n, 1, hi), "y": list(range(0, hi))}
+    return Inst(model(decls, cons), ["x", "y"], doms,
+                lambda a: a["y"] == max(a["x"]) - min(a["x"]))
+
+
+def gen_alldiff_except(rng):
+    """alldifferent_except_0(x) / alldifferent_except(x, S): only values in the
+    excluded set may repeat.  The set is a real argument (range or enum), so a
+    handler that assumed 0 -- or ignored the set -- changes the solution set
+    here rather than passing."""
+    n = rng.randint(2, 4)
+    hi = rng.randint(2, 4)
+    form = rng.choice(["zero", "set", "range"])
+    if form == "zero":
+        decls = [varray("x", n, 0, hi)]
+        cons = ["alldifferent_except_0(x)"]
+        doms = {"x": arr_domain(n, 0, hi)}
+        excl = {0}
+    elif form == "set":
+        v = rng.randint(1, hi)
+        decls = [varray("x", n, 1, hi)]
+        cons = [f"alldifferent_except(x, {{{v}}})"]
+        doms = {"x": arr_domain(n, 1, hi)}
+        excl = {v}
+    else:
+        lo2 = rng.randint(1, hi - 1)
+        hi2 = rng.randint(lo2, hi)
+        decls = [varray("x", n, 1, hi)]
+        cons = [f"alldifferent_except(x, {lo2}..{hi2})"]
+        doms = {"x": arr_domain(n, 1, hi)}
+        excl = set(range(lo2, hi2 + 1))
+
+    def check(a):
+        vals = [v for v in a["x"] if v not in excl]
+        return len(vals) == len(set(vals))
+
+    return Inst(model(decls, cons), ["x"], doms, check)
+
+
 GENS = [gen_count, gen_at_most1, gen_precede, gen_arg_extremum,
         gen_sort, gen_arg_sort, gen_among_seq, gen_element2d,
-        gen_lex_greater, gen_array_bool_not]
+        gen_lex_greater, gen_array_bool_not, gen_regular, gen_span,
+        gen_alldiff_except]
 
 
 # ------------------------------------------------------------------ pins
@@ -593,6 +696,37 @@ def main():
             obj = sum(blocks[-1]["y"]) if (st == "SAT" and blocks) else None
             if st == "UNKNOWN" or obj is None or abs(obj - opt) > 1e-6:
                 print(f"[opt.{k}] sort-opt st={st} obj={obj} want={opt} -> WRONG")
+                wrong += 1
+            else:
+                ok += 1
+        # span stays exact when y is the minimized objective *and* pinned by
+        # another row.  An epigraph-only encoding (mx bounded below, mn above)
+        # accepts the pinned case and prints a schedule whose real span is 0 --
+        # this pair of pins is what makes that regression fail loudly.
+        span_cases = [
+            ("span.pinned_unsat",
+             "var 1..3: x1 :: output_var;\nvar 1..3: x2 :: output_var;\n"
+             "var 0..5: y :: output_var;\n"
+             "constraint fzn_span([x1, x2], y);\n"
+             "constraint int_eq(x1, x2);\nconstraint int_eq(y, 2);\n"
+             "solve minimize y;", "UNSAT"),
+            ("span.pinned_sat",
+             "var 1..3: x1 :: output_var;\nvar 1..3: x2 :: output_var;\n"
+             "var 0..5: y :: output_var;\n"
+             "constraint fzn_span([x1, x2], y);\n"
+             "constraint int_eq(x1, 1);\nconstraint int_eq(x2, 3);\n"
+             "solve minimize y;", "SAT"),
+        ]
+        for label, text, want in span_cases:
+            try:
+                out = run_fzn_text(text, timeout=60)
+            except subprocess.TimeoutExpired:
+                print(f"[{label}] timeout -> WRONG")
+                wrong += 1
+                continue
+            st = status_of(out)
+            if st != want:
+                print(f"[{label}] st={st} want {want} -> WRONG")
                 wrong += 1
             else:
                 ok += 1
